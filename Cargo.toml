@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+  "medusa-domain",
+  "medusa-config",
+  "medusa-store",
+  "medusa-forge",
+  "medusa-eval",
+  "medusa-build",
+  "medusa-sched",
+  "medusa-web",
+  "medusa-control",
+  "medusa-daemon",
+  "medusactl",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"

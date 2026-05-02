@@ -1,0 +1,9 @@
+[package]
+name = "medusa-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "medusa"
+path = "src/main.rs"
