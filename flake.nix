@@ -85,6 +85,7 @@
           checks = {
             formatting = treefmtEval.config.build.check inputs.self;
             inherit (pkgs) medusa;
+            config-smoke = pkgs.callPackage ./nix/tests/config-smoke.nix { };
           };
         };
     };
