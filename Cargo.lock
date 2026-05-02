@@ -960,6 +960,10 @@ version = "0.0.1"
 [[package]]
 name = "medusa-sched"
 version = "0.0.1"
+dependencies = [
+ "medusa-domain",
+ "tracing",
+]
 
 [[package]]
 name = "medusa-store"
