@@ -7,3 +7,12 @@ license.workspace = true
 [[bin]]
 name = "medusa"
 path = "src/main.rs"
+
+[dependencies]
+medusa-config = { workspace = true }
+medusa-store = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -3,3 +3,15 @@ name = "medusa-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+medusa-domain = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
