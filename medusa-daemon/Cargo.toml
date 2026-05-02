@@ -9,9 +9,12 @@ name = "medusa"
 path = "src/main.rs"
 
 [dependencies]
+medusa-build = { path = "../medusa-build" }
 medusa-config = { workspace = true }
+medusa-domain = { workspace = true }
 medusa-eval = { path = "../medusa-eval" }
 medusa-store = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

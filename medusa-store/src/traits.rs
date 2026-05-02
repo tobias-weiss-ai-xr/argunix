@@ -50,6 +50,18 @@ pub trait JobStore: Send + Sync {
     async fn get(&self, id: JobId) -> Result<Option<JobRecord>, StoreError>;
     async fn list_by_eval(&self, eval_id: EvalId) -> Result<Vec<JobRecord>, StoreError>;
     async fn set_status(&self, id: JobId, status: JobStatus) -> Result<(), StoreError>;
+    /// Mark a job as `Running` and stamp `started_at`.
+    async fn start(&self, id: JobId, started_at: DateTime<Utc>) -> Result<(), StoreError>;
+    /// Mark a job terminal: set `status`, `finished_at`, and (where present)
+    /// the on-disk paths produced by the build pipeline.
+    async fn finish(
+        &self,
+        id: JobId,
+        status: JobStatus,
+        finished_at: DateTime<Utc>,
+        log_path: Option<&str>,
+        output_path: Option<&str>,
+    ) -> Result<(), StoreError>;
     /// Used at boot (Q79): mark every still-`running` job as `interrupted`.
     /// Returns the number of rows updated.
     async fn mark_running_interrupted(&self) -> Result<u64, StoreError>;

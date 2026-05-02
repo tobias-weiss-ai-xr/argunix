@@ -3,3 +3,15 @@ name = "medusa-build"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+medusa-domain = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

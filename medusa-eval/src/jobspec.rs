@@ -1,5 +1,6 @@
 use medusa_domain::AttrPath;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// One JSON-lines record from `nix-eval-jobs` stdout. Mirror of the schema
 /// the tool emits — kept loose because nix-eval-jobs has historically added
@@ -15,6 +16,8 @@ pub struct RawJob {
     pub system: Option<String>,
     pub error: Option<String>,
     #[serde(default)]
+    pub outputs: BTreeMap<String, String>,
+    #[serde(default)]
     pub meta: serde_json::Value,
     #[serde(default)]
     pub is_cached: bool,
@@ -28,8 +31,23 @@ pub struct JobSpec {
     pub drv_path: Option<String>,
     pub system: Option<String>,
     pub error: Option<String>,
+    /// Output-name → store path map, e.g. `{"out": "/nix/store/zzz-foo"}`.
+    /// Pre-computed by `nix-eval-jobs` so we can do cache-skip without
+    /// shelling out to `nix-store --query --outputs` separately.
+    pub outputs: BTreeMap<String, String>,
     pub meta: serde_json::Value,
     pub is_cached: bool,
+}
+
+impl JobSpec {
+    /// The primary output path (`outputs["out"]` if present, else the first
+    /// output, else `None`). Used by cache-skip and log-naming.
+    pub fn primary_output(&self) -> Option<&str> {
+        self.outputs
+            .get("out")
+            .or_else(|| self.outputs.values().next())
+            .map(String::as_str)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +83,7 @@ pub fn parse_lines(prefix: &str, body: &str) -> Result<Vec<JobSpec>, ParseError>
             drv_path: raw.drv_path,
             system: raw.system,
             error: raw.error,
+            outputs: raw.outputs,
             meta: raw.meta,
             is_cached: raw.is_cached,
         });
@@ -138,5 +157,27 @@ mod tests {
         let body = r#"{"attr":"hello","drvPath":"/nix/store/x.drv","system":"x86_64-linux","meta":{"description":"hi","platforms":["x86_64-linux"]}}"#;
         let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
         assert_eq!(jobs[0].meta["description"], "hi");
+    }
+
+    #[test]
+    fn parses_outputs_map() {
+        let body = r#"{"attr":"hello","drvPath":"/nix/store/x.drv","system":"x86_64-linux","outputs":{"out":"/nix/store/zzz-hello","dev":"/nix/store/yyy-hello-dev"}}"#;
+        let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
+        assert_eq!(jobs[0].outputs.len(), 2);
+        assert_eq!(jobs[0].primary_output(), Some("/nix/store/zzz-hello"));
+    }
+
+    #[test]
+    fn primary_output_falls_back_to_first_when_no_out() {
+        let body = r#"{"attr":"x","drvPath":"/nix/store/x.drv","system":"x86_64-linux","outputs":{"lib":"/nix/store/aaa-x-lib"}}"#;
+        let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
+        assert_eq!(jobs[0].primary_output(), Some("/nix/store/aaa-x-lib"));
+    }
+
+    #[test]
+    fn primary_output_none_when_outputs_empty() {
+        let body = r#"{"attr":"x","drvPath":"/nix/store/x.drv","system":"x86_64-linux"}"#;
+        let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
+        assert!(jobs[0].primary_output().is_none());
     }
 }

@@ -58,3 +58,4 @@ sqlx = { version = "0.8", default-features = false, features = [
 
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
+zstd = { version = "0.13", default-features = false }

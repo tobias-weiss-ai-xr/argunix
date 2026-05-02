@@ -246,6 +246,39 @@ impl JobStore for SqlxStore {
         Ok(())
     }
 
+    async fn start(&self, id: JobId, started_at: DateTime<Utc>) -> Result<(), StoreError> {
+        sqlx::query("UPDATE jobs SET status = ?1, started_at = ?2 WHERE id = ?3")
+            .bind(JobStatus::Running.as_str())
+            .bind(started_at)
+            .bind(id.get())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn finish(
+        &self,
+        id: JobId,
+        status: JobStatus,
+        finished_at: DateTime<Utc>,
+        log_path: Option<&str>,
+        output_path: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE jobs
+             SET status = ?1, finished_at = ?2, log_path = ?3, output_path = ?4
+             WHERE id = ?5",
+        )
+        .bind(status.as_str())
+        .bind(finished_at)
+        .bind(log_path)
+        .bind(output_path)
+        .bind(id.get())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn mark_running_interrupted(&self) -> Result<u64, StoreError> {
         let r = sqlx::query("UPDATE jobs SET status = ?1 WHERE status = ?2")
             .bind(JobStatus::Interrupted.as_str())
