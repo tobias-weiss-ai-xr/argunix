@@ -1,9 +1,12 @@
+mod worker;
+
 use anyhow::{Context, anyhow};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
 use medusa_store::{EvalStore, JobStore, RepoStore};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -36,6 +39,18 @@ struct ServeArgs {
     /// Override the listen address from the config.
     #[arg(long, value_name = "HOST:PORT")]
     listen: Option<String>,
+    /// Override the work directory used for clones (default: ./work).
+    #[arg(long, value_name = "PATH")]
+    work_dir: Option<PathBuf>,
+    /// Override the log directory (default: ./logs).
+    #[arg(long, value_name = "PATH")]
+    log_dir: Option<PathBuf>,
+    /// Override the GC root base directory.
+    #[arg(long, value_name = "PATH")]
+    gc_root_dir: Option<PathBuf>,
+    /// Override systems to evaluate (default: host's local system).
+    #[arg(long, value_delimiter = ',', value_name = "SYSTEM[,SYSTEM]")]
+    systems: Option<Vec<String>>,
 }
 
 #[derive(Args, Debug)]
@@ -146,11 +161,57 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .context("opening sqlite database at ./db.sqlite")?;
     let store = medusa_store::SqlxStore::new(pool);
 
-    let listen = args.listen.clone().unwrap_or_else(|| config.listen.clone());
+    let n = <medusa_store::SqlxStore as JobStore>::mark_running_interrupted(&store)
+        .await
+        .context("recovering interrupted jobs")?;
+    if n > 0 {
+        tracing::info!(count = n, "marked previously-running jobs as interrupted");
+    }
+
+    let work_dir = args
+        .work_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("./work"));
+    let log_dir = args
+        .log_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("./logs"));
+    let gc_root_dir = args
+        .gc_root_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/nix/var/nix/gcroots/per-user/medusa"));
+    let systems = args
+        .systems
+        .clone()
+        .unwrap_or_else(medusa_eval::detect_local_systems);
+
+    let providers_arc = Arc::new(providers);
+    let config_arc = Arc::new(config);
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker_ctx = worker::WorkerContext {
+        config: config_arc.clone(),
+        providers: providers_arc.clone(),
+        store: store.clone(),
+        work_dir,
+        log_dir,
+        gc_root_dir,
+        eval_timeout: Duration::from_secs(600),
+        build_timeout: Duration::from_secs(7200),
+        clone_timeout: Duration::from_secs(300),
+        systems,
+    };
+    let worker_handle = worker::spawn(worker_ctx, rx);
+
+    let listen = args
+        .listen
+        .clone()
+        .unwrap_or_else(|| config_arc.listen.clone());
     let inner = medusa_web::AppStateInner {
-        config: std::sync::Arc::new(config),
-        providers,
+        config: config_arc,
+        providers: (*providers_arc).clone(),
         store,
+        work_dispatcher: tx,
     };
     let router = medusa_web::router_from_inner(inner);
 
@@ -165,6 +226,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("axum serve")?;
+
+    // axum has finished serving; the only remaining `Sender` for the
+    // worker channel lives inside the dropped `AppStateInner`, so the
+    // worker will see the channel close and exit. Await it to drain any
+    // in-flight evaluation.
+    let _ = worker_handle.await;
     tracing::info!("graceful shutdown complete");
     Ok(())
 }

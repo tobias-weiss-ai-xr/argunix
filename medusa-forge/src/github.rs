@@ -269,6 +269,35 @@ impl Provider for GithubProvider {
         let body: StatusView = response.json().await?;
         Ok(CheckHandle(body.id.to_string()))
     }
+
+    fn clone_url(&self, slug: &Slug) -> String {
+        // Derive the public host from the API URL.
+        // - api.github.com → github.com
+        // - <enterprise>/api/v3 → <enterprise>
+        let host = derive_clone_host(&self.api_url);
+        format!(
+            "https://x-access-token:{}@{}/{}.git",
+            self.token,
+            host,
+            slug.as_str(),
+        )
+    }
+}
+
+fn derive_clone_host(api_url: &str) -> String {
+    let trimmed = api_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    if let Some(rest) = trimmed.strip_prefix("api.") {
+        // github.com SaaS shape: api.github.com → github.com.
+        return rest.split('/').next().unwrap_or(rest).to_string();
+    }
+    // Enterprise shape: <host>/api/v3 → <host>.
+    if let Some((host, _)) = trimmed.split_once("/api/") {
+        return host.to_string();
+    }
+    trimmed.to_string()
 }
 
 fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {

@@ -196,6 +196,10 @@ async fn persist(
         sha = %sha,
         "evaluation queued",
     );
+    // Best-effort: hand off to the worker. If the channel has been closed
+    // (daemon is shutting down), the eval is still in the DB and a future
+    // restart's startup scan will pick it up.
+    let _ = state.work_dispatcher.send(eval_id);
     Ok(())
 }
 

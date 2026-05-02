@@ -89,6 +89,7 @@
             eval-smoke = pkgs.callPackage ./nix/tests/eval-smoke.nix { };
             build-smoke = pkgs.callPackage ./nix/tests/build-smoke.nix { };
             webhook-smoke = pkgs.callPackage ./nix/tests/webhook-smoke.nix { };
+            serve-pipeline-smoke = pkgs.callPackage ./nix/tests/serve-pipeline-smoke.nix { };
           };
         };
     };

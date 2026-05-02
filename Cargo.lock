@@ -1210,6 +1210,7 @@ dependencies = [
  "medusa-config",
  "medusa-domain",
  "medusa-eval",
+ "medusa-forge",
  "medusa-store",
  "medusa-web",
  "serde_json",

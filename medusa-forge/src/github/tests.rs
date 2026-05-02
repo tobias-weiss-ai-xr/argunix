@@ -341,6 +341,34 @@ async fn fetch_merge_ref_returns_none_when_pending() {
     assert!(sha.is_none());
 }
 
+#[test]
+fn clone_url_for_saas_github() {
+    let p = GithubProvider::new(
+        "https://api.github.com".into(),
+        "ghp_xxx".into(),
+        "https://m".into(),
+    );
+    let url = p.clone_url(&Slug::new("myorg/myrepo").unwrap());
+    assert_eq!(
+        url,
+        "https://x-access-token:ghp_xxx@github.com/myorg/myrepo.git"
+    );
+}
+
+#[test]
+fn clone_url_for_enterprise_github() {
+    let p = GithubProvider::new(
+        "https://gh.example.com/api/v3".into(),
+        "tok".into(),
+        "https://m".into(),
+    );
+    let url = p.clone_url(&Slug::new("team/proj").unwrap());
+    assert_eq!(
+        url,
+        "https://x-access-token:tok@gh.example.com/team/proj.git"
+    );
+}
+
 #[tokio::test]
 async fn post_check_succeeds() {
     use wiremock::matchers::body_json;

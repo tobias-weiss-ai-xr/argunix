@@ -93,4 +93,9 @@ pub trait Provider: Send + Sync {
 
     /// Post a check / commit status. Returns the forge-side handle.
     async fn post_check(&self, post: CheckPost) -> Result<CheckHandle, ForgeError>;
+
+    /// Build a clone URL for `slug` that includes whatever auth this
+    /// provider uses. v1 covers HTTPS-with-token; SSH and per-repo
+    /// `clone.method` overrides are deferred to M7.
+    fn clone_url(&self, slug: &Slug) -> String;
 }

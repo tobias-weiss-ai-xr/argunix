@@ -1,8 +1,9 @@
 use medusa_config::{Config, ForgeAuth, ForgeConfig};
-use medusa_domain::ForgeKind;
+use medusa_domain::{EvalId, ForgeKind};
 use medusa_forge::{GithubProvider, Provider};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Daemon-side state shared by every request handler. Wrapped in `Arc`
 /// for `axum`'s `State` extractor (which requires `Clone`).
@@ -12,6 +13,10 @@ pub struct AppStateInner {
     pub config: Arc<Config>,
     pub providers: HashMap<String, Arc<dyn Provider>>,
     pub store: medusa_store::SqlxStore,
+    /// Channel to the background worker. After the webhook handler
+    /// persists an evaluation row, it sends the new id here so the
+    /// worker can pick it up immediately rather than polling.
+    pub work_dispatcher: UnboundedSender<EvalId>,
 }
 
 #[derive(Debug, thiserror::Error)]

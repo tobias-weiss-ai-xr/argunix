@@ -13,6 +13,7 @@ medusa-build = { path = "../medusa-build" }
 medusa-config = { workspace = true }
 medusa-domain = { workspace = true }
 medusa-eval = { path = "../medusa-eval" }
+medusa-forge = { path = "../medusa-forge" }
 medusa-store = { workspace = true }
 medusa-web = { path = "../medusa-web" }
 axum = { workspace = true }
