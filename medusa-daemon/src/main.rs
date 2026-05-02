@@ -21,6 +21,21 @@ enum Command {
     Eval(EvalArgs),
     /// Evaluate and build a local flake end-to-end (M3 single-shot pipeline).
     Build(BuildArgs),
+    /// Run as an HTTP daemon: accept webhooks, queue evaluations.
+    Serve(ServeArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServeArgs {
+    /// Path to the medusa YAML config.
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// Skip checking that every secret file referenced by the config exists.
+    #[arg(long)]
+    skip_secret_check: bool,
+    /// Override the listen address from the config.
+    #[arg(long, value_name = "HOST:PORT")]
+    listen: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -105,7 +120,74 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Run(args) => run(args).await,
         Command::Eval(args) => eval(args).await,
         Command::Build(args) => build(args).await,
+        Command::Serve(args) => serve(args).await,
     }
+}
+
+async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    let config = medusa_config::load(&args.config)
+        .with_context(|| format!("loading config from {}", args.config.display()))?;
+    if !args.skip_secret_check {
+        config
+            .validate_secrets_exist()
+            .context("validating secret files")?;
+    }
+    let providers = medusa_web::build_providers(&config)
+        .await
+        .context("building forge providers")?;
+    tracing::info!(
+        forges = providers.len(),
+        repos = config.repos.len(),
+        "providers initialised"
+    );
+
+    let pool = medusa_store::open_at(Path::new("./db.sqlite"))
+        .await
+        .context("opening sqlite database at ./db.sqlite")?;
+    let store = medusa_store::SqlxStore::new(pool);
+
+    let listen = args.listen.clone().unwrap_or_else(|| config.listen.clone());
+    let inner = medusa_web::AppStateInner {
+        config: std::sync::Arc::new(config),
+        providers,
+        store,
+    };
+    let router = medusa_web::router_from_inner(inner);
+
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("binding {listen}"))?;
+    let local = listener.local_addr().context("reading local addr")?;
+    println!("listening on {local}");
+    tracing::info!(%local, "medusa http server ready");
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("axum serve")?;
+    tracing::info!("graceful shutdown complete");
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let term = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            if let Ok(mut s) = signal(SignalKind::terminate()) {
+                s.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await;
+    };
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    tracing::info!("shutdown signal received; draining");
 }
 
 async fn run(args: RunArgs) -> anyhow::Result<()> {

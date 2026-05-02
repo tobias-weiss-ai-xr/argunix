@@ -14,6 +14,8 @@ medusa-config = { workspace = true }
 medusa-domain = { workspace = true }
 medusa-eval = { path = "../medusa-eval" }
 medusa-store = { workspace = true }
+medusa-web = { path = "../medusa-web" }
+axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
