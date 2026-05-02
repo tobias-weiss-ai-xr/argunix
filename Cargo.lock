@@ -886,7 +886,9 @@ dependencies = [
  "anyhow",
  "clap",
  "medusa-config",
+ "medusa-eval",
  "medusa-store",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -905,6 +907,14 @@ dependencies = [
 [[package]]
 name = "medusa-eval"
 version = "0.0.1"
+dependencies = [
+ "medusa-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "medusa-forge"

@@ -1,33 +1,69 @@
 use anyhow::Context;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Duration;
 
-/// medusa CI daemon (M1 skeleton).
 #[derive(Parser, Debug)]
-#[command(version)]
-struct Args {
+#[command(version, about = "medusa CI daemon")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the medusa daemon (M1 service-mode skeleton).
+    Run(RunArgs),
+    /// Evaluate a local flake and print discovered jobs as JSON.
+    Eval(EvalArgs),
+}
+
+#[derive(Args, Debug)]
+struct RunArgs {
     /// Path to the medusa YAML config.
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
 
     /// Skip checking that every secret file referenced by the config exists.
-    /// Useful for `medusa --check`-style validation in CI.
+    /// Useful for `medusa run --skip-secret-check` validation in CI.
     #[arg(long)]
     skip_secret_check: bool,
 }
 
+#[derive(Args, Debug)]
+struct EvalArgs {
+    /// Path to a local checkout containing a `flake.nix`.
+    #[arg(long, value_name = "PATH")]
+    src: PathBuf,
+
+    /// Comma-separated systems to evaluate fragments under.
+    /// Defaults to the host's local system.
+    #[arg(long, value_delimiter = ',', value_name = "SYSTEM[,SYSTEM]")]
+    systems: Option<Vec<String>>,
+
+    /// Wall-clock seconds per fragment for `nix-eval-jobs`.
+    #[arg(long, default_value_t = 600, value_name = "SECONDS")]
+    timeout_seconds: u64,
+}
+
 fn main() -> anyhow::Result<()> {
     init_tracing();
-    let args = Args::parse();
+    let cli = Cli::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    runtime.block_on(run(args))
+    runtime.block_on(dispatch(cli))
 }
 
-async fn run(args: Args) -> anyhow::Result<()> {
-    // Step 2 of the boot sequence (Q106): load + validate config.
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    match cli.command {
+        Command::Run(args) => run(args).await,
+        Command::Eval(args) => eval(args).await,
+    }
+}
+
+async fn run(args: RunArgs) -> anyhow::Result<()> {
     let config = medusa_config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
     if !args.skip_secret_check {
@@ -42,18 +78,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         "config loaded",
     );
 
-    // Step 1 of the boot sequence: open db and run migrations. The order is
-    // reversed in M1 only because we want config errors to surface before
-    // touching the filesystem; a future restructure can move db open back
-    // ahead of config load when we have a proper init pipeline.
     let pool = medusa_store::open_at(std::path::Path::new("./db.sqlite"))
         .await
         .context("opening sqlite database at ./db.sqlite")?;
     let store = medusa_store::SqlxStore::new(pool);
 
-    // Step 5 of the boot sequence: any rows still marked `running` are
-    // leftovers from a crashed previous instance. Mark them interrupted so
-    // the (future) scheduler can re-queue them.
     let n = <medusa_store::SqlxStore as medusa_store::JobStore>::mark_running_interrupted(&store)
         .await
         .context("recovering interrupted jobs")?;
@@ -62,6 +91,38 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     println!("ready");
+    Ok(())
+}
+
+async fn eval(args: EvalArgs) -> anyhow::Result<()> {
+    let systems = args
+        .systems
+        .unwrap_or_else(medusa_eval::detect_local_systems);
+    let request = medusa_eval::EvalRequest {
+        source_path: args
+            .src
+            .canonicalize()
+            .with_context(|| format!("resolving --src path {}", args.src.display()))?,
+        systems: systems.clone(),
+        outputs: medusa_eval::DEFAULT_FLAKE_OUTPUTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        timeout: Duration::from_secs(args.timeout_seconds),
+    };
+    tracing::info!(
+        src = %request.source_path.display(),
+        ?systems,
+        "starting offline evaluation",
+    );
+
+    let jobs = medusa_eval::evaluate(&request)
+        .await
+        .context("running nix-eval-jobs")?;
+    tracing::info!(count = jobs.len(), "evaluation produced jobs");
+
+    let serialised = serde_json::to_string_pretty(&jobs).context("serialising job list to JSON")?;
+    println!("{serialised}");
     Ok(())
 }
 

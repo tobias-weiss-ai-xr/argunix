@@ -10,9 +10,11 @@ path = "src/main.rs"
 
 [dependencies]
 medusa-config = { workspace = true }
+medusa-eval = { path = "../medusa-eval" }
 medusa-store = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
