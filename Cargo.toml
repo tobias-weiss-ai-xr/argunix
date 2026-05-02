@@ -59,3 +59,11 @@ sqlx = { version = "0.8", default-features = false, features = [
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 zstd = { version = "0.13", default-features = false }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+] }
+wiremock = "0.6"
