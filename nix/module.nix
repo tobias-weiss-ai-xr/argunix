@@ -1,0 +1,251 @@
+# medusa NixOS module (M9-lite).
+#
+# This is the minimal-viable module: enough to deploy a single medusa
+# instance against one or more real GitHub repos. What's deferred to the
+# full M9 / M8 work:
+#   - `Type=notify-reload` + `medusactl reload` (M8): for now, restart the
+#     unit to reload config.
+#   - DynamicUser flexibility: we always use a static `medusa` user so it
+#     can be added to nix's `trusted-users`.
+#   - Some of the deepest sandbox knobs from `design/hydra.md` are not
+#     enabled here yet — listed inline as TODOs to revisit once we've run
+#     this in anger.
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+
+let
+  cfg = config.services.medusa;
+
+  yamlFormat = pkgs.formats.yaml { };
+
+  # Generate a YAML file from the user's `settings` attrset, unless they
+  # supplied a `configFile` directly.
+  settingsFile =
+    if cfg.configFile != null then cfg.configFile else yamlFormat.generate "medusa.yaml" cfg.settings;
+
+  # Render `LoadCredential=<name>:<source>` lines, sorted by name for a
+  # stable unit hash.
+  credentialLines =
+    let
+      names = lib.attrNames cfg.credentials;
+    in
+    map (n: "${n}:${toString cfg.credentials.${n}}") names;
+in
+{
+  options.services.medusa = {
+    enable = lib.mkEnableOption "the medusa CI daemon";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.medusa;
+      defaultText = lib.literalExpression "pkgs.medusa";
+      description = "The medusa package to run.";
+    };
+
+    user = lib.mkOption {
+      type = lib.types.str;
+      default = "medusa";
+      description = ''
+        System user the daemon runs as. The user is added to nix's
+        `trusted-users` so medusa can dispatch builds via the local
+        nix-daemon. Stays static (not `DynamicUser`) for that reason.
+      '';
+    };
+
+    group = lib.mkOption {
+      type = lib.types.str;
+      default = "medusa";
+      description = "System group for the medusa user.";
+    };
+
+    listen = lib.mkOption {
+      type = lib.types.str;
+      default = "127.0.0.1:8080";
+      description = ''
+        `host:port` the HTTP server listens on. Overrides any `listen`
+        field in the YAML config.
+      '';
+    };
+
+    openFirewall = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether to open the listen port in the firewall. Most deployments
+        front medusa with a reverse proxy and leave this false.
+      '';
+    };
+
+    stateDir = lib.mkOption {
+      type = lib.types.path;
+      default = "/var/lib/medusa";
+      description = ''
+        Working directory of the daemon. All relative paths in the YAML
+        (`./db.sqlite`, `./logs`, `./work`) resolve against this. Created
+        and chowned to `cfg.user` by `StateDirectory=`.
+      '';
+    };
+
+    settings = lib.mkOption {
+      inherit (yamlFormat) type;
+      default = { };
+      description = ''
+        Inline medusa configuration. Converted to YAML and written to the
+        store at activation time. Mutually exclusive with `configFile`.
+
+        Reference secret files via `$CREDENTIALS_DIRECTORY/<name>`, where
+        `<name>` is a key of `services.medusa.credentials`. Systemd will
+        materialise them under `$CREDENTIALS_DIRECTORY/` at unit start
+        and tear them down again on stop.
+      '';
+      example = lib.literalExpression ''
+        {
+          external_url = "https://medusa.example.com";
+          forges.github-myorg = {
+            kind = "github";
+            api_url = "https://api.github.com";
+            webhook_secret_path = "$CREDENTIALS_DIRECTORY/github-myorg-webhook";
+            token_path = "$CREDENTIALS_DIRECTORY/github-myorg-token";
+          };
+          repos = [
+            {
+              slug = "myorg/myrepo";
+              forge = "github-myorg";
+              watched_branches = [ "main" ];
+            }
+          ];
+        }
+      '';
+    };
+
+    configFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Path to a pre-existing YAML config. If set, `settings` is ignored.
+      '';
+    };
+
+    credentials = lib.mkOption {
+      type = lib.types.attrsOf lib.types.path;
+      default = { };
+      description = ''
+        Map of `<name>` → source path on the host. Each entry becomes a
+        `LoadCredential=<name>:<source>` line on the unit, exposing the
+        contents at `$CREDENTIALS_DIRECTORY/<name>` for the daemon to
+        read. Reference these paths from `settings`.
+      '';
+      example = lib.literalExpression ''
+        {
+          github-myorg-webhook = "/run/agenix/medusa-webhook";
+          github-myorg-token = "/run/agenix/medusa-token";
+        }
+      '';
+    };
+  };
+
+  config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !(cfg.configFile != null && cfg.settings != { });
+        message = ''
+          services.medusa: set either `settings` or `configFile`, not both.
+        '';
+      }
+    ];
+
+    users.users.${cfg.user} = {
+      isSystemUser = true;
+      inherit (cfg) group;
+      description = "medusa CI daemon";
+      home = cfg.stateDir;
+    };
+    users.groups.${cfg.group} = { };
+
+    # medusa shells out to the nix daemon for evaluation and dispatch.
+    nix.settings.trusted-users = [ cfg.user ];
+
+    networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall (
+      let
+        port = lib.toInt (lib.last (lib.splitString ":" cfg.listen));
+      in
+      [ port ]
+    );
+
+    systemd.services.medusa = {
+      description = "medusa CI daemon";
+      after = [
+        "network-online.target"
+        "nix-daemon.service"
+      ];
+      wants = [ "network-online.target" ];
+      wantedBy = [ "multi-user.target" ];
+
+      path = [
+        pkgs.git
+        pkgs.nix
+        pkgs.nix-eval-jobs
+      ];
+
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = lib.concatStringsSep " " [
+          (lib.getExe' cfg.package "medusa")
+          "serve"
+          "--config"
+          (toString settingsFile)
+          "--listen"
+          cfg.listen
+        ];
+        Restart = "on-failure";
+        RestartSec = 5;
+
+        User = cfg.user;
+        Group = cfg.group;
+
+        StateDirectory = "medusa";
+        StateDirectoryMode = "0750";
+        WorkingDirectory = cfg.stateDir;
+        RuntimeDirectory = "medusa";
+        LogsDirectory = "medusa";
+
+        LoadCredential = credentialLines;
+
+        # Sandboxing. Conservative-but-realistic profile: enough hardening
+        # to catch obvious mistakes, not so much that nix subprocesses
+        # break. Revisit `MemoryDenyWriteExecute` and the syscall filter
+        # once we've shaken this out in production — both are known to
+        # interact with various JIT/Nix tooling.
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectProc = "invisible";
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
+        RestrictAddressFamilies = [
+          "AF_UNIX"
+          "AF_INET"
+          "AF_INET6"
+        ];
+        SystemCallArchitectures = "native";
+        UMask = "0027";
+      };
+    };
+  };
+
+  meta.maintainers = [ ];
+}

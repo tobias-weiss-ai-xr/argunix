@@ -49,11 +49,7 @@ fn evaluate_push(repo: &Repo, push: &PushEvent) -> Decision {
     }
 }
 
-async fn evaluate_pr(
-    provider: &Arc<dyn Provider>,
-    repo: &Repo,
-    pr: &PullRequestEvent,
-) -> Decision {
+async fn evaluate_pr(provider: &Arc<dyn Provider>, repo: &Repo, pr: &PullRequestEvent) -> Decision {
     if !pr.action.should_evaluate() {
         return Decision::DropPrIgnoredAction;
     }
@@ -201,18 +197,10 @@ mod tests {
         ) -> Result<Option<NormalizedEvent>, ForgeError> {
             unreachable!("policy never parses events");
         }
-        async fn fetch_merge_ref(
-            &self,
-            _: &Slug,
-            _: u64,
-        ) -> Result<Option<Sha>, ForgeError> {
+        async fn fetch_merge_ref(&self, _: &Slug, _: u64) -> Result<Option<Sha>, ForgeError> {
             unreachable!("policy never fetches merge refs");
         }
-        async fn query_user_permission(
-            &self,
-            _: &Slug,
-            _: &str,
-        ) -> Result<Permission, ForgeError> {
+        async fn query_user_permission(&self, _: &Slug, _: &str) -> Result<Permission, ForgeError> {
             match &self.result {
                 Ok(p) => Ok(*p),
                 Err(ForgeErrorKind::Unauthorised) => Err(ForgeError::Unauthorised),

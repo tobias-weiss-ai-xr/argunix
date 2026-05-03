@@ -37,6 +37,11 @@
           ];
         };
 
+      flake.nixosModules = {
+        default = ./nix/module.nix;
+        medusa = ./nix/module.nix;
+      };
+
       perSystem =
         { system, pkgs, ... }:
         let
@@ -91,6 +96,7 @@
             webhook-smoke = pkgs.callPackage ./nix/tests/webhook-smoke.nix { };
             serve-pipeline-smoke = pkgs.callPackage ./nix/tests/serve-pipeline-smoke.nix { };
             forge-status-smoke = pkgs.callPackage ./nix/tests/forge-status-smoke.nix { };
+            module-smoke = pkgs.testers.runNixOSTest ./nix/tests/module-smoke.nix;
           };
         };
     };
