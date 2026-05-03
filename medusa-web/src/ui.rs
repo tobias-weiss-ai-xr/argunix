@@ -201,20 +201,33 @@ async fn eval_page(
         .ok_or(UiError::NotFound)?;
     let jobs = <medusa_store::SqlxStore as JobStore>::list_by_eval(&state.store, eval_id).await?;
 
+    let phase_class = eval_status_phase_class(&eval.status);
+    let job_heading = job_heading_for(&eval.status, jobs.len());
     let body = html! {
-        h1 { "eval #" (eval_id.get()) }
+        h1 {
+            "eval #" (eval_id.get())
+            " "
+            span.badge class=(format!("badge-{phase_class}")) { (eval_status_label(&eval.status)) }
+        }
         p { a href={ "/r/" (forge) "/" (slug) } { "← " (slug) } }
         dl.summary {
             dt { "trigger" } dd { (eval.trigger) }
             dt { "ref" }     dd.mono { (eval.git_ref) }
             dt { "sha" }     dd.mono { (eval.sha) }
-            dt { "status" }  dd { (eval_status_label(&eval.status)) }
             dt { "started" } dd.muted { (fmt_opt_time(eval.started_at)) }
             dt { "finished" } dd.muted { (fmt_opt_time(eval.finished_at)) }
         }
-        h2 { "jobs (" (jobs.len()) ")" }
+        h2 { (job_heading) }
         @if jobs.is_empty() {
-            p.muted { "No jobs recorded for this evaluation." }
+            p.muted {
+                @match eval.status {
+                    EvalStatus::Queued => "Queued — waiting for the worker to pick this up.",
+                    EvalStatus::Evaluating => "Evaluating the flake. Job list will appear when nix-eval-jobs finishes.",
+                    EvalStatus::EvaluationFailed => "Evaluation failed before any jobs were discovered.",
+                    EvalStatus::Cancelled => "Cancelled before any jobs were discovered.",
+                    _ => "No jobs recorded for this evaluation.",
+                }
+            }
         } @else {
             table {
                 thead {
@@ -376,6 +389,32 @@ fn eval_status_label(s: &EvalStatus) -> &'static str {
         EvalStatus::Done => "done",
         EvalStatus::EvaluationFailed => "evaluation failed",
         EvalStatus::Cancelled => "cancelled",
+    }
+}
+
+/// CSS class suffix used to colour the eval-status badge — terminal
+/// states get a fixed colour, transient states get the "active" hue.
+fn eval_status_phase_class(s: &EvalStatus) -> &'static str {
+    match s {
+        EvalStatus::Queued | EvalStatus::Evaluating | EvalStatus::Building => "active",
+        EvalStatus::Done => "ok",
+        EvalStatus::EvaluationFailed => "fail",
+        EvalStatus::Cancelled => "muted",
+    }
+}
+
+/// Header for the per-eval jobs section. Tells the user whether the
+/// list they're looking at is final ("jobs (N)") or still in progress
+/// ("jobs (N so far)" while building, etc.).
+fn job_heading_for(status: &EvalStatus, count: usize) -> String {
+    match status {
+        EvalStatus::Queued | EvalStatus::Evaluating => {
+            "jobs (eval still running — list not yet known)".to_string()
+        }
+        EvalStatus::Building => format!("jobs ({count}, all discovered)"),
+        EvalStatus::Done | EvalStatus::EvaluationFailed | EvalStatus::Cancelled => {
+            format!("jobs ({count})")
+        }
     }
 }
 

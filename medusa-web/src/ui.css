@@ -70,3 +70,35 @@ footer {
   border-top: 1px solid #e3e3e3;
   font-size: 0.85em;
 }
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  border-radius: 999px;
+  vertical-align: middle;
+  margin-left: 0.4rem;
+}
+.badge-active {
+  background: #fff4cc;
+  color: #6a4f00;
+  border: 1px solid #e8c870;
+}
+.badge-ok {
+  background: #d6f5dd;
+  color: #145c25;
+  border: 1px solid #79c98e;
+}
+.badge-fail {
+  background: #ffd6d6;
+  color: #7a1212;
+  border: 1px solid #d97a7a;
+}
+.badge-muted {
+  background: #ececec;
+  color: #555;
+  border: 1px solid #c8c8c8;
+}

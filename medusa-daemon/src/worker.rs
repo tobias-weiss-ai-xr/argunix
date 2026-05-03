@@ -231,10 +231,24 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         );
     }
 
+    // Persist every job spec to the DB *before* starting the build
+    // loop. Without this, the read-only UI's job table grows row by
+    // row as the worker iterates, and a user looking at an in-flight
+    // evaluation can't tell whether the rows currently shown are the
+    // final list or whether more are still to come. With upfront
+    // persistence, the table reflects the final shape as soon as the
+    // eval transitions to `Building`, and the eval's status field is
+    // the single source of truth for "is anything still pending?".
+    let mut persisted: Vec<(medusa_eval::JobSpec, JobId)> = Vec::with_capacity(jobs.len());
+    for spec in jobs {
+        let job_id = persist_job(&ctx.store, eval_id, &spec).await?;
+        persisted.push((spec, job_id));
+    }
+
     let mut tally = JobTally::default();
     let summary_debounce = std::time::Duration::from_secs(2);
     let mut last_summary_post: Option<std::time::Instant> = None;
-    for spec in jobs {
+    for (spec, job_id) in persisted {
         if cancel.is_cancelled() {
             tracing::info!(
                 remaining_jobs = tally.success + tally.cached + tally.failure,
@@ -249,7 +263,6 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             .await?;
             return Ok(());
         }
-        let job_id = persist_job(&ctx.store, eval_id, &spec).await?;
         let outcome = build_one(ctx, repo.id, eval_id, job_id, &spec, &caches, &cancel).await;
         let final_status = match outcome {
             Ok(s) => s,
