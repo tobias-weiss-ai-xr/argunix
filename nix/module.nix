@@ -169,6 +169,14 @@ in
     # medusa shells out to the nix daemon for evaluation and dispatch.
     nix.settings.trusted-users = [ cfg.user ];
 
+    # Per-user gcroot dir under nix's standard tree. Created at boot so
+    # the medusa unit can write into it on first build (nix-daemon would
+    # eventually create it lazily on a `nix-store --add-root` from the
+    # user's own session, but we set up systemd, not a login shell).
+    systemd.tmpfiles.rules = [
+      "d /nix/var/nix/gcroots/per-user/${cfg.user} 0755 ${cfg.user} ${cfg.group} - -"
+    ];
+
     networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall (
       let
         port = lib.toInt (lib.last (lib.splitString ":" cfg.listen));
@@ -212,6 +220,14 @@ in
         WorkingDirectory = cfg.stateDir;
         RuntimeDirectory = "medusa";
         LogsDirectory = "medusa";
+
+        # `ProtectSystem=strict` makes the rest of the FS read-only.
+        # Punch a single hole for the GC roots medusa creates after every
+        # successful build (Q47), without giving it write access to any
+        # other path under /nix/var.
+        ReadWritePaths = [
+          "/nix/var/nix/gcroots/per-user/${cfg.user}"
+        ];
 
         LoadCredential = credentialLines;
 

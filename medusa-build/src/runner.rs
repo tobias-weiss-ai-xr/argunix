@@ -44,6 +44,12 @@ pub struct BuildRequest {
     pub log_path: PathBuf,
     pub timeout: Duration,
     pub log_limit: LogCaptureLimit,
+    /// Optional GC-root path. When set, passed as `--add-root <path>` to
+    /// `nix-store --realise` so the build output is registered as a root
+    /// atomically with the build, and nix-store stays quiet (without it,
+    /// nix-store warns "you did not specify '--add-root'…" on every run).
+    /// The caller is responsible for ensuring the parent directory exists.
+    pub gc_root: Option<PathBuf>,
 }
 
 /// Spawn `nix-store --realise <drv>`, capture stdout (output paths) and
@@ -53,8 +59,12 @@ pub struct BuildRequest {
 pub async fn run_build(request: &BuildRequest) -> Result<BuildOutcome, BuildError> {
     tracing::debug!(drv = %request.drv_path, "spawning nix-store --realise");
 
-    let mut child = Command::new("nix-store")
-        .arg("--realise")
+    let mut cmd = Command::new("nix-store");
+    cmd.arg("--realise");
+    if let Some(root) = &request.gc_root {
+        cmd.arg("--add-root").arg(root);
+    }
+    let mut child = cmd
         .arg(&request.drv_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -232,6 +242,7 @@ exit 0
             log_path: log_path.clone(),
             timeout: Duration::from_secs(10),
             log_limit: LogCaptureLimit::default(),
+            gc_root: None,
         };
         let outcome = run_build(&request).await;
 
@@ -250,5 +261,82 @@ exit 0
             !lines.iter().any(|a| *a == "-L" || *a == "--print-build-logs"),
             "argv contains a `nix build`-only flag that nix-store rejects: {lines:?}",
         );
+    }
+
+    /// When the caller asks for a gc-root, run_build must forward
+    /// `--add-root <path>` to nix-store *before* the drv path. Without
+    /// that, nix-store warns "you did not specify '--add-root'" on every
+    /// invocation and the build output is briefly unprotected.
+    #[tokio::test]
+    async fn passes_add_root_when_gc_root_set() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let bin_root = tempdir().unwrap();
+        let bin = bin_root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let argv_log = bin_root.path().join("argv.txt");
+        let script = bin.join("nix-store");
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(
+                f,
+                r#"#!/bin/sh
+out="{}"
+: > "$out"
+for a in "$@"; do printf '%s\n' "$a" >> "$out"; done
+echo /nix/store/zzz-fake
+exit 0
+"#,
+                argv_log.display(),
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut perm = std::fs::metadata(&script).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script, perm).unwrap();
+
+        let log_dir = tempdir().unwrap();
+        let log_path = log_dir.path().join("build.log.zst");
+        let gc_root = log_dir.path().join("gcroot-symlink");
+
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = std::ffi::OsString::from(&bin);
+        new_path.push(":");
+        new_path.push(&original_path);
+        unsafe { std::env::set_var("PATH", &new_path) };
+
+        let request = BuildRequest {
+            drv_path: "/nix/store/aaaa-fake.drv".to_string(),
+            log_path: log_path.clone(),
+            timeout: Duration::from_secs(10),
+            log_limit: LogCaptureLimit::default(),
+            gc_root: Some(gc_root.clone()),
+        };
+        let outcome = run_build(&request).await;
+
+        unsafe { std::env::set_var("PATH", &original_path) };
+
+        outcome.expect("run_build should succeed");
+
+        let argv = std::fs::read_to_string(&argv_log).expect("fake recorded argv");
+        let lines: Vec<&str> = argv.lines().collect();
+
+        let add_root_idx = lines
+            .iter()
+            .position(|a| *a == "--add-root")
+            .expect("--add-root missing from argv");
+        assert_eq!(
+            lines.get(add_root_idx + 1).map(|s| s.as_ref()),
+            Some(gc_root.to_string_lossy().as_ref()),
+            "--add-root must be followed by the gc-root path; got argv {lines:?}",
+        );
+        let drv_idx = lines
+            .iter()
+            .position(|a| *a == "/nix/store/aaaa-fake.drv")
+            .expect("drv path missing");
+        assert!(add_root_idx < drv_idx, "--add-root must precede the drv path");
     }
 }

@@ -540,11 +540,18 @@ async fn build_one_job(
         .join(repo_id.get().to_string())
         .join(eval_id.get().to_string())
         .join(format!("{}.log.zst", job_id.get()));
+    let gc_root = medusa_build::gc_root_path(gc_root_base, repo_id, eval_id, job_id);
+    if let Some(parent) = gc_root.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            tracing::warn!(error = %e, dir = %parent.display(), "failed to create gcroot parent dir");
+        }
+    }
     let request = medusa_build::BuildRequest {
         drv_path: drv_path.clone(),
         log_path: log_path.clone(),
         timeout: build_timeout,
         log_limit: medusa_build::LogCaptureLimit::default(),
+        gc_root: Some(gc_root),
     };
     let outcome = medusa_build::run_build(&request)
         .await
@@ -553,18 +560,12 @@ async fn build_one_job(
     let log_path_str = log_path.to_string_lossy().into_owned();
     match outcome.status {
         medusa_build::BuildStatus::Success => {
+            // gcroot was registered atomically by `nix-store --realise --add-root`.
             let primary_output = outcome
                 .output_paths
                 .first()
                 .cloned()
                 .or_else(|| spec.primary_output().map(String::from));
-
-            if let Some(output) = primary_output.as_deref() {
-                let root = medusa_build::gc_root_path(gc_root_base, repo_id, eval_id, job_id);
-                if let Err(e) = medusa_build::add_gc_root(&root, output).await {
-                    tracing::warn!(error = %e, "failed to add gc root; build will be subject to nix gc");
-                }
-            }
 
             <medusa_store::SqlxStore as JobStore>::finish(
                 store,
