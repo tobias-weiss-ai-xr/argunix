@@ -64,9 +64,9 @@ in
           token_path = "$CREDENTIALS_DIRECTORY/gh-token";
           repos = {
             "tfc/pprintpp" = {
-              build_prs = true;
               watched_branches = [ "master" ];
             };
+            "applicative-systems/mkdocs-flake" = { };
           };
         };
         gitlab = {
@@ -76,7 +76,6 @@ in
           repos = {
             "jonge/pprintpp" = {
               watched_branches = [ "master" ];
-              build_prs = true;
             };
           };
         };
@@ -87,7 +86,6 @@ in
           repos = {
             "tfc/pprintpp" = {
               watched_branches = [ "master" ];
-              build_prs = true;
             };
           };
         };
