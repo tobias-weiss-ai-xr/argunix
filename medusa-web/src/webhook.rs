@@ -25,14 +25,6 @@ pub enum WebhookError {
     },
     #[error("repo `{0}` is not configured in medusa")]
     RepoNotConfigured(String),
-    #[error(
-        "repo `{slug}` is configured under forge kind `{configured}` but webhook hit /{requested}"
-    )]
-    KindMismatch {
-        slug: String,
-        configured: ForgeKind,
-        requested: String,
-    },
     #[error("no provider built for forge `{0}` (this is a daemon bug)")]
     NoProvider(String),
     #[error("reading webhook secret: {0}")]
@@ -51,7 +43,6 @@ impl IntoResponse for WebhookError {
             WebhookError::NoRepository => StatusCode::ACCEPTED,
             WebhookError::InvalidSlug { .. } => StatusCode::BAD_REQUEST,
             WebhookError::RepoNotConfigured(_) => StatusCode::NOT_FOUND,
-            WebhookError::KindMismatch { .. } => StatusCode::BAD_REQUEST,
             WebhookError::NoProvider(_) => StatusCode::INTERNAL_SERVER_ERROR,
             WebhookError::SecretRead(_) => StatusCode::INTERNAL_SERVER_ERROR,
             WebhookError::Forge(medusa_forge::ForgeError::BadSignature) => StatusCode::UNAUTHORIZED,
@@ -108,24 +99,29 @@ pub async fn handle(
         slug: repo_full_name.clone(),
         source: e,
     })?;
+    // The same slug can appear under multiple forges (e.g. you might
+    // have `tfc/pprintpp` on both GitHub and a self-hosted Forgejo —
+    // medusa keys repos by `(forge_name, slug)`). Filter by both the
+    // slug AND the URL's forge kind so the right repo is picked.
     let repo_cfg = state
         .config
         .repos
         .iter()
-        .find(|r| r.slug == slug)
+        .find(|r| {
+            r.slug == slug
+                && state
+                    .config
+                    .forges
+                    .get(&r.forge)
+                    .map(|f| f.kind == expected_kind)
+                    .unwrap_or(false)
+        })
         .ok_or_else(|| WebhookError::RepoNotConfigured(repo_full_name.clone()))?;
 
     let forge_cfg = state.config.forges.get(&repo_cfg.forge).ok_or_else(|| {
         // We checked this at config validation time, but be defensive.
         WebhookError::NoProvider(repo_cfg.forge.clone())
     })?;
-    if forge_cfg.kind != expected_kind {
-        return Err(WebhookError::KindMismatch {
-            slug: slug.as_str().to_string(),
-            configured: forge_cfg.kind,
-            requested: forge_kind.clone(),
-        });
-    }
 
     let provider = state
         .providers

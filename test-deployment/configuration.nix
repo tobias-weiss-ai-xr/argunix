@@ -55,6 +55,8 @@ in
       gh-token   = "/var/lib/medusa-credentials/gh-token";
       gl-webhook = "/var/lib/medusa-credentials/gl-webhook";
       gl-token   = "/var/lib/medusa-credentials/gl-token";
+      fj-webhook = "/var/lib/medusa-credentials/fj-webhook";
+      fj-token   = "/var/lib/medusa-credentials/fj-token";
     };
     settings = {
       external_url = "https://${fqdn}";
@@ -70,6 +72,12 @@ in
         webhook_secret_path = "$CREDENTIALS_DIRECTORY/gl-webhook";
         token_path = "$CREDENTIALS_DIRECTORY/gl-token";
       };
+      forges.codeberg = {
+        kind = "forgejo";
+        api_url = "https://codeberg.org/api/v1";
+        webhook_secret_path = "$CREDENTIALS_DIRECTORY/fj-webhook";
+        token_path = "$CREDENTIALS_DIRECTORY/fj-token";
+      };
       repos = [
         {
           slug = "tfc/pprintpp";
@@ -80,6 +88,12 @@ in
         {
           slug = "jonge/pprintpp";
           forge = "gitlab";
+          watched_branches = [ "master" ];
+          build_prs = true;
+        }
+        {
+          slug = "tfc/pprintpp";
+          forge = "codeberg";
           watched_branches = [ "master" ];
           build_prs = true;
         }
