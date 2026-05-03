@@ -24,6 +24,8 @@ pub struct AppStateInner {
     pub coalesce: Arc<CoalescePool>,
     /// Tracks which forges are currently paused due to 401s (Q82).
     pub pauses: Arc<PauseRegistry>,
+    /// Per-eval cancellation tokens for cancel-on-new-push (Q39).
+    pub cancellations: Arc<crate::cancel::CancelRegistry>,
 }
 
 #[derive(Debug, thiserror::Error)]

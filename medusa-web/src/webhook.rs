@@ -201,6 +201,39 @@ async fn persist(
         return Ok(());
     }
 
+    // Q39: cancel any in-flight evaluations for the same branch with a
+    // different SHA. We only fire here if the new SHA is different
+    // (matching SHAs were already filtered by the coalesce check, but
+    // a new push to the same branch with a different SHA arrives here).
+    let key = crate::cancel::branch_key(&git_ref);
+    let active = state
+        .store
+        .list_active_by_branch_key(repo_id, key)
+        .await?;
+    for prev in active.iter().filter(|e| e.sha != sha) {
+        tracing::info!(
+            repo_id = repo_id.get(),
+            branch = key,
+            superseded_eval = prev.id.get(),
+            superseded_sha = %prev.sha,
+            new_sha = %sha,
+            "cancelling in-flight evaluation superseded by new push (Q39)",
+        );
+        // DB-level cancel: covers the case where the worker hasn't
+        // picked up this eval yet (cancel arrives before the mpsc
+        // dispatch reaches it).
+        let _ = <medusa_store::SqlxStore as EvalStore>::finish(
+            &state.store,
+            prev.id,
+            medusa_domain::EvalStatus::Cancelled,
+            chrono::Utc::now(),
+        )
+        .await;
+        // In-memory cancel: signal any worker currently mid-evaluation
+        // to bail out / kill its `nix-store --realise`.
+        state.cancellations.cancel(prev.id);
+    }
+
     let eval_id = <medusa_store::SqlxStore as EvalStore>::create(
         &state.store,
         medusa_store::NewEvaluation {

@@ -26,7 +26,7 @@ use medusa_config::Config;
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
 use medusa_forge::{CheckPost, CheckState, ForgeError, Provider};
 use medusa_store::{EvalStore, JobStore, RepoStore, SqlxStore};
-use medusa_web::{PauseRegistry, eval_target_url, job_target_url};
+use medusa_web::{CancelRegistry, PauseRegistry, eval_target_url, job_target_url};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -50,6 +50,7 @@ pub struct WorkerContext {
     pub clone_timeout: Duration,
     pub systems: Vec<String>,
     pub pauses: Arc<PauseRegistry>,
+    pub cancellations: Arc<CancelRegistry>,
 }
 
 /// Spawn the worker on the current tokio runtime. Returns a `JoinHandle`
@@ -86,9 +87,27 @@ pub fn spawn(
 async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     tracing::info!("worker picked up evaluation");
 
+    // Q39: register a cancel token *before* checking the DB row, so a
+    // cancel that arrives after this point but before we start work is
+    // captured. If the DB already says Cancelled (cancel arrived before
+    // the worker picked it up), bail without doing anything.
+    let cancel = ctx.cancellations.register(eval_id);
+    let _guard = CancelGuard {
+        registry: &ctx.cancellations,
+        eval_id,
+    };
+
     let eval = <SqlxStore as EvalStore>::get(&ctx.store, eval_id)
         .await?
         .ok_or_else(|| anyhow!("evaluation row {} disappeared", eval_id.get()))?;
+
+    if eval.status == EvalStatus::Cancelled || cancel.is_cancelled() {
+        tracing::info!(
+            "evaluation cancelled before worker pickup; skipping",
+        );
+        return Ok(());
+    }
+
     let repo = <SqlxStore as RepoStore>::get(&ctx.store, eval.repo_id)
         .await?
         .ok_or_else(|| anyhow!("repo row {} disappeared", eval.repo_id.get()))?;
@@ -107,9 +126,26 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     }
 
     let clone_url = provider.clone_url(&repo.slug);
-    clone_repo(&clone_url, &eval.sha, &work_dir, ctx.clone_timeout)
-        .await
-        .with_context(|| format!("cloning {} at {}", repo.slug, eval.sha))?;
+    let clone_fut = clone_repo(&clone_url, &eval.sha, &work_dir, ctx.clone_timeout);
+    tokio::select! {
+        biased;
+        r = clone_fut => r.with_context(|| format!("cloning {} at {}", repo.slug, eval.sha))?,
+        _ = cancel.cancelled() => {
+            tracing::info!("evaluation cancelled during clone (Q39)");
+            <SqlxStore as EvalStore>::finish(
+                &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
+            ).await?;
+            return Ok(());
+        }
+    };
+
+    if cancel.is_cancelled() {
+        tracing::info!("evaluation cancelled before eval phase (Q39)");
+        <SqlxStore as EvalStore>::finish(
+            &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
+        ).await?;
+        return Ok(());
+    }
 
     let request = medusa_eval::EvalRequest {
         source_path: work_dir.clone(),
@@ -120,7 +156,18 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             .collect(),
         timeout: ctx.eval_timeout,
     };
-    let jobs = match medusa_eval::evaluate(&request).await {
+    let jobs = tokio::select! {
+        biased;
+        res = medusa_eval::evaluate(&request) => res,
+        _ = cancel.cancelled() => {
+            tracing::info!("evaluation cancelled during nix-eval-jobs (Q39)");
+            <SqlxStore as EvalStore>::finish(
+                &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
+            ).await?;
+            return Ok(());
+        }
+    };
+    let jobs = match jobs {
         Ok(jobs) => jobs,
         Err(e) => {
             <SqlxStore as EvalStore>::finish(
@@ -164,8 +211,18 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
 
     let mut tally = JobTally::default();
     for spec in jobs {
+        if cancel.is_cancelled() {
+            tracing::info!(
+                remaining_jobs = tally.success + tally.cached + tally.failure,
+                "evaluation cancelled mid-build-loop (Q39); skipping remaining jobs",
+            );
+            <SqlxStore as EvalStore>::finish(
+                &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
+            ).await?;
+            return Ok(());
+        }
         let job_id = persist_job(&ctx.store, eval_id, &spec).await?;
-        let outcome = build_one(ctx, repo.id, eval_id, job_id, &spec, &caches).await;
+        let outcome = build_one(ctx, repo.id, eval_id, job_id, &spec, &caches, &cancel).await;
         let final_status = match outcome {
             Ok(s) => s,
             Err(e) => {
@@ -374,6 +431,7 @@ async fn build_one(
     job_id: JobId,
     spec: &medusa_eval::JobSpec,
     caches: &[medusa_build::CacheRef],
+    cancel: &medusa_web::CancelToken,
 ) -> anyhow::Result<JobStatus> {
     if spec.error.is_some() {
         return Ok(JobStatus::Failure);
@@ -425,7 +483,26 @@ async fn build_one(
         log_limit: medusa_build::LogCaptureLimit::default(),
         gc_root: Some(gc_root.clone()),
     };
-    let outcome = medusa_build::run_build(&request).await?;
+    // Q39 / Q104 / Q105: race the build against the eval's cancel
+    // signal. `biased;` polls the build first — if it just resolved
+    // with success we honour that even if cancel arrived in the same
+    // event-loop tick (Q105). On cancel-wins we drop the build future;
+    // medusa-build's `Command::kill_on_drop(true)` reaps the child.
+    let outcome = tokio::select! {
+        biased;
+        res = medusa_build::run_build(&request) => res?,
+        _ = cancel.cancelled() => {
+            tracing::info!(
+                job_id = job_id.get(),
+                attr = %spec.attr_path,
+                "build cancelled by new push (Q39); killing nix-store",
+            );
+            <SqlxStore as JobStore>::finish(
+                &ctx.store, job_id, JobStatus::Cancelled, Utc::now(), None, None
+            ).await?;
+            return Ok(JobStatus::Cancelled);
+        }
+    };
     let log_path_str = log_path.to_string_lossy().into_owned();
 
     match outcome.status {
@@ -525,6 +602,20 @@ async fn run_git_with_optional_cwd(
         ));
     }
     Ok(())
+}
+
+/// RAII handle that deregisters the cancellation token on `Drop` so the
+/// registry doesn't leak entries when `process()` returns from any of
+/// its many error paths.
+struct CancelGuard<'a> {
+    registry: &'a CancelRegistry,
+    eval_id: EvalId,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.deregister(self.eval_id);
+    }
 }
 
 #[cfg(test)]

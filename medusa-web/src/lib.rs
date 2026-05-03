@@ -8,6 +8,7 @@
 //! Read-only UI, JSON content negotiation, badges, and `/metrics` come
 //! later (M6).
 
+mod cancel;
 mod coalesce;
 mod pause;
 mod policy;
@@ -15,6 +16,7 @@ mod state;
 mod ui;
 mod webhook;
 
+pub use cancel::{CancelRegistry, CancelToken, branch_key};
 pub use coalesce::CoalescePool;
 pub use pause::PauseRegistry;
 

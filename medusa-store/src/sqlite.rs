@@ -211,6 +211,32 @@ impl EvalStore for SqlxStore {
         .await?;
         rows.iter().map(map_eval).collect()
     }
+
+    async fn list_active_by_branch_key(
+        &self,
+        repo_id: RepoId,
+        branch_key_prefix: &str,
+    ) -> Result<Vec<EvalRecord>, StoreError> {
+        // We match either an exact git_ref or a `<key>:<anything>` form
+        // (PR refs like `refs/pull/42/head:feature-x` need to match key
+        // `refs/pull/42/head`). Plain prefix match with `LIKE` works:
+        // we look for `<key>` exactly OR `<key>:%`.
+        let like_pattern = format!("{}:%", branch_key_prefix.replace('\\', "\\\\"));
+        let rows = sqlx::query(
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status
+             FROM evaluations
+             WHERE repo_id = ?1
+               AND status IN ('queued', 'evaluating', 'building')
+               AND (git_ref = ?2 OR git_ref LIKE ?3 ESCAPE '\\')
+             ORDER BY id ASC",
+        )
+        .bind(repo_id.get())
+        .bind(branch_key_prefix)
+        .bind(&like_pattern)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_eval).collect()
+    }
 }
 
 #[async_trait]

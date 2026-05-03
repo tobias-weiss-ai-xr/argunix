@@ -49,6 +49,15 @@ pub trait EvalStore: Send + Sync {
         repo_id: RepoId,
         limit: u32,
     ) -> Result<Vec<EvalRecord>, StoreError>;
+    /// All non-terminal evaluations (queued / evaluating / building) for
+    /// `repo_id` whose `git_ref` *starts with* `branch_key_prefix`. Used by
+    /// cancel-on-new-push (Q39): a fresh push on a branch finds all
+    /// in-flight evals for that branch and cancels them.
+    async fn list_active_by_branch_key(
+        &self,
+        repo_id: RepoId,
+        branch_key_prefix: &str,
+    ) -> Result<Vec<EvalRecord>, StoreError>;
 }
 
 #[async_trait]
