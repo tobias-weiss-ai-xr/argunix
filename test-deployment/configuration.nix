@@ -63,9 +63,9 @@ in
           api_url = "https://api.github.com";
           token_path = "$CREDENTIALS_DIRECTORY/gh-token";
           repos = {
-            "tfc/pprintpp" = {
-              watched_branches = [ "master" ];
-            };
+            "tfc/attoparsecpp".watched_branches = [ "master" ];
+            "tfc/cmake_cpp_example".watched_branches = [ "master" ];
+            "tfc/pprintpp".watched_branches = [ "master" ];
             "applicative-systems/mkdocs-flake" = { };
           };
         };
