@@ -12,6 +12,7 @@ mod state;
 mod webhook;
 
 pub use state::{AppState, AppStateInner, BuildProvidersError, build_providers};
+pub use webhook::{eval_target_url, job_target_url};
 
 use axum::Router;
 use axum::routing::{get, post};

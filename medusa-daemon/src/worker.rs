@@ -11,18 +11,19 @@
 //! 5. Persists each discovered job and runs the build pipeline (medusa-build),
 //! 6. Updates the evaluation's terminal status.
 //!
-//! What's deferred to M5c2/d:
-//! - posting forge status checks (medusa-forge `post_check`),
+//! What's deferred to M5c3/d:
 //! - cancel-on-new-push,
 //! - PR permission/allowlist enforcement,
-//! - merge-ref retry for fork PRs.
+//! - merge-ref retry for fork PRs,
+//! - per-job vs collapsed check threshold (M5c3 ships per-job for any size).
 
 use anyhow::{Context, anyhow};
 use chrono::Utc;
 use medusa_config::Config;
-use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId};
-use medusa_forge::Provider;
+use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
+use medusa_forge::{CheckPost, CheckState, Provider};
 use medusa_store::{EvalStore, JobStore, RepoStore, SqlxStore};
+use medusa_web::{eval_target_url, job_target_url};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -120,6 +121,17 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
                 Utc::now(),
             )
             .await?;
+            // Q52: surface eval-time failure as a single failed forge check.
+            post_overall_check(
+                ctx,
+                provider,
+                &repo.forge,
+                &repo.slug,
+                &eval.sha,
+                eval_id,
+                CheckState::Failure,
+                "evaluation failed",
+            );
             return Err(anyhow::Error::from(e).context("evaluation failed"));
         }
     };
@@ -136,20 +148,146 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         })
         .collect();
 
+    let mut tally = JobTally::default();
     for spec in jobs {
         let job_id = persist_job(&ctx.store, eval_id, &spec).await?;
-        if let Err(e) = build_one(ctx, repo.id, eval_id, job_id, &spec, &caches).await {
-            tracing::error!(error = %e, attr = %spec.attr_path, "build pipeline error");
-        }
+        let outcome = build_one(ctx, repo.id, eval_id, job_id, &spec, &caches).await;
+        let final_status = match outcome {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, attr = %spec.attr_path, "build pipeline error");
+                JobStatus::Failure
+            }
+        };
+        tally.record(final_status);
+        post_per_job_check(
+            ctx,
+            provider,
+            &repo.forge,
+            &repo.slug,
+            &eval.sha,
+            eval_id,
+            &spec.attr_path.as_str().to_string(),
+            final_status,
+        );
     }
 
     <SqlxStore as EvalStore>::finish(&ctx.store, eval_id, EvalStatus::Done, Utc::now()).await?;
-    tracing::info!("evaluation finished");
+    tracing::info!(
+        success = tally.success,
+        cached = tally.cached,
+        failure = tally.failure,
+        "evaluation finished",
+    );
+
+    let overall_state = if tally.failure > 0 {
+        CheckState::Failure
+    } else {
+        CheckState::Success
+    };
+    let description = format!(
+        "{} ok, {} cached, {} failed",
+        tally.success, tally.cached, tally.failure,
+    );
+    post_overall_check(
+        ctx,
+        provider,
+        &repo.forge,
+        &repo.slug,
+        &eval.sha,
+        eval_id,
+        overall_state,
+        &description,
+    );
 
     if let Err(e) = tokio::fs::remove_dir_all(&work_dir).await {
         tracing::warn!(error = %e, dir = %work_dir.display(), "failed to clean workdir");
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct JobTally {
+    success: usize,
+    cached: usize,
+    failure: usize,
+}
+
+impl JobTally {
+    fn record(&mut self, status: JobStatus) {
+        match status {
+            JobStatus::Success => self.success += 1,
+            JobStatus::Cached => self.cached += 1,
+            JobStatus::Failure => self.failure += 1,
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_per_job_check(
+    ctx: &WorkerContext,
+    provider: &Arc<dyn Provider>,
+    forge: &str,
+    slug: &Slug,
+    sha: &Sha,
+    eval_id: EvalId,
+    attr_path: &str,
+    status: JobStatus,
+) {
+    let state = match status {
+        JobStatus::Success | JobStatus::Cached => CheckState::Success,
+        JobStatus::Failure => CheckState::Failure,
+        JobStatus::Cancelled | JobStatus::Interrupted => CheckState::Error,
+        JobStatus::SkippedNoBuilder => return,
+        JobStatus::Queued | JobStatus::Running => return,
+    };
+    let target = job_target_url(&ctx.config.external_url, forge, slug, eval_id, attr_path);
+    let post = CheckPost {
+        slug: slug.clone(),
+        sha: sha.clone(),
+        context: format!("medusa: {attr_path}"),
+        state,
+        description: Some(match status {
+            JobStatus::Cached => "cache hit".to_string(),
+            JobStatus::Success => "build ok".to_string(),
+            JobStatus::Failure => "build failed".to_string(),
+            _ => "build error".to_string(),
+        }),
+        target_url: Some(target),
+    };
+    spawn_post_check(provider.clone(), post);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_overall_check(
+    ctx: &WorkerContext,
+    provider: &Arc<dyn Provider>,
+    forge: &str,
+    slug: &Slug,
+    sha: &Sha,
+    eval_id: EvalId,
+    state: CheckState,
+    description: &str,
+) {
+    let target = eval_target_url(&ctx.config.external_url, forge, slug, eval_id);
+    let post = CheckPost {
+        slug: slug.clone(),
+        sha: sha.clone(),
+        context: "medusa: evaluation".to_string(),
+        state,
+        description: Some(description.to_string()),
+        target_url: Some(target),
+    };
+    spawn_post_check(provider.clone(), post);
+}
+
+fn spawn_post_check(provider: Arc<dyn Provider>, post: CheckPost) {
+    tokio::spawn(async move {
+        if let Err(e) = provider.post_check(post).await {
+            tracing::warn!(error = %e, "forge post_check failed");
+        }
+    });
 }
 
 async fn persist_job(
@@ -182,12 +320,12 @@ async fn build_one(
     job_id: JobId,
     spec: &medusa_eval::JobSpec,
     caches: &[medusa_build::CacheRef],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<JobStatus> {
     if spec.error.is_some() {
-        return Ok(());
+        return Ok(JobStatus::Failure);
     }
     let Some(drv_path) = spec.drv_path.clone() else {
-        return Ok(());
+        return Ok(JobStatus::Failure);
     };
 
     if let Some(output) = spec.primary_output() {
@@ -203,7 +341,7 @@ async fn build_one(
                     Some(output),
                 )
                 .await?;
-                return Ok(());
+                return Ok(JobStatus::Cached);
             }
             Ok(medusa_build::CacheCheckResult::Miss) => {}
             Err(e) => tracing::warn!(error = %e, "cache check failed; falling through to build"),
@@ -248,6 +386,7 @@ async fn build_one(
                 primary.as_deref(),
             )
             .await?;
+            Ok(JobStatus::Success)
         }
         medusa_build::BuildStatus::Failure => {
             <SqlxStore as JobStore>::finish(
@@ -259,9 +398,9 @@ async fn build_one(
                 None,
             )
             .await?;
+            Ok(JobStatus::Failure)
         }
     }
-    Ok(())
 }
 
 async fn clone_repo(

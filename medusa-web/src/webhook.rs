@@ -3,10 +3,11 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use bytes::Bytes;
-use medusa_domain::{ForgeKind, Slug};
-use medusa_forge::{NormalizedEvent, PullRequestEvent, PushEvent};
+use medusa_domain::{EvalId, ForgeKind, Slug};
+use medusa_forge::{CheckPost, CheckState, NormalizedEvent, Provider, PullRequestEvent, PushEvent};
 use medusa_store::{EvalStore, RepoStore};
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
@@ -139,13 +140,14 @@ pub async fn handle(
         return Ok(StatusCode::ACCEPTED);
     };
 
-    persist(&state, &repo_cfg.forge, event).await?;
+    persist(&state, &repo_cfg.forge, &provider, event).await?;
     Ok(StatusCode::ACCEPTED)
 }
 
 async fn persist(
     state: &AppState,
     forge_name: &str,
+    provider: &Arc<dyn Provider>,
     event: NormalizedEvent,
 ) -> Result<(), WebhookError> {
     let (slug, git_ref, sha, trigger) = match &event {
@@ -196,11 +198,64 @@ async fn persist(
         sha = %sha,
         "evaluation queued",
     );
+
+    // Q51: post a `medusa: evaluation` pending check immediately so the
+    // PR shows medusa received the event. We spawn this so a slow forge
+    // doesn't slow the webhook ack — the worker still proceeds even if
+    // this fails.
+    let post = CheckPost {
+        slug: slug.clone(),
+        sha: sha.clone(),
+        context: "medusa: evaluation".to_string(),
+        state: CheckState::Pending,
+        description: Some("evaluating…".to_string()),
+        target_url: Some(eval_target_url(
+            &state.config.external_url,
+            forge_name,
+            &slug,
+            eval_id,
+        )),
+    };
+    spawn_post_check(provider.clone(), post);
+
     // Best-effort: hand off to the worker. If the channel has been closed
     // (daemon is shutting down), the eval is still in the DB and a future
     // restart's startup scan will pick it up.
     let _ = state.work_dispatcher.send(eval_id);
     Ok(())
+}
+
+pub fn eval_target_url(external_url: &str, forge: &str, slug: &Slug, eval_id: EvalId) -> String {
+    let base = external_url.trim_end_matches('/');
+    format!(
+        "{base}/r/{forge}/{slug}/eval/{eval}",
+        slug = slug.as_str(),
+        eval = eval_id.get()
+    )
+}
+
+pub fn job_target_url(
+    external_url: &str,
+    forge: &str,
+    slug: &Slug,
+    eval_id: EvalId,
+    attr_path: &str,
+) -> String {
+    let base = external_url.trim_end_matches('/');
+    format!(
+        "{base}/r/{forge}/{slug}/eval/{eval}/job/{attr}",
+        slug = slug.as_str(),
+        eval = eval_id.get(),
+        attr = attr_path,
+    )
+}
+
+fn spawn_post_check(provider: Arc<dyn Provider>, post: CheckPost) {
+    tokio::spawn(async move {
+        if let Err(e) = provider.post_check(post).await {
+            tracing::warn!(error = %e, "forge post_check failed");
+        }
+    });
 }
 
 fn headers_to_pairs(headers: &HeaderMap) -> Vec<(String, String)> {

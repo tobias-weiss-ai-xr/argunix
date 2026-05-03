@@ -90,6 +90,7 @@
             build-smoke = pkgs.callPackage ./nix/tests/build-smoke.nix { };
             webhook-smoke = pkgs.callPackage ./nix/tests/webhook-smoke.nix { };
             serve-pipeline-smoke = pkgs.callPackage ./nix/tests/serve-pipeline-smoke.nix { };
+            forge-status-smoke = pkgs.callPackage ./nix/tests/forge-status-smoke.nix { };
           };
         };
     };
