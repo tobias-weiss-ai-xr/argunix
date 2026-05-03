@@ -1,3 +1,4 @@
+use crate::coalesce::CoalescePool;
 use medusa_config::{Config, ForgeAuth, ForgeConfig};
 use medusa_domain::{EvalId, ForgeKind};
 use medusa_forge::{GithubProvider, Provider};
@@ -17,6 +18,9 @@ pub struct AppStateInner {
     /// persists an evaluation row, it sends the new id here so the
     /// worker can pick it up immediately rather than polling.
     pub work_dispatcher: UnboundedSender<EvalId>,
+    /// Drops duplicate `(repo_id, sha)` events within a short window
+    /// (Q99). Configured from `Schedule::webhook_coalesce_seconds`.
+    pub coalesce: Arc<CoalescePool>,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -8,10 +8,13 @@
 //! Read-only UI, JSON content negotiation, badges, and `/metrics` come
 //! later (M6).
 
+mod coalesce;
 mod policy;
 mod state;
 mod ui;
 mod webhook;
+
+pub use coalesce::CoalescePool;
 
 pub use policy::{Decision as PolicyDecision, evaluate as evaluate_policy};
 pub use state::{AppState, AppStateInner, BuildProvidersError, build_providers};

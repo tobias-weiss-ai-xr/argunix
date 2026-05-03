@@ -42,16 +42,27 @@ pub struct Schedule {
     /// single check with a markdown summary. See Q19.
     #[serde(default = "default_collapsed_threshold")]
     pub collapsed_check_threshold: u32,
+    /// Window during which duplicate `(repo_id, sha)` webhook events are
+    /// dropped. GitHub fires a `push` and a `pull_request.synchronize`
+    /// for the same SHA milliseconds apart on every PR push; without
+    /// coalescing medusa would run the same eval twice. Q99.
+    #[serde(default = "default_webhook_coalesce_seconds")]
+    pub webhook_coalesce_seconds: u32,
 }
 
 fn default_collapsed_threshold() -> u32 {
     100
 }
 
+fn default_webhook_coalesce_seconds() -> u32 {
+    5
+}
+
 impl Default for Schedule {
     fn default() -> Self {
         Self {
             collapsed_check_threshold: default_collapsed_threshold(),
+            webhook_coalesce_seconds: default_webhook_coalesce_seconds(),
         }
     }
 }

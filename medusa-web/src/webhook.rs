@@ -185,6 +185,21 @@ async fn persist(
     };
 
     let repo_id = state.store.upsert(forge_name, &slug).await?;
+
+    // Q99: drop duplicate `(repo_id, sha)` events within the configured
+    // window. GitHub sends both a `push` and a `pull_request.synchronize`
+    // for the same SHA on every PR push; without this, every PR would
+    // produce two parallel evaluations and two sets of forge checks.
+    if !state.coalesce.admit(repo_id, sha.clone()) {
+        tracing::info!(
+            repo_id = repo_id.get(),
+            slug = %slug,
+            sha = %sha,
+            "dropping duplicate webhook event within coalesce window",
+        );
+        return Ok(());
+    }
+
     let eval_id = <medusa_store::SqlxStore as EvalStore>::create(
         &state.store,
         medusa_store::NewEvaluation {

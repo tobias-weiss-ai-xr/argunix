@@ -207,11 +207,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .listen
         .clone()
         .unwrap_or_else(|| config_arc.listen.clone());
+    let coalesce = std::sync::Arc::new(medusa_web::CoalescePool::new(
+        std::time::Duration::from_secs(config_arc.schedule.webhook_coalesce_seconds.into()),
+    ));
     let inner = medusa_web::AppStateInner {
         config: config_arc,
         providers: (*providers_arc).clone(),
         store,
         work_dispatcher: tx,
+        coalesce,
     };
     let router = medusa_web::router_from_inner(inner);
 
