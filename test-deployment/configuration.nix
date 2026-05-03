@@ -6,12 +6,6 @@
 
 let
   fqdn = "medusa.nix-consulting.net";
-
-  # Placeholder secrets so medusa.service starts cleanly on first boot.
-  # Replace with real values (e.g. via deploy-rs / agenix / sops-nix) before
-  # pointing GitHub webhooks at this host.
-  placeholderWebhookSecret = pkgs.writeText "medusa-placeholder-webhook" "REPLACE-ME-webhook-secret";
-  placeholderGithubToken = pkgs.writeText "medusa-placeholder-token" "REPLACE-ME-github-token";
 in
 {
   imports = [
@@ -57,8 +51,8 @@ in
     enable = true;
     listen = "127.0.0.1:8080";
     credentials = {
-      gh-webhook = "${placeholderWebhookSecret}";
-      gh-token = "${placeholderGithubToken}";
+      gh-webhook = "/var/lib/medusa-credentials/gh-webhook";
+      gh-token   = "/var/lib/medusa-credentials/gh-token";
     };
     settings = {
       external_url = "https://${fqdn}";
@@ -68,7 +62,15 @@ in
         webhook_secret_path = "$CREDENTIALS_DIRECTORY/gh-webhook";
         token_path = "$CREDENTIALS_DIRECTORY/gh-token";
       };
-      repos = [ ];
+      repos = [
+        {
+          slug = "tfc/pprintpp";
+          forge = "gh";
+          watched_branches = [ "master" "main" ];
+          build_prs = true;
+          weight = 1;
+        }
+      ];
     };
   };
 
