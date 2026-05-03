@@ -201,7 +201,14 @@ in
       ];
 
       serviceConfig = {
-        Type = "simple";
+        # `notify-reload` lets `ExecReload=medusactl reload` swap config
+        # atomically while the daemon is running — in-flight builds
+        # finish on the old config, new webhook events use the new
+        # one (Q22 / Q70 / Q71). The daemon emits `READY=1` once the
+        # HTTP server is up, and `RELOADING=1` / `READY=1` around the
+        # config swap.
+        Type = "notify-reload";
+        NotifyAccess = "main";
         ExecStart = lib.concatStringsSep " " [
           (lib.getExe' cfg.package "medusa")
           "serve"
@@ -209,6 +216,12 @@ in
           (toString settingsFile)
           "--listen"
           cfg.listen
+        ];
+        ExecReload = lib.concatStringsSep " " [
+          (lib.getExe' cfg.package "medusactl")
+          "reload"
+          "--config"
+          (toString settingsFile)
         ];
         Restart = "on-failure";
         RestartSec = 5;

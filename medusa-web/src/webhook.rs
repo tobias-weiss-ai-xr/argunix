@@ -146,6 +146,11 @@ async fn handle_inner(
         _ => return Err(WebhookError::UnknownForgeKind(forge_kind)),
     };
 
+    // Snapshot the swappable bundle once at the top — every subsequent
+    // read uses this exact `(config, providers)` pair, so a concurrent
+    // `medusactl reload` can't pull the rug out mid-handler.
+    let snap = state.current.load_full();
+
     // Untrusted preview parse: just enough to find which configured repo
     // and forge this is for. HMAC-verified parse follows.
     let preview: PayloadPreview = serde_json::from_slice(&body).map_err(WebhookError::BadJson)?;
@@ -167,13 +172,13 @@ async fn handle_inner(
     // have `tfc/pprintpp` on both GitHub and a self-hosted Forgejo —
     // medusa keys repos by `(forge_name, slug)`). Filter by both the
     // slug AND the URL's forge kind so the right repo is picked.
-    let repo_cfg = state
+    let repo_cfg = snap
         .config
         .repos
         .iter()
         .find(|r| {
             r.slug == slug
-                && state
+                && snap
                     .config
                     .forges
                     .get(&r.forge)
@@ -183,7 +188,7 @@ async fn handle_inner(
         .ok_or_else(|| WebhookError::RepoNotConfigured(repo_full_name.clone()))?;
     ctx.forge_name = Some(repo_cfg.forge.clone());
 
-    let provider = state
+    let provider = snap
         .providers
         .get(&repo_cfg.forge)
         .ok_or_else(|| WebhookError::NoProvider(repo_cfg.forge.clone()))?
@@ -333,7 +338,7 @@ async fn persist(
         state: CheckState::Pending,
         description: Some("evaluating…".to_string()),
         target_url: Some(eval_target_url(
-            &state.config.external_url,
+            &state.current.load().config.external_url,
             forge_name,
             &slug,
             eval_id,

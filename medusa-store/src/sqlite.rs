@@ -719,19 +719,25 @@ mod tests {
         assert_eq!(pruned[0].id, drop_id);
 
         // Repo gone.
-        assert!(<SqlxStore as RepoStore>::get(&s, drop_id)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(<SqlxStore as RepoStore>::get(&s, kept_id)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            <SqlxStore as RepoStore>::get(&s, drop_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            <SqlxStore as RepoStore>::get(&s, kept_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
         // Eval and job rows for the dropped repo gone too.
-        assert!(<SqlxStore as EvalStore>::get(&s, drop_eval)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            <SqlxStore as EvalStore>::get(&s, drop_eval)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             <SqlxStore as JobStore>::list_by_eval(&s, drop_eval)
                 .await
@@ -740,10 +746,12 @@ mod tests {
             0
         );
         // Kept repo's data untouched.
-        assert!(<SqlxStore as EvalStore>::get(&s, kept_eval)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            <SqlxStore as EvalStore>::get(&s, kept_eval)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             <SqlxStore as JobStore>::list_by_eval(&s, kept_eval)
                 .await
@@ -776,12 +784,9 @@ mod tests {
         let _ = <SqlxStore as RepoStore>::upsert(&s, "gh", &slug)
             .await
             .unwrap();
-        let pruned = <SqlxStore as RepoStore>::prune_repos_not_in(
-            &s,
-            &[("gh".to_string(), slug)],
-        )
-        .await
-        .unwrap();
+        let pruned = <SqlxStore as RepoStore>::prune_repos_not_in(&s, &[("gh".to_string(), slug)])
+            .await
+            .unwrap();
         assert_eq!(pruned.len(), 0);
         assert_eq!(<SqlxStore as RepoStore>::list(&s).await.unwrap().len(), 1);
     }

@@ -21,13 +21,12 @@
 //! picks an evaluation up, it's already been authorised.
 
 use anyhow::{Context, anyhow};
+use arc_swap::ArcSwap;
 use chrono::Utc;
-use medusa_config::Config;
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
 use medusa_forge::{CheckPost, CheckState, ForgeError, Provider};
 use medusa_store::{EvalStore, JobStore, RepoStore, SqlxStore};
-use medusa_web::{CancelRegistry, PauseRegistry, eval_target_url, job_target_url};
-use std::collections::HashMap;
+use medusa_web::{CancelRegistry, ConfigSnapshot, PauseRegistry, eval_target_url, job_target_url};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -39,8 +38,10 @@ use tracing::{Instrument, info_span};
 /// State the worker needs to process evaluations end-to-end.
 #[derive(Clone)]
 pub struct WorkerContext {
-    pub config: Arc<Config>,
-    pub providers: Arc<HashMap<String, Arc<dyn Provider>>>,
+    /// Atomically-swappable bundle of config + providers. The worker
+    /// snapshots this once at the top of every evaluation so a
+    /// reload mid-eval never produces inconsistent state.
+    pub current: Arc<ArcSwap<ConfigSnapshot>>,
     pub store: SqlxStore,
     pub work_dir: PathBuf,
     pub log_dir: PathBuf,
@@ -97,6 +98,12 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         eval_id,
     };
 
+    // Snapshot the swappable bundle for this evaluation. A reload that
+    // lands while we're mid-eval will swap the daemon's pointer but
+    // this snapshot remains valid — we finish on the config we
+    // started with (Q22 / Q70).
+    let snap = ctx.current.load_full();
+
     let eval = <SqlxStore as EvalStore>::get(&ctx.store, eval_id)
         .await?
         .ok_or_else(|| anyhow!("evaluation row {} disappeared", eval_id.get()))?;
@@ -109,7 +116,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     let repo = <SqlxStore as RepoStore>::get(&ctx.store, eval.repo_id)
         .await?
         .ok_or_else(|| anyhow!("repo row {} disappeared", eval.repo_id.get()))?;
-    let provider = ctx
+    let provider = snap
         .providers
         .get(&repo.forge)
         .ok_or_else(|| anyhow!("no provider for forge `{}`", repo.forge))?;
@@ -196,7 +203,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     <SqlxStore as EvalStore>::set_status(&ctx.store, eval_id, EvalStatus::Building).await?;
     tracing::info!(count = jobs.len(), "evaluation finished");
 
-    let caches: Vec<medusa_build::CacheRef> = ctx
+    let caches: Vec<medusa_build::CacheRef> = snap
         .config
         .binary_caches
         .iter()
@@ -213,14 +220,14 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     // job list lives in medusa's UI, reachable via the status's
     // target_url. Markdown summaries land with GitHub-App / Checks
     // API in M5c.
-    let repo_cfg = ctx
+    let repo_cfg = snap
         .config
         .repos
         .iter()
         .find(|r| r.forge == repo.forge && r.slug == repo.slug);
     let threshold = repo_cfg
         .and_then(|r| r.collapsed_check_threshold)
-        .unwrap_or(ctx.config.schedule.collapsed_check_threshold);
+        .unwrap_or(snap.config.schedule.collapsed_check_threshold);
     let total = jobs.len();
     let collapsed_mode = total as u32 > threshold;
     if collapsed_mode {
@@ -443,7 +450,13 @@ fn post_per_job_check_pending(
     eval_id: EvalId,
     attr_path: &str,
 ) {
-    let target = job_target_url(&ctx.config.external_url, forge, slug, eval_id, attr_path);
+    let target = job_target_url(
+        &ctx.current.load().config.external_url,
+        forge,
+        slug,
+        eval_id,
+        attr_path,
+    );
     let post = CheckPost {
         slug: slug.clone(),
         sha: sha.clone(),
@@ -478,7 +491,13 @@ fn post_per_job_check(
         JobStatus::SkippedNoBuilder => return,
         JobStatus::Queued | JobStatus::Running => return,
     };
-    let target = job_target_url(&ctx.config.external_url, forge, slug, eval_id, attr_path);
+    let target = job_target_url(
+        &ctx.current.load().config.external_url,
+        forge,
+        slug,
+        eval_id,
+        attr_path,
+    );
     let post = CheckPost {
         slug: slug.clone(),
         sha: sha.clone(),
@@ -511,7 +530,12 @@ fn post_overall_check(
     state: CheckState,
     description: &str,
 ) {
-    let target = eval_target_url(&ctx.config.external_url, forge, slug, eval_id);
+    let target = eval_target_url(
+        &ctx.current.load().config.external_url,
+        forge,
+        slug,
+        eval_id,
+    );
     let post = CheckPost {
         slug: slug.clone(),
         sha: sha.clone(),

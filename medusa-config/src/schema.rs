@@ -320,9 +320,7 @@ impl TryFrom<WireConfig> for Config {
         for (forge_name, wire_forge) in wire.forges {
             for (slug_str, wire_repo) in wire_forge.repos {
                 let slug = Slug::new(slug_str.clone()).map_err(|e| {
-                    format!(
-                        "invalid slug `{slug_str}` under forge `{forge_name}`: {e}",
-                    )
+                    format!("invalid slug `{slug_str}` under forge `{forge_name}`: {e}",)
                 })?;
                 repos.push(Repo {
                     slug,

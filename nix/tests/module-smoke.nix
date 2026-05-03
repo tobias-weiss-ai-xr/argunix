@@ -40,11 +40,12 @@ in
             kind = "github";
             api_url = "https://api.github.com";
             token_path = "$CREDENTIALS_DIRECTORY/gh-token";
+            # Empty repos {} — without it the auto-install pass would
+            # try to reach api.github.com from within the test VM.
+            # Keep it empty so this test stays purely about module
+            # shape.
+            repos = { };
           };
-          # Empty repos[] — without the auto-install pass would try to
-          # reach api.github.com from within the test VM. Keep it empty
-          # so this test stays purely about module shape.
-          repos = [ ];
         };
       };
 

@@ -1,3 +1,4 @@
+mod control;
 mod worker;
 
 use anyhow::{Context, anyhow};
@@ -51,6 +52,10 @@ struct ServeArgs {
     /// Override systems to evaluate (default: host's local system).
     #[arg(long, value_delimiter = ',', value_name = "SYSTEM[,SYSTEM]")]
     systems: Option<Vec<String>>,
+    /// Path to the unix-domain control socket (`medusactl` connects
+    /// here). Default: `/run/medusa/control.sock`.
+    #[arg(long, value_name = "PATH")]
+    control_socket: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -185,30 +190,40 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(medusa_eval::detect_local_systems);
 
-    let providers_arc = Arc::new(providers);
-    let config_arc = Arc::new(config);
     let pauses = std::sync::Arc::new(medusa_web::PauseRegistry::new());
     let cancellations = std::sync::Arc::new(medusa_web::CancelRegistry::new());
+
+    // Atomic-swappable bundle. Both AppStateInner and WorkerContext
+    // hold the same Arc<ArcSwap<_>>; `medusactl reload` constructs a
+    // new ConfigSnapshot and stores into it, in-flight handlers and
+    // evals keep the snapshot they captured at start.
+    let snapshot = Arc::new(medusa_web::ConfigSnapshot {
+        config: Arc::new(config),
+        providers: Arc::new(providers),
+    });
+    let current = Arc::new(arc_swap::ArcSwap::from(snapshot));
 
     // Config-driven cleanup: at every startup, prune any repo (and
     // its evaluations / jobs / logs / GC roots) that no longer
     // appears in `config.repos`. This catches orphans left behind
     // when an operator renames a forge entry or removes a repo from
     // the YAML.
-    prune_orphan_state(&config_arc, &store, &log_dir, &gc_root_dir).await;
+    prune_orphan_state(&current.load_full().config, &store, &log_dir, &gc_root_dir).await;
 
     // Auto-install / refresh webhooks at every startup. Best-effort:
     // a forge being unreachable doesn't block daemon startup.
-    medusa_web::ensure_webhooks(&config_arc, &providers_arc, &store).await;
+    {
+        let snap = current.load_full();
+        medusa_web::ensure_webhooks(&snap.config, &snap.providers, &store).await;
+    }
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let worker_ctx = worker::WorkerContext {
-        config: config_arc.clone(),
-        providers: providers_arc.clone(),
+        current: current.clone(),
         store: store.clone(),
         work_dir,
-        log_dir,
-        gc_root_dir,
+        log_dir: log_dir.clone(),
+        gc_root_dir: gc_root_dir.clone(),
         eval_timeout: Duration::from_secs(600),
         build_timeout: Duration::from_secs(7200),
         clone_timeout: Duration::from_secs(300),
@@ -221,20 +236,48 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let listen = args
         .listen
         .clone()
-        .unwrap_or_else(|| config_arc.listen.clone());
+        .unwrap_or_else(|| current.load().config.listen.clone());
+    let coalesce_seconds: u64 = current
+        .load()
+        .config
+        .schedule
+        .webhook_coalesce_seconds
+        .into();
     let coalesce = std::sync::Arc::new(medusa_web::CoalescePool::new(
-        std::time::Duration::from_secs(config_arc.schedule.webhook_coalesce_seconds.into()),
+        std::time::Duration::from_secs(coalesce_seconds),
     ));
     let inner = medusa_web::AppStateInner {
-        config: config_arc,
-        providers: (*providers_arc).clone(),
-        store,
+        current: current.clone(),
+        store: store.clone(),
         work_dispatcher: tx,
         coalesce,
         pauses,
         cancellations,
+        started_at: std::time::Instant::now(),
     };
-    let router = medusa_web::router_from_inner(inner);
+    let app_state = std::sync::Arc::new(inner);
+    let router = medusa_web::router(app_state.clone());
+
+    // Spawn the control-socket server. Bound to the path from CLI
+    // args (default `/run/medusa/control.sock`). Runs as a background
+    // task; survives reloads, exits when the daemon shuts down.
+    let control_path = args
+        .control_socket
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/run/medusa/control.sock"));
+    let _control_handle = control::spawn(control::ControlContext {
+        socket_path: control_path,
+        app_state: app_state.clone(),
+        store,
+        log_dir,
+        gc_root_dir,
+        config_path: args.config.clone(),
+        skip_secret_check: args.skip_secret_check,
+    });
+
+    // Tell systemd we're ready (so `Type=notify-reload` can sequence
+    // ExecReload after startup completes).
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
@@ -248,10 +291,6 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .await
         .context("axum serve")?;
 
-    // axum has finished serving; the only remaining `Sender` for the
-    // worker channel lives inside the dropped `AppStateInner`, so the
-    // worker will see the channel close and exit. Await it to drain any
-    // in-flight evaluation.
     let _ = worker_handle.await;
     tracing::info!("graceful shutdown complete");
     Ok(())
@@ -641,7 +680,7 @@ impl Summary {
 /// but don't block startup. Runs in the same task as `serve()` before
 /// the worker is spawned, so nothing is in-flight against the rows
 /// we're about to delete.
-async fn prune_orphan_state(
+pub(crate) async fn prune_orphan_state(
     config: &medusa_config::Config,
     store: &medusa_store::SqlxStore,
     log_dir: &Path,

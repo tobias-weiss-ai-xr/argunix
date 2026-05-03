@@ -23,7 +23,7 @@ pub use coalesce::CoalescePool;
 pub use pause::PauseRegistry;
 
 pub use policy::{Decision as PolicyDecision, evaluate as evaluate_policy};
-pub use state::{AppState, AppStateInner, BuildProvidersError, build_providers};
+pub use state::{AppState, AppStateInner, BuildProvidersError, ConfigSnapshot, build_providers};
 pub use webhook::{eval_target_url, job_target_url};
 
 use axum::Router;

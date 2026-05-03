@@ -1,5 +1,6 @@
 use crate::coalesce::CoalescePool;
 use crate::pause::PauseRegistry;
+use arc_swap::ArcSwap;
 use medusa_config::{Config, ForgeAuth, ForgeConfig};
 use medusa_domain::{EvalId, ForgeKind};
 use medusa_forge::{ForgejoProvider, GithubProvider, GitlabProvider, Provider};
@@ -7,13 +8,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
+/// Bundle of config-derived state that gets atomically swapped on
+/// `medusactl reload`. Every handler/worker reads via `load_full()`
+/// to take a snapshot for its own scope; in-flight work keeps using
+/// the snapshot it captured rather than observing a half-replaced
+/// daemon mid-cycle (Q22 / Q70 / Q71).
+pub struct ConfigSnapshot {
+    pub config: Arc<Config>,
+    pub providers: Arc<HashMap<String, Arc<dyn Provider>>>,
+}
+
 /// Daemon-side state shared by every request handler. Wrapped in `Arc`
 /// for `axum`'s `State` extractor (which requires `Clone`).
 pub type AppState = Arc<AppStateInner>;
 
 pub struct AppStateInner {
-    pub config: Arc<Config>,
-    pub providers: HashMap<String, Arc<dyn Provider>>,
+    /// Current `(config, providers)` bundle, swappable on
+    /// `medusactl reload`. Read with `current.load_full()` to snapshot.
+    pub current: Arc<ArcSwap<ConfigSnapshot>>,
     pub store: medusa_store::SqlxStore,
     /// Channel to the background worker. After the webhook handler
     /// persists an evaluation row, it sends the new id here so the
@@ -26,6 +38,8 @@ pub struct AppStateInner {
     pub pauses: Arc<PauseRegistry>,
     /// Per-eval cancellation tokens for cancel-on-new-push (Q39).
     pub cancellations: Arc<crate::cancel::CancelRegistry>,
+    /// Daemon start time for `medusactl status` uptime reporting.
+    pub started_at: std::time::Instant,
 }
 
 #[derive(Debug, thiserror::Error)]

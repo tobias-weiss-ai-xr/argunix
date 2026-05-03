@@ -10,6 +10,7 @@ medusa-domain = { workspace = true }
 medusa-forge = { path = "../medusa-forge" }
 medusa-store = { workspace = true }
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
