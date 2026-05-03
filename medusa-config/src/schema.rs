@@ -3,27 +3,25 @@ use medusa_domain::{ForgeKind, Slug};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-/// Top-level medusa configuration. See `design/questions-answers.md` Q83.
+/// Top-level medusa configuration.
+///
+/// Runtime model: a flat list of repos each carrying a `forge` string
+/// pointing at an entry in `forges`. The on-disk YAML uses a richer
+/// shape (repos nested inside their forge entry) — see [`WireConfig`]
+/// and [`Config`]'s `try_from` — but every callsite still sees the
+/// flat shape it was originally written against.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "WireConfig")]
 pub struct Config {
     pub external_url: String,
-    #[serde(default = "default_listen")]
     pub listen: String,
-    #[serde(default = "default_control_socket")]
     pub control_socket: std::path::PathBuf,
-    #[serde(default)]
     pub dry_run: bool,
-    #[serde(default)]
     pub schedule: Schedule,
-    #[serde(default)]
     pub retention: Retention,
-    #[serde(default)]
     pub eval: EvalDefaults,
     pub forges: BTreeMap<String, ForgeConfig>,
-    #[serde(default)]
     pub binary_caches: Vec<BinaryCache>,
-    #[serde(default)]
     pub repos: Vec<Repo>,
 }
 
@@ -123,21 +121,14 @@ pub struct EvalOverrides {
     pub allow_network: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Runtime model of a configured forge. Built from [`WireForgeConfig`]
+/// during deserialization; not serde-derived itself because the YAML
+/// shape has an extra `repos` map that doesn't belong on the runtime
+/// type.
+#[derive(Debug, Clone)]
 pub struct ForgeConfig {
     pub kind: ForgeKind,
     pub api_url: String,
-
-    // Auth: either set `token_path` (PAT-style), or both `app_id` and
-    // `app_private_key_path` (GitHub-App-style). [`ForgeConfig::auth`]
-    // turns these into a [`ForgeAuth`] and rejects mixed/empty shapes.
-    // Kept as optional flat fields because serde's `flatten` does not
-    // compose with `deny_unknown_fields`.
-    //
-    // No `webhook_secret_path`: medusa generates and owns the webhook
-    // secret per repo, stored in sqlite. The auto-install pass at
-    // startup pushes it to the forge alongside the hook itself.
     pub token_path: Option<SecretFile>,
     pub app_id: Option<u64>,
     pub app_private_key_path: Option<SecretFile>,
@@ -197,24 +188,20 @@ pub struct BinaryCache {
     pub substitute: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Runtime model of a configured repo. Built from [`WireRepo`] +
+/// the parent forge name during deserialization.
+#[derive(Debug, Clone)]
 pub struct Repo {
     pub slug: Slug,
-    /// Name of an entry in [`Config::forges`].
+    /// Name of an entry in [`Config::forges`]. Populated from the
+    /// parent map key when reading the YAML — never typed by hand.
     pub forge: String,
-    #[serde(default = "default_watched_branches")]
     pub watched_branches: Vec<String>,
-    #[serde(default = "default_build_prs")]
     pub build_prs: bool,
-    #[serde(default)]
     pub pr_allowlist: Vec<String>,
-    #[serde(default)]
     pub clone: CloneConfig,
-    #[serde(default)]
     pub eval: EvalOverrides,
     pub collapsed_check_threshold: Option<u32>,
-    #[serde(default = "default_weight")]
     pub weight: u32,
 }
 
@@ -248,6 +235,134 @@ pub enum CloneMethod {
     Ssh,
 }
 
+// ============================================================
+// Wire shape — what the YAML actually looks like.
+// ============================================================
+//
+// Repos live nested under their forge:
+//
+//   forges:
+//     gh:
+//       kind: github
+//       api_url: https://api.github.com
+//       token_path: /run/credentials/medusa.service/gh-token
+//       repos:
+//         myorg/myrepo:
+//           watched_branches: [main]
+//
+// Two upsides over the previous flat-list shape:
+// - Repo→forge association is structural, not string-referential.
+//   The `UnknownForge` validation case becomes impossible.
+// - Same slug across forges is naturally distinguished by parent map
+//   key, no special handling needed in the YAML.
+//
+// At deserialization time we flatten back to `Config { forges, repos }`
+// so every callsite reading `config.repos` keeps working.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireConfig {
+    external_url: String,
+    #[serde(default = "default_listen")]
+    listen: String,
+    #[serde(default = "default_control_socket")]
+    control_socket: std::path::PathBuf,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    schedule: Schedule,
+    #[serde(default)]
+    retention: Retention,
+    #[serde(default)]
+    eval: EvalDefaults,
+    forges: BTreeMap<String, WireForgeConfig>,
+    #[serde(default)]
+    binary_caches: Vec<BinaryCache>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireForgeConfig {
+    kind: ForgeKind,
+    api_url: String,
+    token_path: Option<SecretFile>,
+    app_id: Option<u64>,
+    app_private_key_path: Option<SecretFile>,
+    #[serde(default)]
+    repos: BTreeMap<String, WireRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireRepo {
+    #[serde(default = "default_watched_branches")]
+    watched_branches: Vec<String>,
+    #[serde(default = "default_build_prs")]
+    build_prs: bool,
+    #[serde(default)]
+    pr_allowlist: Vec<String>,
+    #[serde(default)]
+    clone: CloneConfig,
+    #[serde(default)]
+    eval: EvalOverrides,
+    collapsed_check_threshold: Option<u32>,
+    #[serde(default = "default_weight")]
+    weight: u32,
+}
+
+impl TryFrom<WireConfig> for Config {
+    type Error = String;
+
+    fn try_from(wire: WireConfig) -> Result<Self, Self::Error> {
+        let mut forges = BTreeMap::new();
+        let mut repos = Vec::new();
+
+        for (forge_name, wire_forge) in wire.forges {
+            for (slug_str, wire_repo) in wire_forge.repos {
+                let slug = Slug::new(slug_str.clone()).map_err(|e| {
+                    format!(
+                        "invalid slug `{slug_str}` under forge `{forge_name}`: {e}",
+                    )
+                })?;
+                repos.push(Repo {
+                    slug,
+                    forge: forge_name.clone(),
+                    watched_branches: wire_repo.watched_branches,
+                    build_prs: wire_repo.build_prs,
+                    pr_allowlist: wire_repo.pr_allowlist,
+                    clone: wire_repo.clone,
+                    eval: wire_repo.eval,
+                    collapsed_check_threshold: wire_repo.collapsed_check_threshold,
+                    weight: wire_repo.weight,
+                });
+            }
+            forges.insert(
+                forge_name,
+                ForgeConfig {
+                    kind: wire_forge.kind,
+                    api_url: wire_forge.api_url,
+                    token_path: wire_forge.token_path,
+                    app_id: wire_forge.app_id,
+                    app_private_key_path: wire_forge.app_private_key_path,
+                },
+            );
+        }
+
+        Ok(Config {
+            external_url: wire.external_url,
+            listen: wire.listen,
+            control_socket: wire.control_socket,
+            dry_run: wire.dry_run,
+            schedule: wire.schedule,
+            retention: wire.retention,
+            eval: wire.eval,
+            forges,
+            binary_caches: wire.binary_caches,
+            repos,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,10 +380,8 @@ forges:
     kind: github
     api_url: https://api.github.com
     token_path: /tmp/medusa-test/tok
-
-repos:
-  - slug: myorg/myrepo
-    forge: github-myorg
+    repos:
+      myorg/myrepo: {}
 "#
         .to_string()
     }
@@ -279,6 +392,9 @@ repos:
         assert_eq!(c.listen, "127.0.0.1:8080");
         assert_eq!(c.schedule.collapsed_check_threshold, 100);
         assert!(!c.dry_run);
+        assert_eq!(c.repos.len(), 1);
+        assert_eq!(c.repos[0].forge, "github-myorg");
+        assert_eq!(c.repos[0].slug.as_str(), "myorg/myrepo");
         assert_eq!(c.repos[0].watched_branches, vec!["main"]);
         assert!(c.repos[0].build_prs);
         assert_eq!(c.repos[0].weight, 1);
@@ -306,10 +422,9 @@ forges:
     kind: github
     api_url: https://api.github.com
     token_path: /tmp/tok
-repos:
-  - slug: myorg/myrepo
-    forge: github-myorg
-    extra_field: oops
+    repos:
+      myorg/myrepo:
+        extra_field: oops
 "#;
         let err = serde_yaml::from_str::<Config>(s).unwrap_err();
         assert!(err.to_string().contains("extra_field"));
@@ -324,15 +439,46 @@ forges:
     kind: gitlab
     api_url: https://gitlab.example.com/api/v4
     token_path: /tmp/tok
-repos:
-  - slug: myorg/marketing/marketing-project-1
-    forge: gl
+    repos:
+      myorg/marketing/marketing-project-1: {}
 "#;
         let c = parse(s);
         assert_eq!(
             c.repos[0].slug.as_str(),
             "myorg/marketing/marketing-project-1"
         );
+        assert_eq!(c.repos[0].forge, "gl");
+    }
+
+    #[test]
+    fn same_slug_on_two_forges_disambiguated_by_parent() {
+        // Same `tfc/pprintpp` slug present on both `gh` and `cb`. The
+        // new shape disambiguates by the parent map key — both entries
+        // arrive in `Config.repos` with their respective `forge`
+        // fields populated.
+        let s = r#"
+external_url: https://medusa.example.com
+forges:
+  gh:
+    kind: github
+    api_url: https://api.github.com
+    token_path: /tmp/tok
+    repos:
+      tfc/pprintpp: {}
+  cb:
+    kind: forgejo
+    api_url: https://codeberg.org/api/v1
+    token_path: /tmp/tok2
+    repos:
+      tfc/pprintpp: {}
+"#;
+        let c = parse(s);
+        assert_eq!(c.repos.len(), 2);
+        let forges: Vec<&str> = c.repos.iter().map(|r| r.forge.as_str()).collect();
+        assert!(forges.contains(&"gh"));
+        assert!(forges.contains(&"cb"));
+        // Both with the same slug.
+        assert!(c.repos.iter().all(|r| r.slug.as_str() == "tfc/pprintpp"));
     }
 
     #[test]
@@ -398,9 +544,8 @@ forges:
     kind: github
     api_url: https://api.github.com
     token_path: /tmp/tok
-repos:
-  - slug: invalid-no-slash
-    forge: github-myorg
+    repos:
+      invalid-no-slash: {}
 "#;
         let err = serde_yaml::from_str::<Config>(s).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("slug"));

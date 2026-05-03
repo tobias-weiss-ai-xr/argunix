@@ -4,8 +4,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
-    #[error("repo `{repo}` references unknown forge `{forge}`")]
-    UnknownForge { repo: String, forge: String },
     #[error("repo `{repo}` uses clone.method=ssh but has no clone.ssh_key_path")]
     SshWithoutKey { repo: String },
     #[error("forge `{forge}`: {error}")]
@@ -20,6 +18,11 @@ pub enum ValidationError {
 
 impl Config {
     /// Cross-reference checks that don't touch the filesystem.
+    ///
+    /// The "repo references unknown forge" case that used to live here
+    /// is now structurally impossible: repos are nested under their
+    /// forge in the YAML, so the runtime model can't have a repo whose
+    /// `forge` field doesn't appear in `forges`.
     pub fn validate_references(&self) -> Result<(), ValidationError> {
         for (name, forge) in &self.forges {
             forge.auth().map_err(|e| ValidationError::ForgeAuth {
@@ -28,12 +31,6 @@ impl Config {
             })?;
         }
         for repo in &self.repos {
-            if !self.forges.contains_key(&repo.forge) {
-                return Err(ValidationError::UnknownForge {
-                    repo: repo.slug.as_str().to_string(),
-                    forge: repo.forge.clone(),
-                });
-            }
             if matches!(repo.clone.method, crate::CloneMethod::Ssh)
                 && repo.clone.ssh_key_path.is_none()
             {
@@ -100,31 +97,11 @@ forges:
     kind: forgejo
     api_url: https://forge.example.com/api/v1
     token_path: /tmp/tok
-repos:
-  - slug: a/b
-    forge: fg
+    repos:
+      a/b: {}
 "#,
         );
         c.validate_references().unwrap();
-    }
-
-    #[test]
-    fn unknown_forge_rejected() {
-        let c = parse(
-            r#"
-external_url: https://m.example.com
-forges:
-  fg:
-    kind: forgejo
-    api_url: https://forge.example.com/api/v1
-    token_path: /tmp/tok
-repos:
-  - slug: a/b
-    forge: nonexistent
-"#,
-        );
-        let err = c.validate_references().unwrap_err();
-        assert!(matches!(err, crate::ValidationError::UnknownForge { .. }));
     }
 
     #[test]
@@ -137,11 +114,10 @@ forges:
     kind: forgejo
     api_url: https://forge.example.com/api/v1
     token_path: /tmp/tok
-repos:
-  - slug: a/b
-    forge: fg
-    clone:
-      method: ssh
+    repos:
+      a/b:
+        clone:
+          method: ssh
 "#,
         );
         let err = c.validate_references().unwrap_err();

@@ -51,48 +51,47 @@ in
     enable = true;
     listen = "127.0.0.1:8080";
     credentials = {
-      gh-webhook = "/var/lib/medusa-credentials/gh-webhook";
-      gh-token   = "/var/lib/medusa-credentials/gh-token";
-      gl-token   = "/var/lib/medusa-credentials/gl-token";
-      fj-token   = "/var/lib/medusa-credentials/fj-token";
+      gh-token = "/var/lib/medusa-credentials/gh-token";
+      gl-token = "/var/lib/medusa-credentials/gl-token";
+      fj-token = "/var/lib/medusa-credentials/fj-token";
     };
     settings = {
       external_url = "https://${fqdn}";
-      forges.github = {
-        kind = "github";
-        api_url = "https://api.github.com";
-        token_path = "$CREDENTIALS_DIRECTORY/gh-token";
+      forges = {
+        github = {
+          kind = "github";
+          api_url = "https://api.github.com";
+          token_path = "$CREDENTIALS_DIRECTORY/gh-token";
+          repos = {
+            "tfc/pprintpp" = {
+              build_prs = true;
+              watched_branches = [ "master" ];
+            };
+          };
+        };
+        gitlab = {
+          kind = "gitlab";
+          api_url = "https://gitlab.com/api/v4";
+          token_path = "$CREDENTIALS_DIRECTORY/gl-token";
+          repos = {
+            "jonge/pprintpp" = {
+              watched_branches = [ "master" ];
+              build_prs = true;
+            };
+          };
+        };
+        codeberg = {
+          kind = "forgejo";
+          api_url = "https://codeberg.org/api/v1";
+          token_path = "$CREDENTIALS_DIRECTORY/fj-token";
+          repos = {
+            "tfc/pprintpp" = {
+              watched_branches = [ "master" ];
+              build_prs = true;
+            };
+          };
+        };
       };
-      forges.gitlab = {
-        kind = "gitlab";
-        api_url = "https://gitlab.com/api/v4";
-        token_path = "$CREDENTIALS_DIRECTORY/gl-token";
-      };
-      forges.codeberg = {
-        kind = "forgejo";
-        api_url = "https://codeberg.org/api/v1";
-        token_path = "$CREDENTIALS_DIRECTORY/fj-token";
-      };
-      repos = [
-        {
-          slug = "tfc/pprintpp";
-          forge = "github";
-          build_prs = true;
-          watched_branches = [ "master" ];
-        }
-        {
-          slug = "jonge/pprintpp";
-          forge = "gitlab";
-          watched_branches = [ "master" ];
-          build_prs = true;
-        }
-        {
-          slug = "tfc/pprintpp";
-          forge = "codeberg";
-          watched_branches = [ "master" ];
-          build_prs = true;
-        }
-      ];
     };
   };
 

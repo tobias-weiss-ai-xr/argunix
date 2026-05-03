@@ -1314,6 +1314,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "hex",
  "maud",
  "medusa-config",
  "medusa-domain",

@@ -38,9 +38,9 @@ pub enum WebhookError {
     Store(#[from] medusa_store::StoreError),
 }
 
-impl IntoResponse for WebhookError {
-    fn into_response(self) -> axum::response::Response {
-        let status = match &self {
+impl WebhookError {
+    pub fn status_code(&self) -> StatusCode {
+        match self {
             WebhookError::UnknownForgeKind(_) => StatusCode::NOT_FOUND,
             WebhookError::BadJson(_) => StatusCode::BAD_REQUEST,
             WebhookError::NoRepository => StatusCode::ACCEPTED,
@@ -58,17 +58,35 @@ impl IntoResponse for WebhookError {
             }
             WebhookError::Forge(_) => StatusCode::INTERNAL_SERVER_ERROR,
             WebhookError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        let body = self.to_string();
-        // Log at the level the response code suggests so noisy bots don't
-        // pollute the logs at warn+.
-        if status.is_server_error() {
-            tracing::error!(error = %body, "webhook error");
-        } else if status.is_client_error() {
-            tracing::warn!(status = status.as_u16(), error = %body, "webhook rejected");
         }
+    }
+}
+
+impl IntoResponse for WebhookError {
+    fn into_response(self) -> axum::response::Response {
+        // Logging happens in `handle()` where forge+slug context is
+        // available; this impl just turns the error into a response.
+        let status = self.status_code();
+        let body = self.to_string();
         (status, body).into_response()
     }
+}
+
+/// Context captured during `handle()` so rejection log lines can name
+/// which forge / repo the failed event was for. Populated as soon as
+/// each piece of information is identified; remaining fields stay
+/// `None` if we never got that far.
+#[derive(Default)]
+struct WebhookCtx {
+    /// URL path segment — `github`, `gitlab`, `forgejo`. Always set.
+    forge_kind: String,
+    /// Slug parsed from the payload preview, if we got past the parse step.
+    slug: Option<Slug>,
+    /// Configured forge name from `forges.<key>`, if we got as far as
+    /// matching the repo. Distinct from `forge_kind`: an operator may
+    /// have multiple GitHub forges configured under different keys
+    /// (e.g. `github-myorg`, `github-other`).
+    forge_name: Option<String>,
 }
 
 /// `POST /webhook/{forge_kind}` where `forge_kind` is `github`,
@@ -78,6 +96,48 @@ pub async fn handle(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
+) -> axum::response::Response {
+    let mut ctx = WebhookCtx {
+        forge_kind: forge_kind.clone(),
+        ..Default::default()
+    };
+    match handle_inner(forge_kind, state, headers, body, &mut ctx).await {
+        Ok(status) => status.into_response(),
+        Err(err) => log_and_respond(&ctx, err),
+    }
+}
+
+fn log_and_respond(ctx: &WebhookCtx, err: WebhookError) -> axum::response::Response {
+    let status = err.status_code();
+    let slug_str = ctx.slug.as_ref().map(|s| s.as_str().to_string());
+    let body = err.to_string();
+    if status.is_server_error() {
+        tracing::error!(
+            forge_kind = %ctx.forge_kind,
+            forge_name = ?ctx.forge_name,
+            slug = ?slug_str,
+            error = %body,
+            "webhook error",
+        );
+    } else if status.is_client_error() {
+        tracing::warn!(
+            forge_kind = %ctx.forge_kind,
+            forge_name = ?ctx.forge_name,
+            slug = ?slug_str,
+            status = status.as_u16(),
+            error = %body,
+            "webhook rejected",
+        );
+    }
+    (status, body).into_response()
+}
+
+async fn handle_inner(
+    forge_kind: String,
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    ctx: &mut WebhookCtx,
 ) -> Result<StatusCode, WebhookError> {
     let expected_kind = match forge_kind.as_str() {
         "github" => ForgeKind::Github,
@@ -102,6 +162,7 @@ pub async fn handle(
         slug: repo_full_name.clone(),
         source: e,
     })?;
+    ctx.slug = Some(slug.clone());
     // The same slug can appear under multiple forges (e.g. you might
     // have `tfc/pprintpp` on both GitHub and a self-hosted Forgejo —
     // medusa keys repos by `(forge_name, slug)`). Filter by both the
@@ -120,6 +181,7 @@ pub async fn handle(
                     .unwrap_or(false)
         })
         .ok_or_else(|| WebhookError::RepoNotConfigured(repo_full_name.clone()))?;
+    ctx.forge_name = Some(repo_cfg.forge.clone());
 
     let provider = state
         .providers

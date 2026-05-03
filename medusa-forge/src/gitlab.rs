@@ -372,16 +372,22 @@ impl Provider for GitlabProvider {
         let hooks: Vec<HookView> = list_resp.json().await?;
         let existing = hooks.into_iter().find(|h| h.url == target_url);
 
-        // GitLab uses the legacy plain-secret-token webhook by default;
-        // we send our random bytes as hex so it compares cleanly with
-        // what we send back in the X-Gitlab-Token header. Operators
-        // who'd rather use signing-token can configure it manually
-        // afterwards (it's not exposed in this API consistently
-        // across versions).
-        let secret_hex = hex::encode(secret);
+        // GitLab uses the legacy plain-secret-token webhook by default
+        // when only `token` is set. The caller already provided the
+        // secret as ASCII bytes (auto-install generates hex strings);
+        // we send them verbatim. GitLab will echo them back in
+        // X-Gitlab-Token on every event for byte-comparison.
+        // Operators who'd rather use signing-token can configure it
+        // manually afterwards (the API surface for it isn't
+        // consistent across GitLab versions).
+        let secret_str = std::str::from_utf8(secret).map_err(|_| ForgeError::Api {
+            status: 0,
+            url: "ensure_webhook (local)".to_string(),
+            body: "webhook secret is not valid UTF-8".to_string(),
+        })?;
         let payload = serde_json::json!({
             "url": target_url,
-            "token": secret_hex,
+            "token": secret_str,
             "push_events": true,
             "merge_requests_events": true,
             "enable_ssl_verification": true,

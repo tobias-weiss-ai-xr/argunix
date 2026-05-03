@@ -312,8 +312,15 @@ impl Provider for GithubProvider {
             .into_iter()
             .find(|h| h.config.url.as_deref() == Some(target_url));
 
-        let secret_hex = hex::encode(secret); // GitHub stores secrets as text;
-        // we send hex of our random bytes.
+        // The caller provides the secret already in string-form bytes
+        // (auto-install generates ASCII hex). Send those bytes as the
+        // string secret to the forge so the forge's HMAC key matches
+        // what medusa later reads back from sqlite for verification.
+        let secret_str = std::str::from_utf8(secret).map_err(|_| ForgeError::Api {
+            status: 0,
+            url: "ensure_webhook (local)".to_string(),
+            body: "webhook secret is not valid UTF-8".to_string(),
+        })?;
         let payload = serde_json::json!({
             "name": "web",
             "active": true,
@@ -321,7 +328,7 @@ impl Provider for GithubProvider {
             "config": {
                 "url": target_url,
                 "content_type": "json",
-                "secret": secret_hex,
+                "secret": secret_str,
                 "insecure_ssl": "0",
             }
         });

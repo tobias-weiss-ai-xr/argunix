@@ -78,12 +78,20 @@ async fn ensure_one(
     // Reuse the secret across calls so a previously-installed hook
     // keeps validating after a daemon restart. Generate one only on
     // the first encounter.
+    //
+    // The secret is stored as the *bytes of an ASCII hex string* (not
+    // raw random bytes). This matters because forges store the secret
+    // as text and HMAC-sign with `<text>.as_bytes()` as the key — for
+    // medusa's verify side to use the same key bytes, we must keep
+    // the secret in its string-form throughout. The providers send
+    // `std::str::from_utf8(secret)` directly as the string secret in
+    // their API payload; no hex re-encoding.
     let secret = match store.get_webhook_secret(&repo.forge, &repo.slug).await? {
         Some(s) if !s.is_empty() => s,
         _ => {
-            let mut buf = vec![0u8; 32];
-            rand::thread_rng().fill_bytes(&mut buf);
-            buf
+            let mut raw = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut raw);
+            hex::encode(raw).into_bytes()
         }
     };
 

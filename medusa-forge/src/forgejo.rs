@@ -321,7 +321,14 @@ impl Provider for ForgejoProvider {
             .into_iter()
             .find(|h| h.config.url.as_deref() == Some(target_url));
 
-        let secret_hex = hex::encode(secret);
+        // Send the secret bytes as a string (auto-install ensures
+        // they're ASCII). The forge stores it as text and HMACs with
+        // those text bytes — same key medusa uses to verify later.
+        let secret_str = std::str::from_utf8(secret).map_err(|_| ForgeError::Api {
+            status: 0,
+            url: "ensure_webhook (local)".to_string(),
+            body: "webhook secret is not valid UTF-8".to_string(),
+        })?;
         let payload = serde_json::json!({
             "type": "gitea",
             "active": true,
@@ -329,10 +336,19 @@ impl Provider for ForgejoProvider {
             "config": {
                 "url": target_url,
                 "content_type": "json",
-                "secret": secret_hex,
+                "secret": secret_str,
             }
         });
 
+        // Known Forgejo limitation: PATCHing an existing hook does NOT
+        // update `config.secret` reliably (validated against Codeberg's
+        // current Forgejo). The other fields (events, url,
+        // content_type) update fine. If you regenerate the secret in
+        // medusa's sqlite, you must also delete the hook in the
+        // Forgejo UI so the next auto-install pass POSTs a fresh one
+        // with the new secret. (TODO: detect "hook_id stored but
+        // sqlite was just wiped" via a new `Provider::ensure_webhook`
+        // arg taking the prior hook_id, and force delete+POST.)
         let (method, url) = match &existing {
             Some(h) => (
                 reqwest::Method::PATCH,
