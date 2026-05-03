@@ -106,7 +106,13 @@ async fn run_one(
     let flake_uri = format!("{}#{fragment}", source.display());
     tracing::debug!(fragment, %flake_uri, "spawning nix-eval-jobs");
 
+    // `--extra-experimental-features` is additive, so we don't override
+    // anything an operator already has in `nix.conf`. We just guarantee
+    // that the two features `--flake` URIs depend on are on for the
+    // spawned subprocess — otherwise medusa breaks on any host whose
+    // system-wide nix.conf hasn't been opted in.
     let mut child = Command::new("nix-eval-jobs")
+        .args(["--extra-experimental-features", "nix-command flakes"])
         .arg("--flake")
         .arg(&flake_uri)
         .arg("--meta")
@@ -179,4 +185,96 @@ async fn run_one(
         fragment: fragment.to_string(),
         source: e,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    /// Stand up a fake `nix-eval-jobs` script in `dir/bin/` that records
+    /// its argv to `dir/argv.txt` (one arg per line, NUL-terminated would
+    /// be safer but newlines are fine for the flag we're checking) and
+    /// then prints an empty (zero-jobs) JSON-lines stream so the runner
+    /// returns Ok([]). Returns the directory; the caller must keep it
+    /// alive for the duration of the test.
+    fn fake_nix_eval_jobs_recording_argv(dir: &Path) {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("nix-eval-jobs");
+        let mut f = std::fs::File::create(&script).unwrap();
+        // Write argv ($0 plus all args) one per line into argv.txt next
+        // to the script.
+        writeln!(
+            f,
+            r#"#!/bin/sh
+out="$(dirname "$0")/../argv.txt"
+: > "$out"
+for a in "$@"; do printf '%s\n' "$a" >> "$out"; done
+exit 0
+"#
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&script).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script, perm).unwrap();
+    }
+
+    #[tokio::test]
+    async fn passes_extra_experimental_features_to_nix_eval_jobs() {
+        let bin_root = tempdir().unwrap();
+        fake_nix_eval_jobs_recording_argv(bin_root.path());
+
+        // Need a flake.nix to satisfy the source-existence check, even
+        // though our fake binary ignores everything.
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("flake.nix"), b"# stub\n").unwrap();
+
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = std::ffi::OsString::from(bin_root.path().join("bin"));
+        new_path.push(":");
+        new_path.push(&original_path);
+        // SAFETY: tests are single-threaded enough for the duration of the
+        // spawn; PATH is restored before the test exits.
+        // SAFETY: This test relies on no other test mutating PATH concurrently;
+        // cargo runs tests in parallel by default, so this could be flaky if
+        // we add more PATH-mutating tests. Right now there is exactly one.
+        unsafe { std::env::set_var("PATH", &new_path) };
+
+        let request = EvalRequest {
+            source_path: src.path().to_path_buf(),
+            systems: vec!["x86_64-linux".into()],
+            outputs: vec!["packages".into()],
+            timeout: Duration::from_secs(10),
+        };
+        let result = evaluate(&request).await;
+
+        // Restore PATH before any assertion can panic.
+        unsafe { std::env::set_var("PATH", &original_path) };
+
+        result.expect("evaluate() should succeed against the fake");
+
+        let argv = std::fs::read_to_string(bin_root.path().join("argv.txt"))
+            .expect("fake recorded argv");
+        let lines: Vec<&str> = argv.lines().collect();
+
+        // Expect contiguous "--extra-experimental-features" "nix-command flakes"
+        // somewhere in the args, before --flake.
+        let flag_idx = lines
+            .iter()
+            .position(|a| *a == "--extra-experimental-features")
+            .expect("--extra-experimental-features missing from argv");
+        assert_eq!(
+            lines.get(flag_idx + 1).copied(),
+            Some("nix-command flakes"),
+            "expected experimental-features value `nix-command flakes`, got argv {lines:?}",
+        );
+        let flake_idx = lines
+            .iter()
+            .position(|a| *a == "--flake")
+            .expect("--flake missing");
+        assert!(flag_idx < flake_idx, "feature flag must precede --flake");
+    }
 }

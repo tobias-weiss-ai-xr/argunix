@@ -63,7 +63,12 @@ pub fn spawn(
             let span = info_span!("evaluation", eval_id = eval_id.get());
             if let Err(e) = process(&ctx, eval_id).instrument(span.clone()).await {
                 let _enter = span.enter();
-                tracing::error!(error = %e, "evaluation failed in worker");
+                // `{:#}` is anyhow's "alternate" Display, which walks the
+                // entire context chain on a single line — we lose the
+                // backtrace but get the cause. Without this you only see
+                // the topmost `.context("…")` and the actual root failure
+                // (a nix-eval-jobs stderr, a git error, …) is invisible.
+                tracing::error!(error = %format!("{e:#}"), "evaluation failed in worker");
                 let _ = <SqlxStore as EvalStore>::finish(
                     &ctx.store,
                     eval_id,
@@ -124,7 +129,12 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
                 Utc::now(),
             )
             .await?;
-            // Q52: surface eval-time failure as a single failed forge check.
+            // Q52: surface eval-time failure as a single failed forge
+            // check. Github's status `description` field is capped at 140
+            // chars, so we truncate the (often multi-line) nix-eval-jobs
+            // error before posting; the full chain still goes to the
+            // daemon log via the worker's outer error trap.
+            let detail = summarise_for_check(&e.to_string(), 130);
             post_overall_check(
                 ctx,
                 provider,
@@ -133,7 +143,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
                 &eval.sha,
                 eval_id,
                 CheckState::Failure,
-                "evaluation failed",
+                &format!("evaluation failed: {detail}"),
             );
             return Err(anyhow::Error::from(e).context("evaluation failed"));
         }
@@ -207,6 +217,24 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         tracing::warn!(error = %e, dir = %work_dir.display(), "failed to clean workdir");
     }
     Ok(())
+}
+
+/// Pull a forge-check-friendly one-liner out of a (potentially multi-line)
+/// error message: take the first non-empty line, strip whitespace, and
+/// hard-cap at `max_chars` characters with an ellipsis if needed.
+fn summarise_for_check(err: &str, max_chars: usize) -> String {
+    let first = err
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first.chars().count() <= max_chars {
+        first.to_string()
+    } else {
+        let mut out: String = first.chars().take(max_chars - 1).collect();
+        out.push('…');
+        out
+    }
 }
 
 #[derive(Default)]
@@ -468,4 +496,29 @@ async fn run_git_with_optional_cwd(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarise_for_check;
+
+    #[test]
+    fn summary_picks_first_nonempty_line() {
+        let err = "\n\n  evaluation failed  \nbecause of reasons\nwith more context\n";
+        assert_eq!(summarise_for_check(err, 80), "evaluation failed");
+    }
+
+    #[test]
+    fn summary_truncates_with_ellipsis() {
+        let line = "a".repeat(200);
+        let s = summarise_for_check(&line, 50);
+        assert_eq!(s.chars().count(), 50);
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn summary_handles_empty_input() {
+        assert_eq!(summarise_for_check("", 20), "");
+        assert_eq!(summarise_for_check("\n\n\n", 20), "");
+    }
 }
