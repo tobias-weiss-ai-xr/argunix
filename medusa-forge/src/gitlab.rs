@@ -479,9 +479,8 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
     }
 
     let view: PushView = serde_json::from_slice(body).map_err(ForgeError::BadPayload)?;
-    let slug = Slug::new(view.project.path_with_namespace.clone()).map_err(|e| {
-        ForgeError::InvalidSlug(view.project.path_with_namespace, e)
-    })?;
+    let slug = Slug::new(view.project.path_with_namespace.clone())
+        .map_err(|e| ForgeError::InvalidSlug(view.project.path_with_namespace, e))?;
     let sha = Sha::new(view.after.clone()).map_err(|e| ForgeError::InvalidSha(view.after, e))?;
 
     Ok(PushEvent {
@@ -536,9 +535,8 @@ fn parse_merge_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
     }
 
     let view: MrView = serde_json::from_slice(body).map_err(ForgeError::BadPayload)?;
-    let slug = Slug::new(view.project.path_with_namespace.clone()).map_err(|e| {
-        ForgeError::InvalidSlug(view.project.path_with_namespace.clone(), e)
-    })?;
+    let slug = Slug::new(view.project.path_with_namespace.clone())
+        .map_err(|e| ForgeError::InvalidSlug(view.project.path_with_namespace.clone(), e))?;
     let head_sha = Sha::new(view.object_attributes.last_commit.id.clone())
         .map_err(|e| ForgeError::InvalidSha(view.object_attributes.last_commit.id, e))?;
 

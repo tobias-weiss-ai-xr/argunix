@@ -313,7 +313,7 @@ impl Provider for GithubProvider {
             .find(|h| h.config.url.as_deref() == Some(target_url));
 
         let secret_hex = hex::encode(secret); // GitHub stores secrets as text;
-                                              // we send hex of our random bytes.
+        // we send hex of our random bytes.
         let payload = serde_json::json!({
             "name": "web",
             "active": true,

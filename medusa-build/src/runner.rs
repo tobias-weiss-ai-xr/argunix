@@ -318,7 +318,9 @@ exit 0
             "argv missing --realise: {lines:?}",
         );
         assert!(
-            !lines.iter().any(|a| *a == "-L" || *a == "--print-build-logs"),
+            !lines
+                .iter()
+                .any(|a| *a == "-L" || *a == "--print-build-logs"),
             "argv contains a `nix build`-only flag that nix-store rejects: {lines:?}",
         );
     }
@@ -403,7 +405,10 @@ exit 0
             .iter()
             .position(|a| *a == "/nix/store/aaaa-fake.drv")
             .expect("drv path missing");
-        assert!(add_root_idx < drv_idx, "--add-root must precede the drv path");
+        assert!(
+            add_root_idx < drv_idx,
+            "--add-root must precede the drv path"
+        );
     }
 
     /// When `nix-store --realise` succeeds with empty stderr (the output

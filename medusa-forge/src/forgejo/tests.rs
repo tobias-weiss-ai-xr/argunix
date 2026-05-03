@@ -15,11 +15,7 @@ fn sign(secret: &[u8], body: &[u8]) -> String {
 
 #[tokio::test]
 async fn verify_signature_accepts_x_gitea_signature() {
-    let p = ForgejoProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = ForgejoProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = b"hello";
     let secret = b"shh";
     let sig = sign(secret, body);
@@ -29,11 +25,7 @@ async fn verify_signature_accepts_x_gitea_signature() {
 
 #[tokio::test]
 async fn verify_signature_accepts_x_forgejo_signature() {
-    let p = ForgejoProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = ForgejoProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = b"hello";
     let secret = b"shh";
     let sig = sign(secret, body);
@@ -43,11 +35,7 @@ async fn verify_signature_accepts_x_forgejo_signature() {
 
 #[tokio::test]
 async fn verify_signature_rejects_wrong_secret() {
-    let p = ForgejoProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = ForgejoProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = b"hello";
     let sig = sign(b"correct", body);
     let headers = vec![("X-Gitea-Signature".to_string(), sig)];
@@ -60,11 +48,7 @@ async fn verify_signature_rejects_wrong_secret() {
 
 #[tokio::test]
 async fn parses_push_event() {
-    let p = ForgejoProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = ForgejoProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = serde_json::json!({
         "ref": "refs/heads/main",
         "after": "0123456789abcdef0123456789abcdef01234567",
@@ -78,7 +62,9 @@ async fn parses_push_event() {
         .await
         .unwrap()
         .unwrap();
-    let NormalizedEvent::Push(push) = evt else { panic!("expected push") };
+    let NormalizedEvent::Push(push) = evt else {
+        panic!("expected push")
+    };
     assert_eq!(push.slug.as_str(), "alice/myrepo");
     assert_eq!(push.git_ref, "refs/heads/main");
     assert_eq!(push.pusher.as_deref(), Some("alice"));
@@ -86,11 +72,7 @@ async fn parses_push_event() {
 
 #[tokio::test]
 async fn parses_pull_request_event() {
-    let p = ForgejoProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = ForgejoProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = serde_json::json!({
         "action": "opened",
         "number": 7,
@@ -116,7 +98,9 @@ async fn parses_pull_request_event() {
         .await
         .unwrap()
         .unwrap();
-    let NormalizedEvent::PullRequest(pr) = evt else { panic!("expected PR") };
+    let NormalizedEvent::PullRequest(pr) = evt else {
+        panic!("expected PR")
+    };
     assert_eq!(pr.author, "alice");
     assert_eq!(pr.action, PullRequestAction::Opened);
     assert!(!pr.is_fork);
@@ -124,15 +108,9 @@ async fn parses_pull_request_event() {
 
 #[tokio::test]
 async fn ping_event_is_dropped() {
-    let p = ForgejoProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = ForgejoProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let headers = vec![("X-Gitea-Event".to_string(), "ping".to_string())];
-    assert!(
-        p.parse_event(&headers, b"{}").await.unwrap().is_none()
-    );
+    assert!(p.parse_event(&headers, b"{}").await.unwrap().is_none());
 }
 
 #[tokio::test]

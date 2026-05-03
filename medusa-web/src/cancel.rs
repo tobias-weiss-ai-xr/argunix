@@ -198,7 +198,10 @@ mod tests {
     #[test]
     fn branch_key_strips_pr_branch_suffix() {
         assert_eq!(branch_key("refs/heads/main"), "refs/heads/main");
-        assert_eq!(branch_key("refs/pull/42/head:feature-x"), "refs/pull/42/head");
+        assert_eq!(
+            branch_key("refs/pull/42/head:feature-x"),
+            "refs/pull/42/head"
+        );
         assert_eq!(branch_key("refs/tags/v1.0"), "refs/tags/v1.0");
         assert_eq!(branch_key(""), "");
     }

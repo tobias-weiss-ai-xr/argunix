@@ -217,10 +217,7 @@ async fn persist(
     // (matching SHAs were already filtered by the coalesce check, but
     // a new push to the same branch with a different SHA arrives here).
     let key = crate::cancel::branch_key(&git_ref);
-    let active = state
-        .store
-        .list_active_by_branch_key(repo_id, key)
-        .await?;
+    let active = state.store.list_active_by_branch_key(repo_id, key).await?;
     for prev in active.iter().filter(|e| e.sha != sha) {
         tracing::info!(
             repo_id = repo_id.get(),

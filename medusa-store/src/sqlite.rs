@@ -143,13 +143,11 @@ impl RepoStore for SqlxStore {
         forge: &str,
         slug: &Slug,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let row = sqlx::query(
-            "SELECT webhook_secret FROM repos WHERE forge = ?1 AND slug = ?2",
-        )
-        .bind(forge)
-        .bind(slug.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT webhook_secret FROM repos WHERE forge = ?1 AND slug = ?2")
+            .bind(forge)
+            .bind(slug.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
         match row {
             None => Ok(None),
             Some(r) => {
@@ -165,14 +163,12 @@ impl RepoStore for SqlxStore {
         secret: &[u8],
         hook_id: &str,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "UPDATE repos SET webhook_secret = ?1, webhook_hook_id = ?2 WHERE id = ?3",
-        )
-        .bind(secret)
-        .bind(hook_id)
-        .bind(repo_id.get())
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE repos SET webhook_secret = ?1, webhook_hook_id = ?2 WHERE id = ?3")
+            .bind(secret)
+            .bind(hook_id)
+            .bind(repo_id.get())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

@@ -98,11 +98,7 @@ impl PauseRegistry {
 
     #[cfg(test)]
     fn paused_since(&self, forge: &str) -> Option<Instant> {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(forge)
-            .map(|e| e.since)
+        self.inner.lock().unwrap().get(forge).map(|e| e.since)
     }
 }
 

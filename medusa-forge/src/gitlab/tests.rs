@@ -22,22 +22,16 @@ fn signing_token_signature(secret: &[u8], id: &str, ts: &str, body: &[u8]) -> St
 
 #[tokio::test]
 async fn verify_signature_accepts_matching_token() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let headers = vec![("X-Gitlab-Token".to_string(), "shh".to_string())];
-    p.verify_signature(&headers, b"any body", b"shh").await.unwrap();
+    p.verify_signature(&headers, b"any body", b"shh")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn verify_signature_rejects_mismatched_token() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let headers = vec![("X-Gitlab-Token".to_string(), "wrong".to_string())];
     let err = p
         .verify_signature(&headers, b"any body", b"shh")
@@ -48,25 +42,14 @@ async fn verify_signature_rejects_mismatched_token() {
 
 #[tokio::test]
 async fn verify_signature_rejects_missing_header() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
-    let err = p
-        .verify_signature(&[], b"x", b"shh")
-        .await
-        .unwrap_err();
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
+    let err = p.verify_signature(&[], b"x", b"shh").await.unwrap_err();
     assert!(matches!(err, ForgeError::MissingHeader(_)));
 }
 
 #[tokio::test]
 async fn verify_signing_token_accepts_valid_signature() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = br#"{"hello":"world"}"#;
     let id = "msg_2x9f";
     let ts = "1714742400";
@@ -84,11 +67,7 @@ async fn verify_signing_token_accepts_valid_signature() {
 async fn verify_signing_token_accepts_one_of_multiple_v1_entries() {
     // Operators can rotate signing keys; GitLab then sends multiple
     // signatures separated by spaces. Any one matching is enough.
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = b"body";
     let id = "abc";
     let ts = "1";
@@ -109,11 +88,7 @@ async fn verify_signing_token_accepts_one_of_multiple_v1_entries() {
 
 #[tokio::test]
 async fn verify_signing_token_rejects_wrong_secret() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = b"body";
     let id = "abc";
     let ts = "1";
@@ -132,11 +107,7 @@ async fn verify_signing_token_rejects_wrong_secret() {
 
 #[tokio::test]
 async fn verify_signing_token_rejects_when_companion_headers_missing() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let headers = vec![("webhook-signature".to_string(), "v1,xxx".to_string())];
     let err = p
         .verify_signature(&headers, b"x", b"shh")
@@ -150,11 +121,7 @@ async fn verify_signing_token_decodes_whsec_prefix() {
     // Standard Webhooks (and GitLab's signing token UI) format:
     // the secret arrives as `whsec_<base64>`; the actual HMAC key is
     // the base64-decoded suffix.
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = b"some webhook body";
     let id = "msg_42";
     let ts = "1714742400";
@@ -178,11 +145,7 @@ async fn verify_signing_token_decodes_whsec_prefix() {
 async fn verify_signing_token_ignores_unknown_schemes() {
     // A future GitLab might emit a `v2,...` entry alongside `v1,...`;
     // we should still validate as long as one v1 entry matches.
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = b"body";
     let id = "abc";
     let ts = "1";
@@ -201,11 +164,7 @@ async fn verify_signing_token_ignores_unknown_schemes() {
 
 #[tokio::test]
 async fn parses_push_event() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = serde_json::json!({
         "ref": "refs/heads/main",
         "after": "0123456789abcdef0123456789abcdef01234567",
@@ -219,18 +178,16 @@ async fn parses_push_event() {
         .await
         .unwrap()
         .unwrap();
-    let NormalizedEvent::Push(push) = evt else { panic!("expected push") };
+    let NormalizedEvent::Push(push) = evt else {
+        panic!("expected push")
+    };
     assert_eq!(push.slug.as_str(), "alice/myrepo");
     assert_eq!(push.pusher.as_deref(), Some("alice"));
 }
 
 #[tokio::test]
 async fn parses_subgroup_push_slug() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = serde_json::json!({
         "ref": "refs/heads/main",
         "after": "0123456789abcdef0123456789abcdef01234567",
@@ -244,17 +201,15 @@ async fn parses_subgroup_push_slug() {
         .await
         .unwrap()
         .unwrap();
-    let NormalizedEvent::Push(push) = evt else { panic!("expected push") };
+    let NormalizedEvent::Push(push) = evt else {
+        panic!("expected push")
+    };
     assert_eq!(push.slug.as_str(), "myorg/marketing/site");
 }
 
 #[tokio::test]
 async fn parses_merge_request_event() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = serde_json::json!({
         "project": { "path_with_namespace": "alice/myrepo" },
         "user": { "username": "stranger" },
@@ -278,7 +233,9 @@ async fn parses_merge_request_event() {
         .await
         .unwrap()
         .unwrap();
-    let NormalizedEvent::PullRequest(pr) = evt else { panic!("expected MR") };
+    let NormalizedEvent::PullRequest(pr) = evt else {
+        panic!("expected MR")
+    };
     assert_eq!(pr.pr_number, 42);
     assert_eq!(pr.author, "stranger");
     assert_eq!(pr.action, PullRequestAction::Opened);
@@ -287,11 +244,7 @@ async fn parses_merge_request_event() {
 
 #[tokio::test]
 async fn merge_request_update_maps_to_synchronize() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = serde_json::json!({
         "project": { "path_with_namespace": "alice/myrepo" },
         "user": { "username": "alice" },
@@ -313,17 +266,15 @@ async fn merge_request_update_maps_to_synchronize() {
         .await
         .unwrap()
         .unwrap();
-    let NormalizedEvent::PullRequest(pr) = evt else { panic!("expected MR") };
+    let NormalizedEvent::PullRequest(pr) = evt else {
+        panic!("expected MR")
+    };
     assert_eq!(pr.action, PullRequestAction::Synchronize);
 }
 
 #[tokio::test]
 async fn pipeline_event_is_dropped() {
-    let p = GitlabProvider::new(
-        "http://unused".into(),
-        "tok".into(),
-        "https://m".into(),
-    );
+    let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let headers = vec![("X-Gitlab-Event".to_string(), "Pipeline Hook".to_string())];
     assert!(p.parse_event(&headers, b"{}").await.unwrap().is_none());
 }
@@ -335,19 +286,15 @@ async fn query_user_permission_resolves_developer_to_write() {
         .and(path("/users"))
         .and(query_param("username", "alice"))
         .and(header("PRIVATE-TOKEN", "tok"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "id": 7 }])),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "id": 7 }])))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/projects/alice%2Fmyrepo/members/all/7"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": 7,
-                "access_level": 30
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 7,
+            "access_level": 30
+        })))
         .mount(&server)
         .await;
 
@@ -392,9 +339,7 @@ async fn post_check_succeeds_for_subgroup_slug() {
             "description": "evaluating…",
             "target_url": "https://m/r/gitlab/myorg/marketing/site/eval/1"
         })))
-        .respond_with(
-            ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": 99 })),
-        )
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": 99 })))
         .mount(&server)
         .await;
 

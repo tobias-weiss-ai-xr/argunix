@@ -308,7 +308,14 @@ mod tests {
         let prov = provider_returning(Permission::Write);
         let pauses = fresh_pauses();
         assert_eq!(
-            evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await,
+            evaluate(
+                &prov,
+                &repo,
+                &pr(PullRequestAction::Opened, "alice"),
+                "gh",
+                &pauses
+            )
+            .await,
             Decision::Build,
         );
     }
@@ -353,7 +360,14 @@ mod tests {
         let prov = provider_returning(Permission::Admin);
         let pauses = fresh_pauses();
         assert_eq!(
-            evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await,
+            evaluate(
+                &prov,
+                &repo,
+                &pr(PullRequestAction::Opened, "alice"),
+                "gh",
+                &pauses
+            )
+            .await,
             Decision::DropPrsDisabled,
         );
     }
@@ -380,7 +394,14 @@ mod tests {
         let prov = provider_unauthorised();
         let pauses = fresh_pauses();
         assert_eq!(
-            evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await,
+            evaluate(
+                &prov,
+                &repo,
+                &pr(PullRequestAction::Opened, "alice"),
+                "gh",
+                &pauses
+            )
+            .await,
             Decision::Build,
         );
     }
@@ -390,7 +411,14 @@ mod tests {
         let repo = repo_with(true, vec![], vec!["main"]);
         let prov = provider_unauthorised();
         let pauses = fresh_pauses();
-        let d = evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await;
+        let d = evaluate(
+            &prov,
+            &repo,
+            &pr(PullRequestAction::Opened, "alice"),
+            "gh",
+            &pauses,
+        )
+        .await;
         assert!(matches!(d, Decision::DropPrUntrustedAuthor { .. }));
     }
 
@@ -400,7 +428,14 @@ mod tests {
         let repo = repo_with(true, vec![], vec!["main"]);
         let prov = provider_unauthorised();
         let pauses = fresh_pauses();
-        let _ = evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await;
+        let _ = evaluate(
+            &prov,
+            &repo,
+            &pr(PullRequestAction::Opened, "alice"),
+            "gh",
+            &pauses,
+        )
+        .await;
         assert!(pauses.is_paused("gh"));
     }
 
@@ -414,7 +449,14 @@ mod tests {
         assert!(pauses.is_paused("gh"));
 
         let prov = provider_returning(Permission::Write);
-        let _ = evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await;
+        let _ = evaluate(
+            &prov,
+            &repo,
+            &pr(PullRequestAction::Opened, "alice"),
+            "gh",
+            &pauses,
+        )
+        .await;
         assert!(!pauses.is_paused("gh"));
     }
 }

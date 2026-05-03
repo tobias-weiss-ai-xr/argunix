@@ -251,10 +251,10 @@ async fn eval_page(
             }
         }
     };
-    Ok(Html(
-        layout(&format!("{forge}/{slug} #{}", eval_id.get()), body).into_string(),
+    Ok(
+        Html(layout(&format!("{forge}/{slug} #{}", eval_id.get()), body).into_string())
+            .into_response(),
     )
-    .into_response())
 }
 
 async fn job_page(
@@ -328,7 +328,10 @@ async fn log_handler(
 
     Ok((
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         bytes,
     )
         .into_response())
@@ -460,8 +463,7 @@ mod tests {
 
     #[test]
     fn parse_log() {
-        let p =
-            parse_repo_tail("myorg/myrepo/eval/3/job/packages.x86_64-linux.hello/log").unwrap();
+        let p = parse_repo_tail("myorg/myrepo/eval/3/job/packages.x86_64-linux.hello/log").unwrap();
         assert_eq!(p.slug, "myorg/myrepo");
         assert_eq!(
             p.kind,

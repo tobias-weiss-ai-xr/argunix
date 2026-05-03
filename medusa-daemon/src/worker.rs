@@ -102,9 +102,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow!("evaluation row {} disappeared", eval_id.get()))?;
 
     if eval.status == EvalStatus::Cancelled || cancel.is_cancelled() {
-        tracing::info!(
-            "evaluation cancelled before worker pickup; skipping",
-        );
+        tracing::info!("evaluation cancelled before worker pickup; skipping",);
         return Ok(());
     }
 
@@ -141,9 +139,8 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
 
     if cancel.is_cancelled() {
         tracing::info!("evaluation cancelled before eval phase (Q39)");
-        <SqlxStore as EvalStore>::finish(
-            &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
-        ).await?;
+        <SqlxStore as EvalStore>::finish(&ctx.store, eval_id, EvalStatus::Cancelled, Utc::now())
+            .await?;
         return Ok(());
     }
 
@@ -244,8 +241,12 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
                 "evaluation cancelled mid-build-loop (Q39); skipping remaining jobs",
             );
             <SqlxStore as EvalStore>::finish(
-                &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
-            ).await?;
+                &ctx.store,
+                eval_id,
+                EvalStatus::Cancelled,
+                Utc::now(),
+            )
+            .await?;
             return Ok(());
         }
         let job_id = persist_job(&ctx.store, eval_id, &spec).await?;
@@ -412,7 +413,12 @@ fn post_per_job_check(
         }),
         target_url: Some(target),
     };
-    spawn_post_check(provider.clone(), post, forge.to_string(), ctx.pauses.clone());
+    spawn_post_check(
+        provider.clone(),
+        post,
+        forge.to_string(),
+        ctx.pauses.clone(),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -435,7 +441,12 @@ fn post_overall_check(
         description: Some(description.to_string()),
         target_url: Some(target),
     };
-    spawn_post_check(provider.clone(), post, forge.to_string(), ctx.pauses.clone());
+    spawn_post_check(
+        provider.clone(),
+        post,
+        forge.to_string(),
+        ctx.pauses.clone(),
+    );
 }
 
 /// Q82: skip post_check entirely if the forge is paused; mark the forge
@@ -727,7 +738,6 @@ mod tests {
             s.len()
         );
     }
-
 
     #[test]
     fn summary_picks_first_nonempty_line() {

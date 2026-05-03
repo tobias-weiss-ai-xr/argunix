@@ -90,10 +90,7 @@ async fn build_one(
 /// Read the token file referenced by `forge_cfg.auth().token_path`.
 /// Returns `BuildProvidersError::AppAuthUnsupported` for app-style
 /// configs (M5c work) — those land later when we add Checks API.
-async fn read_token(
-    name: &str,
-    forge_cfg: &ForgeConfig,
-) -> Result<String, BuildProvidersError> {
+async fn read_token(name: &str, forge_cfg: &ForgeConfig) -> Result<String, BuildProvidersError> {
     let auth = forge_cfg.auth().map_err(|e| BuildProvidersError::Auth {
         forge: name.to_string(),
         error: e,

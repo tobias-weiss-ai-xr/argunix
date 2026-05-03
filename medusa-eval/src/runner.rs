@@ -256,8 +256,8 @@ exit 0
 
         result.expect("evaluate() should succeed against the fake");
 
-        let argv = std::fs::read_to_string(bin_root.path().join("argv.txt"))
-            .expect("fake recorded argv");
+        let argv =
+            std::fs::read_to_string(bin_root.path().join("argv.txt")).expect("fake recorded argv");
         let lines: Vec<&str> = argv.lines().collect();
 
         // Expect contiguous "--extra-experimental-features" "nix-command flakes"
