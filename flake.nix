@@ -12,6 +12,9 @@
 
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
+
+    disko.url = "github:nix-community/disko";
+    disko.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -40,6 +43,21 @@
       flake.nixosModules = {
         default = ./nix/module.nix;
         medusa = ./nix/module.nix;
+      };
+
+      # Test deployment to medusa.nix-consulting.net.
+      # Provision with `nixos-anywhere`; later updates via
+      # `nixos-rebuild switch --target-host`.
+      flake.nixosConfigurations.medusa = inputs.nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          inputs.disko.nixosModules.disko
+          inputs.self.nixosModules.default
+          {
+            nixpkgs.overlays = [ inputs.self.overlays.default ];
+          }
+          ./test-deployment/configuration.nix
+        ];
       };
 
       perSystem =
