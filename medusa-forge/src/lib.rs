@@ -13,7 +13,9 @@
 //! M5a ships the trait + the github implementation with PAT auth; gitlab,
 //! forgejo, and github-app auth land later.
 
+pub mod forgejo;
 pub mod github;
+pub mod gitlab;
 
 mod errors;
 mod events;
@@ -21,7 +23,9 @@ mod permission;
 
 pub use errors::ForgeError;
 pub use events::{NormalizedEvent, PullRequestAction, PullRequestEvent, PushEvent};
+pub use forgejo::ForgejoProvider;
 pub use github::GithubProvider;
+pub use gitlab::GitlabProvider;
 pub use permission::Permission;
 
 use async_trait::async_trait;

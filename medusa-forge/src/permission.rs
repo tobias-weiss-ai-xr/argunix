@@ -38,6 +38,32 @@ impl Permission {
             _ => Permission::None,
         }
     }
+
+    /// Map a Gitea/Forgejo `permission` string (`admin`, `write`,
+    /// `read`, `none`) to our enum. Gitea has a coarser ladder than
+    /// GitHub — no separate triage/maintain.
+    pub(crate) fn from_gitea(s: &str) -> Self {
+        match s {
+            "admin" | "owner" => Permission::Admin,
+            "write" => Permission::Write,
+            "read" => Permission::Read,
+            _ => Permission::None,
+        }
+    }
+
+    /// Map a GitLab `access_level` integer to our enum.
+    /// GitLab levels: 10 Guest, 20 Reporter, 30 Developer,
+    /// 40 Maintainer, 50 Owner.
+    pub(crate) fn from_gitlab_access_level(level: u32) -> Self {
+        match level {
+            50 => Permission::Admin,
+            40 => Permission::Maintain,
+            30 => Permission::Write,
+            20 => Permission::Triage, // Reporter — read + report issues, no push
+            10 => Permission::Read,
+            _ => Permission::None,
+        }
+    }
 }
 
 #[cfg(test)]

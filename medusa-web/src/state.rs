@@ -2,7 +2,7 @@ use crate::coalesce::CoalescePool;
 use crate::pause::PauseRegistry;
 use medusa_config::{Config, ForgeAuth, ForgeConfig};
 use medusa_domain::{EvalId, ForgeKind};
-use medusa_forge::{GithubProvider, Provider};
+use medusa_forge::{ForgejoProvider, GithubProvider, GitlabProvider, Provider};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -67,38 +67,50 @@ async fn build_one(
     forge_cfg: &ForgeConfig,
     external_url: &str,
 ) -> Result<Arc<dyn Provider>, BuildProvidersError> {
+    let token = read_token(name, forge_cfg).await?;
     match forge_cfg.kind {
-        ForgeKind::Github => {
-            let auth = forge_cfg.auth().map_err(|e| BuildProvidersError::Auth {
-                forge: name.to_string(),
-                error: e,
-            })?;
-            let token = match auth {
-                ForgeAuth::Token { token_path } => {
-                    let raw = tokio::fs::read_to_string(token_path.path())
-                        .await
-                        .map_err(|e| BuildProvidersError::TokenRead {
-                            forge: name.to_string(),
-                            path: token_path.path().to_path_buf(),
-                            source: e,
-                        })?;
-                    raw.trim().to_string()
-                }
-                ForgeAuth::App { .. } => {
-                    return Err(BuildProvidersError::AppAuthUnsupported {
-                        forge: name.to_string(),
-                    });
-                }
-            };
-            let provider =
-                GithubProvider::new(forge_cfg.api_url.clone(), token, external_url.to_string());
-            Ok(Arc::new(provider) as Arc<dyn Provider>)
+        ForgeKind::Github => Ok(Arc::new(GithubProvider::new(
+            forge_cfg.api_url.clone(),
+            token,
+            external_url.to_string(),
+        )) as Arc<dyn Provider>),
+        ForgeKind::Gitlab => Ok(Arc::new(GitlabProvider::new(
+            forge_cfg.api_url.clone(),
+            token,
+            external_url.to_string(),
+        )) as Arc<dyn Provider>),
+        ForgeKind::Forgejo => Ok(Arc::new(ForgejoProvider::new(
+            forge_cfg.api_url.clone(),
+            token,
+            external_url.to_string(),
+        )) as Arc<dyn Provider>),
+    }
+}
+
+/// Read the token file referenced by `forge_cfg.auth().token_path`.
+/// Returns `BuildProvidersError::AppAuthUnsupported` for app-style
+/// configs (M5c work) — those land later when we add Checks API.
+async fn read_token(
+    name: &str,
+    forge_cfg: &ForgeConfig,
+) -> Result<String, BuildProvidersError> {
+    let auth = forge_cfg.auth().map_err(|e| BuildProvidersError::Auth {
+        forge: name.to_string(),
+        error: e,
+    })?;
+    match auth {
+        ForgeAuth::Token { token_path } => {
+            let raw = tokio::fs::read_to_string(token_path.path())
+                .await
+                .map_err(|e| BuildProvidersError::TokenRead {
+                    forge: name.to_string(),
+                    path: token_path.path().to_path_buf(),
+                    source: e,
+                })?;
+            Ok(raw.trim().to_string())
         }
-        kind @ (ForgeKind::Gitlab | ForgeKind::Forgejo) => {
-            Err(BuildProvidersError::UnsupportedKind {
-                forge: name.to_string(),
-                kind,
-            })
-        }
+        ForgeAuth::App { .. } => Err(BuildProvidersError::AppAuthUnsupported {
+            forge: name.to_string(),
+        }),
     }
 }

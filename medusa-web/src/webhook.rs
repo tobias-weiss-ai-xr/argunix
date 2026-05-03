@@ -77,24 +77,29 @@ impl IntoResponse for WebhookError {
     }
 }
 
-/// `POST /webhook/{forge_kind}`. Path segment must currently be `github`;
-/// `gitlab` and `forgejo` land in M7.
+/// `POST /webhook/{forge_kind}` where `forge_kind` is `github`,
+/// `gitlab`, or `forgejo`.
 pub async fn handle(
     Path(forge_kind): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, WebhookError> {
-    if forge_kind != "github" {
-        return Err(WebhookError::UnknownForgeKind(forge_kind));
-    }
+    let expected_kind = match forge_kind.as_str() {
+        "github" => ForgeKind::Github,
+        "gitlab" => ForgeKind::Gitlab,
+        "forgejo" => ForgeKind::Forgejo,
+        _ => return Err(WebhookError::UnknownForgeKind(forge_kind)),
+    };
 
     // Untrusted preview parse: just enough to find which configured repo
     // and forge this is for. HMAC-verified parse follows.
     let preview: PayloadPreview = serde_json::from_slice(&body).map_err(WebhookError::BadJson)?;
-    let Some(repo_full_name) = preview.repository.map(|r| r.full_name) else {
-        return Err(WebhookError::NoRepository);
-    };
+    let repo_full_name = preview
+        .repository
+        .map(|r| r.full_name)
+        .or(preview.project.and_then(|p| p.path_with_namespace))
+        .ok_or(WebhookError::NoRepository)?;
 
     let slug = Slug::new(repo_full_name.clone()).map_err(|e| WebhookError::InvalidSlug {
         slug: repo_full_name.clone(),
@@ -111,7 +116,7 @@ pub async fn handle(
         // We checked this at config validation time, but be defensive.
         WebhookError::NoProvider(repo_cfg.forge.clone())
     })?;
-    if forge_cfg.kind != ForgeKind::Github {
+    if forge_cfg.kind != expected_kind {
         return Err(WebhookError::KindMismatch {
             slug: slug.as_str().to_string(),
             configured: forge_cfg.kind,
@@ -347,10 +352,18 @@ fn headers_to_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
 
 #[derive(Debug, Deserialize)]
 struct PayloadPreview {
+    /// GitHub / Forgejo: `repository.full_name`.
     repository: Option<RepositoryPreview>,
+    /// GitLab: `project.path_with_namespace`.
+    project: Option<ProjectPreview>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RepositoryPreview {
     full_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectPreview {
+    path_with_namespace: Option<String>,
 }
