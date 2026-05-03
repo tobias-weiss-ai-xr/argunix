@@ -245,6 +245,42 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         persisted.push((spec, job_id));
     }
 
+    // Replace the initial Q51 "evaluating…" overall check with a
+    // "building N jobs" pending update. Without this, the GitHub /
+    // GitLab / Forgejo UI shows "evaluating…" the entire time builds
+    // are running, which is misleading once eval is actually done.
+    // In collapsed_mode the rolling tally updates further refine
+    // this; here we just ensure there's at least one transition.
+    post_overall_check(
+        ctx,
+        provider,
+        &repo.forge,
+        &repo.slug,
+        &eval.sha,
+        eval_id,
+        CheckState::Pending,
+        &format!("building {total} jobs"),
+    );
+
+    // Post pending per-job checks upfront so the user sees the full
+    // matrix of `medusa: <attr>` rows on the commit page immediately,
+    // each in the "queued" state, rather than rows blinking into
+    // existence one by one as builds finish. Skipped in collapsed
+    // mode where per-job checks are entirely suppressed.
+    if !collapsed_mode {
+        for (spec, _) in &persisted {
+            post_per_job_check_pending(
+                ctx,
+                provider,
+                &repo.forge,
+                &repo.slug,
+                &eval.sha,
+                eval_id,
+                spec.attr_path.as_str(),
+            );
+        }
+    }
+
     let mut tally = JobTally::default();
     let summary_debounce = std::time::Duration::from_secs(2);
     let mut last_summary_post: Option<std::time::Instant> = None;
@@ -392,6 +428,36 @@ impl JobTally {
             _ => {}
         }
     }
+}
+
+/// Post the initial Pending check for a per-job context, fired upfront
+/// so the user sees "queued" on the commit page immediately rather
+/// than rows appearing one by one as builds finish.
+#[allow(clippy::too_many_arguments)]
+fn post_per_job_check_pending(
+    ctx: &WorkerContext,
+    provider: &Arc<dyn Provider>,
+    forge: &str,
+    slug: &Slug,
+    sha: &Sha,
+    eval_id: EvalId,
+    attr_path: &str,
+) {
+    let target = job_target_url(&ctx.config.external_url, forge, slug, eval_id, attr_path);
+    let post = CheckPost {
+        slug: slug.clone(),
+        sha: sha.clone(),
+        context: format!("medusa: {attr_path}"),
+        state: CheckState::Pending,
+        description: Some("queued".to_string()),
+        target_url: Some(target),
+    };
+    spawn_post_check(
+        provider.clone(),
+        post,
+        forge.to_string(),
+        ctx.pauses.clone(),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
