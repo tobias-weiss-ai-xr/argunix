@@ -10,6 +10,7 @@
 
 mod policy;
 mod state;
+mod ui;
 mod webhook;
 
 pub use policy::{Decision as PolicyDecision, evaluate as evaluate_policy};
@@ -22,7 +23,9 @@ use std::sync::Arc;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(ui::index))
         .route("/healthz", get(healthz))
+        .route("/r/{forge}/{*tail}", get(ui::dispatch_repo))
         .route("/webhook/{forge_kind}", post(webhook::handle))
         .with_state(state)
 }

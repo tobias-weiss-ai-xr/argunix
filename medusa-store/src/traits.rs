@@ -42,6 +42,13 @@ pub trait EvalStore: Send + Sync {
         status: EvalStatus,
         finished_at: DateTime<Utc>,
     ) -> Result<(), StoreError>;
+    /// Most-recent evaluations for `repo_id`, newest first, capped at `limit`.
+    /// Used by the read-only UI's repo page.
+    async fn list_by_repo(
+        &self,
+        repo_id: RepoId,
+        limit: u32,
+    ) -> Result<Vec<EvalRecord>, StoreError>;
 }
 
 #[async_trait]

@@ -192,6 +192,25 @@ impl EvalStore for SqlxStore {
             .await?;
         Ok(())
     }
+
+    async fn list_by_repo(
+        &self,
+        repo_id: RepoId,
+        limit: u32,
+    ) -> Result<Vec<EvalRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status
+             FROM evaluations
+             WHERE repo_id = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )
+        .bind(repo_id.get())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_eval).collect()
+    }
 }
 
 #[async_trait]

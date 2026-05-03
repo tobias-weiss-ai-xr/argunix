@@ -170,6 +170,12 @@ fn parse_realise_stdout(stdout: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialise PATH-mutating tests in this module. cargo test runs in
+    /// parallel by default; without this, the two `does_not_pass_…` /
+    /// `passes_add_root_…` tests race on the global PATH env var.
+    static PATH_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parses_realise_output_paths() {
@@ -228,13 +234,11 @@ exit 0
         let log_dir = tempdir().unwrap();
         let log_path = log_dir.path().join("build.log.zst");
 
+        let _guard = PATH_LOCK.lock().unwrap();
         let original_path = std::env::var_os("PATH").unwrap_or_default();
         let mut new_path = std::ffi::OsString::from(&bin);
         new_path.push(":");
         new_path.push(&original_path);
-        // SAFETY: this test prepends to PATH; it relies on no other test
-        // mutating PATH concurrently. Today this is the only PATH-mutating
-        // test in this crate.
         unsafe { std::env::set_var("PATH", &new_path) };
 
         let request = BuildRequest {
@@ -302,6 +306,7 @@ exit 0
         let log_path = log_dir.path().join("build.log.zst");
         let gc_root = log_dir.path().join("gcroot-symlink");
 
+        let _guard = PATH_LOCK.lock().unwrap();
         let original_path = std::env::var_os("PATH").unwrap_or_default();
         let mut new_path = std::ffi::OsString::from(&bin);
         new_path.push(":");
