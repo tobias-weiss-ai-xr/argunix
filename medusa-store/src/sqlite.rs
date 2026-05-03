@@ -171,6 +171,69 @@ impl RepoStore for SqlxStore {
             .await?;
         Ok(())
     }
+
+    async fn prune_repos_not_in(
+        &self,
+        keep: &[(String, Slug)],
+    ) -> Result<Vec<RepoRecord>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let all_rows = sqlx::query("SELECT id, forge, slug FROM repos")
+            .fetch_all(&mut *tx)
+            .await?;
+        let all: Vec<RepoRecord> = all_rows.iter().map(map_repo).collect::<Result<_, _>>()?;
+        let kept: std::collections::HashSet<(&str, &str)> =
+            keep.iter().map(|(f, s)| (f.as_str(), s.as_str())).collect();
+        let orphans: Vec<RepoRecord> = all
+            .into_iter()
+            .filter(|r| !kept.contains(&(r.forge.as_str(), r.slug.as_str())))
+            .collect();
+
+        // Order matters: queue → forge_status → jobs → evaluations →
+        // repos. Each statement scopes by repo_id via subqueries; the
+        // whole thing runs in one transaction so a failure mid-cascade
+        // leaves no partial state.
+        for r in &orphans {
+            let id = r.id.get();
+            sqlx::query(
+                "DELETE FROM queue WHERE job_id IN (
+                     SELECT j.id FROM jobs j
+                     JOIN evaluations e ON j.eval_id = e.id
+                     WHERE e.repo_id = ?1
+                 )",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM forge_status WHERE eval_id IN (
+                     SELECT id FROM evaluations WHERE repo_id = ?1
+                 )",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM jobs WHERE eval_id IN (
+                     SELECT id FROM evaluations WHERE repo_id = ?1
+                 )",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM evaluations WHERE repo_id = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM repos WHERE id = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(orphans)
+    }
 }
 
 #[async_trait]
@@ -582,5 +645,144 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(r.handle.as_deref(), Some("check-2"));
+    }
+
+    #[tokio::test]
+    async fn prune_drops_orphan_repos_with_cascade() {
+        let s = store().await;
+        let kept_slug = Slug::new("alice/keep").unwrap();
+        let drop_slug = Slug::new("bob/drop").unwrap();
+
+        // Set up two repos. Both get an evaluation and a job each so
+        // we can verify the cascade really nukes the dependent rows.
+        let kept_id = <SqlxStore as RepoStore>::upsert(&s, "github", &kept_slug)
+            .await
+            .unwrap();
+        let drop_id = <SqlxStore as RepoStore>::upsert(&s, "old-forge", &drop_slug)
+            .await
+            .unwrap();
+
+        let kept_eval = <SqlxStore as EvalStore>::create(
+            &s,
+            NewEvaluation {
+                repo_id: kept_id,
+                trigger: "push".into(),
+                git_ref: "refs/heads/main".into(),
+                sha: medusa_domain::Sha::new("0".repeat(40)).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        let drop_eval = <SqlxStore as EvalStore>::create(
+            &s,
+            NewEvaluation {
+                repo_id: drop_id,
+                trigger: "push".into(),
+                git_ref: "refs/heads/main".into(),
+                sha: medusa_domain::Sha::new("1".repeat(40)).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let _ = <SqlxStore as JobStore>::create(
+            &s,
+            NewJob {
+                eval_id: kept_eval,
+                attr_path: AttrPath::new("packages.x86_64-linux.kept"),
+                drv_path: None,
+                system: "x86_64-linux".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = <SqlxStore as JobStore>::create(
+            &s,
+            NewJob {
+                eval_id: drop_eval,
+                attr_path: AttrPath::new("packages.x86_64-linux.drop"),
+                drv_path: None,
+                system: "x86_64-linux".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Prune with a `keep` list containing only the first repo.
+        let pruned = <SqlxStore as RepoStore>::prune_repos_not_in(
+            &s,
+            &[("github".to_string(), kept_slug.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].id, drop_id);
+
+        // Repo gone.
+        assert!(<SqlxStore as RepoStore>::get(&s, drop_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(<SqlxStore as RepoStore>::get(&s, kept_id)
+            .await
+            .unwrap()
+            .is_some());
+        // Eval and job rows for the dropped repo gone too.
+        assert!(<SqlxStore as EvalStore>::get(&s, drop_eval)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            <SqlxStore as JobStore>::list_by_eval(&s, drop_eval)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        // Kept repo's data untouched.
+        assert!(<SqlxStore as EvalStore>::get(&s, kept_eval)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            <SqlxStore as JobStore>::list_by_eval(&s, kept_eval)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_with_empty_keep_drops_everything() {
+        let s = store().await;
+        let _ = <SqlxStore as RepoStore>::upsert(&s, "gh", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        let _ = <SqlxStore as RepoStore>::upsert(&s, "gl", &Slug::new("c/d").unwrap())
+            .await
+            .unwrap();
+        let pruned = <SqlxStore as RepoStore>::prune_repos_not_in(&s, &[])
+            .await
+            .unwrap();
+        assert_eq!(pruned.len(), 2);
+        assert_eq!(<SqlxStore as RepoStore>::list(&s).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_no_op_when_all_repos_in_keep() {
+        let s = store().await;
+        let slug = Slug::new("a/b").unwrap();
+        let _ = <SqlxStore as RepoStore>::upsert(&s, "gh", &slug)
+            .await
+            .unwrap();
+        let pruned = <SqlxStore as RepoStore>::prune_repos_not_in(
+            &s,
+            &[("gh".to_string(), slug)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(pruned.len(), 0);
+        assert_eq!(<SqlxStore as RepoStore>::list(&s).await.unwrap().len(), 1);
     }
 }

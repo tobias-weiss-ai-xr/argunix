@@ -47,6 +47,15 @@ pub trait RepoStore: Send + Sync {
         secret: &[u8],
         hook_id: &str,
     ) -> Result<(), StoreError>;
+    /// Delete every repo (and its cascaded evaluations / jobs / queue
+    /// rows / forge_status rows) whose `(forge, slug)` does not appear
+    /// in `keep`. Returns the deleted repo records so the caller can
+    /// also clean up their on-disk logs and GC roots. Runs in a single
+    /// transaction.
+    async fn prune_repos_not_in(
+        &self,
+        keep: &[(String, Slug)],
+    ) -> Result<Vec<RepoRecord>, StoreError>;
 }
 
 #[async_trait]

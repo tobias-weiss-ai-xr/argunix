@@ -190,6 +190,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let pauses = std::sync::Arc::new(medusa_web::PauseRegistry::new());
     let cancellations = std::sync::Arc::new(medusa_web::CancelRegistry::new());
 
+    // Config-driven cleanup: at every startup, prune any repo (and
+    // its evaluations / jobs / logs / GC roots) that no longer
+    // appears in `config.repos`. This catches orphans left behind
+    // when an operator renames a forge entry or removes a repo from
+    // the YAML.
+    prune_orphan_state(&config_arc, &store, &log_dir, &gc_root_dir).await;
+
     // Auto-install / refresh webhooks at every startup. Best-effort:
     // a forge being unreachable doesn't block daemon startup.
     medusa_web::ensure_webhooks(&config_arc, &providers_arc, &store).await;
@@ -626,6 +633,61 @@ impl Summary {
             _ => {}
         }
     }
+}
+
+/// Drop any repo no longer present in `config.repos`, plus its
+/// evaluations / jobs / queue rows / forge_status rows / build logs /
+/// GC roots. Best-effort filesystem cleanup: failures log a warning
+/// but don't block startup. Runs in the same task as `serve()` before
+/// the worker is spawned, so nothing is in-flight against the rows
+/// we're about to delete.
+async fn prune_orphan_state(
+    config: &medusa_config::Config,
+    store: &medusa_store::SqlxStore,
+    log_dir: &Path,
+    gc_root_dir: &Path,
+) {
+    let keep: Vec<(String, medusa_domain::Slug)> = config
+        .repos
+        .iter()
+        .map(|r| (r.forge.clone(), r.slug.clone()))
+        .collect();
+    let pruned = match <medusa_store::SqlxStore as medusa_store::RepoStore>::prune_repos_not_in(
+        store, &keep,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "config-driven prune failed; orphan rows may remain");
+            return;
+        }
+    };
+    if pruned.is_empty() {
+        return;
+    }
+    for repo in &pruned {
+        let id = repo.id.get().to_string();
+        let logs_path = log_dir.join(&id);
+        let gc_path = gc_root_dir.join(&id);
+        if let Err(e) = tokio::fs::remove_dir_all(&logs_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, dir = %logs_path.display(), "failed to remove orphan log dir");
+            }
+        }
+        if let Err(e) = tokio::fs::remove_dir_all(&gc_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, dir = %gc_path.display(), "failed to remove orphan gcroot dir");
+            }
+        }
+        tracing::info!(
+            forge = %repo.forge,
+            slug = %repo.slug,
+            repo_id = repo.id.get(),
+            "pruned orphan repo no longer in config",
+        );
+    }
+    tracing::info!(count = pruned.len(), "config-driven prune pass complete");
 }
 
 fn init_tracing() {
