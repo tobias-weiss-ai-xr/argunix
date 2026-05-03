@@ -7,8 +7,9 @@
 #
 # Verifies:
 #   - The module evaluates and the systemd unit starts.
-#   - LoadCredential exposes the webhook secret under
-#     $CREDENTIALS_DIRECTORY and the daemon accepts it.
+#   - LoadCredential exposes the forge token under $CREDENTIALS_DIRECTORY
+#     and the daemon accepts it. (Webhook secrets are now medusa-managed,
+#     stored in sqlite — no operator file involved.)
 #   - Port 8080 listens and /healthz returns "ok".
 #   - The medusa user is in nix.settings.trusted-users.
 #
@@ -17,7 +18,6 @@
 { pkgs, ... }:
 
 let
-  webhookSecret = pkgs.writeText "medusa-test-webhook-secret" "shh";
   githubToken = pkgs.writeText "medusa-test-github-token" "tok";
 in
 {
@@ -32,7 +32,6 @@ in
         enable = true;
         listen = "127.0.0.1:8080";
         credentials = {
-          gh-webhook = "${webhookSecret}";
           gh-token = "${githubToken}";
         };
         settings = {
@@ -40,16 +39,12 @@ in
           forges.gh = {
             kind = "github";
             api_url = "https://api.github.com";
-            webhook_secret_path = "$CREDENTIALS_DIRECTORY/gh-webhook";
             token_path = "$CREDENTIALS_DIRECTORY/gh-token";
           };
-          repos = [
-            {
-              slug = "myorg/myrepo";
-              forge = "gh";
-              watched_branches = [ "main" ];
-            }
-          ];
+          # Empty repos[] — without the auto-install pass would try to
+          # reach api.github.com from within the test VM. Keep it empty
+          # so this test stays purely about module shape.
+          repos = [ ];
         };
       };
 

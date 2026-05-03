@@ -49,7 +49,6 @@ impl Config {
     /// startup; not in tests, since the secrets typically don't exist there.
     pub fn validate_secrets_exist(&self) -> Result<(), ValidationError> {
         for (name, forge) in &self.forges {
-            check_readable(&forge.webhook_secret_path)?;
             let auth = forge.auth().map_err(|e| ValidationError::ForgeAuth {
                 forge: name.clone(),
                 error: e,
@@ -100,7 +99,6 @@ forges:
   fg:
     kind: forgejo
     api_url: https://forge.example.com/api/v1
-    webhook_secret_path: /tmp/wh
     token_path: /tmp/tok
 repos:
   - slug: a/b
@@ -119,7 +117,6 @@ forges:
   fg:
     kind: forgejo
     api_url: https://forge.example.com/api/v1
-    webhook_secret_path: /tmp/wh
     token_path: /tmp/tok
 repos:
   - slug: a/b
@@ -139,7 +136,6 @@ forges:
   fg:
     kind: forgejo
     api_url: https://forge.example.com/api/v1
-    webhook_secret_path: /tmp/wh
     token_path: /tmp/tok
 repos:
   - slug: a/b
@@ -161,7 +157,6 @@ forges:
   fg:
     kind: forgejo
     api_url: https://forge.example.com/api/v1
-    webhook_secret_path: /tmp/medusa-definitely-not-a-real-path-zzz
     token_path: /tmp/medusa-definitely-not-a-real-path-zzz
 "#,
         );
@@ -175,9 +170,7 @@ forges:
     #[test]
     fn validate_secrets_exist_passes_when_files_present() {
         let dir = tempfile::tempdir().unwrap();
-        let wh = dir.path().join("wh");
         let tok = dir.path().join("tok");
-        std::fs::write(&wh, "x").unwrap();
         std::fs::write(&tok, "x").unwrap();
         let yaml = format!(
             r#"
@@ -186,10 +179,8 @@ forges:
   fg:
     kind: forgejo
     api_url: https://forge.example.com/api/v1
-    webhook_secret_path: {wh}
     token_path: {tok}
 "#,
-            wh = wh.display(),
             tok = tok.display(),
         );
         let c: Config = serde_yaml::from_str(&yaml).unwrap();

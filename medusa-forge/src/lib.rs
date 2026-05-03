@@ -98,8 +98,26 @@ pub trait Provider: Send + Sync {
     /// Post a check / commit status. Returns the forge-side handle.
     async fn post_check(&self, post: CheckPost) -> Result<CheckHandle, ForgeError>;
 
+    /// Idempotently ensure a webhook exists at `slug` pointing at
+    /// `target_url` with secret `secret`. Implementations look up an
+    /// existing webhook by URL match, PATCH it if found, POST a new
+    /// one otherwise. Returns the forge-side hook id (caller stores
+    /// it for future updates).
+    async fn ensure_webhook(
+        &self,
+        slug: &Slug,
+        target_url: &str,
+        secret: &[u8],
+    ) -> Result<HookId, ForgeError>;
+
     /// Build a clone URL for `slug` that includes whatever auth this
     /// provider uses. v1 covers HTTPS-with-token; SSH and per-repo
     /// `clone.method` overrides are deferred to M7.
     fn clone_url(&self, slug: &Slug) -> String;
 }
+
+/// Forge-side webhook id, returned by `ensure_webhook`. Stored in
+/// sqlite as text (string-form) so the schema doesn't have to know
+/// whether a particular forge uses ints, UUIDs, etc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookId(pub String);

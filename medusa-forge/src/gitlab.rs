@@ -16,7 +16,7 @@
 use crate::errors::ForgeError;
 use crate::events::{NormalizedEvent, PullRequestAction, PullRequestEvent, PushEvent};
 use crate::permission::Permission;
-use crate::{CheckHandle, CheckPost, CheckState, Provider};
+use crate::{CheckHandle, CheckPost, CheckState, HookId, Provider};
 use async_trait::async_trait;
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -334,6 +334,89 @@ impl Provider for GitlabProvider {
             Err(_) => url.clone(),
         };
         Ok(CheckHandle(handle))
+    }
+
+    async fn ensure_webhook(
+        &self,
+        slug: &Slug,
+        target_url: &str,
+        secret: &[u8],
+    ) -> Result<HookId, ForgeError> {
+        let project = Self::project_path(slug);
+        let list_url = format!("{}/projects/{}/hooks", self.api_url, project);
+        let list_resp = self
+            .client
+            .get(&list_url)
+            .header(USER_AGENT, &self.user_agent)
+            .header(ACCEPT, "application/json")
+            .header(PRIVATE_TOKEN, &self.token)
+            .send()
+            .await?;
+        let status = list_resp.status();
+        if status.as_u16() == 401 {
+            return Err(ForgeError::Unauthorised);
+        }
+        if !status.is_success() {
+            let body = list_resp.text().await.unwrap_or_default();
+            return Err(ForgeError::Api {
+                status: status.as_u16(),
+                url: list_url,
+                body,
+            });
+        }
+        #[derive(Deserialize)]
+        struct HookView {
+            id: i64,
+            url: String,
+        }
+        let hooks: Vec<HookView> = list_resp.json().await?;
+        let existing = hooks.into_iter().find(|h| h.url == target_url);
+
+        // GitLab uses the legacy plain-secret-token webhook by default;
+        // we send our random bytes as hex so it compares cleanly with
+        // what we send back in the X-Gitlab-Token header. Operators
+        // who'd rather use signing-token can configure it manually
+        // afterwards (it's not exposed in this API consistently
+        // across versions).
+        let secret_hex = hex::encode(secret);
+        let payload = serde_json::json!({
+            "url": target_url,
+            "token": secret_hex,
+            "push_events": true,
+            "merge_requests_events": true,
+            "enable_ssl_verification": true,
+        });
+
+        let (method, url) = match &existing {
+            Some(h) => (
+                reqwest::Method::PUT,
+                format!("{}/projects/{}/hooks/{}", self.api_url, project, h.id),
+            ),
+            None => (reqwest::Method::POST, list_url.clone()),
+        };
+        let resp = self
+            .client
+            .request(method, &url)
+            .header(USER_AGENT, &self.user_agent)
+            .header(ACCEPT, "application/json")
+            .header(PRIVATE_TOKEN, &self.token)
+            .json(&payload)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            return Err(ForgeError::Unauthorised);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ForgeError::Api {
+                status: status.as_u16(),
+                url,
+                body,
+            });
+        }
+        let view: HookView = resp.json().await?;
+        Ok(HookId(view.id.to_string()))
     }
 
     fn clone_url(&self, slug: &Slug) -> String {

@@ -13,7 +13,7 @@
 use crate::errors::ForgeError;
 use crate::events::{NormalizedEvent, PullRequestAction, PullRequestEvent, PushEvent};
 use crate::permission::Permission;
-use crate::{CheckHandle, CheckPost, CheckState, Provider};
+use crate::{CheckHandle, CheckPost, CheckState, HookId, Provider};
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use medusa_domain::{Sha, Slug};
@@ -268,6 +268,94 @@ impl Provider for GithubProvider {
         }
         let body: StatusView = response.json().await?;
         Ok(CheckHandle(body.id.to_string()))
+    }
+
+    async fn ensure_webhook(
+        &self,
+        slug: &Slug,
+        target_url: &str,
+        secret: &[u8],
+    ) -> Result<HookId, ForgeError> {
+        // GET existing hooks; find one whose `config.url` matches.
+        let list_url = format!("{}/repos/{}/hooks", self.api_url, slug.as_str());
+        let list_resp = self
+            .client
+            .get(&list_url)
+            .header(USER_AGENT, &self.user_agent)
+            .header(ACCEPT, "application/vnd.github+json")
+            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+            .send()
+            .await?;
+        let status = list_resp.status();
+        if status.as_u16() == 401 {
+            return Err(ForgeError::Unauthorised);
+        }
+        if !status.is_success() {
+            let body = list_resp.text().await.unwrap_or_default();
+            return Err(ForgeError::Api {
+                status: status.as_u16(),
+                url: list_url,
+                body,
+            });
+        }
+        #[derive(Deserialize)]
+        struct HookView {
+            id: i64,
+            config: HookConfig,
+        }
+        #[derive(Deserialize)]
+        struct HookConfig {
+            url: Option<String>,
+        }
+        let hooks: Vec<HookView> = list_resp.json().await?;
+        let existing = hooks
+            .into_iter()
+            .find(|h| h.config.url.as_deref() == Some(target_url));
+
+        let secret_hex = hex::encode(secret); // GitHub stores secrets as text;
+                                              // we send hex of our random bytes.
+        let payload = serde_json::json!({
+            "name": "web",
+            "active": true,
+            "events": ["push", "pull_request"],
+            "config": {
+                "url": target_url,
+                "content_type": "json",
+                "secret": secret_hex,
+                "insecure_ssl": "0",
+            }
+        });
+
+        let (method, url) = match &existing {
+            Some(h) => (
+                reqwest::Method::PATCH,
+                format!("{}/repos/{}/hooks/{}", self.api_url, slug.as_str(), h.id),
+            ),
+            None => (reqwest::Method::POST, list_url.clone()),
+        };
+        let resp = self
+            .client
+            .request(method, &url)
+            .header(USER_AGENT, &self.user_agent)
+            .header(ACCEPT, "application/vnd.github+json")
+            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+            .json(&payload)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            return Err(ForgeError::Unauthorised);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ForgeError::Api {
+                status: status.as_u16(),
+                url,
+                body,
+            });
+        }
+        let view: HookView = resp.json().await?;
+        Ok(HookId(view.id.to_string()))
     }
 
     fn clone_url(&self, slug: &Slug) -> String {

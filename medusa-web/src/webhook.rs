@@ -27,8 +27,11 @@ pub enum WebhookError {
     RepoNotConfigured(String),
     #[error("no provider built for forge `{0}` (this is a daemon bug)")]
     NoProvider(String),
-    #[error("reading webhook secret: {0}")]
-    SecretRead(#[source] std::io::Error),
+    #[error(
+        "no webhook secret stored for `{forge}/{slug}` — auto-install hasn't \
+         completed for this repo yet"
+    )]
+    WebhookNotProvisioned { forge: String, slug: String },
     #[error(transparent)]
     Forge(#[from] medusa_forge::ForgeError),
     #[error(transparent)]
@@ -44,7 +47,7 @@ impl IntoResponse for WebhookError {
             WebhookError::InvalidSlug { .. } => StatusCode::BAD_REQUEST,
             WebhookError::RepoNotConfigured(_) => StatusCode::NOT_FOUND,
             WebhookError::NoProvider(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            WebhookError::SecretRead(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            WebhookError::WebhookNotProvisioned { .. } => StatusCode::SERVICE_UNAVAILABLE,
             WebhookError::Forge(medusa_forge::ForgeError::BadSignature) => StatusCode::UNAUTHORIZED,
             WebhookError::Forge(medusa_forge::ForgeError::MissingHeader(_))
             | WebhookError::Forge(medusa_forge::ForgeError::InvalidHeader { .. })
@@ -118,20 +121,24 @@ pub async fn handle(
         })
         .ok_or_else(|| WebhookError::RepoNotConfigured(repo_full_name.clone()))?;
 
-    let forge_cfg = state.config.forges.get(&repo_cfg.forge).ok_or_else(|| {
-        // We checked this at config validation time, but be defensive.
-        WebhookError::NoProvider(repo_cfg.forge.clone())
-    })?;
-
     let provider = state
         .providers
         .get(&repo_cfg.forge)
         .ok_or_else(|| WebhookError::NoProvider(repo_cfg.forge.clone()))?
         .clone();
 
-    let secret = tokio::fs::read(forge_cfg.webhook_secret_path.path())
-        .await
-        .map_err(WebhookError::SecretRead)?;
+    // Webhook secret is medusa-managed: generated at startup, stored
+    // in sqlite, pushed to the forge by the auto-install pass. If
+    // we don't have it yet the auto-install hasn't completed (or
+    // failed) — reject this event with 404 since we can't verify it.
+    let secret = state
+        .store
+        .get_webhook_secret(&repo_cfg.forge, &slug)
+        .await?
+        .ok_or_else(|| WebhookError::WebhookNotProvisioned {
+            forge: repo_cfg.forge.clone(),
+            slug: slug.as_str().to_string(),
+        })?;
 
     let header_pairs = headers_to_pairs(&headers);
 

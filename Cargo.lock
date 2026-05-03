@@ -1309,6 +1309,7 @@ dependencies = [
 name = "medusa-web"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "bytes",
@@ -1318,6 +1319,7 @@ dependencies = [
  "medusa-domain",
  "medusa-forge",
  "medusa-store",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "thiserror",

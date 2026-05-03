@@ -128,13 +128,16 @@ pub struct EvalOverrides {
 pub struct ForgeConfig {
     pub kind: ForgeKind,
     pub api_url: String,
-    pub webhook_secret_path: SecretFile,
 
     // Auth: either set `token_path` (PAT-style), or both `app_id` and
     // `app_private_key_path` (GitHub-App-style). [`ForgeConfig::auth`]
     // turns these into a [`ForgeAuth`] and rejects mixed/empty shapes.
     // Kept as optional flat fields because serde's `flatten` does not
     // compose with `deny_unknown_fields`.
+    //
+    // No `webhook_secret_path`: medusa generates and owns the webhook
+    // secret per repo, stored in sqlite. The auto-install pass at
+    // startup pushes it to the forge alongside the hook itself.
     pub token_path: Option<SecretFile>,
     pub app_id: Option<u64>,
     pub app_private_key_path: Option<SecretFile>,
@@ -261,7 +264,6 @@ forges:
   github-myorg:
     kind: github
     api_url: https://api.github.com
-    webhook_secret_path: /tmp/medusa-test/wh
     token_path: /tmp/medusa-test/tok
 
 repos:
@@ -303,7 +305,6 @@ forges:
   github-myorg:
     kind: github
     api_url: https://api.github.com
-    webhook_secret_path: /tmp/wh
     token_path: /tmp/tok
 repos:
   - slug: myorg/myrepo
@@ -322,7 +323,6 @@ forges:
   gl:
     kind: gitlab
     api_url: https://gitlab.example.com/api/v4
-    webhook_secret_path: /tmp/wh
     token_path: /tmp/tok
 repos:
   - slug: myorg/marketing/marketing-project-1
@@ -343,7 +343,6 @@ forges:
   github-myorg:
     kind: github
     api_url: https://api.github.com
-    webhook_secret_path: /tmp/wh
     app_id: 12345
     app_private_key_path: /tmp/key.pem
 "#;
@@ -363,7 +362,6 @@ forges:
   github-myorg:
     kind: github
     api_url: https://api.github.com
-    webhook_secret_path: /tmp/wh
 "#;
         let c = parse(s);
         assert_eq!(
@@ -380,7 +378,6 @@ forges:
   github-myorg:
     kind: github
     api_url: https://api.github.com
-    webhook_secret_path: /tmp/wh
     token_path: /tmp/tok
     app_id: 12345
     app_private_key_path: /tmp/key.pem
@@ -400,7 +397,6 @@ forges:
   github-myorg:
     kind: github
     api_url: https://api.github.com
-    webhook_secret_path: /tmp/wh
     token_path: /tmp/tok
 repos:
   - slug: invalid-no-slash

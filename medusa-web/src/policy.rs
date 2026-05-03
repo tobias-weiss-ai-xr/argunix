@@ -235,6 +235,14 @@ mod tests {
         async fn post_check(&self, _: CheckPost) -> Result<CheckHandle, ForgeError> {
             unreachable!("policy never posts checks");
         }
+        async fn ensure_webhook(
+            &self,
+            _: &Slug,
+            _: &str,
+            _: &[u8],
+        ) -> Result<medusa_forge::HookId, ForgeError> {
+            unreachable!("policy never installs webhooks");
+        }
         fn clone_url(&self, _: &Slug) -> String {
             unreachable!("policy never builds clone URLs");
         }

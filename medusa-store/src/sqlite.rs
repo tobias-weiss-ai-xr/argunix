@@ -137,6 +137,44 @@ impl RepoStore for SqlxStore {
             .await?;
         rows.iter().map(map_repo).collect()
     }
+
+    async fn get_webhook_secret(
+        &self,
+        forge: &str,
+        slug: &Slug,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let row = sqlx::query(
+            "SELECT webhook_secret FROM repos WHERE forge = ?1 AND slug = ?2",
+        )
+        .bind(forge)
+        .bind(slug.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let blob: Option<Vec<u8>> = r.try_get("webhook_secret")?;
+                Ok(blob)
+            }
+        }
+    }
+
+    async fn set_webhook(
+        &self,
+        repo_id: RepoId,
+        secret: &[u8],
+        hook_id: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE repos SET webhook_secret = ?1, webhook_hook_id = ?2 WHERE id = ?3",
+        )
+        .bind(secret)
+        .bind(hook_id)
+        .bind(repo_id.get())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]

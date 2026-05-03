@@ -8,6 +8,7 @@
 //! Read-only UI, JSON content negotiation, badges, and `/metrics` come
 //! later (M6).
 
+mod auto_install;
 mod cancel;
 mod coalesce;
 mod pause;
@@ -16,6 +17,7 @@ mod state;
 mod ui;
 mod webhook;
 
+pub use auto_install::ensure_all as ensure_webhooks;
 pub use cancel::{CancelRegistry, CancelToken, branch_key};
 pub use coalesce::CoalescePool;
 pub use pause::PauseRegistry;

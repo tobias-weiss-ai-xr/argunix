@@ -53,9 +53,7 @@ in
     credentials = {
       gh-webhook = "/var/lib/medusa-credentials/gh-webhook";
       gh-token   = "/var/lib/medusa-credentials/gh-token";
-      gl-webhook = "/var/lib/medusa-credentials/gl-webhook";
       gl-token   = "/var/lib/medusa-credentials/gl-token";
-      fj-webhook = "/var/lib/medusa-credentials/fj-webhook";
       fj-token   = "/var/lib/medusa-credentials/fj-token";
     };
     settings = {
@@ -63,19 +61,16 @@ in
       forges.github = {
         kind = "github";
         api_url = "https://api.github.com";
-        webhook_secret_path = "$CREDENTIALS_DIRECTORY/gh-webhook";
         token_path = "$CREDENTIALS_DIRECTORY/gh-token";
       };
       forges.gitlab = {
         kind = "gitlab";
         api_url = "https://gitlab.com/api/v4";
-        webhook_secret_path = "$CREDENTIALS_DIRECTORY/gl-webhook";
         token_path = "$CREDENTIALS_DIRECTORY/gl-token";
       };
       forges.codeberg = {
         kind = "forgejo";
         api_url = "https://codeberg.org/api/v1";
-        webhook_secret_path = "$CREDENTIALS_DIRECTORY/fj-webhook";
         token_path = "$CREDENTIALS_DIRECTORY/fj-token";
       };
       repos = [

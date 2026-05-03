@@ -190,6 +190,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let pauses = std::sync::Arc::new(medusa_web::PauseRegistry::new());
     let cancellations = std::sync::Arc::new(medusa_web::CancelRegistry::new());
 
+    // Auto-install / refresh webhooks at every startup. Best-effort:
+    // a forge being unreachable doesn't block daemon startup.
+    medusa_web::ensure_webhooks(&config_arc, &providers_arc, &store).await;
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let worker_ctx = worker::WorkerContext {
         config: config_arc.clone(),

@@ -9,11 +9,13 @@ medusa-config = { workspace = true }
 medusa-domain = { workspace = true }
 medusa-forge = { path = "../medusa-forge" }
 medusa-store = { workspace = true }
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 maud = "0.27"
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

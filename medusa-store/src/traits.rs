@@ -29,6 +29,24 @@ pub trait RepoStore: Send + Sync {
     async fn get(&self, id: RepoId) -> Result<Option<RepoRecord>, StoreError>;
     async fn find(&self, forge: &str, slug: &Slug) -> Result<Option<RepoRecord>, StoreError>;
     async fn list(&self) -> Result<Vec<RepoRecord>, StoreError>;
+    /// Read the medusa-managed webhook secret for `(forge, slug)`. None
+    /// if the auto-install pass hasn't generated/stored one yet.
+    async fn get_webhook_secret(
+        &self,
+        forge: &str,
+        slug: &Slug,
+    ) -> Result<Option<Vec<u8>>, StoreError>;
+    /// Persist the generated `secret` and the forge-side `hook_id`
+    /// returned by `Provider::ensure_webhook`. The hook id is opaque
+    /// (string form) — GitHub returns an integer, GitLab an integer,
+    /// Forgejo an integer; we store as text to keep the schema
+    /// agnostic. Idempotent: overwrites any prior values.
+    async fn set_webhook(
+        &self,
+        repo_id: RepoId,
+        secret: &[u8],
+        hook_id: &str,
+    ) -> Result<(), StoreError>;
 }
 
 #[async_trait]
