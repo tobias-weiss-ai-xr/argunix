@@ -1269,6 +1269,7 @@ name = "medusa-forge"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "base64",
  "hex",
  "hmac",
  "medusa-domain",

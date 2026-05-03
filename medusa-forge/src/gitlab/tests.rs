@@ -1,8 +1,24 @@
 use super::*;
 use crate::events::{NormalizedEvent, PullRequestAction};
 use crate::{CheckPost, CheckState};
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Helper: compute the same signature GitLab would send.
+fn signing_token_signature(secret: &[u8], id: &str, ts: &str, body: &[u8]) -> String {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+    mac.update(id.as_bytes());
+    mac.update(b".");
+    mac.update(ts.as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    let bytes = mac.finalize().into_bytes();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
 
 #[tokio::test]
 async fn verify_signature_accepts_matching_token() {
@@ -42,6 +58,145 @@ async fn verify_signature_rejects_missing_header() {
         .await
         .unwrap_err();
     assert!(matches!(err, ForgeError::MissingHeader(_)));
+}
+
+#[tokio::test]
+async fn verify_signing_token_accepts_valid_signature() {
+    let p = GitlabProvider::new(
+        "http://unused".into(),
+        "tok".into(),
+        "https://m".into(),
+    );
+    let body = br#"{"hello":"world"}"#;
+    let id = "msg_2x9f";
+    let ts = "1714742400";
+    let secret = b"signing-token-bytes";
+    let sig = signing_token_signature(secret, id, ts, body);
+    let headers = vec![
+        ("webhook-id".to_string(), id.to_string()),
+        ("webhook-timestamp".to_string(), ts.to_string()),
+        ("webhook-signature".to_string(), format!("v1,{sig}")),
+    ];
+    p.verify_signature(&headers, body, secret).await.unwrap();
+}
+
+#[tokio::test]
+async fn verify_signing_token_accepts_one_of_multiple_v1_entries() {
+    // Operators can rotate signing keys; GitLab then sends multiple
+    // signatures separated by spaces. Any one matching is enough.
+    let p = GitlabProvider::new(
+        "http://unused".into(),
+        "tok".into(),
+        "https://m".into(),
+    );
+    let body = b"body";
+    let id = "abc";
+    let ts = "1";
+    let real = b"real-secret";
+    let stale = b"stale-secret";
+    let real_sig = signing_token_signature(real, id, ts, body);
+    let stale_sig = signing_token_signature(stale, id, ts, body);
+    let headers = vec![
+        ("webhook-id".to_string(), id.to_string()),
+        ("webhook-timestamp".to_string(), ts.to_string()),
+        (
+            "webhook-signature".to_string(),
+            format!("v1,{stale_sig} v1,{real_sig}"),
+        ),
+    ];
+    p.verify_signature(&headers, body, real).await.unwrap();
+}
+
+#[tokio::test]
+async fn verify_signing_token_rejects_wrong_secret() {
+    let p = GitlabProvider::new(
+        "http://unused".into(),
+        "tok".into(),
+        "https://m".into(),
+    );
+    let body = b"body";
+    let id = "abc";
+    let ts = "1";
+    let sig = signing_token_signature(b"correct", id, ts, body);
+    let headers = vec![
+        ("webhook-id".to_string(), id.to_string()),
+        ("webhook-timestamp".to_string(), ts.to_string()),
+        ("webhook-signature".to_string(), format!("v1,{sig}")),
+    ];
+    let err = p
+        .verify_signature(&headers, body, b"wrong")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ForgeError::BadSignature));
+}
+
+#[tokio::test]
+async fn verify_signing_token_rejects_when_companion_headers_missing() {
+    let p = GitlabProvider::new(
+        "http://unused".into(),
+        "tok".into(),
+        "https://m".into(),
+    );
+    let headers = vec![("webhook-signature".to_string(), "v1,xxx".to_string())];
+    let err = p
+        .verify_signature(&headers, b"x", b"shh")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ForgeError::MissingHeader(_)));
+}
+
+#[tokio::test]
+async fn verify_signing_token_decodes_whsec_prefix() {
+    // Standard Webhooks (and GitLab's signing token UI) format:
+    // the secret arrives as `whsec_<base64>`; the actual HMAC key is
+    // the base64-decoded suffix.
+    let p = GitlabProvider::new(
+        "http://unused".into(),
+        "tok".into(),
+        "https://m".into(),
+    );
+    let body = b"some webhook body";
+    let id = "msg_42";
+    let ts = "1714742400";
+    let raw_key: &[u8] = b"this-is-the-real-32-byte-hmac-ke";
+    let prefixed = format!(
+        "whsec_{}",
+        base64::engine::general_purpose::STANDARD.encode(raw_key)
+    );
+    let sig = signing_token_signature(raw_key, id, ts, body);
+    let headers = vec![
+        ("webhook-id".to_string(), id.to_string()),
+        ("webhook-timestamp".to_string(), ts.to_string()),
+        ("webhook-signature".to_string(), format!("v1,{sig}")),
+    ];
+    p.verify_signature(&headers, body, prefixed.as_bytes())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn verify_signing_token_ignores_unknown_schemes() {
+    // A future GitLab might emit a `v2,...` entry alongside `v1,...`;
+    // we should still validate as long as one v1 entry matches.
+    let p = GitlabProvider::new(
+        "http://unused".into(),
+        "tok".into(),
+        "https://m".into(),
+    );
+    let body = b"body";
+    let id = "abc";
+    let ts = "1";
+    let secret = b"shh";
+    let sig = signing_token_signature(secret, id, ts, body);
+    let headers = vec![
+        ("webhook-id".to_string(), id.to_string()),
+        ("webhook-timestamp".to_string(), ts.to_string()),
+        (
+            "webhook-signature".to_string(),
+            format!("v2,unknown-format v1,{sig}"),
+        ),
+    ];
+    p.verify_signature(&headers, body, secret).await.unwrap();
 }
 
 #[tokio::test]

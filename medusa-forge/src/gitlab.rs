@@ -18,9 +18,12 @@ use crate::events::{NormalizedEvent, PullRequestAction, PullRequestEvent, PushEv
 use crate::permission::Permission;
 use crate::{CheckHandle, CheckPost, CheckState, Provider};
 use async_trait::async_trait;
+use base64::Engine;
+use hmac::{Hmac, Mac};
 use medusa_domain::{Sha, Slug};
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Deserialize;
+use sha2::Sha256;
 
 const DEFAULT_USER_AGENT: &str = "medusa-ci";
 const PRIVATE_TOKEN: &str = "PRIVATE-TOKEN";
@@ -84,9 +87,34 @@ impl Provider for GitlabProvider {
     async fn verify_signature(
         &self,
         headers: &[(String, String)],
-        _body: &[u8],
+        body: &[u8],
         secret_bytes: &[u8],
     ) -> Result<(), ForgeError> {
+        // GitLab supports two webhook auth flavours; we try the newer
+        // one first (it's labelled "Signing token" in their UI and
+        // recommended over the legacy plain-shared-secret path) and
+        // fall back to the legacy `X-Gitlab-Token` if it isn't
+        // present. The signing-token path follows the Standard
+        // Webhooks spec (introduced in GitLab 19.0):
+        //
+        //   webhook-signature: v1,<base64(HMAC-SHA256)>  [v1,...  ...]
+        //   webhook-id:        <unique message id>
+        //   webhook-timestamp: <unix seconds>
+        //
+        // The HMAC is computed over the string
+        // `{webhook-id}.{webhook-timestamp}.{body}` with the signing
+        // token as the key, base64-encoded (standard alphabet,
+        // padding `=`). The header may carry multiple
+        // `v<n>,<base64>` entries separated by spaces — operators
+        // can rotate keys, so we accept any one matching.
+        if let Some(sig_header) = Self::header(headers, "webhook-signature") {
+            let id = Self::header(headers, "webhook-id")
+                .ok_or(ForgeError::MissingHeader("webhook-id"))?;
+            let ts = Self::header(headers, "webhook-timestamp")
+                .ok_or(ForgeError::MissingHeader("webhook-timestamp"))?;
+            return verify_signing_token(secret_bytes, id, ts, body, sig_header);
+        }
+
         let header = Self::header(headers, "X-Gitlab-Token")
             .ok_or(ForgeError::MissingHeader("X-Gitlab-Token"))?;
         // Constant-time comparison would be ideal here. The `subtle`
@@ -463,6 +491,82 @@ fn parse_merge_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
         ),
         is_fork,
     })
+}
+
+/// Verify a GitLab signing-token signature header against `body` and
+/// the known signing token (`secret`). Returns `Ok(())` if any of the
+/// space-separated `v1,<base64>` entries in `signature_header` matches
+/// our locally-computed HMAC.
+///
+/// Per the Standard Webhooks spec / GitLab's docs:
+/// - signed string = `{webhook-id}.{webhook-timestamp}.{body}`
+/// - HMAC-SHA256 with the signing token as key
+/// - base64-encoded (standard alphabet)
+///
+/// Standard Webhooks stores secrets as `whsec_<base64>`; the actual
+/// HMAC key is the base64-decoded suffix. We accept both: if the
+/// secret starts with `whsec_` we decode, otherwise we use the raw
+/// bytes (covers ad-hoc deployments using a plain string).
+fn verify_signing_token(
+    secret: &[u8],
+    webhook_id: &str,
+    webhook_timestamp: &str,
+    body: &[u8],
+    signature_header: &str,
+) -> Result<(), ForgeError> {
+    let key = signing_key_bytes(secret);
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(&key).map_err(|_| ForgeError::BadSignature)?;
+    mac.update(webhook_id.as_bytes());
+    mac.update(b".");
+    mac.update(webhook_timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    let expected = mac.finalize().into_bytes();
+
+    // Compare *raw bytes* of decoded signatures rather than base64
+    // strings — sidesteps padding / alphabet mismatches if a future
+    // GitLab variant ever sends URL-safe base64.
+    for entry in signature_header.split_whitespace() {
+        let Some((scheme, sig_b64)) = entry.split_once(',') else {
+            continue;
+        };
+        if scheme != "v1" {
+            continue;
+        }
+        let Ok(sig) = decode_signature_b64(sig_b64) else {
+            continue;
+        };
+        if sig.as_slice() == expected.as_slice() {
+            return Ok(());
+        }
+    }
+    Err(ForgeError::BadSignature)
+}
+
+/// Standard Webhooks: keys are stored as `whsec_<base64>`. Decode if
+/// we see the prefix; otherwise use the bytes as-is.
+fn signing_key_bytes(secret: &[u8]) -> Vec<u8> {
+    if let Some(rest) = secret.strip_prefix(b"whsec_") {
+        if let Ok(s) = std::str::from_utf8(rest) {
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s.trim()) {
+                return bytes;
+            }
+        }
+    }
+    secret.to_vec()
+}
+
+/// Decode a `v1,<base64>` signature payload, accepting both standard
+/// (`+/=`) and URL-safe (`-_`) alphabets. Padding optional in either.
+fn decode_signature_b64(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::engine::general_purpose;
+    general_purpose::STANDARD
+        .decode(s)
+        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(s))
+        .or_else(|_| general_purpose::URL_SAFE.decode(s))
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(s))
 }
 
 /// Translate GitLab's MR action labels (open / reopen / update / close /

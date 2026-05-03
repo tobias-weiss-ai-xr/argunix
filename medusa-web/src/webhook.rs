@@ -95,9 +95,12 @@ pub async fn handle(
     // Untrusted preview parse: just enough to find which configured repo
     // and forge this is for. HMAC-verified parse follows.
     let preview: PayloadPreview = serde_json::from_slice(&body).map_err(WebhookError::BadJson)?;
+    // GitLab includes a top-level `repository` object that lacks
+    // `full_name` — present from before GitLab unified namespaces and
+    // kept around for compatibility. We accept either source.
     let repo_full_name = preview
         .repository
-        .map(|r| r.full_name)
+        .and_then(|r| r.full_name)
         .or(preview.project.and_then(|p| p.path_with_namespace))
         .ok_or(WebhookError::NoRepository)?;
 
@@ -360,10 +363,67 @@ struct PayloadPreview {
 
 #[derive(Debug, Deserialize)]
 struct RepositoryPreview {
-    full_name: String,
+    /// GitHub & Forgejo include this; GitLab doesn't (the field is
+    /// absent from its `repository` sub-object — GitLab carries the
+    /// canonical project identity in `project.path_with_namespace`).
+    full_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ProjectPreview {
     path_with_namespace: Option<String>,
+}
+
+#[cfg(test)]
+mod preview_tests {
+    //! Regression tests for the untrusted-payload preview parser. The
+    //! only purpose of this parse is to extract the slug — anything
+    //! else (signature, full event shape) is verified by the provider
+    //! after this point.
+    use super::*;
+
+    fn extract(body: &[u8]) -> Option<String> {
+        let p: PayloadPreview = serde_json::from_slice(body).ok()?;
+        p.repository
+            .and_then(|r| r.full_name)
+            .or(p.project.and_then(|p| p.path_with_namespace))
+    }
+
+    #[test]
+    fn github_payload_uses_repository_full_name() {
+        let body = serde_json::json!({
+            "ref": "refs/heads/main",
+            "repository": { "full_name": "alice/repo" }
+        })
+        .to_string();
+        assert_eq!(extract(body.as_bytes()), Some("alice/repo".to_string()));
+    }
+
+    #[test]
+    fn gitlab_payload_falls_through_to_project_path() {
+        // GitLab's actual webhook shape has a top-level `repository`
+        // object with NO `full_name`, plus the canonical identity at
+        // `project.path_with_namespace`.
+        let body = serde_json::json!({
+            "ref": "refs/heads/main",
+            "repository": {
+                "name": "pprintpp",
+                "url": "git@gitlab.com:jonge/pprintpp.git",
+                "git_http_url": "https://gitlab.com/jonge/pprintpp.git",
+                "visibility_level": 20
+            },
+            "project": {
+                "id": 1234,
+                "path_with_namespace": "jonge/pprintpp"
+            }
+        })
+        .to_string();
+        assert_eq!(extract(body.as_bytes()), Some("jonge/pprintpp".to_string()));
+    }
+
+    #[test]
+    fn payload_without_either_returns_none() {
+        let body = b"{}";
+        assert_eq!(extract(body), None);
+    }
 }

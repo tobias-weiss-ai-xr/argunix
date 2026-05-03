@@ -53,22 +53,35 @@ in
     credentials = {
       gh-webhook = "/var/lib/medusa-credentials/gh-webhook";
       gh-token   = "/var/lib/medusa-credentials/gh-token";
+      gl-webhook = "/var/lib/medusa-credentials/gl-webhook";
+      gl-token   = "/var/lib/medusa-credentials/gl-token";
     };
     settings = {
       external_url = "https://${fqdn}";
-      forges.gh = {
+      forges.github = {
         kind = "github";
         api_url = "https://api.github.com";
         webhook_secret_path = "$CREDENTIALS_DIRECTORY/gh-webhook";
         token_path = "$CREDENTIALS_DIRECTORY/gh-token";
       };
+      forges.gitlab = {
+        kind = "gitlab";
+        api_url = "https://gitlab.com/api/v4";
+        webhook_secret_path = "$CREDENTIALS_DIRECTORY/gl-webhook";
+        token_path = "$CREDENTIALS_DIRECTORY/gl-token";
+      };
       repos = [
         {
           slug = "tfc/pprintpp";
-          forge = "gh";
-          watched_branches = [ "master" "main" ];
+          forge = "github";
           build_prs = true;
-          weight = 1;
+          watched_branches = [ "master" ];
+        }
+        {
+          slug = "jonge/pprintpp";
+          forge = "gitlab";
+          watched_branches = [ "master" ];
+          build_prs = true;
         }
       ];
     };
