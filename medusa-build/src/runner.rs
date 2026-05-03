@@ -110,7 +110,21 @@ pub async fn run_build(request: &BuildRequest) -> Result<BuildOutcome, BuildErro
         }
     };
 
-    write_zstd_log(&request.log_path, stderr_buf).await?;
+    // If `nix-store --realise` produced no stderr but succeeded, the
+    // output was substituted (or already present) and no build ran on
+    // this host. Try the local log archive — `nix-store --read-log` —
+    // first, in case medusa or someone else on this machine built the
+    // drv earlier. If that's also empty, write an honest placeholder
+    // saying we didn't build it, rather than leaving a blank file
+    // that makes the UI link dead-end.
+    let log_bytes = if status.success() && stderr_buf.iter().all(u8::is_ascii_whitespace) {
+        read_archived_drv_log(&request.drv_path)
+            .await
+            .unwrap_or_else(|| no_log_placeholder(&request.drv_path).into_bytes())
+    } else {
+        stderr_buf
+    };
+    write_zstd_log(&request.log_path, log_bytes).await?;
 
     let outputs = parse_realise_stdout(&stdout_buf);
 
@@ -125,6 +139,43 @@ pub async fn run_build(request: &BuildRequest) -> Result<BuildOutcome, BuildErro
         log_path: request.log_path.clone(),
         log_truncated,
     })
+}
+
+/// `nix-store --read-log <drv>` — local `/nix/var/log/nix/drvs/...` only.
+/// Best-effort: any failure (binary missing, drv not in the archive,
+/// non-zero exit) returns None and the caller writes a placeholder.
+async fn read_archived_drv_log(drv_path: &str) -> Option<Vec<u8>> {
+    let output = Command::new("nix-store")
+        .arg("--read-log")
+        .arg(drv_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if output.status.success() && !output.stdout.is_empty() {
+        Some(output.stdout)
+    } else {
+        None
+    }
+}
+
+/// "We didn't build this" placeholder. Written into the `.log.zst` when
+/// the realise succeeded with no captured stderr and the local log
+/// archive has nothing for this drv either — meaning the output came
+/// from a substituter and never built on this host. We deliberately
+/// don't query the substituter for an upstream log: that's network
+/// traffic on every cache hit and the upstream log isn't *our* build.
+fn no_log_placeholder(drv_path: &str) -> String {
+    format!(
+        "(no local build log)\n\n\
+         The derivation `{drv_path}` was not built by this host — its\n\
+         output was substituted from a binary cache (or was already\n\
+         present in the local store from an earlier run). medusa\n\
+         records the build logs of its own builds; logs from other\n\
+         hosts (e.g. cache.nixos.org's Hydra) are not fetched.\n",
+    )
 }
 
 async fn collect_capped<R: AsyncReadExt + Unpin>(
@@ -216,6 +267,11 @@ mod tests {
             writeln!(
                 f,
                 r#"#!/bin/sh
+# `--read-log` is what run_build's empty-stderr fallback calls; we
+# want it to return non-zero so the fallback writes the placeholder
+# instead and the assertion can still find the original --realise
+# argv (which would otherwise be overwritten by the second call).
+if [ "$1" = "--read-log" ]; then exit 1; fi
 out="{}"
 : > "$out"
 for a in "$@"; do printf '%s\n' "$a" >> "$out"; done
@@ -287,6 +343,11 @@ exit 0
             writeln!(
                 f,
                 r#"#!/bin/sh
+# `--read-log` is what run_build's empty-stderr fallback calls; we
+# want it to return non-zero so the fallback writes the placeholder
+# instead and the assertion can still find the original --realise
+# argv (which would otherwise be overwritten by the second call).
+if [ "$1" = "--read-log" ]; then exit 1; fi
 out="{}"
 : > "$out"
 for a in "$@"; do printf '%s\n' "$a" >> "$out"; done
@@ -343,5 +404,154 @@ exit 0
             .position(|a| *a == "/nix/store/aaaa-fake.drv")
             .expect("drv path missing");
         assert!(add_root_idx < drv_idx, "--add-root must precede the drv path");
+    }
+
+    /// When `nix-store --realise` succeeds with empty stderr (the output
+    /// was already in the local store and no build ran), run_build must
+    /// fall back to `nix-store --read-log <drv>` so the captured log
+    /// contains the *original* build's output instead of being blank.
+    #[tokio::test]
+    async fn empty_stderr_falls_back_to_read_log() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let bin_root = tempdir().unwrap();
+        let bin = bin_root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("nix-store");
+        // Fake nix-store: --realise prints the store path on stdout and
+        // exits silently (no stderr); --read-log prints a canned log
+        // body that the test will look for in the captured .log.zst.
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(
+                f,
+                r#"#!/bin/sh
+case "$1" in
+  --realise)
+    echo /nix/store/zzz-fake
+    exit 0
+    ;;
+  --read-log)
+    echo "[archived] hello world"
+    echo "[archived] line two"
+    exit 0
+    ;;
+esac
+exit 99
+"#,
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut perm = std::fs::metadata(&script).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script, perm).unwrap();
+
+        let log_dir = tempdir().unwrap();
+        let log_path = log_dir.path().join("build.log.zst");
+
+        let _guard = PATH_LOCK.lock().unwrap();
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = std::ffi::OsString::from(&bin);
+        new_path.push(":");
+        new_path.push(&original_path);
+        unsafe { std::env::set_var("PATH", &new_path) };
+
+        let request = BuildRequest {
+            drv_path: "/nix/store/aaaa-fake.drv".to_string(),
+            log_path: log_path.clone(),
+            timeout: Duration::from_secs(10),
+            log_limit: LogCaptureLimit::default(),
+            gc_root: None,
+        };
+        let outcome = run_build(&request).await;
+
+        unsafe { std::env::set_var("PATH", &original_path) };
+
+        let outcome = outcome.expect("run_build should succeed");
+        assert_eq!(outcome.status, BuildStatus::Success);
+
+        // Read the .log.zst back and confirm it contains the read-log content.
+        let f = std::fs::File::open(&log_path).expect("log file written");
+        let mut decoder = zstd::stream::Decoder::new(f).unwrap();
+        let mut decoded = String::new();
+        decoder.read_to_string(&mut decoded).unwrap();
+        assert!(
+            decoded.contains("[archived] hello world"),
+            "expected archived log content in .log.zst, got: {decoded:?}",
+        );
+    }
+
+    /// Substituted derivation, no local archived log either: the on-disk
+    /// `.log.zst` must contain the explanatory placeholder, not be blank.
+    #[tokio::test]
+    async fn empty_stderr_with_no_local_log_writes_placeholder() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let bin_root = tempdir().unwrap();
+        let bin = bin_root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // nix-store: --realise succeeds with empty stderr; --read-log
+        // exits non-zero (no archived log).
+        {
+            let script = bin.join("nix-store");
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(
+                f,
+                r#"#!/bin/sh
+case "$1" in
+  --realise) echo /nix/store/zzz-fake; exit 0 ;;
+  --read-log) exit 1 ;;
+esac
+exit 99
+"#,
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+            let mut perm = std::fs::metadata(&script).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&script, perm).unwrap();
+        }
+
+        let log_dir = tempdir().unwrap();
+        let log_path = log_dir.path().join("build.log.zst");
+
+        let _guard = PATH_LOCK.lock().unwrap();
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = std::ffi::OsString::from(&bin);
+        new_path.push(":");
+        new_path.push(&original_path);
+        unsafe { std::env::set_var("PATH", &new_path) };
+
+        let request = BuildRequest {
+            drv_path: "/nix/store/aaaa-fake.drv".to_string(),
+            log_path: log_path.clone(),
+            timeout: Duration::from_secs(10),
+            log_limit: LogCaptureLimit::default(),
+            gc_root: None,
+        };
+        let outcome = run_build(&request).await;
+
+        unsafe { std::env::set_var("PATH", &original_path) };
+
+        let outcome = outcome.expect("run_build should succeed");
+        assert_eq!(outcome.status, BuildStatus::Success);
+
+        let f = std::fs::File::open(&log_path).expect("log file written");
+        let mut decoder = zstd::stream::Decoder::new(f).unwrap();
+        let mut decoded = String::new();
+        decoder.read_to_string(&mut decoded).unwrap();
+        assert!(
+            decoded.contains("(no local build log)"),
+            "expected placeholder in .log.zst, got: {decoded:?}",
+        );
+        assert!(
+            decoded.contains("/nix/store/aaaa-fake.drv"),
+            "placeholder should mention the drv path, got: {decoded:?}",
+        );
     }
 }
