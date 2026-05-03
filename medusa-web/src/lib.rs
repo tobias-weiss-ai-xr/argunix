@@ -8,9 +8,11 @@
 //! Read-only UI, JSON content negotiation, badges, and `/metrics` come
 //! later (M6).
 
+mod policy;
 mod state;
 mod webhook;
 
+pub use policy::{Decision as PolicyDecision, evaluate as evaluate_policy};
 pub use state::{AppState, AppStateInner, BuildProvidersError, build_providers};
 pub use webhook::{eval_target_url, job_target_url};
 

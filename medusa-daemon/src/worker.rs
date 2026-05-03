@@ -13,9 +13,12 @@
 //!
 //! What's deferred to M5c3/d:
 //! - cancel-on-new-push,
-//! - PR permission/allowlist enforcement,
 //! - merge-ref retry for fork PRs,
 //! - per-job vs collapsed check threshold (M5c3 ships per-job for any size).
+//!
+//! PR permission/allowlist and watched-branches gating happen earlier in
+//! the pipeline — see `medusa_web::policy` — so by the time the worker
+//! picks an evaluation up, it's already been authorised.
 
 use anyhow::{Context, anyhow};
 use chrono::Utc;

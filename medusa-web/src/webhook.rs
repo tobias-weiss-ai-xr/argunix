@@ -140,7 +140,18 @@ pub async fn handle(
         return Ok(StatusCode::ACCEPTED);
     };
 
-    persist(&state, &repo_cfg.forge, &provider, event).await?;
+    match crate::policy::evaluate(&provider, repo_cfg, &event).await {
+        crate::policy::Decision::Build => {
+            persist(&state, &repo_cfg.forge, &provider, event).await?;
+        }
+        decision => {
+            tracing::info!(
+                slug = %slug,
+                decision = ?decision,
+                "webhook event dropped by policy",
+            );
+        }
+    }
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -164,20 +175,13 @@ async fn persist(
             pr_number,
             head_sha,
             head_ref,
-            action,
             ..
-        }) => {
-            if !action.should_evaluate() {
-                tracing::debug!(action = ?action, pr = pr_number, "PR action ignored");
-                return Ok(());
-            }
-            (
-                slug.clone(),
-                format!("refs/pull/{pr_number}/head:{head_ref}"),
-                head_sha.clone(),
-                "pull_request".to_string(),
-            )
-        }
+        }) => (
+            slug.clone(),
+            format!("refs/pull/{pr_number}/head:{head_ref}"),
+            head_sha.clone(),
+            "pull_request".to_string(),
+        ),
     };
 
     let repo_id = state.store.upsert(forge_name, &slug).await?;
