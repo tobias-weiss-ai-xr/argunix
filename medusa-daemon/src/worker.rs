@@ -24,9 +24,9 @@ use anyhow::{Context, anyhow};
 use chrono::Utc;
 use medusa_config::Config;
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
-use medusa_forge::{CheckPost, CheckState, Provider};
+use medusa_forge::{CheckPost, CheckState, ForgeError, Provider};
 use medusa_store::{EvalStore, JobStore, RepoStore, SqlxStore};
-use medusa_web::{eval_target_url, job_target_url};
+use medusa_web::{PauseRegistry, eval_target_url, job_target_url};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -49,6 +49,7 @@ pub struct WorkerContext {
     pub build_timeout: Duration,
     pub clone_timeout: Duration,
     pub systems: Vec<String>,
+    pub pauses: Arc<PauseRegistry>,
 }
 
 /// Spawn the worker on the current tokio runtime. Returns a `JoinHandle`
@@ -287,7 +288,7 @@ fn post_per_job_check(
         }),
         target_url: Some(target),
     };
-    spawn_post_check(provider.clone(), post);
+    spawn_post_check(provider.clone(), post, forge.to_string(), ctx.pauses.clone());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -310,13 +311,35 @@ fn post_overall_check(
         description: Some(description.to_string()),
         target_url: Some(target),
     };
-    spawn_post_check(provider.clone(), post);
+    spawn_post_check(provider.clone(), post, forge.to_string(), ctx.pauses.clone());
 }
 
-fn spawn_post_check(provider: Arc<dyn Provider>, post: CheckPost) {
+/// Q82: skip post_check entirely if the forge is paused; mark the forge
+/// healthy on a successful post and pause it on 401. Other errors leave
+/// the registry alone — those are transient and don't indicate a broken
+/// credential.
+fn spawn_post_check(
+    provider: Arc<dyn Provider>,
+    post: CheckPost,
+    forge_name: String,
+    pauses: Arc<PauseRegistry>,
+) {
+    if pauses.is_paused(&forge_name) {
+        tracing::info!(
+            forge = %forge_name,
+            "skipping forge post_check: forge paused (Q82)",
+        );
+        return;
+    }
     tokio::spawn(async move {
-        if let Err(e) = provider.post_check(post).await {
-            tracing::warn!(error = %e, "forge post_check failed");
+        match provider.post_check(post).await {
+            Ok(_) => pauses.mark_healthy(&forge_name),
+            Err(ForgeError::Unauthorised) => {
+                pauses.pause(&forge_name, "401 from post_check");
+            }
+            Err(e) => {
+                tracing::warn!(forge = %forge_name, error = %e, "forge post_check failed");
+            }
         }
     });
 }

@@ -1,4 +1,5 @@
 use crate::coalesce::CoalescePool;
+use crate::pause::PauseRegistry;
 use medusa_config::{Config, ForgeAuth, ForgeConfig};
 use medusa_domain::{EvalId, ForgeKind};
 use medusa_forge::{GithubProvider, Provider};
@@ -21,6 +22,8 @@ pub struct AppStateInner {
     /// Drops duplicate `(repo_id, sha)` events within a short window
     /// (Q99). Configured from `Schedule::webhook_coalesce_seconds`.
     pub coalesce: Arc<CoalescePool>,
+    /// Tracks which forges are currently paused due to 401s (Q82).
+    pub pauses: Arc<PauseRegistry>,
 }
 
 #[derive(Debug, thiserror::Error)]

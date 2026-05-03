@@ -140,7 +140,8 @@ pub async fn handle(
         return Ok(StatusCode::ACCEPTED);
     };
 
-    match crate::policy::evaluate(&provider, repo_cfg, &event).await {
+    match crate::policy::evaluate(&provider, repo_cfg, &event, &repo_cfg.forge, &state.pauses).await
+    {
         crate::policy::Decision::Build => {
             persist(&state, &repo_cfg.forge, &provider, event).await?;
         }
@@ -235,7 +236,12 @@ async fn persist(
             eval_id,
         )),
     };
-    spawn_post_check(provider.clone(), post);
+    spawn_post_check(
+        provider.clone(),
+        post,
+        forge_name.to_string(),
+        state.pauses.clone(),
+    );
 
     // Best-effort: hand off to the worker. If the channel has been closed
     // (daemon is shutting down), the eval is still in the DB and a future
@@ -269,10 +275,28 @@ pub fn job_target_url(
     )
 }
 
-fn spawn_post_check(provider: Arc<dyn Provider>, post: CheckPost) {
+fn spawn_post_check(
+    provider: Arc<dyn Provider>,
+    post: CheckPost,
+    forge_name: String,
+    pauses: Arc<crate::pause::PauseRegistry>,
+) {
+    if pauses.is_paused(&forge_name) {
+        tracing::info!(
+            forge = %forge_name,
+            "skipping forge post_check: forge paused (Q82)",
+        );
+        return;
+    }
     tokio::spawn(async move {
-        if let Err(e) = provider.post_check(post).await {
-            tracing::warn!(error = %e, "forge post_check failed");
+        match provider.post_check(post).await {
+            Ok(_) => pauses.mark_healthy(&forge_name),
+            Err(medusa_forge::ForgeError::Unauthorised) => {
+                pauses.pause(&forge_name, "401 from post_check");
+            }
+            Err(e) => {
+                tracing::warn!(forge = %forge_name, error = %e, "forge post_check failed");
+            }
         }
     });
 }

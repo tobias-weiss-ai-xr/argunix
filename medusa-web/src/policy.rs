@@ -12,8 +12,9 @@
 //!   per-repo `pr_allowlist`. Forge failures are logged at warn level
 //!   (per Q31) but never reject a build that the allowlist would accept.
 
+use crate::pause::PauseRegistry;
 use medusa_config::Repo;
-use medusa_forge::{NormalizedEvent, Provider, PullRequestEvent, PushEvent};
+use medusa_forge::{ForgeError, NormalizedEvent, Provider, PullRequestEvent, PushEvent};
 use std::sync::Arc;
 
 /// Verdict for a single webhook event.
@@ -28,14 +29,22 @@ pub enum Decision {
 
 /// Apply the policy. The caller has already filtered the event to one
 /// belonging to `repo`.
+///
+/// `forge_name` is the configured key under `forges:` and is used as the
+/// PauseRegistry key — when `query_user_permission` returns 401 we mark
+/// the forge paused; on success we mark it healthy. Q82.
 pub async fn evaluate(
     provider: &Arc<dyn Provider>,
     repo: &Repo,
     event: &NormalizedEvent,
+    forge_name: &str,
+    pauses: &PauseRegistry,
 ) -> Decision {
     match event {
         NormalizedEvent::Push(push) => evaluate_push(repo, push),
-        NormalizedEvent::PullRequest(pr) => evaluate_pr(provider, repo, pr).await,
+        NormalizedEvent::PullRequest(pr) => {
+            evaluate_pr(provider, repo, pr, forge_name, pauses).await
+        }
     }
 }
 
@@ -49,7 +58,13 @@ fn evaluate_push(repo: &Repo, push: &PushEvent) -> Decision {
     }
 }
 
-async fn evaluate_pr(provider: &Arc<dyn Provider>, repo: &Repo, pr: &PullRequestEvent) -> Decision {
+async fn evaluate_pr(
+    provider: &Arc<dyn Provider>,
+    repo: &Repo,
+    pr: &PullRequestEvent,
+    forge_name: &str,
+    pauses: &PauseRegistry,
+) -> Decision {
     if !pr.action.should_evaluate() {
         return Decision::DropPrIgnoredAction;
     }
@@ -58,8 +73,13 @@ async fn evaluate_pr(provider: &Arc<dyn Provider>, repo: &Repo, pr: &PullRequest
     }
 
     match provider.query_user_permission(&pr.slug, &pr.author).await {
-        Ok(perm) if perm.can_trigger_ci() => Decision::Build,
+        Ok(perm) if perm.can_trigger_ci() => {
+            // The call landed without auth issues — clear any prior pause.
+            pauses.mark_healthy(forge_name);
+            Decision::Build
+        }
         Ok(perm) => {
+            pauses.mark_healthy(forge_name);
             if author_in_allowlist(&pr.author, &repo.pr_allowlist) {
                 Decision::Build
             } else {
@@ -75,6 +95,12 @@ async fn evaluate_pr(provider: &Arc<dyn Provider>, repo: &Repo, pr: &PullRequest
             }
         }
         Err(e) => {
+            // Q82: 401 means the token is broken — pause this forge.
+            // Other errors (network blips, 5xx) don't pause, just fall
+            // through to the existing Q31 allowlist-fallback behaviour.
+            if matches!(e, ForgeError::Unauthorised) {
+                pauses.pause(forge_name, "401 from query_user_permission");
+            }
             // Q31: forge query failed — fall back to allowlist only.
             if author_in_allowlist(&pr.author, &repo.pr_allowlist) {
                 tracing::warn!(
@@ -224,12 +250,17 @@ mod tests {
         }) as Arc<dyn Provider>
     }
 
+    fn fresh_pauses() -> PauseRegistry {
+        PauseRegistry::new()
+    }
+
     #[tokio::test]
     async fn push_to_watched_branch_builds() {
         let repo = repo_with(true, vec![], vec!["main"]);
         let prov = provider_returning(Permission::Read);
+        let pauses = fresh_pauses();
         assert_eq!(
-            evaluate(&prov, &repo, &push("refs/heads/main")).await,
+            evaluate(&prov, &repo, &push("refs/heads/main"), "gh", &pauses).await,
             Decision::Build,
         );
     }
@@ -238,7 +269,8 @@ mod tests {
     async fn push_to_unwatched_branch_dropped() {
         let repo = repo_with(true, vec![], vec!["main"]);
         let prov = provider_returning(Permission::Read);
-        let d = evaluate(&prov, &repo, &push("refs/heads/feature")).await;
+        let pauses = fresh_pauses();
+        let d = evaluate(&prov, &repo, &push("refs/heads/feature"), "gh", &pauses).await;
         assert!(matches!(d, Decision::DropPushUnwatchedBranch { .. }));
     }
 
@@ -246,8 +278,9 @@ mod tests {
     async fn push_with_fully_qualified_config_entry() {
         let repo = repo_with(true, vec![], vec!["refs/heads/release"]);
         let prov = provider_returning(Permission::Read);
+        let pauses = fresh_pauses();
         assert_eq!(
-            evaluate(&prov, &repo, &push("refs/heads/release")).await,
+            evaluate(&prov, &repo, &push("refs/heads/release"), "gh", &pauses).await,
             Decision::Build,
         );
     }
@@ -256,7 +289,8 @@ mod tests {
     async fn tag_push_never_matches_branch_list() {
         let repo = repo_with(true, vec![], vec!["main", "v1"]);
         let prov = provider_returning(Permission::Read);
-        let d = evaluate(&prov, &repo, &push("refs/tags/v1")).await;
+        let pauses = fresh_pauses();
+        let d = evaluate(&prov, &repo, &push("refs/tags/v1"), "gh", &pauses).await;
         assert!(matches!(d, Decision::DropPushUnwatchedBranch { .. }));
     }
 
@@ -264,8 +298,9 @@ mod tests {
     async fn pr_with_writer_author_builds() {
         let repo = repo_with(true, vec![], vec!["main"]);
         let prov = provider_returning(Permission::Write);
+        let pauses = fresh_pauses();
         assert_eq!(
-            evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice")).await,
+            evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await,
             Decision::Build,
         );
     }
@@ -274,7 +309,15 @@ mod tests {
     async fn pr_with_stranger_author_dropped() {
         let repo = repo_with(true, vec![], vec!["main"]);
         let prov = provider_returning(Permission::None);
-        let d = evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "stranger")).await;
+        let pauses = fresh_pauses();
+        let d = evaluate(
+            &prov,
+            &repo,
+            &pr(PullRequestAction::Opened, "stranger"),
+            "gh",
+            &pauses,
+        )
+        .await;
         assert!(matches!(d, Decision::DropPrUntrustedAuthor { .. }));
     }
 
@@ -282,8 +325,16 @@ mod tests {
     async fn pr_with_stranger_author_in_allowlist_builds() {
         let repo = repo_with(true, vec!["stranger"], vec!["main"]);
         let prov = provider_returning(Permission::None);
+        let pauses = fresh_pauses();
         assert_eq!(
-            evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "stranger")).await,
+            evaluate(
+                &prov,
+                &repo,
+                &pr(PullRequestAction::Opened, "stranger"),
+                "gh",
+                &pauses,
+            )
+            .await,
             Decision::Build,
         );
     }
@@ -292,8 +343,9 @@ mod tests {
     async fn pr_when_build_prs_disabled_dropped() {
         let repo = repo_with(false, vec!["alice"], vec!["main"]);
         let prov = provider_returning(Permission::Admin);
+        let pauses = fresh_pauses();
         assert_eq!(
-            evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice")).await,
+            evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await,
             Decision::DropPrsDisabled,
         );
     }
@@ -302,7 +354,15 @@ mod tests {
     async fn pr_with_ignored_action_dropped() {
         let repo = repo_with(true, vec![], vec!["main"]);
         let prov = provider_returning(Permission::Admin);
-        let d = evaluate(&prov, &repo, &pr(PullRequestAction::Closed, "alice")).await;
+        let pauses = fresh_pauses();
+        let d = evaluate(
+            &prov,
+            &repo,
+            &pr(PullRequestAction::Closed, "alice"),
+            "gh",
+            &pauses,
+        )
+        .await;
         assert_eq!(d, Decision::DropPrIgnoredAction);
     }
 
@@ -310,8 +370,9 @@ mod tests {
     async fn pr_forge_failure_falls_back_to_allowlist_allow() {
         let repo = repo_with(true, vec!["alice"], vec!["main"]);
         let prov = provider_unauthorised();
+        let pauses = fresh_pauses();
         assert_eq!(
-            evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice")).await,
+            evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await,
             Decision::Build,
         );
     }
@@ -320,7 +381,32 @@ mod tests {
     async fn pr_forge_failure_without_allowlist_drops() {
         let repo = repo_with(true, vec![], vec!["main"]);
         let prov = provider_unauthorised();
-        let d = evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice")).await;
+        let pauses = fresh_pauses();
+        let d = evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await;
         assert!(matches!(d, Decision::DropPrUntrustedAuthor { .. }));
+    }
+
+    /// Q82: a 401 from query_user_permission marks the forge paused.
+    #[tokio::test]
+    async fn pr_unauthorised_pauses_forge() {
+        let repo = repo_with(true, vec![], vec!["main"]);
+        let prov = provider_unauthorised();
+        let pauses = fresh_pauses();
+        let _ = evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await;
+        assert!(pauses.is_paused("gh"));
+    }
+
+    /// Q82: a successful permission lookup clears any prior pause —
+    /// this is how medusa auto-recovers after a token rotation.
+    #[tokio::test]
+    async fn pr_successful_query_unpauses_forge() {
+        let repo = repo_with(true, vec![], vec!["main"]);
+        let pauses = fresh_pauses();
+        pauses.pause("gh", "401 from earlier webhook");
+        assert!(pauses.is_paused("gh"));
+
+        let prov = provider_returning(Permission::Write);
+        let _ = evaluate(&prov, &repo, &pr(PullRequestAction::Opened, "alice"), "gh", &pauses).await;
+        assert!(!pauses.is_paused("gh"));
     }
 }

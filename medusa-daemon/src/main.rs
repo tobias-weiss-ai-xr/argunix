@@ -187,6 +187,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let providers_arc = Arc::new(providers);
     let config_arc = Arc::new(config);
+    let pauses = std::sync::Arc::new(medusa_web::PauseRegistry::new());
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let worker_ctx = worker::WorkerContext {
@@ -200,6 +201,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         build_timeout: Duration::from_secs(7200),
         clone_timeout: Duration::from_secs(300),
         systems,
+        pauses: pauses.clone(),
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
 
@@ -216,6 +218,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         store,
         work_dispatcher: tx,
         coalesce,
+        pauses,
     };
     let router = medusa_web::router_from_inner(inner);
 
