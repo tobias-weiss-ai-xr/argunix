@@ -46,7 +46,7 @@ pub struct BuildRequest {
     pub log_limit: LogCaptureLimit,
 }
 
-/// Spawn `nix-store --realise -L <drv>`, capture stdout (output paths) and
+/// Spawn `nix-store --realise <drv>`, capture stdout (output paths) and
 /// stderr (build log), and return a [`BuildOutcome`] with status and on-disk
 /// log path. The caller is responsible for translating success → `Success`
 /// or `Cached` and for adding the GC root.
@@ -55,7 +55,6 @@ pub async fn run_build(request: &BuildRequest) -> Result<BuildOutcome, BuildErro
 
     let mut child = Command::new("nix-store")
         .arg("--realise")
-        .arg("-L")
         .arg(&request.drv_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -175,5 +174,81 @@ mod tests {
     #[test]
     fn parse_realise_handles_empty_stdout() {
         assert!(parse_realise_stdout(b"").is_empty());
+    }
+
+    /// Regression test for an earlier bug where medusa-build invoked
+    /// `nix-store --realise -L <drv>`. `-L` is a `nix` (new-CLI) flag and
+    /// the legacy `nix-store` rejects it, so every realise call exited
+    /// with an argv error before doing any building. This test stands up
+    /// a fake `nix-store` that records its argv to a file, runs
+    /// run_build(), and asserts that `-L` never appears.
+    #[tokio::test]
+    async fn does_not_pass_minus_L_to_nix_store() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let bin_root = tempdir().unwrap();
+        let bin = bin_root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let argv_log = bin_root.path().join("argv.txt");
+        let script = bin.join("nix-store");
+        // Write + close + chmod, in that order. Linux returns ETXTBSY
+        // if you try to exec a file that still has a writable fd open.
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(
+                f,
+                r#"#!/bin/sh
+out="{}"
+: > "$out"
+for a in "$@"; do printf '%s\n' "$a" >> "$out"; done
+echo /nix/store/zzz-fake
+exit 0
+"#,
+                argv_log.display(),
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut perm = std::fs::metadata(&script).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script, perm).unwrap();
+
+        let log_dir = tempdir().unwrap();
+        let log_path = log_dir.path().join("build.log.zst");
+
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = std::ffi::OsString::from(&bin);
+        new_path.push(":");
+        new_path.push(&original_path);
+        // SAFETY: this test prepends to PATH; it relies on no other test
+        // mutating PATH concurrently. Today this is the only PATH-mutating
+        // test in this crate.
+        unsafe { std::env::set_var("PATH", &new_path) };
+
+        let request = BuildRequest {
+            drv_path: "/nix/store/aaaa-fake.drv".to_string(),
+            log_path: log_path.clone(),
+            timeout: Duration::from_secs(10),
+            log_limit: LogCaptureLimit::default(),
+        };
+        let outcome = run_build(&request).await;
+
+        unsafe { std::env::set_var("PATH", &original_path) };
+
+        let outcome = outcome.expect("run_build should succeed");
+        assert_eq!(outcome.status, BuildStatus::Success);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("fake recorded argv");
+        let lines: Vec<&str> = argv.lines().collect();
+        assert!(
+            lines.iter().any(|a| *a == "--realise"),
+            "argv missing --realise: {lines:?}",
+        );
+        assert!(
+            !lines.iter().any(|a| *a == "-L" || *a == "--print-build-logs"),
+            "argv contains a `nix build`-only flag that nix-store rejects: {lines:?}",
+        );
     }
 }
