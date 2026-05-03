@@ -209,7 +209,34 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         })
         .collect();
 
+    // Q5/Q19: above the threshold we collapse per-job checks into a
+    // single rolling `medusa: evaluation` status whose description is
+    // updated as jobs finish. PAT path (commit statuses) caps the
+    // description at 140 chars — no markdown bullets — so the full
+    // job list lives in medusa's UI, reachable via the status's
+    // target_url. Markdown summaries land with GitHub-App / Checks
+    // API in M5c.
+    let repo_cfg = ctx
+        .config
+        .repos
+        .iter()
+        .find(|r| r.forge == repo.forge && r.slug == repo.slug);
+    let threshold = repo_cfg
+        .and_then(|r| r.collapsed_check_threshold)
+        .unwrap_or(ctx.config.schedule.collapsed_check_threshold);
+    let total = jobs.len();
+    let collapsed_mode = total as u32 > threshold;
+    if collapsed_mode {
+        tracing::info!(
+            jobs = total,
+            threshold,
+            "collapsed check mode active; per-job statuses suppressed (Q19)",
+        );
+    }
+
     let mut tally = JobTally::default();
+    let summary_debounce = std::time::Duration::from_secs(2);
+    let mut last_summary_post: Option<std::time::Instant> = None;
     for spec in jobs {
         if cancel.is_cancelled() {
             tracing::info!(
@@ -231,16 +258,41 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             }
         };
         tally.record(final_status);
-        post_per_job_check(
-            ctx,
-            provider,
-            &repo.forge,
-            &repo.slug,
-            &eval.sha,
-            eval_id,
-            &spec.attr_path.as_str().to_string(),
-            final_status,
-        );
+        if collapsed_mode {
+            // Q69: debounce. Only post a summary update if 2s elapsed
+            // since the last one. The unconditional final post after
+            // the loop will catch any tail tally that the debounce
+            // dropped.
+            let elapsed_ok = match last_summary_post {
+                None => true,
+                Some(t) => t.elapsed() >= summary_debounce,
+            };
+            if elapsed_ok {
+                let desc = collapsed_progress(&tally, total);
+                post_overall_check(
+                    ctx,
+                    provider,
+                    &repo.forge,
+                    &repo.slug,
+                    &eval.sha,
+                    eval_id,
+                    CheckState::Pending,
+                    &desc,
+                );
+                last_summary_post = Some(std::time::Instant::now());
+            }
+        } else {
+            post_per_job_check(
+                ctx,
+                provider,
+                &repo.forge,
+                &repo.slug,
+                &eval.sha,
+                eval_id,
+                &spec.attr_path.as_str().to_string(),
+                final_status,
+            );
+        }
     }
 
     <SqlxStore as EvalStore>::finish(&ctx.store, eval_id, EvalStatus::Done, Utc::now()).await?;
@@ -275,6 +327,21 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         tracing::warn!(error = %e, dir = %work_dir.display(), "failed to clean workdir");
     }
     Ok(())
+}
+
+/// Q19/Q102: in-progress description for the rolling collapsed check.
+/// GitHub commit-status descriptions are capped at 140 chars; this is
+/// generously inside that.
+fn collapsed_progress(tally: &JobTally, total: usize) -> String {
+    let done = tally.success + tally.cached + tally.failure;
+    format!(
+        "{done}/{total} done — {ok} ok, {cached} cached, {failed} failed",
+        done = done,
+        total = total,
+        ok = tally.success,
+        cached = tally.cached,
+        failed = tally.failure,
+    )
 }
 
 /// Pull a forge-check-friendly one-liner out of a (potentially multi-line)
@@ -620,7 +687,47 @@ impl Drop for CancelGuard<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::summarise_for_check;
+    use super::{JobTally, collapsed_progress, summarise_for_check};
+    use medusa_domain::JobStatus;
+
+    #[test]
+    fn collapsed_progress_zero_done() {
+        let t = JobTally::default();
+        let s = collapsed_progress(&t, 200);
+        assert_eq!(s, "0/200 done — 0 ok, 0 cached, 0 failed");
+    }
+
+    #[test]
+    fn collapsed_progress_mixed() {
+        let mut t = JobTally::default();
+        for _ in 0..10 {
+            t.record(JobStatus::Success);
+        }
+        for _ in 0..3 {
+            t.record(JobStatus::Cached);
+        }
+        for _ in 0..2 {
+            t.record(JobStatus::Failure);
+        }
+        let s = collapsed_progress(&t, 200);
+        assert_eq!(s, "15/200 done — 10 ok, 3 cached, 2 failed");
+    }
+
+    #[test]
+    fn collapsed_progress_fits_github_140char_cap() {
+        let mut t = JobTally::default();
+        // Worst case: every counter at 5 digits, total at 5 digits.
+        for _ in 0..99_999 {
+            t.record(JobStatus::Success);
+        }
+        let s = collapsed_progress(&t, 99_999);
+        assert!(
+            s.len() <= 140,
+            "collapsed_progress exceeded GitHub's 140-char description cap: {} chars",
+            s.len()
+        );
+    }
+
 
     #[test]
     fn summary_picks_first_nonempty_line() {
