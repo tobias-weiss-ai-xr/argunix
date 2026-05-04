@@ -15,8 +15,10 @@ use russh::keys::ssh_key::{self, PrivateKey};
 use russh::keys::{Algorithm, PrivateKeyWithHashAlg};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -50,11 +52,19 @@ pub struct AgentConfig {
     /// Initial reconnect backoff. Doubles up to 30s on repeated failures;
     /// resets to this value on every successful hello.
     pub reconnect_initial_backoff: Duration,
+    /// Command to spawn for each inbound build channel. Defaults to
+    /// `["nix-store", "--serve", "--write"]`. Tests substitute a stub
+    /// like `["cat"]` so the byte-pump can be exercised without a
+    /// real nix store.
+    pub nix_serve_command: Arc<Vec<String>>,
 }
 
 impl AgentConfig {
     pub fn default_backoff() -> Duration {
         Duration::from_secs(2)
+    }
+    pub fn default_nix_serve_command() -> Arc<Vec<String>> {
+        Arc::new(vec!["nix-store".into(), "--serve".into(), "--write".into()])
     }
 }
 
@@ -120,7 +130,10 @@ async fn serve_one_connection(
     let key = Arc::new(key);
 
     let client_cfg = Arc::new(client::Config::default());
-    let mut session = client::connect(client_cfg, cfg.medusa, AgentClient)
+    let handler = AgentClient {
+        nix_serve_cmd: cfg.nix_serve_command.clone(),
+    };
+    let mut session = client::connect(client_cfg, cfg.medusa, handler)
         .await
         .map_err(|source| AgentError::Connect {
             addr: cfg.medusa,
@@ -251,12 +264,13 @@ async fn serve_one_connection(
     }
 }
 
-/// russh client Handler. PR slice for build-channel handling lands
-/// in the next iteration; for now the default `server_channel_open_session`
-/// just drops the channel, which is correct for the heartbeat-only
-/// lifecycle of this slice.
+/// russh client Handler. Dispatches inbound build channels (medusa-
+/// initiated) to a `nix-store --serve --write` subprocess and pumps
+/// bytes between the channel and the subprocess's stdio.
 #[derive(Clone)]
-struct AgentClient;
+struct AgentClient {
+    nix_serve_cmd: Arc<Vec<String>>,
+}
 
 impl Handler for AgentClient {
     type Error = russh::Error;
@@ -265,22 +279,98 @@ impl Handler for AgentClient {
         // first-seen host pubkey in <state-dir>/medusa-host-key and
         // refuses to connect if it ever changes — same trust shape
         // as the daemon's view of the agent. Slice for that lands
-        // alongside the build-channel handling; today we accept any
-        // host key so the test harness works.
+        // in a follow-up; today we accept any host key so the test
+        // harness works.
         Ok(true)
     }
     async fn server_channel_open_session(
         &mut self,
-        _channel: russh::Channel<ClientMsg>,
+        channel: russh::Channel<ClientMsg>,
         _session: &mut ClientSession,
     ) -> Result<(), Self::Error> {
-        // Build-channel handling slice. For now drop the channel —
-        // medusa will see the channel close and treat the dispatch
-        // as a transport failure (re-queue with anti-affinity, capped
-        // at 3, per PR #2). Tests of the heartbeat-only path don't
-        // exercise this path.
+        let cmd = self.nix_serve_cmd.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_build_channel(channel, cmd).await {
+                tracing::warn!(error = %e, "build-channel proxy ended with error");
+            }
+        });
         Ok(())
     }
+}
+
+/// Spawn the `nix-store --serve --write` subprocess and bidirectionally
+/// pump bytes between the SSH build channel and the subprocess's
+/// stdin/stdout. medusa-side never parses the wire bytes — they're
+/// the standard nix-serve protocol that medusa's own `nix-store
+/// --realise` worker speaks.
+async fn serve_build_channel(
+    mut channel: russh::Channel<ClientMsg>,
+    cmd: Arc<Vec<String>>,
+) -> Result<(), std::io::Error> {
+    if cmd.is_empty() {
+        return Err(std::io::Error::other("nix_serve_command is empty"));
+    }
+    let mut child = tokio::process::Command::new(&cmd[0])
+        .args(cmd[1..].iter())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let mut stdout = child.stdout.take().expect("stdout piped");
+
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut stdin_open = true;
+    loop {
+        tokio::select! {
+            // SSH channel → subprocess stdin
+            ev = channel.wait() => match ev {
+                Some(ChannelMsg::Data { data }) => {
+                    if !stdin_open {
+                        continue;
+                    }
+                    if stdin.write_all(&data).await.is_err() {
+                        stdin_open = false;
+                        continue;
+                    }
+                    if stdin.flush().await.is_err() {
+                        stdin_open = false;
+                    }
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                    let _ = stdin.shutdown().await;
+                    break;
+                }
+                Some(_) => continue,
+            },
+            // subprocess stdout → SSH channel
+            r = stdout.read(&mut buf) => match r {
+                Ok(0) => break,
+                Ok(n) => {
+                    if channel.data(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    // After break: drain any remaining stdout, then half-close + close.
+    while let Ok(Ok(n)) =
+        tokio::time::timeout(Duration::from_millis(500), stdout.read(&mut buf)).await
+    {
+        if n == 0 {
+            break;
+        }
+        if channel.data(&buf[..n]).await.is_err() {
+            break;
+        }
+    }
+    let _ = channel.eof().await;
+    let _ = channel.close().await;
+    let _ = child.wait().await;
+    Ok(())
 }
 
 // Suppress unused-import warning on `Handle` when only Handler is in use.

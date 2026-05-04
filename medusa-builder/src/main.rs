@@ -5,10 +5,14 @@
 //! the dial-and-serve loop. SIGTERM triggers a clean disconnect via
 //! a `shutdown` control message.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use medusa_builder_agent::{discover_capabilities, load_or_generate};
+use medusa_builder_agent::{AgentConfig, discover_capabilities, load_or_generate, run};
+use medusa_domain::BuilderName;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::net::lookup_host;
+use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -74,22 +78,89 @@ async fn main() -> Result<()> {
     );
 
     // Resolve builder name.
-    let name = cli
+    let name_str = cli
         .name
         .or_else(|| hostname::get_hostname())
         .unwrap_or_else(|| "medusa-builder".into());
+    let name = BuilderName::new(&name_str)
+        .map_err(|e| anyhow!("invalid builder name `{name_str}`: {e}"))?;
 
-    // The actual dial-and-serve loop is the next slice of M13b. For
-    // now we surface the inputs we'd feed it and exit cleanly so the
-    // binary builds and `medusa-builder --help` works as a smoke
-    // check on the bin target.
+    // Resolve `host:port` once at startup. The agent reconnects against
+    // this fixed address; if DNS changes, the unit needs a restart.
+    let host_port = format!("{}:{}", cli.medusa_host, cli.medusa_port);
+    let medusa_addr = lookup_host(&host_port)
+        .await
+        .with_context(|| format!("resolving medusa address `{host_port}`"))?
+        .next()
+        .ok_or_else(|| anyhow!("no addresses resolved for `{host_port}`"))?;
+
+    // Read the enrollment token if a path was provided. Once medusa's
+    // TOFU row is in place, the operator removes the file (or the
+    // `enrollment_token_path` line) and pubkey auth takes over.
+    let enrollment_token = match cli.enrollment_token_path.as_ref() {
+        Some(path) => {
+            let bytes = tokio::fs::read(path)
+                .await
+                .with_context(|| format!("reading enrollment token at {}", path.display()))?;
+            Some(Arc::new(strip_trailing_newlines(bytes)))
+        }
+        None => None,
+    };
+
+    let cfg = AgentConfig {
+        medusa: medusa_addr,
+        identity,
+        enrollment_token,
+        name,
+        capabilities: caps.inner,
+        reconnect_initial_backoff: AgentConfig::default_backoff(),
+        nix_serve_command: AgentConfig::default_nix_serve_command(),
+    };
+
     tracing::info!(
-        name = %name,
-        medusa = %format!("{}:{}", cli.medusa_host, cli.medusa_port),
-        enrollment_token = ?cli.enrollment_token_path,
-        "agent inputs gathered (dial loop pending in M13b slice 2)",
+        name = %name_str,
+        medusa = %host_port,
+        medusa_resolved = %medusa_addr,
+        "agent starting",
     );
+
+    let shutdown = wait_for_shutdown();
+    run(cfg, shutdown).await.context("agent loop")?;
     Ok(())
+}
+
+/// Wait for SIGTERM or SIGINT; resolves on either.
+async fn wait_for_shutdown() {
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not install SIGTERM handler");
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not install SIGINT handler");
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+        _ = sigint.recv()  => tracing::info!("received SIGINT, shutting down"),
+    }
+}
+
+/// Trim trailing newlines/whitespace from a token file. Operators
+/// typically `echo "secret" > /run/credentials/...` which appends a
+/// newline; medusa's server side compares the exact bytes.
+fn strip_trailing_newlines(mut v: Vec<u8>) -> Vec<u8> {
+    while matches!(v.last(), Some(b'\n') | Some(b'\r')) {
+        v.pop();
+    }
+    v
 }
 
 /// Minimal hostname resolver — the `hostname` crate is overkill for

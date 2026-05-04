@@ -43,6 +43,7 @@
       flake.nixosModules = {
         default = ./nix/module.nix;
         medusa = ./nix/module.nix;
+        medusa-builder = ./nix/builder-module.nix;
       };
 
       # Test deployment to medusa.nix-consulting.net.
@@ -115,6 +116,7 @@
             serve-pipeline-smoke = pkgs.callPackage ./nix/tests/serve-pipeline-smoke.nix { };
             forge-status-smoke = pkgs.callPackage ./nix/tests/forge-status-smoke.nix { };
             module-smoke = pkgs.testers.runNixOSTest ./nix/tests/module-smoke.nix;
+            builder-module-smoke = pkgs.testers.runNixOSTest ./nix/tests/builder-module-smoke.nix;
           };
         };
     };

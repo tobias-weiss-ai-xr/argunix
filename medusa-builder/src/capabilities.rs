@@ -38,7 +38,15 @@ pub struct Capabilities {
 /// `hello`, so a config change on the builder is picked up at the
 /// next reconnect / heartbeat cycle.
 pub async fn discover_capabilities(nix_bin: &str) -> Result<Capabilities, CapabilitiesError> {
+    // `nix show-config` lives under the `nix-command` experimental
+    // feature. Some NixOS installs don't enable it system-wide, so we
+    // turn it on per-invocation rather than depending on operator
+    // config. (`config show` is the non-deprecated spelling, but
+    // routes through the same gate; pinning the alias keeps stderr
+    // quiet on both old and new nix.)
     let output = tokio::process::Command::new(nix_bin)
+        .arg("--extra-experimental-features")
+        .arg("nix-command")
         .arg("show-config")
         .arg("--json")
         .stdin(Stdio::null())

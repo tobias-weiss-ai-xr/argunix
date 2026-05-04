@@ -12,10 +12,12 @@ use std::time::Duration;
 
 use medusa_builder_agent::{AgentConfig, PersistedKey, run};
 use medusa_builders::{
-    BuilderRegistry, BuilderServer, ConnState, ServerConfig, load_or_generate as load_host_key,
+    BuilderDispatcher, BuilderRegistry, BuilderServer, ConnState, ServerConfig,
+    load_or_generate as load_host_key,
 };
 use medusa_domain::{BuilderCapabilities, BuilderName};
 use medusa_store::{BuilderStore, SqlxStore, open_in_memory};
+use russh::ChannelMsg;
 
 const ENROLL_TOKEN: &[u8] = b"agent-e2e-token";
 
@@ -107,6 +109,7 @@ async fn token_first_then_pubkey_subsequent() {
         name: BuilderName::new("agent-test").unwrap(),
         capabilities: caps(),
         reconnect_initial_backoff: Duration::from_millis(100),
+        nix_serve_command: AgentConfig::default_nix_serve_command(),
     };
     let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
     let cfg_a = cfg.clone();
@@ -128,6 +131,66 @@ async fn token_first_then_pubkey_subsequent() {
     // Trigger shutdown; the agent sends a Shutdown control message.
     // The server should flip the registry to Disconnecting before
     // the connection actually closes.
+    let _ = sd_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), agent_handle).await;
+}
+
+#[tokio::test]
+async fn build_channel_round_trips_bytes_through_subprocess() {
+    let (addr, _store, registry) = spawn_server().await;
+    let identity = fresh_identity();
+
+    // Stub the per-build subprocess with `cat` so anything medusa
+    // writes on the channel comes straight back through the
+    // subprocess's stdin→stdout. That's enough to verify the
+    // bidirectional pump end-to-end without bringing in real nix.
+    let cfg = AgentConfig {
+        medusa: addr,
+        identity: identity.clone(),
+        enrollment_token: Some(Arc::new(ENROLL_TOKEN.to_vec())),
+        name: BuilderName::new("cat-builder").unwrap(),
+        capabilities: caps(),
+        reconnect_initial_backoff: Duration::from_millis(100),
+        nix_serve_command: Arc::new(vec!["cat".into()]),
+    };
+    let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
+    let cfg_a = cfg.clone();
+    let agent_handle = tokio::spawn(async move {
+        let _ = run(cfg_a, async move {
+            let _ = sd_rx.await;
+        })
+        .await;
+    });
+
+    wait_for_active(&registry, "cat-builder").await;
+
+    // Open a build channel from medusa side and round-trip bytes.
+    let dispatcher = BuilderDispatcher::new(registry.clone());
+    let mut dispatched = dispatcher
+        .open_channel(&BuilderName::new("cat-builder").unwrap())
+        .await
+        .expect("dispatch must succeed");
+    let mut channel = dispatched.take_channel().expect("channel present");
+
+    let payload = b"medusa-says-hi\n";
+    channel.data(&payload[..]).await.unwrap();
+
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while got.len() < payload.len() && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), channel.wait()).await {
+            Ok(Some(ChannelMsg::Data { data })) => got.extend_from_slice(&data),
+            Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) | Ok(None) => break,
+            _ => continue,
+        }
+    }
+    assert_eq!(
+        &got, payload,
+        "bytes sent on the build channel must be echoed by `cat`",
+    );
+
+    drop(channel);
+    drop(dispatched);
     let _ = sd_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(3), agent_handle).await;
 }
