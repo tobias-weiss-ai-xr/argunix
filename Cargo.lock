@@ -1941,6 +1941,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "chrono",
  "ed25519-dalek 2.2.0",
  "medusa-domain",
@@ -1948,6 +1949,7 @@ dependencies = [
  "rand 0.10.1",
  "rand 0.8.6",
  "russh",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

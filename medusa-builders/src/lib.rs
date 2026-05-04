@@ -9,8 +9,10 @@
 
 mod auth;
 mod host_key;
+mod protocol;
 mod server;
 
 pub use auth::AuthState;
 pub use host_key::{HostKey, HostKeyError, load_or_generate};
+pub use protocol::{ControlMessage, LineFramer, ProtocolError};
 pub use server::{BuilderServer, ServerConfig, ServerError};
