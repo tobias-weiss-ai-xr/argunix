@@ -106,6 +106,11 @@ pub trait EvalStore: Send + Sync {
         repo_id: RepoId,
         branch_key_prefix: &str,
     ) -> Result<Vec<EvalRecord>, StoreError>;
+    /// IDs of every evaluation whose status isn't terminal. Used at
+    /// daemon startup to redrive evaluations the previous instance was
+    /// in the middle of when it shut down (or crashed). Order: oldest
+    /// first, so the worker drains FIFO.
+    async fn list_non_terminal_ids(&self) -> Result<Vec<EvalId>, StoreError>;
 }
 
 #[async_trait]

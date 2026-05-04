@@ -384,6 +384,17 @@ impl EvalStore for SqlxStore {
         .await?;
         rows.iter().map(map_eval).collect()
     }
+
+    async fn list_non_terminal_ids(&self) -> Result<Vec<EvalId>, StoreError> {
+        let rows = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM evaluations
+             WHERE status IN ('queued', 'evaluating', 'building')
+             ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(EvalId::new).collect())
+    }
 }
 
 #[async_trait]
@@ -816,6 +827,99 @@ mod tests {
             .unwrap();
         assert_eq!(r.status, EvalStatus::Done);
         assert!(r.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_non_terminal_ids_returns_pending_and_in_flight_evals() {
+        let s = store().await;
+        let repo_id = <SqlxStore as RepoStore>::upsert(&s, "github", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        let mk = |gref: &str, sha: &str| NewEvaluation {
+            repo_id,
+            trigger: "push".to_string(),
+            git_ref: gref.to_string(),
+            sha: Sha::new(sha).unwrap(),
+        };
+        let queued = <SqlxStore as EvalStore>::create(
+            &s,
+            mk(
+                "refs/heads/main",
+                "1111111111111111111111111111111111111111",
+            ),
+        )
+        .await
+        .unwrap();
+        let evaluating = <SqlxStore as EvalStore>::create(
+            &s,
+            mk(
+                "refs/heads/main",
+                "2222222222222222222222222222222222222222",
+            ),
+        )
+        .await
+        .unwrap();
+        <SqlxStore as EvalStore>::set_status(&s, evaluating, EvalStatus::Evaluating)
+            .await
+            .unwrap();
+        let building = <SqlxStore as EvalStore>::create(
+            &s,
+            mk(
+                "refs/heads/main",
+                "3333333333333333333333333333333333333333",
+            ),
+        )
+        .await
+        .unwrap();
+        <SqlxStore as EvalStore>::set_status(&s, building, EvalStatus::Building)
+            .await
+            .unwrap();
+        // Three terminal evals — must NOT show up.
+        let done = <SqlxStore as EvalStore>::create(
+            &s,
+            mk(
+                "refs/heads/main",
+                "4444444444444444444444444444444444444444",
+            ),
+        )
+        .await
+        .unwrap();
+        <SqlxStore as EvalStore>::finish(&s, done, EvalStatus::Done, Utc::now())
+            .await
+            .unwrap();
+        let failed = <SqlxStore as EvalStore>::create(
+            &s,
+            mk(
+                "refs/heads/main",
+                "5555555555555555555555555555555555555555",
+            ),
+        )
+        .await
+        .unwrap();
+        <SqlxStore as EvalStore>::finish(&s, failed, EvalStatus::EvaluationFailed, Utc::now())
+            .await
+            .unwrap();
+        let cancelled = <SqlxStore as EvalStore>::create(
+            &s,
+            mk(
+                "refs/heads/main",
+                "6666666666666666666666666666666666666666",
+            ),
+        )
+        .await
+        .unwrap();
+        <SqlxStore as EvalStore>::finish(&s, cancelled, EvalStatus::Cancelled, Utc::now())
+            .await
+            .unwrap();
+
+        let ids = <SqlxStore as EvalStore>::list_non_terminal_ids(&s)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![queued, evaluating, building],
+            "must return only non-terminal evaluations, oldest first",
+        );
     }
 
     #[tokio::test]
