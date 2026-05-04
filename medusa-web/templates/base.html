@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{% block title %}argunix{% endblock %}</title>
+    <link rel="stylesheet" href="/static/ui.css" />
+  </head>
+  <body class="bg-slate-50 text-slate-900 font-sans">
+    <header class="max-w-5xl mx-auto px-4 pt-6 pb-2">
+      <a class="flex items-center gap-3 no-underline text-slate-900" href="/">
+        <img
+          src="/static/img/argunix.svg"
+          alt="argunix"
+          class="h-10 w-10"
+        />
+        <span class="text-xl font-semibold">argunix</span>
+      </a>
+    </header>
+    <main class="max-w-5xl mx-auto px-4 py-6">
+      {% block content %}{% endblock %}
+    </main>
+    <footer class="max-w-5xl mx-auto px-4 py-4 text-xs text-slate-500">
+      argunix CI
+    </footer>
+  </body>
+</html>

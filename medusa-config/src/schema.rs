@@ -2,6 +2,7 @@ use crate::SecretFile;
 use medusa_domain::{ForgeKind, Slug};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// Top-level medusa configuration.
 ///
@@ -20,6 +21,7 @@ pub struct Config {
     pub schedule: Schedule,
     pub retention: Retention,
     pub eval: EvalDefaults,
+    pub web: WebConfig,
     pub forges: BTreeMap<String, ForgeConfig>,
     pub binary_caches: Vec<BinaryCache>,
     pub repos: Vec<Repo>,
@@ -58,6 +60,34 @@ struct WireBuilderEnrollment {
 
 fn default_builder_listen() -> String {
     "0.0.0.0:2222".to_string()
+}
+
+/// Paths used by the read-only HTTP UI.
+///
+/// `static_dir` is the directory served at `/static/` — Tailwind-compiled
+/// CSS, images, fonts, etc. Read at daemon startup; reload swaps the
+/// rest of the config but not this path (`ServeDir` is wired at
+/// router-construction time).
+///
+/// HTML templates are baked into the binary by Askama at compile time,
+/// so there is intentionally no `template_dir` knob.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    #[serde(default = "default_static_dir")]
+    pub static_dir: PathBuf,
+}
+
+fn default_static_dir() -> PathBuf {
+    PathBuf::from("static")
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            static_dir: default_static_dir(),
+        }
+    }
 }
 
 fn default_listen() -> String {
@@ -310,6 +340,8 @@ struct WireConfig {
     retention: Retention,
     #[serde(default)]
     eval: EvalDefaults,
+    #[serde(default)]
+    web: WebConfig,
     forges: BTreeMap<String, WireForgeConfig>,
     #[serde(default)]
     binary_caches: Vec<BinaryCache>,
@@ -391,6 +423,7 @@ impl TryFrom<WireConfig> for Config {
             schedule: wire.schedule,
             retention: wire.retention,
             eval: wire.eval,
+            web: wire.web,
             forges,
             binary_caches: wire.binary_caches,
             repos,

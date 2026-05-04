@@ -1,0 +1,10 @@
+/* Source for Tailwind v4. The CLI reads `@source` directives and
+ * scans those globs for utility-class usage; we point it at the
+ * templates directory next door. Output ends up at static/ui.css,
+ * which is what the daemon serves under `/static/ui.css`.
+ *
+ * Compiled by `nix/package.nix`'s postInstall step; the stale
+ * `static/ui.css` checked into the repo is overwritten there. */
+@import "tailwindcss";
+
+@source "../templates";

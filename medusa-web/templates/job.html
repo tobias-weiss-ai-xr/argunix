@@ -1,0 +1,37 @@
+{% extends "base.html" %} {% block title %}{{ attr_path }} — argunix{% endblock %} {% block content %}
+<h1 class="text-2xl font-semibold font-mono mb-2">{{ attr_path }}</h1>
+<p class="mb-4">
+  <a
+    class="text-blue-600 hover:underline"
+    href="/r/{{ forge }}/{{ slug }}/eval/{{ eval_id }}"
+    >← eval #{{ eval_id }}</a
+  >
+</p>
+
+<dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm mb-4">
+  <dt class="text-slate-500">system</dt>
+  <dd class="font-mono">{{ system }}</dd>
+  <dt class="text-slate-500">status</dt>
+  <dd>{{ status_label }}</dd>
+  <dt class="text-slate-500">started</dt>
+  <dd class="text-slate-500">{{ started }}</dd>
+  <dt class="text-slate-500">finished</dt>
+  <dd class="text-slate-500">{{ finished }}</dd>
+  {% if let Some(d) = drv_path %}
+  <dt class="text-slate-500">derivation</dt>
+  <dd class="font-mono break-all">{{ d }}</dd>
+  {% endif %} {% if let Some(o) = output_path %}
+  <dt class="text-slate-500">output</dt>
+  <dd class="font-mono break-all">{{ o }}</dd>
+  {% endif %}
+</dl>
+
+{% if has_log %}
+<p>
+  <a
+    class="text-blue-600 hover:underline"
+    href="/r/{{ forge }}/{{ slug }}/eval/{{ eval_id }}/job/{{ attr_path }}/log"
+    >view build log</a
+  >
+</p>
+{% endif %} {% endblock %}

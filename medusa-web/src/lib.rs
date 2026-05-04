@@ -29,13 +29,20 @@ pub use webhook::{eval_target_url, job_target_url};
 use axum::Router;
 use axum::routing::{get, post};
 use std::sync::Arc;
+use tower_http::services::ServeDir;
 
 pub fn router(state: AppState) -> Router {
+    // ServeDir takes the path at construction time, not per-request, so we
+    // resolve `static_dir` from the initial config snapshot. Reload swaps
+    // forge providers but not asset paths.
+    let static_dir = state.current.load_full().config.web.static_dir.clone();
+
     Router::new()
         .route("/", get(ui::index))
         .route("/healthz", get(healthz))
         .route("/r/{forge}/{*tail}", get(ui::dispatch_repo))
         .route("/webhook/{forge_kind}", post(webhook::handle))
+        .nest_service("/static", ServeDir::new(static_dir))
         .with_state(state)
 }
 

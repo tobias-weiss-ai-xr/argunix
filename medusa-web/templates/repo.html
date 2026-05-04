@@ -1,0 +1,37 @@
+{% extends "base.html" %} {% block title %}{{ forge }}/{{ slug }} — argunix{% endblock %} {% block content %}
+<h1 class="text-2xl font-semibold mb-2">{{ forge }} / {{ slug }}</h1>
+<p class="mb-4">
+  <a class="text-blue-600 hover:underline" href="/">← all repos</a>
+</p>
+{% if evals.is_empty() %}
+<p class="text-slate-500">No evaluations yet.</p>
+{% else %}
+<table class="w-full text-sm border-collapse">
+  <thead class="text-left text-slate-500">
+    <tr>
+      <th class="py-2 pr-4">id</th>
+      <th class="py-2 pr-4">ref</th>
+      <th class="py-2 pr-4">sha</th>
+      <th class="py-2 pr-4">status</th>
+      <th class="py-2">finished</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in evals %}
+    <tr class="border-t border-slate-200">
+      <td class="py-2 pr-4">
+        <a
+          class="text-blue-600 hover:underline"
+          href="/r/{{ forge }}/{{ slug }}/eval/{{ e.id }}"
+          >#{{ e.id }}</a
+        >
+      </td>
+      <td class="py-2 pr-4 font-mono">{{ e.git_ref }}</td>
+      <td class="py-2 pr-4 font-mono">{{ e.short_sha }}</td>
+      <td class="py-2 pr-4">{{ e.status }}</td>
+      <td class="py-2 text-slate-500">{{ e.finished }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %} {% endblock %}

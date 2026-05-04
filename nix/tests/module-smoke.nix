@@ -65,6 +65,18 @@ in
     machine.succeed("getent passwd medusa")
     machine.succeed("grep -q '^trusted-users.*medusa' /etc/nix/nix.conf")
 
+    # Static assets: the package ships a Tailwind-compiled `ui.css`
+    # and an `img/` directory under `$out/share/medusa/static`; the
+    # module wires `web.static_dir` to that path. Past versions left
+    # `static_dir` defaulted to a non-existent relative path, so
+    # every `/static/...` request 404'd and the UI rendered with no
+    # styling. Asserting both: the CSS exists and contains the
+    # tailwind banner (proves it was built, not the placeholder).
+    css = machine.succeed("curl -fsS http://127.0.0.1:8080/static/ui.css")
+    assert "tailwindcss" in css, f"expected tailwind-compiled CSS, got: {css[:200]!r}"
+    assert len(css) > 1000, f"unexpectedly short CSS ({len(css)} bytes)"
+    machine.succeed("curl -fsS -o /dev/null http://127.0.0.1:8080/static/img/argunix.svg")
+
     # Shutdown drain: systemctl stop must return cleanly within the
     # unit's TimeoutStopSec (default 90s). Past versions hung
     # because:

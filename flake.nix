@@ -76,6 +76,12 @@
               shellcheck.enable = true;
               shfmt.enable = true;
             };
+            # Askama templates use Jinja-like `{% ... %}` tags that
+            # prettier doesn't understand — it reflows them across lines
+            # and breaks rendering. Exclude the template folder.
+            settings.formatter.prettier.excludes = [
+              "medusa-web/templates/*"
+            ];
           };
         in
         {

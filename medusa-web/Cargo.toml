@@ -16,7 +16,8 @@ axum = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
-maud = "0.27"
+askama = { workspace = true }
+tower-http = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

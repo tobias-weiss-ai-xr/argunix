@@ -1,0 +1,28 @@
+{% extends "base.html" %} {% block title %}argunix{% endblock %} {% block content %}
+<h1 class="text-2xl font-semibold mb-4">Repositories</h1>
+{% if repos.is_empty() %}
+<p class="text-slate-500">No repos have produced an evaluation yet.</p>
+{% else %}
+<table class="w-full text-sm border-collapse">
+  <thead class="text-left text-slate-500">
+    <tr>
+      <th class="py-2 pr-4">forge</th>
+      <th class="py-2">repo</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in repos %}
+    <tr class="border-t border-slate-200">
+      <td class="py-2 pr-4">{{ r.forge }}</td>
+      <td class="py-2">
+        <a
+          class="text-blue-600 hover:underline"
+          href="/r/{{ r.forge }}/{{ r.slug }}"
+          >{{ r.slug }}</a
+        >
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %} {% endblock %}

@@ -159,6 +159,15 @@ in
       }
     ];
 
+    # Point the read-only UI's `ServeDir` at the package-installed
+    # static assets (Tailwind-compiled `ui.css` + images) by default.
+    # Operators using a custom `configFile` are responsible for
+    # setting `web.static_dir` themselves; we only override when
+    # using inline `settings`.
+    services.medusa.settings = lib.mkIf (cfg.configFile == null) {
+      web.static_dir = lib.mkDefault "${cfg.package}/share/medusa/static";
+    };
+
     users.users.${cfg.user} = {
       isSystemUser = true;
       inherit (cfg) group;

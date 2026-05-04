@@ -12,44 +12,100 @@
 //! the only way to support gitlab-subgroup slugs that contain slashes
 //! without enumerating every depth ahead of time.
 //!
-//! No JSON content negotiation, no badges, no metrics — those are M6-full.
+//! Markup lives in `medusa-web/templates/*.html` and is rendered with
+//! Askama (compile-time, type-checked). Static assets — including the
+//! Tailwind-compiled `ui.css` referenced by `base.html` — are served
+//! separately by a `ServeDir` mounted at `/static` (see `lib.rs`).
 
 use crate::state::AppState;
+use askama::Template;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use maud::{DOCTYPE, Markup, html};
 use medusa_domain::{EvalId, EvalStatus, JobStatus, Slug};
 use medusa_store::{EvalStore, JobStore, RepoStore};
 
+#[derive(Template)]
+#[template(path = "index.html")]
+struct IndexTemplate {
+    repos: Vec<RepoRow>,
+}
+
+struct RepoRow {
+    forge: String,
+    slug: String,
+}
+
+#[derive(Template)]
+#[template(path = "repo.html")]
+struct RepoTemplate {
+    forge: String,
+    slug: String,
+    evals: Vec<EvalRow>,
+}
+
+struct EvalRow {
+    id: i64,
+    git_ref: String,
+    short_sha: String,
+    status: &'static str,
+    finished: String,
+}
+
+#[derive(Template)]
+#[template(path = "eval.html")]
+struct EvalTemplate {
+    forge: String,
+    slug: String,
+    eval_id: i64,
+    status_label: &'static str,
+    phase_class: &'static str,
+    trigger: String,
+    git_ref: String,
+    sha: String,
+    started: String,
+    finished: String,
+    job_heading: String,
+    empty_jobs_msg: &'static str,
+    jobs: Vec<JobRow>,
+}
+
+struct JobRow {
+    attr_path: String,
+    system: String,
+    status: &'static str,
+    finished: String,
+    has_log: bool,
+}
+
+#[derive(Template)]
+#[template(path = "job.html")]
+struct JobTemplate {
+    forge: String,
+    slug: String,
+    eval_id: i64,
+    attr_path: String,
+    system: String,
+    status_label: &'static str,
+    started: String,
+    finished: String,
+    drv_path: Option<String>,
+    output_path: Option<String>,
+    has_log: bool,
+}
+
 pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiError> {
-    let repos = state.store.list().await?;
-    Ok(Html(
-        layout(
-            "medusa",
-            html! {
-                h1 { "medusa" }
-                @if repos.is_empty() {
-                    p.muted { "No repos have produced an evaluation yet." }
-                } @else {
-                    table {
-                        thead { tr { th { "forge" } th { "repo" } } }
-                        tbody {
-                            @for r in &repos {
-                                tr {
-                                    td { (r.forge) }
-                                    td {
-                                        a href={ "/r/" (r.forge) "/" (r.slug) } { (r.slug) }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    ))
+    let repos = state
+        .store
+        .list()
+        .await?
+        .into_iter()
+        .map(|r| RepoRow {
+            forge: r.forge,
+            slug: r.slug.as_str().to_string(),
+        })
+        .collect();
+    Ok(Html(render(&IndexTemplate { repos })?))
 }
 
 /// Single catch-all for everything under `/r/<forge>/...`. Parses the
@@ -99,11 +155,9 @@ fn parse_repo_tail(tail: &str) -> Option<ParsedTail<'_>> {
     if tail.is_empty() {
         return None;
     }
-    // Find `/eval/` segment marker.
     if let Some(eval_marker) = tail.find("/eval/") {
         let slug = &tail[..eval_marker];
         let after_eval = &tail[eval_marker + "/eval/".len()..];
-        // The eval-id is the first segment after `/eval/`.
         let (eval_str, rest) = match after_eval.find('/') {
             Some(i) => (&after_eval[..i], Some(&after_eval[i + 1..])),
             None => (after_eval, None),
@@ -115,7 +169,6 @@ fn parse_repo_tail(tail: &str) -> Option<ParsedTail<'_>> {
                 kind: TailKind::Eval(eval_id),
             }),
             Some(after) => {
-                // After `/eval/<id>/` we expect `job/<attr>` optionally followed by `/log`.
                 let after = after.strip_prefix("job/")?;
                 if let Some(attr) = after.strip_suffix("/log") {
                     Some(ParsedTail {
@@ -153,41 +206,23 @@ async fn repo_page(
         .ok_or(UiError::NotFound)?;
     let evals = state.store.list_by_repo(repo.id, 50).await?;
 
-    let body = html! {
-        h1 { (forge) " / " (slug) }
-        p { a href="/" { "← all repos" } }
-        @if evals.is_empty() {
-            p.muted { "No evaluations yet." }
-        } @else {
-            table {
-                thead {
-                    tr { th { "id" } th { "ref" } th { "sha" } th { "status" } th { "finished" } }
-                }
-                tbody {
-                    @for e in &evals {
-                        tr {
-                            td {
-                                a href={ "/r/" (forge) "/" (slug) "/eval/" (e.id.get()) } {
-                                    "#" (e.id.get())
-                                }
-                            }
-                            td.mono { (e.git_ref) }
-                            td.mono { (short_sha(e.sha.as_str())) }
-                            td { (eval_status_label(&e.status)) }
-                            td.muted {
-                                @if let Some(t) = e.finished_at {
-                                    (t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                                } @else {
-                                    "—"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    };
-    Ok(Html(layout(&format!("{forge}/{slug}"), body).into_string()).into_response())
+    let evals = evals
+        .into_iter()
+        .map(|e| EvalRow {
+            id: e.id.get(),
+            git_ref: e.git_ref,
+            short_sha: short_sha(e.sha.as_str()).to_string(),
+            status: eval_status_label(&e.status),
+            finished: fmt_opt_time(e.finished_at),
+        })
+        .collect();
+
+    let html = render(&RepoTemplate {
+        forge,
+        slug: slug.as_str().to_string(),
+        evals,
+    })?;
+    Ok(Html(html).into_response())
 }
 
 async fn eval_page(
@@ -201,73 +236,35 @@ async fn eval_page(
         .ok_or(UiError::NotFound)?;
     let jobs = <medusa_store::SqlxStore as JobStore>::list_by_eval(&state.store, eval_id).await?;
 
-    let phase_class = eval_status_phase_class(&eval.status);
     let job_heading = job_heading_for(&eval.status, jobs.len());
-    let body = html! {
-        h1 {
-            "eval #" (eval_id.get())
-            " "
-            span.badge class=(format!("badge-{phase_class}")) { (eval_status_label(&eval.status)) }
-        }
-        p { a href={ "/r/" (forge) "/" (slug) } { "← " (slug) } }
-        dl.summary {
-            dt { "trigger" } dd { (eval.trigger) }
-            dt { "ref" }     dd.mono { (eval.git_ref) }
-            dt { "sha" }     dd.mono { (eval.sha) }
-            dt { "started" } dd.muted { (fmt_opt_time(eval.started_at)) }
-            dt { "finished" } dd.muted { (fmt_opt_time(eval.finished_at)) }
-        }
-        h2 { (job_heading) }
-        @if jobs.is_empty() {
-            p.muted {
-                @match eval.status {
-                    EvalStatus::Queued => "Queued — waiting for the worker to pick this up.",
-                    EvalStatus::Evaluating => "Evaluating the flake. Job list will appear when nix-eval-jobs finishes.",
-                    EvalStatus::EvaluationFailed => "Evaluation failed before any jobs were discovered.",
-                    EvalStatus::Cancelled => "Cancelled before any jobs were discovered.",
-                    _ => "No jobs recorded for this evaluation.",
-                }
-            }
-        } @else {
-            table {
-                thead {
-                    tr {
-                        th { "attr" } th { "system" } th { "status" }
-                        th { "finished" } th { "log" }
-                    }
-                }
-                tbody {
-                    @for j in &jobs {
-                        tr {
-                            td.mono {
-                                a href={ "/r/" (forge) "/" (slug) "/eval/"
-                                         (eval_id.get()) "/job/" (j.attr_path) } {
-                                    (j.attr_path)
-                                }
-                            }
-                            td.mono { (j.system) }
-                            td { (job_status_label(&j.status)) }
-                            td.muted { (fmt_opt_time(j.finished_at)) }
-                            td {
-                                @if j.log_path.is_some() {
-                                    a href={ "/r/" (forge) "/" (slug) "/eval/"
-                                             (eval_id.get()) "/job/" (j.attr_path) "/log" } {
-                                        "log"
-                                    }
-                                } @else {
-                                    span.muted { "—" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    };
-    Ok(
-        Html(layout(&format!("{forge}/{slug} #{}", eval_id.get()), body).into_string())
-            .into_response(),
-    )
+    let empty_jobs_msg = empty_jobs_msg_for(&eval.status);
+    let job_rows = jobs
+        .into_iter()
+        .map(|j| JobRow {
+            attr_path: j.attr_path.to_string(),
+            system: j.system,
+            status: job_status_label(&j.status),
+            finished: fmt_opt_time(j.finished_at),
+            has_log: j.log_path.is_some(),
+        })
+        .collect();
+
+    let html = render(&EvalTemplate {
+        forge,
+        slug: slug.as_str().to_string(),
+        eval_id: eval_id.get(),
+        status_label: eval_status_label(&eval.status),
+        phase_class: eval_status_phase_class(&eval.status),
+        trigger: eval.trigger.to_string(),
+        git_ref: eval.git_ref,
+        sha: eval.sha.to_string(),
+        started: fmt_opt_time(eval.started_at),
+        finished: fmt_opt_time(eval.finished_at),
+        job_heading,
+        empty_jobs_msg,
+        jobs: job_rows,
+    })?;
+    Ok(Html(html).into_response())
 }
 
 async fn job_page(
@@ -283,31 +280,20 @@ async fn job_page(
         .find(|j| j.attr_path.as_str() == attr)
         .ok_or(UiError::NotFound)?;
 
-    let body = html! {
-        h1.mono { (job.attr_path) }
-        p {
-            a href={ "/r/" (forge) "/" (slug) "/eval/" (eval_id.get()) } { "← eval #" (eval_id.get()) }
-        }
-        dl.summary {
-            dt { "system" }   dd.mono { (job.system) }
-            dt { "status" }   dd { (job_status_label(&job.status)) }
-            dt { "started" }  dd.muted { (fmt_opt_time(job.started_at)) }
-            dt { "finished" } dd.muted { (fmt_opt_time(job.finished_at)) }
-            @if let Some(d) = &job.drv_path {
-                dt { "derivation" } dd.mono { (d) }
-            }
-            @if let Some(o) = &job.output_path {
-                dt { "output" } dd.mono { (o) }
-            }
-        }
-        @if job.log_path.is_some() {
-            p {
-                a href={ "/r/" (forge) "/" (slug) "/eval/" (eval_id.get())
-                         "/job/" (job.attr_path) "/log" } { "view build log" }
-            }
-        }
-    };
-    Ok(Html(layout(&job.attr_path.to_string(), body).into_string()).into_response())
+    let html = render(&JobTemplate {
+        forge,
+        slug: slug.as_str().to_string(),
+        eval_id: eval_id.get(),
+        attr_path: job.attr_path.to_string(),
+        system: job.system,
+        status_label: job_status_label(&job.status),
+        started: fmt_opt_time(job.started_at),
+        finished: fmt_opt_time(job.finished_at),
+        drv_path: job.drv_path,
+        output_path: job.output_path,
+        has_log: job.log_path.is_some(),
+    })?;
+    Ok(Html(html).into_response())
 }
 
 /// Stream the zstd-compressed build log decompressed as `text/plain`.
@@ -325,8 +311,6 @@ async fn log_handler(
         .ok_or(UiError::NotFound)?;
     let log_path = job.log_path.as_deref().ok_or(UiError::NotFound)?;
 
-    // Decompress on a blocking thread — small files (<100MB cap) so the
-    // memory cost is bounded by `LogCaptureLimit`.
     let path = log_path.to_string();
     let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
         let f = std::fs::File::open(&path)?;
@@ -352,22 +336,8 @@ async fn log_handler(
 
 // -------- helpers --------
 
-fn layout(title: &str, body: Markup) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width,initial-scale=1";
-                title { (title) " — medusa" }
-                style { (include_str!("ui.css")) }
-            }
-            body {
-                main { (body) }
-                footer.muted { "medusa CI" }
-            }
-        }
-    }
+fn render<T: Template>(t: &T) -> Result<String, UiError> {
+    t.render().map_err(UiError::Render)
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -418,6 +388,18 @@ fn job_heading_for(status: &EvalStatus, count: usize) -> String {
     }
 }
 
+fn empty_jobs_msg_for(status: &EvalStatus) -> &'static str {
+    match status {
+        EvalStatus::Queued => "Queued — waiting for the worker to pick this up.",
+        EvalStatus::Evaluating => {
+            "Evaluating the flake. Job list will appear when nix-eval-jobs finishes."
+        }
+        EvalStatus::EvaluationFailed => "Evaluation failed before any jobs were discovered.",
+        EvalStatus::Cancelled => "Cancelled before any jobs were discovered.",
+        _ => "No jobs recorded for this evaluation.",
+    }
+}
+
 fn job_status_label(s: &JobStatus) -> &'static str {
     match s {
         JobStatus::Queued => "queued",
@@ -439,13 +421,17 @@ pub enum UiError {
     Store(#[from] medusa_store::StoreError),
     #[error("reading build log: {0}")]
     LogRead(#[source] std::io::Error),
+    #[error("rendering template: {0}")]
+    Render(#[source] askama::Error),
 }
 
 impl IntoResponse for UiError {
     fn into_response(self) -> Response {
         let status = match &self {
             UiError::NotFound => StatusCode::NOT_FOUND,
-            UiError::Store(_) | UiError::LogRead(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            UiError::Store(_) | UiError::LogRead(_) | UiError::Render(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         if status.is_server_error() {
             tracing::error!(error = %self, "ui handler failed");

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}{{ forge }}/{{ slug }} #{{ eval_id }} — argunix{% endblock %}
+{% block content %}
+  <h1 class="text-2xl font-semibold mb-2">
+    eval #{{ eval_id }}
+    <span class="ml-2 inline-block px-2 py-0.5 rounded text-xs align-middle
+      {%- if phase_class == "ok" %} bg-green-100 text-green-800
+      {%- else if phase_class == "fail" %} bg-red-100 text-red-800
+      {%- else if phase_class == "active" %} bg-blue-100 text-blue-800
+      {%- else %} bg-slate-200 text-slate-700{% endif %}"
+      >
+      {{ status_label }}
+    </span>
+  </h1>
+  <p class="mb-4"><a class="text-blue-600 hover:underline" href="/r/{{ forge }}/{{ slug }}">← {{ slug }}</a></p>
+
+  <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm mb-6">
+    <dt class="text-slate-500">trigger</dt><dd>{{ trigger }}</dd>
+    <dt class="text-slate-500">ref</dt><dd class="font-mono">{{ git_ref }}</dd>
+    <dt class="text-slate-500">sha</dt><dd class="font-mono">{{ sha }}</dd>
+    <dt class="text-slate-500">started</dt><dd class="text-slate-500">{{ started }}</dd>
+    <dt class="text-slate-500">finished</dt><dd class="text-slate-500">{{ finished }}</dd>
+  </dl>
+
+  <h2 class="text-lg font-semibold mb-2">{{ job_heading }}</h2>
+  {% if jobs.is_empty() %}
+    <p class="text-slate-500">{{ empty_jobs_msg }}</p>
+  {% else %}
+    <table class="w-full text-sm border-collapse">
+      <thead class="text-left text-slate-500">
+        <tr>
+          <th class="py-2 pr-4">attr</th>
+          <th class="py-2 pr-4">system</th>
+          <th class="py-2 pr-4">status</th>
+          <th class="py-2 pr-4">finished</th>
+          <th class="py-2">log</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for j in jobs %}
+          <tr class="border-t border-slate-200">
+            <td class="py-2 pr-4 font-mono">
+              <a class="text-blue-600 hover:underline"
+                 href="/r/{{ forge }}/{{ slug }}/eval/{{ eval_id }}/job/{{ j.attr_path }}">{{ j.attr_path }}</a>
+            </td>
+            <td class="py-2 pr-4 font-mono">{{ j.system }}</td>
+            <td class="py-2 pr-4">{{ j.status }}</td>
+            <td class="py-2 pr-4 text-slate-500">{{ j.finished }}</td>
+            <td class="py-2">
+              {% if j.has_log %}
+                <a class="text-blue-600 hover:underline"
+                   href="/r/{{ forge }}/{{ slug }}/eval/{{ eval_id }}/job/{{ j.attr_path }}/log">log</a>
+              {% else %}
+                <span class="text-slate-400">—</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+{% endblock %}
