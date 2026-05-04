@@ -64,5 +64,27 @@ in
 
     machine.succeed("getent passwd medusa")
     machine.succeed("grep -q '^trusted-users.*medusa' /etc/nix/nix.conf")
+
+    # Shutdown drain: systemctl stop must return cleanly within the
+    # unit's TimeoutStopSec (default 90s). Past versions hung
+    # because:
+    #   - mpsc Sender clones never dropped (worker drained forever);
+    #   - axum's `with_graceful_shutdown` waited on a parked
+    #     keep-alive HTTP connection that never closed.
+    # Open a long-lived keep-alive connection so the second pathway
+    # would hang the daemon if it ever regressed; assert the unit
+    # still stops within a few seconds.
+    machine.succeed(
+        "exec 3<>/dev/tcp/127.0.0.1/8080;"
+        " printf 'GET /healthz HTTP/1.1\\r\\nHost: x\\r\\nConnection: keep-alive\\r\\n\\r\\n' >&3;"
+        " head -c 1 <&3 >/dev/null;"  # consume one byte of the response
+        " exec 3<>/dev/null &"  # background; nothing closes FD 3 explicitly
+    )
+    import time
+    t0 = time.monotonic()
+    machine.succeed("timeout 25 systemctl stop medusa.service")
+    elapsed = time.monotonic() - t0
+    assert elapsed < 20, f"medusa.service took {elapsed:.1f}s to stop — drain likely hung"
+    machine.succeed("systemctl is-failed medusa.service || true")
   '';
 }

@@ -59,7 +59,7 @@ in
     settings = {
       external_url = "https://${fqdn}";
       builder_enrollment = {
-        listen = "[::]:2222";
+        listen = "[::]:45678";
         token_path = "$CREDENTIALS_DIRECTORY/builder-enrollment-token";
       };
       forges = {

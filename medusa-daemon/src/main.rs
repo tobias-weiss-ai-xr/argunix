@@ -275,19 +275,22 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     // Spawn the control-socket server. Bound to the path from CLI
     // args (default `/run/medusa/control.sock`). Runs as a background
-    // task; survives reloads, exits when the daemon shuts down.
+    // task; survives reloads, gets aborted at daemon shutdown so it
+    // releases its `AppState` clone (which holds an `mpsc::Sender`
+    // to the worker — without dropping that, the worker's `rx.recv()`
+    // never returns `None` and the drain hangs).
     let control_path = args
         .control_socket
         .clone()
         .unwrap_or_else(|| PathBuf::from("/run/medusa/control.sock"));
-    spawn_builder_server_if_configured(
+    let builder_server_handle = spawn_builder_server_if_configured(
         &current.load_full().config,
         &store,
         builder_registry.clone(),
     )
     .await
     .context("starting builder enrollment server")?;
-    let _control_handle = control::spawn(control::ControlContext {
+    let control_handle = control::spawn(control::ControlContext {
         socket_path: control_path,
         app_state: app_state.clone(),
         store,
@@ -309,13 +312,75 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     println!("listening on {local}");
     tracing::info!(%local, "medusa http server ready");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("axum serve")?;
+    // Run axum on a separate task so the shutdown sequence below can
+    // bound its drain time. Past versions used
+    // `serve(...).with_graceful_shutdown(...).await` directly, which
+    // hangs forever when an HTTP keep-alive (e.g. a reverse proxy
+    // upstream) is still parked on the connection.
+    let (graceful_tx, graceful_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_fut = axum::serve(listener, router).with_graceful_shutdown(async move {
+        let _ = graceful_rx.await;
+    });
+    // axum's `WithGracefulShutdown` isn't `IntoFuture`-aware until
+    // it's awaited; wrap in an `async` block to give tokio::spawn an
+    // actual `Future`.
+    let serve_handle = tokio::spawn(async move { serve_fut.await });
 
-    let _ = worker_handle.await;
-    tracing::info!("graceful shutdown complete");
+    // Wait for the actual signal — the shutdown_signal future used to
+    // be wired *into* axum's graceful_shutdown, but we now want to
+    // sequence the rest of the shutdown explicitly.
+    shutdown_signal().await;
+    tracing::info!("shutdown signal received; draining");
+
+    // Tell axum to start its drain (returns Err only if the receiver
+    // already dropped, which we don't care about).
+    let _ = graceful_tx.send(());
+
+    // Cap the HTTP drain. `with_graceful_shutdown` waits for every
+    // open connection to close — long-poll/SSE clients and
+    // misbehaving reverse-proxy keep-alives can park there forever.
+    // 10 s is plenty for a real in-flight POST handler to finish.
+    match tokio::time::timeout(Duration::from_secs(10), serve_handle).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => tracing::warn!(error = %e, "axum serve returned error during drain"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "axum serve task join error"),
+        Err(_) => tracing::warn!("axum drain exceeded 10s; aborting in-flight HTTP connections"),
+    }
+
+    // Release every clone of the worker's mpsc Sender so its
+    // `rx.recv()` returns None and the worker drains in-flight
+    // evaluations before exiting:
+    //   1. axum dropped its router-state clone when its serve future
+    //      resolved (or was aborted).
+    //   2. The control task holds another clone via `ControlContext`;
+    //      abort it (it's a hot accept-loop with no other clean exit).
+    //   3. Drop the local `app_state` Arc held by main itself.
+    control_handle.abort();
+    let _ = control_handle.await;
+    drop(app_state);
+
+    // Stop the builder enrollment server cleanly when configured.
+    // Without aborting it, connected agents see a TCP RST when the
+    // runtime drops; aborting first lets russh send the SSH
+    // disconnect message, which is the politer wire shape and stops
+    // the agent from logging a spurious error on graceful operator
+    // restarts.
+    if let Some(h) = builder_server_handle {
+        h.abort();
+        let _ = h.await;
+    }
+
+    // Bounded drain — systemd's `TimeoutStopSec` would SIGKILL us
+    // eventually, but that races with the unit's restart counter and
+    // can leave half-finished log entries. 30 s gives an in-flight
+    // `nix-store --realise` a fair chance to wrap up; longer than
+    // that and the operator wanted a hard restart anyway.
+    match tokio::time::timeout(Duration::from_secs(30), worker_handle).await {
+        Ok(_) => tracing::info!("graceful shutdown complete"),
+        Err(_) => tracing::warn!(
+            "worker did not drain within 30s; exiting and letting systemd reap any in-flight build"
+        ),
+    }
     Ok(())
 }
 
@@ -765,9 +830,9 @@ async fn spawn_builder_server_if_configured(
     config: &medusa_config::Config,
     store: &medusa_store::SqlxStore,
     registry: Arc<medusa_builders::BuilderRegistry>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
     let Some(enroll) = config.builder_enrollment.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
 
     let listen: std::net::SocketAddr = enroll
@@ -811,14 +876,14 @@ async fn spawn_builder_server_if_configured(
         socket_server: Some(socket_server),
     };
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         if let Err(e) = medusa_builders::BuilderServer::run(server_cfg).await {
             tracing::error!(error = %e, "builder enrollment server exited");
         }
     });
 
     tracing::info!(%listen, "builder enrollment server listening");
-    Ok(())
+    Ok(Some(handle))
 }
 
 fn strip_trailing_newlines(mut v: Vec<u8>) -> Vec<u8> {
