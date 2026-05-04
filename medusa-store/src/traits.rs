@@ -106,11 +106,17 @@ pub trait EvalStore: Send + Sync {
         repo_id: RepoId,
         branch_key_prefix: &str,
     ) -> Result<Vec<EvalRecord>, StoreError>;
-    /// IDs of every evaluation whose status isn't terminal. Used at
-    /// daemon startup to redrive evaluations the previous instance was
-    /// in the middle of when it shut down (or crashed). Order: oldest
-    /// first, so the worker drains FIFO.
-    async fn list_non_terminal_ids(&self) -> Result<Vec<EvalId>, StoreError>;
+    /// IDs of every evaluation in the `Queued` state — i.e. webhook
+    /// landed, row created, but the worker hasn't picked it up yet.
+    /// Used at daemon startup to redrive evals the previous instance
+    /// died before processing.
+    ///
+    /// Deliberately excludes `Evaluating`/`Building` evals: jobs
+    /// already exist for those, and re-running `process()` would
+    /// re-execute `nix-eval-jobs` and persist a *second* row per
+    /// attr_path (no upsert today). Per-job redrive for
+    /// in-flight evals is a separate, larger change.
+    async fn list_queued_ids(&self) -> Result<Vec<EvalId>, StoreError>;
 }
 
 #[async_trait]

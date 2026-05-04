@@ -248,18 +248,18 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
 
-    // Redrive every evaluation the previous instance left mid-flight.
-    // `mark_running_interrupted` above flipped Running jobs to
-    // Interrupted; this pushes the *evaluations* themselves back onto
-    // the worker so jobs that were never started (Queued) and jobs
-    // that need re-running (Interrupted) get picked up. Worker is
-    // idempotent — it'll re-walk the eval, skip terminal jobs, and
-    // resume the rest.
-    match <medusa_store::SqlxStore as EvalStore>::list_non_terminal_ids(&store).await {
+    // Redrive `Queued` evaluations the previous instance never
+    // started processing. We deliberately do NOT redrive
+    // `Evaluating`/`Building` evals here: jobs already exist for
+    // those, and re-running `process()` would re-execute
+    // `nix-eval-jobs` and `persist_job` for every spec, duplicating
+    // every job row for the eval. Per-job redispatch for in-flight
+    // evals is a separate, larger change tracked in `bugs.md`.
+    match <medusa_store::SqlxStore as EvalStore>::list_queued_ids(&store).await {
         Ok(ids) if !ids.is_empty() => {
             tracing::info!(
                 count = ids.len(),
-                "redriving non-terminal evaluations from prior run"
+                "redriving queued evaluations from prior run"
             );
             for id in ids {
                 if let Err(e) = tx.send(id) {
@@ -268,7 +268,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             }
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "could not list non-terminal evaluations at startup"),
+        Err(e) => tracing::warn!(error = %e, "could not list queued evaluations at startup"),
     }
 
     let listen = args

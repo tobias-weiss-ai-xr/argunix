@@ -385,10 +385,10 @@ impl EvalStore for SqlxStore {
         rows.iter().map(map_eval).collect()
     }
 
-    async fn list_non_terminal_ids(&self) -> Result<Vec<EvalId>, StoreError> {
+    async fn list_queued_ids(&self) -> Result<Vec<EvalId>, StoreError> {
         let rows = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM evaluations
-             WHERE status IN ('queued', 'evaluating', 'building')
+             WHERE status = 'queued'
              ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -830,7 +830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_non_terminal_ids_returns_pending_and_in_flight_evals() {
+    async fn list_queued_ids_returns_only_queued_evals() {
         let s = store().await;
         let repo_id = <SqlxStore as RepoStore>::upsert(&s, "github", &Slug::new("a/b").unwrap())
             .await
@@ -912,14 +912,16 @@ mod tests {
             .await
             .unwrap();
 
-        let ids = <SqlxStore as EvalStore>::list_non_terminal_ids(&s)
-            .await
-            .unwrap();
+        let ids = <SqlxStore as EvalStore>::list_queued_ids(&s).await.unwrap();
         assert_eq!(
             ids,
-            vec![queued, evaluating, building],
-            "must return only non-terminal evaluations, oldest first",
+            vec![queued],
+            "must return only Queued evaluations — Evaluating/Building \
+             have existing job rows that re-running process() would \
+             duplicate",
         );
+        // Sanity-check we set up the fixtures right.
+        let _ = (evaluating, building, done, failed, cancelled);
     }
 
     #[tokio::test]
