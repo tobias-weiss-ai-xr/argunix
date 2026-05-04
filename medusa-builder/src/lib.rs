@@ -11,8 +11,10 @@
 //! This crate is split into a `medusa_builder_agent` library + a
 //! `medusa-builder` binary. The library is what tests exercise.
 
+mod agent;
 mod capabilities;
 mod identity;
 
+pub use agent::{AgentConfig, AgentError, run};
 pub use capabilities::{Capabilities, CapabilitiesError, discover_capabilities};
 pub use identity::{IdentityError, PersistedKey, load_or_generate};
