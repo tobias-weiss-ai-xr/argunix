@@ -21,6 +21,14 @@ pub struct RawJob {
     pub meta: serde_json::Value,
     #[serde(default)]
     pub is_cached: bool,
+    /// Mirrors `requiredSystemFeatures` from the .drv. nix-eval-jobs
+    /// emits this per-attr when the derivation declares it. Used by
+    /// the worker's pre-flight to fail-fast when no connected builder
+    /// can satisfy the features (otherwise nix's remote-build
+    /// scheduler retries internally for a long time before printing
+    /// "Failed to find a machine").
+    #[serde(default)]
+    pub required_system_features: Vec<String>,
 }
 
 /// A medusa-side job spec produced by combining a [`RawJob`] with the
@@ -37,6 +45,9 @@ pub struct JobSpec {
     pub outputs: BTreeMap<String, String>,
     pub meta: serde_json::Value,
     pub is_cached: bool,
+    /// `requiredSystemFeatures` from the .drv (e.g. `["cuda"]`,
+    /// `["uid-range"]`). Empty when the derivation didn't declare any.
+    pub required_system_features: Vec<String>,
 }
 
 impl JobSpec {
@@ -86,6 +97,7 @@ pub fn parse_lines(prefix: &str, body: &str) -> Result<Vec<JobSpec>, ParseError>
             outputs: raw.outputs,
             meta: raw.meta,
             is_cached: raw.is_cached,
+            required_system_features: raw.required_system_features,
         });
     }
     Ok(out)
@@ -172,6 +184,23 @@ mod tests {
         let body = r#"{"attr":"x","drvPath":"/nix/store/x.drv","system":"x86_64-linux","outputs":{"lib":"/nix/store/aaa-x-lib"}}"#;
         let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
         assert_eq!(jobs[0].primary_output(), Some("/nix/store/aaa-x-lib"));
+    }
+
+    #[test]
+    fn parses_required_system_features() {
+        let body = r#"{"attr":"x","drvPath":"/nix/store/x.drv","system":"x86_64-linux","requiredSystemFeatures":["cuda","uid-range"]}"#;
+        let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
+        assert_eq!(
+            jobs[0].required_system_features,
+            vec!["cuda".to_string(), "uid-range".to_string()],
+        );
+    }
+
+    #[test]
+    fn missing_required_system_features_is_empty_vec() {
+        let body = r#"{"attr":"x","drvPath":"/nix/store/x.drv","system":"x86_64-linux"}"#;
+        let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
+        assert!(jobs[0].required_system_features.is_empty());
     }
 
     #[test]

@@ -439,6 +439,49 @@ fn summarise_for_check(err: &str, max_chars: usize) -> String {
     }
 }
 
+/// Build the synthetic stderr written into the job's log file when
+/// the pre-flight rejects the build. Mirrors the shape of nix's own
+/// "Failed to find a machine for remote build!" message so an
+/// operator scanning the UI doesn't have to learn a second format.
+fn synthesize_no_eligible_builder_log(
+    attr: &str,
+    drv: &str,
+    system: &str,
+    required: &[String],
+    registry: &medusa_builders::BuilderRegistry,
+) -> String {
+    let mut out = String::new();
+    out.push_str("medusa pre-flight: no connected builder satisfies this derivation's\n");
+    out.push_str("requiredSystemFeatures. Failing fast instead of waiting for nix's\n");
+    out.push_str("remote-build scheduler to give up.\n\n");
+    out.push_str(&format!("attribute: {attr}\n"));
+    out.push_str(&format!("derivation: {drv}\n"));
+    out.push_str(&format!(
+        "required (system, features): ({system}, {required:?})\n\n"
+    ));
+    let snapshots = registry.list();
+    if snapshots.is_empty() {
+        out.push_str("connected builders: (none)\n");
+    } else {
+        out.push_str("connected builders:\n");
+        for b in snapshots {
+            out.push_str(&format!(
+                "  - {name}: systems={systems:?} features={features:?} max_jobs={max} state={state:?}\n",
+                name = b.name,
+                systems = b.capabilities.systems,
+                features = b.capabilities.features,
+                max = b.capabilities.max_jobs,
+                state = b.state,
+            ));
+        }
+    }
+    out.push_str("\nFix one of:\n");
+    out.push_str("  1. Add the missing feature(s) to a builder's nix.settings.system-features.\n");
+    out.push_str("  2. Add a builder host that natively satisfies the feature.\n");
+    out.push_str("  3. Drop the requirement from the derivation if it isn't actually needed.\n");
+    out
+}
+
 #[derive(Default)]
 struct JobTally {
     success: usize,
@@ -661,13 +704,57 @@ async fn build_one(
         }
     }
 
-    <SqlxStore as JobStore>::start(&ctx.store, job_id, Utc::now()).await?;
-
     let log_path = ctx
         .log_dir
         .join(repo_id.get().to_string())
         .join(eval_id.get().to_string())
         .join(format!("{}.log.zst", job_id.get()));
+
+    // Pre-flight: if the derivation declares `requiredSystemFeatures`
+    // and no connected builder advertises every feature on the
+    // matching system, fail fast. Without this, nix's remote-build
+    // scheduler silently retries internally for many minutes before
+    // printing "Failed to find a machine" — visible to the operator
+    // only when the build finally gives up. See `bugs.md`.
+    if !spec.required_system_features.is_empty() {
+        if let Some(system) = spec.system.as_deref() {
+            let eligible = ctx.builder_registry.eligible(
+                system,
+                &spec.required_system_features,
+                &std::collections::HashSet::new(),
+            );
+            if eligible.is_empty() {
+                let log = synthesize_no_eligible_builder_log(
+                    &spec.attr_path.as_str().to_string(),
+                    &drv_path,
+                    system,
+                    &spec.required_system_features,
+                    &ctx.builder_registry,
+                );
+                if let Err(e) = medusa_build::write_zstd_log(&log_path, log.into_bytes()).await {
+                    tracing::warn!(error = %e, "failed to write fail-fast log");
+                }
+                <SqlxStore as JobStore>::finish(
+                    &ctx.store,
+                    job_id,
+                    JobStatus::Failure,
+                    Utc::now(),
+                    Some(&log_path.to_string_lossy()),
+                    None,
+                )
+                .await?;
+                tracing::warn!(
+                    drv = %drv_path,
+                    system,
+                    required = ?spec.required_system_features,
+                    "no eligible builder advertises required features; failing job fast",
+                );
+                return Ok(JobStatus::Failure);
+            }
+        }
+    }
+
+    <SqlxStore as JobStore>::start(&ctx.store, job_id, Utc::now()).await?;
     // Pre-create the gcroot parent dir so `nix-store --add-root` can drop
     // the symlink atomically with the build (otherwise it ENOENTs and the
     // realise call fails before any building happens).
@@ -839,8 +926,36 @@ impl Drop for CancelGuard<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobTally, collapsed_progress, summarise_for_check};
+    use super::{
+        JobTally, collapsed_progress, summarise_for_check, synthesize_no_eligible_builder_log,
+    };
+    use medusa_builders::BuilderRegistry;
     use medusa_domain::JobStatus;
+
+    #[test]
+    fn no_eligible_builder_log_lists_drv_attr_features_and_builders() {
+        let reg = BuilderRegistry::new();
+        let log = synthesize_no_eligible_builder_log(
+            "packages.x86_64-linux.test-cuda-amd",
+            "/nix/store/xxx-test-cuda-amd.drv",
+            "x86_64-linux",
+            &["cuda".into(), "uid-range".into()],
+            &reg,
+        );
+        assert!(log.contains("packages.x86_64-linux.test-cuda-amd"));
+        assert!(log.contains("/nix/store/xxx-test-cuda-amd.drv"));
+        assert!(log.contains("x86_64-linux"));
+        assert!(log.contains("cuda"));
+        assert!(log.contains("uid-range"));
+        assert!(
+            log.contains("connected builders: (none)"),
+            "empty registry must surface in the log",
+        );
+        assert!(
+            log.contains("Fix one of"),
+            "operator-actionable hint must be included",
+        );
+    }
 
     #[test]
     fn collapsed_progress_zero_done() {
