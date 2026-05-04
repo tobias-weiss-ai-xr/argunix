@@ -10,6 +10,7 @@ members = [
   "medusa-sched",
   "medusa-web",
   "medusa-control",
+  "medusa-builders",
   "medusa-daemon",
   "medusactl",
 ]
@@ -77,3 +78,5 @@ axum = { version = "0.8", default-features = false, features = [
   "tokio",
 ] }
 bytes = "1"
+russh = "0.60"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
