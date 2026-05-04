@@ -13,6 +13,7 @@ mod host_key;
 mod protocol;
 mod registry;
 mod server;
+mod socket_server;
 
 pub use auth::AuthState;
 pub use dispatcher::{BuilderDispatcher, DispatchError, DispatchedBuild};
@@ -23,3 +24,4 @@ pub use registry::{
     RusshSession,
 };
 pub use server::{BuilderServer, ServerConfig, ServerError};
+pub use socket_server::{SocketError, SocketGuard, SocketServer};

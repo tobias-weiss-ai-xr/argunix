@@ -19,6 +19,16 @@ pub enum DispatchError {
     NoEligibleBuilder { system: String },
     #[error("opening channel to builder `{name}` failed; no fallback available")]
     AllOpensFailed { name: String },
+    #[error("builder `{name}` is not currently registered")]
+    NotRegistered { name: String },
+    #[error("builder `{name}` has no SSH session (test fixture without a real connection)")]
+    NoSession { name: String },
+    #[error("opening channel to builder `{name}`: {source}")]
+    OpenFailed {
+        name: String,
+        #[source]
+        source: russh::Error,
+    },
 }
 
 pub struct BuilderDispatcher {
@@ -90,6 +100,37 @@ impl BuilderDispatcher {
                 system: system.to_string(),
             },
         })
+    }
+
+    /// Open a fresh SSH session channel into a *specific* builder.
+    /// Used by the socket-server proxy: nix's `--builders` arg lists
+    /// every connected builder, nix picks one, then invokes
+    /// `medusa-pipe <name>` for the chosen one — at which point we
+    /// already know the builder, no `eligible` walk needed.
+    pub async fn open_channel(&self, name: &BuilderName) -> Result<DispatchedBuild, DispatchError> {
+        let session = self
+            .registry
+            .session(name)
+            .ok_or_else(|| DispatchError::NotRegistered {
+                name: name.as_str().to_string(),
+            })?;
+        // Reserve before await so concurrent dispatches see the
+        // pending count.
+        self.registry.inc_in_flight(name);
+        match session.handle.channel_open_session().await {
+            Ok(channel) => Ok(DispatchedBuild {
+                registry: self.registry.clone(),
+                name: name.clone(),
+                channel: Some(channel),
+            }),
+            Err(e) => {
+                self.registry.dec_in_flight(name);
+                Err(DispatchError::OpenFailed {
+                    name: name.as_str().to_string(),
+                    source: e,
+                })
+            }
+        }
     }
 }
 
