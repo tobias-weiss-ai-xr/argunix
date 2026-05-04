@@ -38,6 +38,46 @@ pub enum Request {
     /// Snapshot of daemon health: uptime, configured forge/repo
     /// counts, paused forges, queue depth.
     Status,
+    /// List every known builder (registered + revoked) for `medusactl
+    /// builders`. Response `details` is an array of builder snapshot
+    /// objects (see [`BuilderInfo`]).
+    BuildersList,
+    /// Revoke a builder by name. Sets `revoked_at` in sqlite and, if
+    /// the builder is currently connected, sends a `kick` message and
+    /// disconnects the SSH session. Subsequent reconnects with the
+    /// existing pubkey fail; the agent has to re-enroll with a fresh
+    /// enrollment token.
+    BuildersRevoke { name: String },
+    /// Rename `old → new`. Fails if `old` doesn't exist or if `new`
+    /// already exists.
+    BuildersRename { old: String, new: String },
+}
+
+/// One row of the `medusactl builders` output.
+///
+/// Mirrors `medusa-store::BuilderRecord` plus the runtime-only
+/// `connected` / `in_flight` fields the registry adds. Lives here
+/// rather than in `medusa-store` so `medusactl` doesn't have to
+/// pull in sqlx.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BuilderInfo {
+    pub id: i64,
+    pub name: String,
+    pub systems: Vec<String>,
+    pub features: Vec<String>,
+    pub max_jobs: u32,
+    pub nix_version: String,
+    pub enrolled_at: String,
+    pub last_seen: String,
+    /// `Some(rfc3339)` if the operator revoked it; `None` for active rows.
+    pub revoked_at: Option<String>,
+    /// True if the registry currently holds an SSH session for this
+    /// builder. False for revoked rows or builders that are simply
+    /// not connected right now.
+    pub connected: bool,
+    /// Builds in progress on this builder. Always `0` for revoked /
+    /// disconnected rows.
+    pub in_flight: u32,
 }
 
 /// Server's reply. `status` is `"ok"` on success or `"error"` on
@@ -179,5 +219,60 @@ mod tests {
         assert_eq!(s, r#"{"status":"error","message":"config invalid"}"#);
         let back: Response = serde_json::from_str(&s).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn builders_list_request_round_trips() {
+        let r = Request::BuildersList;
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, r#"{"command":"builders-list"}"#);
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn builders_revoke_request_round_trips() {
+        let r = Request::BuildersRevoke {
+            name: "bobs-mini".into(),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, r#"{"command":"builders-revoke","name":"bobs-mini"}"#);
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn builders_rename_request_round_trips() {
+        let r = Request::BuildersRename {
+            old: "old".into(),
+            new: "new".into(),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            s,
+            r#"{"command":"builders-rename","old":"old","new":"new"}"#
+        );
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn builder_info_round_trips() {
+        let info = BuilderInfo {
+            id: 7,
+            name: "bobs-mini".into(),
+            systems: vec!["aarch64-darwin".into()],
+            features: vec!["big-parallel".into()],
+            max_jobs: 2,
+            nix_version: "2.18.1".into(),
+            enrolled_at: "2026-05-04T10:00:00Z".into(),
+            last_seen: "2026-05-04T10:30:00Z".into(),
+            revoked_at: None,
+            connected: true,
+            in_flight: 1,
+        };
+        let s = serde_json::to_string(&info).unwrap();
+        let back: BuilderInfo = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, info);
     }
 }

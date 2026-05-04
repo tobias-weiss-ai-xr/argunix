@@ -265,6 +265,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .control_socket
         .clone()
         .unwrap_or_else(|| PathBuf::from("/run/medusa/control.sock"));
+    // M13: shared registry of currently-connected builders. PR #8b
+    // will hand this to a BuilderServer; for now medusactl just sees
+    // an empty list when builder_enrollment isn't configured.
+    let builder_registry = medusa_builders::BuilderRegistry::new();
     let _control_handle = control::spawn(control::ControlContext {
         socket_path: control_path,
         app_state: app_state.clone(),
@@ -273,6 +277,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         gc_root_dir,
         config_path: args.config.clone(),
         skip_secret_check: args.skip_secret_check,
+        builder_registry,
     });
 
     // Tell systemd we're ready (so `Type=notify-reload` can sequence

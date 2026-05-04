@@ -10,7 +10,9 @@
 //! doesn't block subsequent `status` queries.
 
 use anyhow::Context;
-use medusa_control::{Request, Response};
+use medusa_builders::BuilderRegistry;
+use medusa_control::{BuilderInfo, Request, Response};
+use medusa_store::BuilderStore;
 use medusa_web::{AppState, ConfigSnapshot};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +30,10 @@ pub struct ControlContext {
     pub gc_root_dir: PathBuf,
     pub config_path: PathBuf,
     pub skip_secret_check: bool,
+    /// Runtime view of currently-connected builders (M13). Empty when
+    /// `builder_enrollment` isn't configured. Held as Arc so it can
+    /// also be shared with the BuilderServer once PR #8b wires it up.
+    pub builder_registry: Arc<BuilderRegistry>,
 }
 
 pub fn spawn(ctx: ControlContext) -> tokio::task::JoinHandle<()> {
@@ -104,6 +110,20 @@ async fn dispatch(req: Request, ctx: &ControlContext) -> Response {
             }
         }
         Request::Status => Response::ok_with(handle_status(ctx).await),
+        Request::BuildersList => match handle_builders_list(ctx).await {
+            Ok(v) => Response::ok_with(v),
+            Err(e) => Response::error(format!("{e:#}")),
+        },
+        Request::BuildersRevoke { name } => match handle_builders_revoke(&name, ctx).await {
+            Ok(v) => Response::ok_with(v),
+            Err(e) => Response::error(format!("{e:#}")),
+        },
+        Request::BuildersRename { old, new } => {
+            match handle_builders_rename(&old, &new, ctx).await {
+                Ok(v) => Response::ok_with(v),
+                Err(e) => Response::error(format!("{e:#}")),
+            }
+        }
     }
 }
 
@@ -161,4 +181,108 @@ async fn handle_status(ctx: &ControlContext) -> serde_json::Value {
         "external_url": snap.config.external_url,
         "paused_forges": ctx.app_state.pauses.snapshot(),
     })
+}
+
+async fn handle_builders_list(ctx: &ControlContext) -> anyhow::Result<serde_json::Value> {
+    let rows = ctx
+        .store
+        .list_all()
+        .await
+        .context("listing builders from sqlite")?;
+    let mut out: Vec<BuilderInfo> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let snap = ctx.builder_registry.snapshot(&row.name);
+        let connected = snap.is_some() && row.revoked_at.is_none();
+        let in_flight = snap.as_ref().map(|s| s.in_flight).unwrap_or(0);
+        out.push(BuilderInfo {
+            id: row.id.get(),
+            name: row.name.as_str().to_string(),
+            systems: row.capabilities.systems,
+            features: row.capabilities.features,
+            max_jobs: row.capabilities.max_jobs,
+            nix_version: row.capabilities.nix_version,
+            enrolled_at: row.enrolled_at.to_rfc3339(),
+            last_seen: row.last_seen.to_rfc3339(),
+            revoked_at: row.revoked_at.map(|t| t.to_rfc3339()),
+            connected,
+            in_flight,
+        });
+    }
+    Ok(serde_json::to_value(&out)?)
+}
+
+async fn handle_builders_revoke(
+    name: &str,
+    ctx: &ControlContext,
+) -> anyhow::Result<serde_json::Value> {
+    let now = chrono::Utc::now();
+    let revoked = ctx
+        .store
+        .revoke(name, now)
+        .await
+        .context("revoking builder in sqlite")?;
+    if !revoked {
+        anyhow::bail!("no such builder: {name}");
+    }
+    // If there's a live SSH session, kick it now so the builder
+    // doesn't keep heartbeating after revocation. The Drop on the
+    // ConnectionHandler will remove the registry row when the SSH
+    // session tears down.
+    let kicked = match medusa_domain::BuilderName::new(name) {
+        Ok(builder_name) => match ctx.builder_registry.session(&builder_name) {
+            Some(session) => {
+                let kick = medusa_builders::ControlMessage::Kick {
+                    reason: "revoked by operator".into(),
+                };
+                let bytes: bytes::Bytes = kick.encode_line().into();
+                let _ = session.handle.data(session.control_channel, bytes).await;
+                let _ = session
+                    .handle
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        "revoked by operator".into(),
+                        "en".into(),
+                    )
+                    .await;
+                true
+            }
+            None => false,
+        },
+        Err(_) => false,
+    };
+    tracing::info!(
+        builder = %name,
+        kicked,
+        "builder revoked",
+    );
+    Ok(serde_json::json!({
+        "name": name,
+        "kicked": kicked,
+    }))
+}
+
+async fn handle_builders_rename(
+    old: &str,
+    new: &str,
+    ctx: &ControlContext,
+) -> anyhow::Result<serde_json::Value> {
+    // Validate the target name shape eagerly so a typo doesn't land
+    // an unconstrained value in sqlite (BuilderName parsing happens
+    // at row read time, but we want to catch this at write time).
+    let _ = medusa_domain::BuilderName::new(new)
+        .with_context(|| format!("invalid new builder name `{new}`"))?;
+    let renamed = ctx
+        .store
+        .rename(old, new)
+        .await
+        .context("renaming builder in sqlite")?;
+    if !renamed {
+        anyhow::bail!("rename failed: `{old}` doesn't exist or `{new}` already does");
+    }
+    tracing::info!(old, new, "builder renamed");
+    // Live registry entries keyed on old name aren't auto-renamed —
+    // the next reconnect's hello will pick up the new sqlite row's
+    // name. Operators can `medusactl builders` after rename to see
+    // the row under its new name.
+    Ok(serde_json::json!({ "old": old, "new": new }))
 }
