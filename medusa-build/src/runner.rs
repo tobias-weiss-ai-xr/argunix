@@ -50,6 +50,12 @@ pub struct BuildRequest {
     /// nix-store warns "you did not specify '--add-root'…" on every run).
     /// The caller is responsible for ensuring the parent directory exists.
     pub gc_root: Option<PathBuf>,
+    /// Optional `--builders <arg>` value composed from the dynamic
+    /// builder pool (see `compose_builders_arg`). When `None` or empty,
+    /// nix falls through to the host's `nix.buildMachines`. The caller
+    /// is responsible for snapshotting the registry just before the
+    /// build so the value reflects builders Active *now*.
+    pub builders_arg: Option<String>,
 }
 
 /// Spawn `nix-store --realise <drv>`, capture stdout (output paths) and
@@ -63,6 +69,15 @@ pub async fn run_build(request: &BuildRequest) -> Result<BuildOutcome, BuildErro
     cmd.arg("--realise");
     if let Some(root) = &request.gc_root {
         cmd.arg("--add-root").arg(root);
+    }
+    if let Some(arg) = request.builders_arg.as_deref().filter(|s| !s.is_empty()) {
+        // `--builders <arg>` overrides nix.buildMachines for this
+        // invocation. Without it, nix would (a) build locally if the
+        // host can satisfy `requiredSystemFeatures`, or (b) consult
+        // the host-level `/etc/nix/machines`. With it, nix dispatches
+        // through the dynamic pool — the empty case keeps the
+        // additive-not-replacing semantic from `design/builders.md`.
+        cmd.arg("--builders").arg(arg);
     }
     let mut child = cmd
         .arg(&request.drv_path)
@@ -303,6 +318,7 @@ exit 0
             timeout: Duration::from_secs(10),
             log_limit: LogCaptureLimit::default(),
             gc_root: None,
+            builders_arg: None,
         };
         let outcome = run_build(&request).await;
 
@@ -382,6 +398,7 @@ exit 0
             timeout: Duration::from_secs(10),
             log_limit: LogCaptureLimit::default(),
             gc_root: Some(gc_root.clone()),
+            builders_arg: None,
         };
         let outcome = run_build(&request).await;
 
@@ -470,6 +487,7 @@ exit 99
             timeout: Duration::from_secs(10),
             log_limit: LogCaptureLimit::default(),
             gc_root: None,
+            builders_arg: None,
         };
         let outcome = run_build(&request).await;
 
@@ -538,6 +556,7 @@ exit 99
             timeout: Duration::from_secs(10),
             log_limit: LogCaptureLimit::default(),
             gc_root: None,
+            builders_arg: None,
         };
         let outcome = run_build(&request).await;
 

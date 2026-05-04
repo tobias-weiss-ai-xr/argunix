@@ -178,12 +178,16 @@ in
       "d /nix/var/nix/gcroots/per-user/${cfg.user} 0755 ${cfg.user} ${cfg.group} - -"
     ];
 
-    networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall (
+    networking.firewall.allowedTCPPorts =
       let
-        port = lib.toInt (lib.last (lib.splitString ":" cfg.listen));
+        httpPort = lib.toInt (lib.last (lib.splitString ":" cfg.listen));
+        builderListen = cfg.settings.builder_enrollment.listen or null;
+        # Strip optional `[ipv6]:` / `host:` prefix; the port is always
+        # the part after the final colon.
+        builderPort =
+          if builderListen != null then lib.toInt (lib.last (lib.splitString ":" builderListen)) else null;
       in
-      [ port ]
-    );
+      lib.optional cfg.openFirewall httpPort ++ lib.optional (builderPort != null) builderPort;
 
     systemd.services.medusa = {
       description = "medusa CI daemon";
@@ -216,6 +220,8 @@ in
           (toString settingsFile)
           "--listen"
           cfg.listen
+          "--medusa-pipe-path"
+          (lib.getExe' cfg.package "medusa-pipe")
         ];
         ExecReload = lib.concatStringsSep " " [
           (lib.getExe' cfg.package "medusactl")

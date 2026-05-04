@@ -52,6 +52,15 @@ pub struct WorkerContext {
     pub systems: Vec<String>,
     pub pauses: Arc<PauseRegistry>,
     pub cancellations: Arc<CancelRegistry>,
+    /// Snapshot of the dynamic builder pool. Per-build, the worker
+    /// composes a `--builders` argument from currently-Active entries
+    /// and hands it to `run_build`. `None` (or no Active entries)
+    /// means the host's `nix.buildMachines` is used unchanged.
+    pub builder_registry: Arc<medusa_builders::BuilderRegistry>,
+    /// Absolute path to the `medusa-pipe` shim. Embedded into every
+    /// `--builders ssh-ng://x@local?ssh-command=…` URI so nix can
+    /// fork it for each dispatch.
+    pub medusa_pipe_path: String,
 }
 
 /// Spawn the worker on the current tokio runtime. Returns a `JoinHandle`
@@ -657,12 +666,17 @@ async fn build_one(
             tracing::warn!(error = %e, dir = %parent.display(), "failed to create gcroot parent dir; build will run without a gcroot");
         }
     }
+    // Snapshot the registry just before dispatch — builders that
+    // connected after this point will be picked up on the next build.
+    let builders_arg =
+        medusa_build::compose_builders_arg(&ctx.builder_registry, &ctx.medusa_pipe_path);
     let request = medusa_build::BuildRequest {
         drv_path: drv_path.clone(),
         log_path: log_path.clone(),
         timeout: ctx.build_timeout,
         log_limit: medusa_build::LogCaptureLimit::default(),
         gc_root: Some(gc_root.clone()),
+        builders_arg,
     };
     // Q39 / Q104 / Q105: race the build against the eval's cancel
     // signal. `biased;` polls the build first — if it just resolved

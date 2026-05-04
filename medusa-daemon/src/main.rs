@@ -56,6 +56,13 @@ struct ServeArgs {
     /// here). Default: `/run/medusa/control.sock`.
     #[arg(long, value_name = "PATH")]
     control_socket: Option<PathBuf>,
+    /// Absolute path to the `medusa-pipe` shim. Embedded into the
+    /// `--builders ssh-ng://x@local?ssh-command=…` URI for every
+    /// build dispatch. Defaults to `medusa-pipe` (resolved on the
+    /// daemon's PATH) — the NixOS module pins it to the absolute
+    /// path inside `pkgs.medusa`.
+    #[arg(long, value_name = "PATH", default_value = "medusa-pipe")]
+    medusa_pipe_path: String,
 }
 
 #[derive(Args, Debug)]
@@ -217,6 +224,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         medusa_web::ensure_webhooks(&snap.config, &snap.providers, &store).await;
     }
 
+    // M13: shared registry of currently-connected builders. Created
+    // before the worker so it can compose `--builders` per dispatch;
+    // BuilderServer (when `builder_enrollment` is configured) writes
+    // into the same Arc; medusactl reads it via the control socket.
+    let builder_registry = medusa_builders::BuilderRegistry::new();
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let worker_ctx = worker::WorkerContext {
         current: current.clone(),
@@ -230,6 +243,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         systems,
         pauses: pauses.clone(),
         cancellations: cancellations.clone(),
+        builder_registry: builder_registry.clone(),
+        medusa_pipe_path: args.medusa_pipe_path.clone(),
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
 
@@ -265,10 +280,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .control_socket
         .clone()
         .unwrap_or_else(|| PathBuf::from("/run/medusa/control.sock"));
-    // M13: shared registry of currently-connected builders. PR #8b
-    // will hand this to a BuilderServer; for now medusactl just sees
-    // an empty list when builder_enrollment isn't configured.
-    let builder_registry = medusa_builders::BuilderRegistry::new();
+    spawn_builder_server_if_configured(
+        &current.load_full().config,
+        &store,
+        builder_registry.clone(),
+    )
+    .await
+    .context("starting builder enrollment server")?;
     let _control_handle = control::spawn(control::ControlContext {
         socket_path: control_path,
         app_state: app_state.clone(),
@@ -617,6 +635,10 @@ async fn build_one_job(
         timeout: build_timeout,
         log_limit: medusa_build::LogCaptureLimit::default(),
         gc_root: Some(gc_root),
+        // The single-shot `medusa build` CLI runs locally — no
+        // dynamic pool involvement. Falls through to the host's
+        // `nix.buildMachines` like before.
+        builders_arg: None,
     };
     let outcome = medusa_build::run_build(&request)
         .await
@@ -732,6 +754,78 @@ pub(crate) async fn prune_orphan_state(
         );
     }
     tracing::info!(count = pruned.len(), "config-driven prune pass complete");
+}
+
+/// If `config.builder_enrollment` is set, load/generate the embedded
+/// SSH host key under `./builder-host-key`, read the enrollment token,
+/// and spawn the builder-pool SSH server on the configured listen
+/// address. No-op when `builder_enrollment` is absent — operators not
+/// using the dynamic pool keep paying nothing for it.
+async fn spawn_builder_server_if_configured(
+    config: &medusa_config::Config,
+    store: &medusa_store::SqlxStore,
+    registry: Arc<medusa_builders::BuilderRegistry>,
+) -> anyhow::Result<()> {
+    let Some(enroll) = config.builder_enrollment.as_ref() else {
+        return Ok(());
+    };
+
+    let listen: std::net::SocketAddr = enroll
+        .listen
+        .parse()
+        .with_context(|| format!("parsing builder_enrollment.listen `{}`", enroll.listen))?;
+
+    let host_key_path = PathBuf::from("./builder-host-key");
+    let host_key = medusa_builders::load_or_generate(&host_key_path).with_context(|| {
+        format!(
+            "loading/generating builder host key at {}",
+            host_key_path.display()
+        )
+    })?;
+
+    let token_bytes = tokio::fs::read(enroll.token_path.path())
+        .await
+        .with_context(|| {
+            format!(
+                "reading builder enrollment token at {}",
+                enroll.token_path.path().display()
+            )
+        })?;
+    let token = Arc::new(strip_trailing_newlines(token_bytes));
+
+    // Per-builder unix sockets at `<runtime>/builders/<name>.sock`.
+    // The BuilderServer's per-connection handler calls
+    // `SocketServer::listen_for(name)` on Hello acceptance and holds
+    // the returned guard for the connection's lifetime, so the file
+    // is gone the moment the builder disconnects.
+    let socket_dir = PathBuf::from("/run/medusa/builders");
+    let dispatcher = Arc::new(medusa_builders::BuilderDispatcher::new(registry.clone()));
+    let socket_server = Arc::new(medusa_builders::SocketServer::new(socket_dir, dispatcher));
+
+    let server_cfg = medusa_builders::ServerConfig {
+        listen,
+        host_key,
+        enrollment_token: token,
+        store: Arc::new(store.clone()),
+        registry,
+        socket_server: Some(socket_server),
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = medusa_builders::BuilderServer::run(server_cfg).await {
+            tracing::error!(error = %e, "builder enrollment server exited");
+        }
+    });
+
+    tracing::info!(%listen, "builder enrollment server listening");
+    Ok(())
+}
+
+fn strip_trailing_newlines(mut v: Vec<u8>) -> Vec<u8> {
+    while matches!(v.last(), Some(b'\n') | Some(b'\r')) {
+        v.pop();
+    }
+    v
 }
 
 fn init_tracing() {

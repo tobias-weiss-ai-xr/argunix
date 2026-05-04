@@ -28,7 +28,10 @@ in
       settings = {
         external_url = "https://medusa.example.com";
         builder_enrollment = {
-          listen = "0.0.0.0:2222";
+          # `[::]:2222` listens on both IPv4 and IPv6 — the test
+          # network gives each node both, and the agent's
+          # `lookup_host` may return either family first.
+          listen = "[::]:2222";
           token_path = "$CREDENTIALS_DIRECTORY/builder-enrollment-token";
         };
         forges.gh = {
@@ -40,7 +43,9 @@ in
       };
     };
 
-    networking.firewall.allowedTCPPorts = [ 2222 ];
+    # Module auto-opens settings.builder_enrollment.listen — no
+    # operator-side firewall config needed.
+    environment.systemPackages = [ pkgs.medusa ];
     virtualisation.memorySize = 1024;
   };
 
@@ -67,15 +72,28 @@ in
     # Builder dials medusa, enrols via TOFU password auth, and lands
     # in the registry as `active`. The agent's first dial races
     # against medusa's startup; the reconnect-backoff loop covers it.
+    # JSON output is pretty-printed (spaces after `:`), so match on
+    # the values rather than literal `"key":"value"` substrings.
     medusa.wait_until_succeeds(
-        "medusactl --socket /run/medusa/control.sock builders --json"
-        " | grep -F '\"name\":\"smoke-builder\"'",
+        "medusactl --socket /run/medusa/control.sock builders list --json"
+        " | grep -q smoke-builder",
         timeout=30,
     )
     medusa.wait_until_succeeds(
-        "medusactl --socket /run/medusa/control.sock builders --json"
-        " | grep -F '\"connected\":true'",
+        "medusactl --socket /run/medusa/control.sock builders list --json"
+        " | tr -d ' \\n' | grep -q '\"connected\":true'",
         timeout=30,
+    )
+
+    # SocketServer side: the per-builder unix socket exists for the
+    # lifetime of the Active connection. medusa-pipe will connect to
+    # this socket on every dispatch. Owned by the medusa user.
+    medusa.wait_until_succeeds(
+        "test -S /run/medusa/builders/smoke-builder.sock",
+        timeout=10,
+    )
+    medusa.succeed(
+        "stat -c '%U' /run/medusa/builders/smoke-builder.sock | grep -q '^medusa$'",
     )
   '';
 }

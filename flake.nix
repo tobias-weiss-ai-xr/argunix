@@ -117,6 +117,7 @@
             forge-status-smoke = pkgs.callPackage ./nix/tests/forge-status-smoke.nix { };
             module-smoke = pkgs.testers.runNixOSTest ./nix/tests/module-smoke.nix;
             builder-module-smoke = pkgs.testers.runNixOSTest ./nix/tests/builder-module-smoke.nix;
+            builder-enrollment = pkgs.testers.runNixOSTest ./nix/tests/builder-enrollment.nix;
           };
         };
     };
