@@ -54,9 +54,12 @@ pub struct AgentConfig {
     /// resets to this value on every successful hello.
     pub reconnect_initial_backoff: Duration,
     /// Command to spawn for each inbound build channel. Defaults to
-    /// `["nix-store", "--serve", "--write"]`. Tests substitute a stub
-    /// like `["cat"]` so the byte-pump can be exercised without a
-    /// real nix store.
+    /// `["nix-daemon", "--stdio"]`. medusa dispatches via
+    /// `--builders ssh-ng://…`, and the `ssh-ng` scheme expects the
+    /// remote end to speak the nix daemon protocol over stdio — not
+    /// the legacy `nix-store --serve` protocol used by `ssh://`.
+    /// Tests substitute a stub like `["cat"]` so the byte-pump can be
+    /// exercised without a real nix store.
     pub nix_serve_command: Arc<Vec<String>>,
     /// Path under which the agent pins medusa's SSH host key (TOFU).
     /// First successful connect writes the presented pubkey here in
@@ -74,7 +77,7 @@ impl AgentConfig {
         Duration::from_secs(2)
     }
     pub fn default_nix_serve_command() -> Arc<Vec<String>> {
-        Arc::new(vec!["nix-store".into(), "--serve".into(), "--write".into()])
+        Arc::new(vec!["nix-daemon".into(), "--stdio".into()])
     }
 }
 
@@ -276,8 +279,9 @@ async fn serve_one_connection(
 }
 
 /// russh client Handler. Dispatches inbound build channels (medusa-
-/// initiated) to a `nix-store --serve --write` subprocess and pumps
-/// bytes between the channel and the subprocess's stdio.
+/// initiated) to a `nix-daemon --stdio` subprocess (or whatever
+/// `nix_serve_command` was set to) and pumps bytes between the
+/// channel and the subprocess's stdio.
 #[derive(Clone)]
 struct AgentClient {
     nix_serve_cmd: Arc<Vec<String>>,
@@ -325,11 +329,12 @@ impl Handler for AgentClient {
     }
 }
 
-/// Spawn the `nix-store --serve --write` subprocess and bidirectionally
-/// pump bytes between the SSH build channel and the subprocess's
-/// stdin/stdout. medusa-side never parses the wire bytes — they're
-/// the standard nix-serve protocol that medusa's own `nix-store
-/// --realise` worker speaks.
+/// Spawn the configured nix subprocess (`nix-daemon --stdio` by
+/// default) and bidirectionally pump bytes between the SSH build
+/// channel and the subprocess's stdin/stdout. medusa-side never
+/// parses the wire bytes — they're the standard nix daemon protocol
+/// that medusa's own `nix-store --realise --builders ssh-ng://…`
+/// worker speaks.
 async fn serve_build_channel(
     mut channel: russh::Channel<ClientMsg>,
     cmd: Arc<Vec<String>>,

@@ -13,10 +13,13 @@
 //!
 //! medusa uses:
 //!
-//! - `URI = ssh-ng://x@local?ssh-command=<medusa-pipe-path>%20<name>` —
-//!   `medusa-pipe` becomes nix's transport, connecting to the
+//! - `URI = ssh-ng://localhost?remote-program=<medusa-pipe-path>%20<name>` —
+//!   authority `localhost` makes nix skip the `ssh` prefix
+//!   (`fakeSSH=true`) and exec the `remote-program` directly;
+//!   `medusa-pipe` then becomes nix's transport, connecting to the
 //!   per-builder Unix socket which the daemon proxies onto the chosen
-//!   agent's SSH session.
+//!   agent's SSH session. nix appends `--stdio` to the program argv,
+//!   which medusa-pipe accepts-and-ignores.
 //! - `SSH-KEY = -` — none, the proxy doesn't need one.
 //! - `SPEED-FACTOR = 1` — uniform until we have a reason to differentiate.
 //! - `MANDATORY-FEATURES` empty.
@@ -57,9 +60,16 @@ fn format_one(
     caps: &medusa_domain::BuilderCapabilities,
     medusa_pipe_path: &str,
 ) -> String {
+    // Authority `localhost` triggers nix's `fakeSSH=true` path, which
+    // skips the `ssh user@host …` prefix and runs `<remote-program>`
+    // directly. `remote-program` is whitespace-tokenised by nix and
+    // gets `--stdio` appended; medusa-pipe accepts-and-ignores any
+    // trailing args, so the resulting argv is
+    //   <medusa-pipe> <name> --stdio
+    // — exactly what we want.
     let url_encoded_pipe = url_encode_token(medusa_pipe_path);
     let uri = format!(
-        "ssh-ng://x@local?ssh-command={pipe}%20{name}",
+        "ssh-ng://localhost?remote-program={pipe}%20{name}",
         pipe = url_encoded_pipe,
         name = name,
     );
@@ -139,7 +149,7 @@ mod tests {
         let got = compose_builders_arg(&reg, "/usr/bin/medusa-pipe").unwrap();
         assert_eq!(
             got,
-            "ssh-ng://x@local?ssh-command=/usr/bin/medusa-pipe%20bobs-mini \
+            "ssh-ng://localhost?remote-program=/usr/bin/medusa-pipe%20bobs-mini \
              aarch64-darwin - 2 1 big-parallel -"
                 .replace("             ", "")
         );

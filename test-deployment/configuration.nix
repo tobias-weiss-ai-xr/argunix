@@ -54,9 +54,14 @@ in
       gh-token = "/var/lib/medusa-credentials/gh-token";
       gl-token = "/var/lib/medusa-credentials/gl-token";
       fj-token = "/var/lib/medusa-credentials/fj-token";
+      builder-enrollment-token = "/var/lib/medusa-credentials/builder-enrollment-token";
     };
     settings = {
       external_url = "https://${fqdn}";
+      builder_enrollment = {
+        listen = "[::]:2222";
+        token_path = "$CREDENTIALS_DIRECTORY/builder-enrollment-token";
+      };
       forges = {
         github = {
           kind = "github";

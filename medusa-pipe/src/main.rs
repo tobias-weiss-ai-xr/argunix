@@ -22,16 +22,26 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
     about = "Forward stdin/stdout to /run/medusa/builders/<name>.sock"
 )]
 struct Cli {
+    /// Override the directory containing per-builder sockets. Defaults
+    /// to /run/medusa/builders. Useful for tests and for non-NixOS hosts
+    /// where the daemon's RuntimeDirectory is elsewhere. Must come
+    /// before the positional `name` since trailing positional args are
+    /// captured into `_ignored` (see below).
+    #[arg(long, default_value = "/run/medusa/builders")]
+    socket_dir: PathBuf,
+
     /// Builder name. Must match a registered (Active) builder on the
     /// medusa daemon side; otherwise the daemon refuses the connection
     /// and this process exits non-zero.
     name: String,
 
-    /// Override the directory containing per-builder sockets. Defaults
-    /// to /run/medusa/builders. Useful for tests and for non-NixOS hosts
-    /// where the daemon's RuntimeDirectory is elsewhere.
-    #[arg(long, default_value = "/run/medusa/builders")]
-    socket_dir: PathBuf,
+    /// nix's `ssh-ng://` store (which is what dispatches to us)
+    /// unconditionally appends `--stdio` to the remote-program argv,
+    /// and may append `--store <uri>` and other flags in the future.
+    /// We accept-and-discard everything past `name` so future nix
+    /// versions don't break dispatch.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    _ignored: Vec<String>,
 }
 
 fn validate_name(name: &str) -> Result<()> {
