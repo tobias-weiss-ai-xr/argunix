@@ -2,6 +2,7 @@ use crate::auth::AuthState;
 use crate::host_key::HostKey;
 use crate::protocol::{ControlMessage, LineFramer};
 use crate::registry::{BuilderRegistry, ConnState, ConnectedBuilder, RusshSession};
+use crate::socket_server::{SocketGuard, SocketServer};
 use medusa_domain::{BuilderCapabilities, BuilderName, BuilderPubkey};
 use medusa_store::{BuilderStore, NewBuilder, SqlxStore};
 use russh::keys::PrivateKey;
@@ -42,6 +43,12 @@ pub struct ServerConfig {
     /// Runtime view of which builders are currently connected. PR #7's
     /// dispatcher reads it; medusactl reads it.
     pub registry: Arc<BuilderRegistry>,
+    /// When set, every successful `hello` opens a per-builder Unix
+    /// socket via [`SocketServer::listen_for`]; the connection's drop
+    /// path tears the socket down. `None` skips the socket lifecycle —
+    /// used in tests and in deployments that haven't enabled the
+    /// dynamic builder pool yet.
+    pub socket_server: Option<Arc<SocketServer>>,
 }
 
 /// Marker name kept for `pub use` consumers; the actual entry point is
@@ -70,6 +77,7 @@ impl BuilderServer {
             store: cfg.store,
             enrollment_token: cfg.enrollment_token,
             registry: cfg.registry,
+            socket_server: cfg.socket_server,
         };
         let listen = cfg.listen;
         server
@@ -88,6 +96,7 @@ struct ServerInner {
     store: Arc<SqlxStore>,
     enrollment_token: Arc<Vec<u8>>,
     registry: Arc<BuilderRegistry>,
+    socket_server: Option<Arc<SocketServer>>,
 }
 
 impl Server for ServerInner {
@@ -98,12 +107,14 @@ impl Server for ServerInner {
             store: self.store.clone(),
             enrollment_token: self.enrollment_token.clone(),
             registry: self.registry.clone(),
+            socket_server: self.socket_server.clone(),
             connection_id,
             state: Arc::new(Mutex::new(AuthState::Unauthenticated)),
             offered_pubkey: Arc::new(Mutex::new(None)),
             framers: Arc::new(Mutex::new(HashMap::new())),
             control_channel: Arc::new(Mutex::new(None)),
             registered_name: Arc::new(std::sync::Mutex::new(None)),
+            socket_guard: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -115,6 +126,7 @@ pub(crate) struct ConnectionHandler {
     store: Arc<SqlxStore>,
     enrollment_token: Arc<Vec<u8>>,
     registry: Arc<BuilderRegistry>,
+    socket_server: Option<Arc<SocketServer>>,
     /// Distinguishes this connection from any other for the same
     /// builder name; used by `BuilderRegistry::remove_if_matches` so
     /// a stale handler dropping after a takeover can't yank the
@@ -136,6 +148,10 @@ pub(crate) struct ConnectionHandler {
     /// Name we registered under, if `hello` succeeded. `Drop` reads
     /// this synchronously (so it can't be a tokio Mutex).
     registered_name: Arc<std::sync::Mutex<Option<BuilderName>>>,
+    /// Per-connection Unix socket in `<socket_dir>/<name>.sock`.
+    /// Created on Hello acceptance when `socket_server` is Some;
+    /// `Drop` removes it synchronously.
+    socket_guard: Arc<std::sync::Mutex<Option<SocketGuard>>>,
 }
 
 impl ConnectionHandler {
@@ -161,6 +177,9 @@ impl Drop for ConnectionHandler {
         if let Some(n) = name {
             self.registry.remove_if_matches(&n, self.connection_id);
         }
+        // Drop the SocketGuard — its own Drop aborts the accept task
+        // and removes the socket file synchronously.
+        let _ = self.socket_guard.lock().unwrap().take();
     }
 }
 
@@ -442,6 +461,28 @@ impl ConnectionHandler {
                         tokio::spawn(async move {
                             kick_displaced(name, prev_session).await;
                         });
+                    }
+                }
+
+                // Bring up the per-builder Unix socket if the daemon
+                // is configured for the dynamic builder pool. nix
+                // will start invoking `medusa-pipe <name>` against
+                // this socket as soon as the dispatcher includes the
+                // builder in its `--builders` arg.
+                if let Some(sock) = self.socket_server.as_ref() {
+                    match sock.listen_for(record.name.clone()).await {
+                        Ok(guard) => {
+                            *self.socket_guard.lock().unwrap() = Some(guard);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                builder = %record.name,
+                                error = %e,
+                                "could not open per-builder socket; \
+                                 dispatch will skip this builder until \
+                                 it reconnects",
+                            );
+                        }
                     }
                 }
                 *self.state.lock().await = AuthState::Established(record);
