@@ -40,38 +40,36 @@ let
 
   fakeNixStore = writeShellScriptBin "nix-store" ''
     set -eu
+    # medusa-build invokes a combined form:
+    #   nix-store --realise [--add-root <root>] [-L] <drv>
+    # We parse all args into (root, drv) and then dispatch on drv.
     case "$1" in
-      --realise)
-        # Two distinct call shapes: bare realise (build), or
-        # `--add-root <root> --indirect --realise <output>` (gc root).
-        #
-        # The dispatcher already consumed `--realise`; check whether the
-        # next args look like a build or a gc-root call.
-        :
-        ;;
-      --add-root)
-        # nix-store --add-root <root> --indirect --realise <output>
-        root="$2"
-        out="$5"
-        mkdir -p "$(dirname "$root")"
-        ln -sfn "$out" "$root"
-        exit 0
-        ;;
+      --realise) shift ;;
       *)
         echo "fake nix-store: unsupported subcommand $*" >&2
         exit 2
         ;;
     esac
-
-    # Build path: parse `[-L] <drv-path>`
-    shift # consume --realise
+    root=""
     drv=""
     while [ $# -gt 0 ]; do
       case "$1" in
         -L) shift ;;
+        --add-root) root="$2"; shift 2 ;;
+        --indirect) shift ;;
         *) drv="$1"; shift ;;
       esac
     done
+
+    install_root() {
+      # On success, register the GC root as `--add-root --indirect` would:
+      # an indirect symlink at $root pointing at the output path.
+      if [ -n "$root" ]; then
+        mkdir -p "$(dirname "$root")"
+        ln -sfn "$1" "$root"
+      fi
+    }
+
     case "$drv" in
       /nix/store/cccc-cached.drv)
         # Should never be invoked — the cache hit short-circuits the build.
@@ -83,6 +81,7 @@ let
         echo "[fake-build] building succeed" >&2
         echo "[fake-build] step 1/2" >&2
         echo "[fake-build] step 2/2" >&2
+        install_root /nix/store/dddd-succeed
         exit 0
         ;;
       /nix/store/eeee-fail.drv)
@@ -123,7 +122,6 @@ let
     esac
   '';
 
-  webhookSecret = writeText "medusa-test-webhook-secret" "wh-secret";
   token = writeText "medusa-test-github-token" "tok-value";
   signingKey = writeText "medusa-test-cache-signing-key" "fake-key";
 
@@ -132,8 +130,10 @@ let
     forges.github-myorg = {
       kind = "github";
       api_url = "https://api.github.com";
-      webhook_secret_path = "${webhookSecret}";
       token_path = "${token}";
+      repos = {
+        "myorg/myrepo" = { };
+      };
     };
     binary_caches = [
       {
@@ -141,12 +141,6 @@ let
         signing_key_path = "${signingKey}";
         push = false;
         substitute = true;
-      }
-    ];
-    repos = [
-      {
-        slug = "myorg/myrepo";
-        forge = "github-myorg";
       }
     ];
   };
@@ -171,65 +165,71 @@ runCommand "medusa-build-smoke"
     meta.description = "M3: medusa build runs eval, cache-skip, build, log capture, gc roots";
   }
   ''
-        set -euo pipefail
+    set -euo pipefail
 
-        workdir=$(mktemp -d)
-        cd "$workdir"
+    workdir=$(mktemp -d)
+    cd "$workdir"
 
-        medusa build \
-          --config ${config} \
-          --src ${fixtureFlake} \
-          --slug myorg/myrepo \
-          --forge github-myorg \
-          --systems x86_64-linux \
-          --gc-root-dir "$workdir/gcroots" \
-          --log-dir "$workdir/logs" \
-          > summary.txt 2> stderr.log
+    medusa build \
+      --config ${config} \
+      --src ${fixtureFlake} \
+      --slug myorg/myrepo \
+      --forge github-myorg \
+      --systems x86_64-linux \
+      --gc-root-dir "$workdir/gcroots" \
+      --log-dir "$workdir/logs" \
+      > summary.txt 2> stderr.log
 
-        echo "--- summary ---"
-        cat summary.txt
-        echo "--- daemon stderr (tail) ---"
-        tail -n 30 stderr.log
+    echo "--- summary ---"
+    cat summary.txt
+    echo "--- daemon stderr (tail) ---"
+    tail -n 30 stderr.log
 
-        grep -q 'cached=1' summary.txt
-        grep -q 'success=1' summary.txt
-        grep -q 'failure=1' summary.txt
+    grep -q 'cached=1' summary.txt
+    grep -q 'success=1' summary.txt
+    grep -q 'failure=1' summary.txt
 
-        # DB shape: one repo, one eval, three jobs with the expected statuses.
-        sqlite3 db.sqlite '.headers on' \
-          'SELECT attr_path, status FROM jobs ORDER BY id;'
+    # DB shape: one repo, one eval, three jobs with the expected statuses.
+    sqlite3 db.sqlite '.headers on' \
+      'SELECT attr_path, status FROM jobs ORDER BY id;'
 
-        statuses=$(sqlite3 db.sqlite \
-          "SELECT status FROM jobs ORDER BY attr_path;")
-        echo "--- statuses ---"
-        echo "$statuses"
-        test "$statuses" = "cached
-    failure
-    success"
+    statuses=$(sqlite3 db.sqlite \
+      "SELECT status FROM jobs ORDER BY attr_path;" | tr '\n' ',')
+    echo "--- statuses ---"
+    echo "$statuses"
+    test "$statuses" = "cached,failure,success,"
 
-        # Cached job has output_path but no log_path. sqlite3 prints an
-        # empty line for NULL columns, which `test -z` treats as empty.
-        cached_log=$(sqlite3 db.sqlite \
-          "SELECT log_path FROM jobs WHERE attr_path LIKE '%.cached';")
-        test -z "$cached_log"
+    sqlite3 db.sqlite '.headers on' \
+      'SELECT attr_path, status, log_path, output_path FROM jobs ORDER BY attr_path;'
 
-        # Successful + failed jobs have log files on disk, both zstd-compressed.
-        succeed_log=$(sqlite3 db.sqlite \
-          "SELECT log_path FROM jobs WHERE attr_path LIKE '%.succeed';")
-        test -f "$succeed_log"
-        zstd -d -c "$succeed_log" | grep -q '\[fake-build\] step 2/2'
+    # Cached job has output_path but no log_path. sqlite3 prints an
+    # empty line for NULL columns, which `test -z` treats as empty.
+    cached_log=$(sqlite3 db.sqlite \
+      "SELECT log_path FROM jobs WHERE attr_path LIKE '%.cached';")
+    echo "cached_log=[$cached_log]"
+    test -z "$cached_log"
 
-        fail_log=$(sqlite3 db.sqlite \
-          "SELECT log_path FROM jobs WHERE attr_path LIKE '%.fail';")
-        test -f "$fail_log"
-        zstd -d -c "$fail_log" | grep -q 'simulated build failure'
+    # Successful + failed jobs have log files on disk, both zstd-compressed.
+    succeed_log=$(sqlite3 db.sqlite \
+      "SELECT log_path FROM jobs WHERE attr_path LIKE '%.succeed';")
+    echo "succeed_log=[$succeed_log]"
+    test -f "$succeed_log"
+    zstd -d -c "$succeed_log" | grep -q '\[fake-build\] step 2/2'
 
-        # GC root only for the successful build.
-        test -L "$workdir/gcroots"/*/*/*
-        succeed_root=$(find "$workdir/gcroots" -type l -lname '/nix/store/dddd-succeed' | head -n1)
-        test -n "$succeed_root"
-        fail_root=$(find "$workdir/gcroots" -type l -lname '/nix/store/eeee-fail' || true)
-        test -z "$fail_root"
+    fail_log=$(sqlite3 db.sqlite \
+      "SELECT log_path FROM jobs WHERE attr_path LIKE '%.fail';")
+    echo "fail_log=[$fail_log]"
+    test -f "$fail_log"
+    zstd -d -c "$fail_log" | grep -q 'simulated build failure'
 
-        touch $out
+    # GC root only for the successful build.
+    echo "--- gcroots tree ---"
+    find "$workdir/gcroots" -ls
+    test -L "$workdir/gcroots"/*/*/*
+    succeed_root=$(find "$workdir/gcroots" -type l -lname '/nix/store/dddd-succeed' | head -n1)
+    test -n "$succeed_root"
+    fail_root=$(find "$workdir/gcroots" -type l -lname '/nix/store/eeee-fail' || true)
+    test -z "$fail_root"
+
+    touch $out
   ''

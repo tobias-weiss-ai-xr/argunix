@@ -2,7 +2,10 @@ use crate::records::{
     BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, NewBuilder, NewEvaluation, NewJob,
     RepoRecord,
 };
-use crate::traits::{BuilderStore, EvalStore, ForgeStatusStore, JobStore, RepoStore, StoreError};
+use crate::traits::{
+    BuilderStore, EvalStore, ForgeStatusStore, InterruptOutcome, JobStore, MAX_INTERRUPTIONS,
+    RepoStore, StoreError,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use medusa_domain::{
@@ -124,6 +127,9 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
     let status: String = row.try_get("status")?;
     let log_path: Option<String> = row.try_get("log_path")?;
     let output_path: Option<String> = row.try_get("output_path")?;
+    let builder_id: Option<i64> = row.try_get("builder_id")?;
+    let interrupt_count: i64 = row.try_get("interrupt_count")?;
+    let failure_reason: Option<String> = row.try_get("failure_reason")?;
     Ok(JobRecord {
         id: JobId::new(id),
         eval_id: EvalId::new(eval_id),
@@ -135,6 +141,9 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
         status: to_job_status(&status)?,
         log_path,
         output_path,
+        builder_id: builder_id.map(BuilderId::new),
+        interrupt_count: interrupt_count.max(0) as u32,
+        failure_reason,
     })
 }
 
@@ -399,7 +408,7 @@ impl JobStore for SqlxStore {
     async fn get(&self, id: JobId) -> Result<Option<JobRecord>, StoreError> {
         let row = sqlx::query(
             "SELECT id, eval_id, attr_path, drv_path, system, started_at, finished_at,
-                    status, log_path, output_path
+                    status, log_path, output_path, builder_id, interrupt_count, failure_reason
              FROM jobs WHERE id = ?1",
         )
         .bind(id.get())
@@ -411,7 +420,7 @@ impl JobStore for SqlxStore {
     async fn list_by_eval(&self, eval_id: EvalId) -> Result<Vec<JobRecord>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, eval_id, attr_path, drv_path, system, started_at, finished_at,
-                    status, log_path, output_path
+                    status, log_path, output_path, builder_id, interrupt_count, failure_reason
              FROM jobs WHERE eval_id = ?1 ORDER BY id",
         )
         .bind(eval_id.get())
@@ -469,6 +478,83 @@ impl JobStore for SqlxStore {
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected())
+    }
+
+    async fn dispatch(
+        &self,
+        id: JobId,
+        builder_id: BuilderId,
+        started_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE jobs
+             SET status = ?1, started_at = ?2, builder_id = ?3
+             WHERE id = ?4",
+        )
+        .bind(JobStatus::Running.as_str())
+        .bind(started_at)
+        .bind(builder_id.get())
+        .bind(id.get())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_interruption(
+        &self,
+        id: JobId,
+        now: DateTime<Utc>,
+    ) -> Result<InterruptOutcome, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // Read current state under the transaction so two concurrent
+        // interruption signals on the same job (e.g. SSH disconnect AND
+        // a worker timeout firing in the same tick) don't both see the
+        // same `interrupt_count` and double-increment it.
+        let row = sqlx::query("SELECT interrupt_count, builder_id FROM jobs WHERE id = ?1")
+            .bind(id.get())
+            .fetch_one(&mut *tx)
+            .await?;
+        let prev_count: i64 = row.try_get("interrupt_count")?;
+        let prior_builder: Option<i64> = row.try_get("builder_id")?;
+        let prior_builder = prior_builder.map(BuilderId::new);
+        let new_count = (prev_count.max(0) as u32).saturating_add(1);
+
+        let outcome = if new_count <= MAX_INTERRUPTIONS {
+            sqlx::query(
+                "UPDATE jobs
+                 SET status = ?1, interrupt_count = ?2
+                 WHERE id = ?3",
+            )
+            .bind(JobStatus::Interrupted.as_str())
+            .bind(new_count as i64)
+            .bind(id.get())
+            .execute(&mut *tx)
+            .await?;
+            InterruptOutcome::ReQueued {
+                new_count,
+                prior_builder,
+            }
+        } else {
+            sqlx::query(
+                "UPDATE jobs
+                 SET status = ?1,
+                     interrupt_count = ?2,
+                     finished_at = ?3,
+                     failure_reason = ?4
+                 WHERE id = ?5",
+            )
+            .bind(JobStatus::Failure.as_str())
+            .bind(new_count as i64)
+            .bind(now)
+            .bind("exceeded interruption retry limit")
+            .bind(id.get())
+            .execute(&mut *tx)
+            .await?;
+            InterruptOutcome::FailedExceeded { prior_builder }
+        };
+
+        tx.commit().await?;
+        Ok(outcome)
     }
 }
 
@@ -1187,6 +1273,183 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    async fn fixture_job(s: &SqlxStore) -> (BuilderId, JobId) {
+        let now = Utc::now();
+        let builder_id = <SqlxStore as BuilderStore>::upsert(
+            s,
+            NewBuilder {
+                name: BuilderName::new("b1").unwrap(),
+                pubkey: pubkey(1),
+                capabilities: caps(&["x86_64-linux"], &[], 1),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+        let repo_id = <SqlxStore as RepoStore>::upsert(s, "github", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        let eval_id = <SqlxStore as EvalStore>::create(
+            s,
+            NewEvaluation {
+                repo_id,
+                trigger: "push".into(),
+                git_ref: "refs/heads/main".into(),
+                sha: Sha::new("0".repeat(40)).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        let job_id = <SqlxStore as JobStore>::create(
+            s,
+            NewJob {
+                eval_id,
+                attr_path: AttrPath::new("packages.x86_64-linux.foo"),
+                drv_path: Some("/nix/store/xxx-foo.drv".into()),
+                system: "x86_64-linux".into(),
+            },
+        )
+        .await
+        .unwrap();
+        (builder_id, job_id)
+    }
+
+    #[tokio::test]
+    async fn dispatch_records_builder_and_started_at() {
+        let s = store().await;
+        let (builder_id, job_id) = fixture_job(&s).await;
+        let started = Utc::now();
+        <SqlxStore as JobStore>::dispatch(&s, job_id, builder_id, started)
+            .await
+            .unwrap();
+        let j = <SqlxStore as JobStore>::get(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(j.status, JobStatus::Running);
+        assert_eq!(j.started_at, Some(started));
+        assert_eq!(j.builder_id, Some(builder_id));
+        assert_eq!(j.interrupt_count, 0);
+        assert!(j.failure_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_interruption_under_cap_requeues_and_remembers_prior_builder() {
+        let s = store().await;
+        let (builder_id, job_id) = fixture_job(&s).await;
+        <SqlxStore as JobStore>::dispatch(&s, job_id, builder_id, Utc::now())
+            .await
+            .unwrap();
+
+        let outcome = <SqlxStore as JobStore>::record_interruption(&s, job_id, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            InterruptOutcome::ReQueued {
+                new_count: 1,
+                prior_builder: Some(builder_id),
+            }
+        );
+        let j = <SqlxStore as JobStore>::get(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(j.status, JobStatus::Interrupted);
+        assert_eq!(j.interrupt_count, 1);
+        // The builder reference is preserved so a re-dispatch can read it
+        // for anti-affinity even after the job goes back through the queue.
+        assert_eq!(j.builder_id, Some(builder_id));
+        // No finished_at because the job isn't terminal.
+        assert!(j.finished_at.is_none());
+        assert!(j.failure_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_interruption_caps_at_three_then_fails_with_reason() {
+        let s = store().await;
+        let (builder_id, job_id) = fixture_job(&s).await;
+        <SqlxStore as JobStore>::dispatch(&s, job_id, builder_id, Utc::now())
+            .await
+            .unwrap();
+
+        // 1, 2, 3 — all within cap, all ReQueued.
+        for expected in 1..=MAX_INTERRUPTIONS {
+            let outcome = <SqlxStore as JobStore>::record_interruption(&s, job_id, Utc::now())
+                .await
+                .unwrap();
+            match outcome {
+                InterruptOutcome::ReQueued { new_count, .. } => {
+                    assert_eq!(new_count, expected)
+                }
+                other => panic!("expected ReQueued at count {expected}, got {other:?}"),
+            }
+        }
+
+        // 4th interruption blows the cap — flips to Failure with reason.
+        let now = Utc::now();
+        let outcome = <SqlxStore as JobStore>::record_interruption(&s, job_id, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            InterruptOutcome::FailedExceeded {
+                prior_builder: Some(builder_id),
+            }
+        );
+        let j = <SqlxStore as JobStore>::get(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(j.status, JobStatus::Failure);
+        assert_eq!(j.interrupt_count, MAX_INTERRUPTIONS + 1);
+        assert_eq!(j.finished_at, Some(now));
+        assert_eq!(
+            j.failure_reason.as_deref(),
+            Some("exceeded interruption retry limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn record_interruption_without_prior_dispatch_returns_none_builder() {
+        // A job interrupted before it ever got dispatched (rare — would
+        // mean the dispatcher kicked off a build channel without writing
+        // the row first). The store still does the right thing.
+        let s = store().await;
+        let (_, job_id) = fixture_job(&s).await;
+        let outcome = <SqlxStore as JobStore>::record_interruption(&s, job_id, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            InterruptOutcome::ReQueued {
+                new_count: 1,
+                prior_builder: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_recovery_does_not_increment_interrupt_count() {
+        // Coordinator-crash recovery (Q79) is medusa's fault, not the
+        // builder's — it must NOT advance the per-job retry cap.
+        let s = store().await;
+        let (builder_id, job_id) = fixture_job(&s).await;
+        <SqlxStore as JobStore>::dispatch(&s, job_id, builder_id, Utc::now())
+            .await
+            .unwrap();
+        let n = <SqlxStore as JobStore>::mark_running_interrupted(&s)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let j = <SqlxStore as JobStore>::get(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(j.status, JobStatus::Interrupted);
+        assert_eq!(j.interrupt_count, 0);
     }
 
     #[tokio::test]

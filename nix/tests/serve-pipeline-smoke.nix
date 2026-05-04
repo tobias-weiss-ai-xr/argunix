@@ -10,13 +10,34 @@
   writers,
   curl,
   openssl,
+  python3,
   sqlite,
   medusa,
 }:
 let
-  webhookSecret = "shh-webhook-secret";
-  webhookSecretFile = writeText "medusa-test-webhook-secret" webhookSecret;
   token = writeText "medusa-test-github-token" "tok-value";
+
+  # Trivial fake forge so ensure_webhook persists the generated secret
+  # to sqlite (we read it back for HMAC signing of the test payload).
+  fakeForge = writeText "fake-forge.py" ''
+    import http.server, json
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+            self.wfile.write(b"[]")
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            self.send_response(201); self.send_header("Content-Type", "application/json"); self.end_headers()
+            # GitHub provider deserialises POST response as `{id, config}`;
+            # `config` is required, so we include it as an empty object.
+            self.wfile.write(json.dumps({"id": 1, "config": {}}).encode())
+        def log_message(self, *_a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    print(f"fake-forge listening on 127.0.0.1:{srv.server_port}", flush=True)
+    srv.serve_forever()
+  '';
 
   fakeFlake = writeText "fake-flake.nix" ''
     {
@@ -70,32 +91,36 @@ let
 
   fakeNixStore = writeShellScriptBin "nix-store" ''
     set -eu
+    # medusa-build uses a combined invocation:
+    #   nix-store --realise [--add-root <root>] [-L] <drv>
+    # Parse all args into (root, drv) and dispatch on drv. Install the
+    # GC root symlink on success when --add-root was given.
     case "$1" in
-      --realise)
-        shift
-        ;;
-      --add-root)
-        root="$2"; out="$5"
-        mkdir -p "$(dirname "$root")"
-        ln -sfn "$out" "$root"
-        exit 0
-        ;;
-      *)
-        exit 2
-        ;;
+      --realise) shift ;;
+      *) exit 2 ;;
     esac
+    root=""
     drv=""
     while [ $# -gt 0 ]; do
       case "$1" in
         -L) shift ;;
+        --add-root) root="$2"; shift 2 ;;
+        --indirect) shift ;;
         *) drv="$1"; shift ;;
       esac
     done
+    install_root() {
+      if [ -n "$root" ]; then
+        mkdir -p "$(dirname "$root")"
+        ln -sfn "$1" "$root"
+      fi
+    }
     case "$drv" in
       /nix/store/aaaa-hello.drv)
         echo "/nix/store/aaaa-hello"
         echo "[fake-build] hello: line 1" >&2
         echo "[fake-build] hello: line 2" >&2
+        install_root /nix/store/aaaa-hello
         exit 0
         ;;
       /nix/store/bbbb-goodbye.drv)
@@ -121,21 +146,17 @@ let
     esac
   '';
 
-  config = writers.writeYAML "medusa.yaml" {
+  configTemplate = writers.writeYAML "medusa.yaml.template" {
     external_url = "https://medusa.example.com";
     listen = "127.0.0.1:0";
     forges.github-myorg = {
       kind = "github";
-      api_url = "https://api.github.com";
-      webhook_secret_path = "${webhookSecretFile}";
+      api_url = "API_URL_PLACEHOLDER";
       token_path = "${token}";
+      repos = {
+        "myorg/myrepo" = { };
+      };
     };
-    repos = [
-      {
-        slug = "myorg/myrepo";
-        forge = "github-myorg";
-      }
-    ];
   };
 
   pushBody = builtins.toJSON {
@@ -155,87 +176,113 @@ runCommand "medusa-serve-pipeline-smoke"
       fakeNix
       curl
       openssl
+      python3
       sqlite
     ];
     meta.description = "M5c1: webhook triggers worker, which clones, evals, builds, and updates DB";
   }
   ''
-        set -euo pipefail
+    set -euo pipefail
 
-        workdir=$(mktemp -d)
-        cd "$workdir"
+    workdir=$(mktemp -d)
+    cd "$workdir"
 
-        medusa serve \
-          --config ${config} \
-          --listen "127.0.0.1:0" \
-          --work-dir "$workdir/work" \
-          --log-dir "$workdir/logs" \
-          --gc-root-dir "$workdir/gcroots" \
-          --systems x86_64-linux \
-          > daemon.stdout 2> daemon.stderr &
-        daemon_pid=$!
-        trap 'kill $daemon_pid 2>/dev/null || true; wait $daemon_pid 2>/dev/null || true' EXIT
+    # Fake forge → ensure_webhook persists the generated secret in sqlite.
+    python3 ${fakeForge} > forge.stdout 2> forge.stderr &
+    forge_pid=$!
+    trap 'kill -KILL $forge_pid 2>/dev/null || true; wait 2>/dev/null || true' EXIT
+    forge_addr=""
+    for _ in $(seq 1 100); do
+      if grep -q '^fake-forge listening on ' forge.stdout 2>/dev/null; then
+        forge_addr=$(awk '/^fake-forge listening on / { print $4; exit }' forge.stdout)
+        break
+      fi
+      sleep 0.05
+    done
+    test -n "$forge_addr"
+    sed "s|API_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > medusa.yaml
 
-        listen=""
-        for _ in $(seq 1 100); do
-          if grep -q '^listening on ' daemon.stdout 2>/dev/null; then
-            listen=$(awk '/^listening on / { print $3; exit }' daemon.stdout)
-            break
-          fi
-          sleep 0.05
-        done
-        test -n "$listen"
-        echo "daemon listening on $listen"
+    medusa serve \
+      --config "$workdir/medusa.yaml" \
+      --listen "127.0.0.1:0" \
+      --work-dir "$workdir/work" \
+      --log-dir "$workdir/logs" \
+      --gc-root-dir "$workdir/gcroots" \
+      --systems x86_64-linux \
+      > daemon.stdout 2> daemon.stderr &
+    daemon_pid=$!
+    # SIGKILL on cleanup — medusa's graceful shutdown can wait for an
+    # idle worker that never closes its receiver, blocking the trap.
+    trap 'kill -KILL $daemon_pid 2>/dev/null || true; kill -KILL $forge_pid 2>/dev/null || true; wait 2>/dev/null || true' EXIT
 
-        body='${pushBody}'
-        sig=$(printf %s "$body" | openssl dgst -sha256 -hmac '${webhookSecret}' | awk '{print "sha256="$2}')
+    listen=""
+    for _ in $(seq 1 100); do
+      if grep -q '^listening on ' daemon.stdout 2>/dev/null; then
+        listen=$(awk '/^listening on / { print $3; exit }' daemon.stdout)
+        break
+      fi
+      sleep 0.05
+    done
+    test -n "$listen"
+    echo "daemon listening on $listen"
 
-        code=$(curl -s -o resp.txt -w '%{http_code}' \
-          -X POST "http://$listen/webhook/github" \
-          -H 'Content-Type: application/json' \
-          -H 'X-GitHub-Event: push' \
-          -H "X-Hub-Signature-256: $sig" \
-          -d "$body")
-        test "$code" = "202"
-        echo "webhook accepted"
+    # Medusa generates the webhook secret per (forge, slug) at boot;
+    # read it from sqlite to sign the test payload.
+    webhookSecretHex=$(sqlite3 db.sqlite \
+      "SELECT hex(webhook_secret) FROM repos WHERE forge='github-myorg' AND slug='myorg/myrepo';")
+    test -n "$webhookSecretHex"
 
-        # Poll the DB until the worker drives the eval to a terminal state.
-        status=""
-        for _ in $(seq 1 200); do
-          status=$(sqlite3 db.sqlite 'SELECT status FROM evaluations WHERE id=1;' 2>/dev/null || echo "")
-          case "$status" in
-            done|evaluation_failed|cancelled) break ;;
-          esac
-          sleep 0.05
-        done
-        echo "evaluation status: $status"
-        test "$status" = "done"
+    body='${pushBody}'
+    sig=$(printf %s "$body" \
+      | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$webhookSecretHex" \
+      | awk '{print "sha256="$2}')
 
-        echo "--- jobs ---"
-        sqlite3 db.sqlite '.headers on' \
-          'SELECT attr_path, status FROM jobs ORDER BY id;'
+    code=$(curl -s -o resp.txt -w '%{http_code}' \
+      -X POST "http://$listen/webhook/github" \
+      -H 'Content-Type: application/json' \
+      -H 'X-GitHub-Event: push' \
+      -H "X-Hub-Signature-256: $sig" \
+      -d "$body")
+    test "$code" = "202"
+    echo "webhook accepted"
 
-        job_statuses=$(sqlite3 db.sqlite \
-          "SELECT status FROM jobs ORDER BY attr_path;")
-        echo "$job_statuses"
-        test "$job_statuses" = "failure
-    success"
+    # Poll the DB until the worker drives the eval to a terminal state.
+    status=""
+    for _ in $(seq 1 200); do
+      status=$(sqlite3 db.sqlite 'SELECT status FROM evaluations WHERE id=1;' 2>/dev/null || echo "")
+      case "$status" in
+        done|evaluation_failed|cancelled) break ;;
+      esac
+      sleep 0.05
+    done
+    echo "evaluation status: $status"
+    test "$status" = "done"
 
-        # The successful build's log must exist and contain the fake build output.
-        succeed_log=$(sqlite3 db.sqlite \
-          "SELECT log_path FROM jobs WHERE attr_path LIKE '%.hello';")
-        test -f "$succeed_log"
+    echo "--- jobs ---"
+    sqlite3 db.sqlite '.headers on' \
+      'SELECT attr_path, status FROM jobs ORDER BY id;'
 
-        # GC root only for the success.
-        succeed_root=$(find "$workdir/gcroots" -type l -lname '/nix/store/aaaa-hello' | head -n1)
-        test -n "$succeed_root"
+    job_statuses=$(sqlite3 db.sqlite \
+      "SELECT status FROM jobs ORDER BY attr_path;" | tr '\n' ',')
+    echo "$job_statuses"
+    test "$job_statuses" = "failure,success,"
 
-        kill -TERM $daemon_pid
-        wait $daemon_pid || true
-        trap - EXIT
+    # The successful build's log must exist and contain the fake build output.
+    succeed_log=$(sqlite3 db.sqlite \
+      "SELECT log_path FROM jobs WHERE attr_path LIKE '%.hello';")
+    test -f "$succeed_log"
 
-        echo "--- daemon stderr (last 30 lines) ---"
-        tail -n 30 daemon.stderr || true
+    # GC root only for the success.
+    succeed_root=$(find "$workdir/gcroots" -type l -lname '/nix/store/aaaa-hello' | head -n1)
+    test -n "$succeed_root"
 
-        touch $out
+    kill -KILL $daemon_pid 2>/dev/null || true
+    kill -KILL $forge_pid 2>/dev/null || true
+    wait 2>/dev/null || true
+    trap - EXIT
+
+    echo "--- daemon stderr (last 30 lines) ---"
+    tail -n 30 daemon.stderr || true
+
+    touch $out
   ''

@@ -127,8 +127,49 @@ pub trait JobStore: Send + Sync {
         output_path: Option<&str>,
     ) -> Result<(), StoreError>;
     /// Used at boot (Q79): mark every still-`running` job as `interrupted`.
-    /// Returns the number of rows updated.
+    /// Returns the number of rows updated. Does NOT touch `interrupt_count`
+    /// — boot-time interruption is medusa's fault, not the builder's, and
+    /// shouldn't push the job toward the per-job retry cap.
     async fn mark_running_interrupted(&self) -> Result<u64, StoreError>;
+
+    /// Record dispatch of `id` to `builder_id` and stamp `started_at`.
+    /// Sets status to `Running` and writes the builder for anti-affinity
+    /// tracking on any later re-queue.
+    async fn dispatch(
+        &self,
+        id: JobId,
+        builder_id: BuilderId,
+        started_at: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+
+    /// Transport-failure recovery (M13 / design/builders.md Q109). Under a
+    /// single transaction: increment `interrupt_count`; if the new count is
+    /// ≤ `MAX_INTERRUPTIONS`, flip status to `Interrupted`; otherwise flip
+    /// to `Failure`, stamp `finished_at`, and write
+    /// `failure_reason="exceeded interruption retry limit"`. Returns the
+    /// outcome and (when re-queueing) the prior builder so the caller can
+    /// build an anti-affinity exclude-set for the next dispatch.
+    async fn record_interruption(
+        &self,
+        id: JobId,
+        now: DateTime<Utc>,
+    ) -> Result<InterruptOutcome, StoreError>;
+}
+
+/// Maximum number of transport interruptions before a job flips from
+/// `Interrupted` to `Failure`. Counter lives on `jobs.interrupt_count`.
+pub const MAX_INTERRUPTIONS: u32 = 3;
+
+/// What `JobStore::record_interruption` decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptOutcome {
+    /// Re-queue with anti-affinity excluding `prior_builder`.
+    ReQueued {
+        new_count: u32,
+        prior_builder: Option<BuilderId>,
+    },
+    /// Cap exceeded; the job is now in `Failure` and should not be re-queued.
+    FailedExceeded { prior_builder: Option<BuilderId> },
 }
 
 #[async_trait]

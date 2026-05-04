@@ -5,7 +5,6 @@
   medusa,
 }:
 let
-  webhookSecret = writeText "medusa-test-webhook-secret" "wh-secret";
   token = writeText "medusa-test-github-token" "tok-value";
 
   config = writers.writeYAML "medusa.yaml" {
@@ -13,15 +12,11 @@ let
     forges.github-myorg = {
       kind = "github";
       api_url = "https://api.github.com";
-      webhook_secret_path = "${webhookSecret}";
       token_path = "${token}";
+      repos = {
+        "myorg/myrepo" = { };
+      };
     };
-    repos = [
-      {
-        slug = "myorg/myrepo";
-        forge = "github-myorg";
-      }
-    ];
   };
 in
 runCommand "medusa-config-smoke"

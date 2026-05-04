@@ -20,8 +20,6 @@
   medusa,
 }:
 let
-  webhookSecret = "shh-webhook-secret";
-  webhookSecretFile = writeText "medusa-test-webhook-secret" webhookSecret;
   token = writeText "medusa-test-github-token" "tok-value";
 
   fakeFlake = writeText "fake-flake.nix" ''
@@ -133,13 +131,29 @@ let
             self.send_response(201)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"id": cid, "state": "pending"}).encode())
+            # POST /hooks is the ensure_webhook install path; the
+            # provider deserializes the response as `HookView { id, config }`,
+            # where `config` is required (not Option). Other POST paths
+            # (commit statuses) don't constrain the response shape.
+            if self.path.endswith("/hooks"):
+                payload = {"id": cid, "config": {}}
+            else:
+                payload = {"id": cid, "state": "pending"}
+            self.wfile.write(json.dumps(payload).encode())
 
         def do_GET(self):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b"{}")
+            # ensure_webhook GETs `/repos/{slug}/hooks` and decodes the
+            # body as `Vec<HookView>`. Returning `{}` here would fail to
+            # deserialize and ensure_webhook would error out before
+            # persisting the secret. Empty array is "no existing hook,
+            # please POST a new one" — what we want.
+            if self.path.endswith("/hooks"):
+                self.wfile.write(b"[]")
+            else:
+                self.wfile.write(b"{}")
 
         def log_message(self, *_a):
             pass
@@ -155,15 +169,11 @@ let
     forges.github-myorg = {
       kind = "github";
       api_url = "API_URL_PLACEHOLDER";
-      webhook_secret_path = "${webhookSecretFile}";
       token_path = "${token}";
+      repos = {
+        "myorg/myrepo" = { };
+      };
     };
-    repos = [
-      {
-        slug = "myorg/myrepo";
-        forge = "github-myorg";
-      }
-    ];
   };
 
   pushBody = builtins.toJSON {
@@ -198,7 +208,28 @@ runCommand "medusa-forge-status-smoke"
     FAKE_FORGE_LOG="$workdir/forge.log" \
       python3 ${fakeForge} > forge.stdout 2> forge.stderr &
     forge_pid=$!
-    trap 'kill $forge_pid 2>/dev/null || true; kill $daemon_pid 2>/dev/null || true; wait 2>/dev/null || true' EXIT
+    # SIGKILL — medusa's graceful TERM can wait for the worker
+    # JoinHandle which only completes when the worker rx closes.
+    # On any failure, dump the daemon stderr so the runCommand log is
+    # actionable instead of just showing the last echo.
+    on_exit() {
+      ec=$?
+      if [ "$ec" -ne 0 ]; then
+        echo "--- daemon.stdout ---"; cat daemon.stdout 2>/dev/null || true
+        echo "--- daemon.stderr ---"; cat daemon.stderr 2>/dev/null || true
+        echo "--- forge.log ---"; cat forge.log 2>/dev/null || true
+        echo "--- forge.stdout ---"; cat forge.stdout 2>/dev/null || true
+        echo "--- forge.stderr ---"; cat forge.stderr 2>/dev/null || true
+        echo "--- db ---"
+        sqlite3 db.sqlite '.headers on' 'SELECT * FROM repos;' 2>/dev/null || true
+        sqlite3 db.sqlite '.headers on' 'SELECT * FROM evaluations;' 2>/dev/null || true
+        sqlite3 db.sqlite '.headers on' 'SELECT * FROM jobs;' 2>/dev/null || true
+      fi
+      kill -KILL $forge_pid 2>/dev/null || true
+      kill -KILL ''${daemon_pid:-0} 2>/dev/null || true
+      wait 2>/dev/null || true
+    }
+    trap on_exit EXIT
 
     forge_addr=""
     for _ in $(seq 1 100); do
@@ -236,9 +267,15 @@ runCommand "medusa-forge-status-smoke"
     test -n "$listen"
     echo "medusa listening on $listen"
 
-    # 4. Send the webhook.
+    # 4. Send the webhook. The secret is medusa-generated at boot;
+    # read it from sqlite to sign with the right key.
+    webhookSecretHex=$(sqlite3 db.sqlite \
+      "SELECT hex(webhook_secret) FROM repos WHERE forge='github-myorg' AND slug='myorg/myrepo';")
+    test -n "$webhookSecretHex"
     body='${pushBody}'
-    sig=$(printf %s "$body" | openssl dgst -sha256 -hmac '${webhookSecret}' | awk '{print "sha256="$2}')
+    sig=$(printf %s "$body" \
+      | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$webhookSecretHex" \
+      | awk '{print "sha256="$2}')
 
     code=$(curl -s -o /dev/null -w '%{http_code}' \
       -X POST "http://$listen/webhook/github" \
@@ -284,11 +321,10 @@ runCommand "medusa-forge-status-smoke"
     echo "$final" | grep -F '"state":"failure"'
     echo "$final" | grep -F '1 ok, 0 cached, 1 failed'
 
-    # Shutdown.
-    kill -TERM $daemon_pid
-    wait $daemon_pid || true
-    kill $forge_pid || true
-    wait $forge_pid || true
+    # Shutdown — see trap above for why SIGKILL.
+    kill -KILL $daemon_pid 2>/dev/null || true
+    kill -KILL $forge_pid 2>/dev/null || true
+    wait 2>/dev/null || true
     trap - EXIT
 
     touch $out

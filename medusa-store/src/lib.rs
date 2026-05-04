@@ -17,7 +17,10 @@ pub use records::{
     RepoRecord,
 };
 pub use sqlite::SqlxStore;
-pub use traits::{BuilderStore, EvalStore, ForgeStatusStore, JobStore, RepoStore, StoreError};
+pub use traits::{
+    BuilderStore, EvalStore, ForgeStatusStore, InterruptOutcome, JobStore, MAX_INTERRUPTIONS,
+    RepoStore, StoreError,
+};
 
 use sqlx::sqlite::SqlitePool;
 use std::path::Path;

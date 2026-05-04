@@ -9,29 +9,51 @@
   writers,
   curl,
   openssl,
+  python3,
   sqlite,
   medusa,
 }:
 let
-  webhookSecret = "shh-webhook-secret";
-  webhookSecretFile = writeText "medusa-test-webhook-secret" webhookSecret;
   token = writeText "medusa-test-github-token" "tok-value";
 
-  config = writers.writeYAML "medusa.yaml" {
+  # Tiny in-process forge that auto-install can reach. Returns an empty hook
+  # list on GET (so medusa goes straight to POST) and a fake hook id on POST.
+  # Without it, ensure_webhook fails and `repos.webhook_secret` never gets
+  # persisted — the test could not sign the payload.
+  fakeForge = writeText "fake-forge.py" ''
+    import http.server, json
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+            self.wfile.write(b"[]")
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            self.send_response(201); self.send_header("Content-Type", "application/json"); self.end_headers()
+            # GitHub provider deserialises the response as
+            # `HookView { id, config }`, where `config` is a struct (not
+            # Option). Returning just `{"id": 1}` makes serde reject the
+            # body and ensure_webhook returns an error — which means the
+            # secret never gets persisted to sqlite. Include `config: {}`.
+            self.wfile.write(json.dumps({"id": 1, "config": {}}).encode())
+        def log_message(self, *_a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    print(f"fake-forge listening on 127.0.0.1:{srv.server_port}", flush=True)
+    srv.serve_forever()
+  '';
+
+  configTemplate = writers.writeYAML "medusa.yaml.template" {
     external_url = "https://medusa.example.com";
     listen = "127.0.0.1:0"; # bind to an ephemeral port; we override at CLI
     forges.github-myorg = {
       kind = "github";
-      api_url = "https://api.github.com";
-      webhook_secret_path = "${webhookSecretFile}";
+      api_url = "API_URL_PLACEHOLDER";
       token_path = "${token}";
+      repos = {
+        "myorg/myrepo" = { };
+      };
     };
-    repos = [
-      {
-        slug = "myorg/myrepo";
-        forge = "github-myorg";
-      }
-    ];
   };
 
   # Realistic-ish push payload. We pin the body so the HMAC is reproducible.
@@ -54,6 +76,7 @@ runCommand "medusa-webhook-smoke"
       medusa
       curl
       openssl
+      python3
       sqlite
     ];
     meta.description = "M5b: medusa serve accepts validated webhooks and queues evaluations";
@@ -64,10 +87,30 @@ runCommand "medusa-webhook-smoke"
     workdir=$(mktemp -d)
     cd "$workdir"
 
-    medusa serve --config ${config} --listen "127.0.0.1:0" \
+    # Start the fake forge so ensure_webhook can install + persist the
+    # generated secret in sqlite (we need the secret to sign payloads).
+    python3 ${fakeForge} > forge.stdout 2> forge.stderr &
+    forge_pid=$!
+    trap 'kill -KILL $forge_pid 2>/dev/null || true; wait 2>/dev/null || true' EXIT
+
+    forge_addr=""
+    for _ in $(seq 1 100); do
+      if grep -q '^fake-forge listening on ' forge.stdout 2>/dev/null; then
+        forge_addr=$(awk '/^fake-forge listening on / { print $4; exit }' forge.stdout)
+        break
+      fi
+      sleep 0.05
+    done
+    test -n "$forge_addr"
+    sed "s|API_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > medusa.yaml
+
+    medusa serve --config "$workdir/medusa.yaml" --listen "127.0.0.1:0" \
       > daemon.stdout 2> daemon.stderr &
     daemon_pid=$!
-    trap 'kill $daemon_pid 2>/dev/null || true; wait $daemon_pid 2>/dev/null || true' EXIT
+    # Use SIGKILL on cleanup. medusa's graceful shutdown can wait for
+    # an idle worker to drain (worker rx never closes by itself), which
+    # would block the trap's `wait` indefinitely.
+    trap 'kill -KILL $daemon_pid 2>/dev/null || true; kill -KILL $forge_pid 2>/dev/null || true; wait 2>/dev/null || true' EXIT
 
     # Wait for the daemon to print its bound address.
     listen=""
@@ -90,10 +133,16 @@ runCommand "medusa-webhook-smoke"
     done
     curl -fs "http://$listen/healthz" > /dev/null
 
+    # Medusa generates and stores the webhook secret per (forge, slug)
+    # at boot. Read it out of sqlite so we can sign payloads with it.
+    webhookSecret=$(sqlite3 db.sqlite \
+      "SELECT hex(webhook_secret) FROM repos WHERE forge='github-myorg' AND slug='myorg/myrepo';")
+    test -n "$webhookSecret"
+    echo "webhook secret: $webhookSecret (hex)"
     sign() {
       local body="$1"
       printf %s "$body" \
-        | openssl dgst -sha256 -hmac '${webhookSecret}' \
+        | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$webhookSecret" \
         | awk '{print "sha256="$2}'
     }
 
@@ -163,9 +212,11 @@ runCommand "medusa-webhook-smoke"
     git_ref=$(sqlite3 db.sqlite 'SELECT git_ref FROM evaluations LIMIT 1;')
     test "$git_ref" = "refs/heads/main"
 
-    # Graceful shutdown
-    kill -TERM $daemon_pid
-    wait $daemon_pid || true
+    # Hard shutdown — daemon worker rx never closes by itself, so a
+    # graceful TERM can wait forever for the worker to drain.
+    kill -KILL $daemon_pid 2>/dev/null || true
+    kill -KILL $forge_pid 2>/dev/null || true
+    wait 2>/dev/null || true
     trap - EXIT
 
     echo "--- daemon stderr (last 20 lines) ---"

@@ -53,6 +53,17 @@ pub struct JobRecord {
     pub status: JobStatus,
     pub log_path: Option<String>,
     pub output_path: Option<String>,
+    /// The most recent builder this job was dispatched to. None means the
+    /// job has never been dispatched (still queued) or pre-dates M13. The
+    /// dispatcher reads this on re-queue to set anti-affinity.
+    pub builder_id: Option<BuilderId>,
+    /// How many times this job has been interrupted by transport drop /
+    /// graceful builder shutdown. Capped by `MAX_INTERRUPTIONS`; on
+    /// exceedance the job flips to `Failure` with `failure_reason` set.
+    pub interrupt_count: u32,
+    /// Set when a job fails for a non-build-process reason (currently only
+    /// "exceeded interruption retry limit"). NULL for build-level failures.
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
