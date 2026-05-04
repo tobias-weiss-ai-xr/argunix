@@ -11,8 +11,8 @@ mod validate;
 
 pub use path::{ResolveError, resolve_path};
 pub use schema::{
-    BinaryCache, CloneConfig, CloneMethod, Config, EvalDefaults, EvalOverrides, ForgeAuth,
-    ForgeAuthShapeError, ForgeConfig, Repo, Retention, Schedule,
+    BinaryCache, BuilderEnrollment, CloneConfig, CloneMethod, Config, EvalDefaults, EvalOverrides,
+    ForgeAuth, ForgeAuthShapeError, ForgeConfig, Repo, Retention, Schedule,
 };
 pub use secret::SecretFile;
 pub use validate::ValidationError;

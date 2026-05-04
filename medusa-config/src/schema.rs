@@ -23,6 +23,41 @@ pub struct Config {
     pub forges: BTreeMap<String, ForgeConfig>,
     pub binary_caches: Vec<BinaryCache>,
     pub repos: Vec<Repo>,
+    /// Dynamic builder pool listener (M13). Absent ⇒ medusa falls back to
+    /// the host's existing `nix.buildMachines`. Present ⇒ medusa runs an
+    /// embedded SSH server that accepts incoming builder enrollments and
+    /// reverse-tunnel registrations on `listen`.
+    pub builder_enrollment: Option<BuilderEnrollment>,
+}
+
+/// Top-level YAML block that turns on the dynamic builder pool.
+///
+/// One block, set once, never edited per-builder — see `design/builders.md`.
+/// Operators rotate the token by replacing the file on disk and triggering
+/// `medusactl reload`; existing builders keep their pubkey-based connections,
+/// only fresh enrollments need the new token.
+#[derive(Debug, Clone)]
+pub struct BuilderEnrollment {
+    /// File containing the shared enrollment token. Builders dialing in for
+    /// the first time present this token via SSH password auth; subsequent
+    /// connects use pubkey auth against the `builders` sqlite row written
+    /// at first contact (TOFU).
+    pub token_path: SecretFile,
+    /// `host:port` for the embedded russh server. Default `0.0.0.0:2222`.
+    /// Distinct from the webhook `listen` port — the protocol is SSH.
+    pub listen: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireBuilderEnrollment {
+    token_path: SecretFile,
+    #[serde(default = "default_builder_listen")]
+    listen: String,
+}
+
+fn default_builder_listen() -> String {
+    "0.0.0.0:2222".to_string()
 }
 
 fn default_listen() -> String {
@@ -278,6 +313,8 @@ struct WireConfig {
     forges: BTreeMap<String, WireForgeConfig>,
     #[serde(default)]
     binary_caches: Vec<BinaryCache>,
+    #[serde(default)]
+    builder_enrollment: Option<WireBuilderEnrollment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,6 +394,10 @@ impl TryFrom<WireConfig> for Config {
             forges,
             binary_caches: wire.binary_caches,
             repos,
+            builder_enrollment: wire.builder_enrollment.map(|w| BuilderEnrollment {
+                token_path: w.token_path,
+                listen: w.listen,
+            }),
         })
     }
 }
