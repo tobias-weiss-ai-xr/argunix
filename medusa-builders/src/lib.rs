@@ -14,6 +14,7 @@ mod protocol;
 mod registry;
 mod server;
 mod socket_server;
+mod systems;
 
 pub use auth::AuthState;
 pub use dispatcher::{BuilderDispatcher, DispatchError, DispatchedBuild};
@@ -25,3 +26,4 @@ pub use registry::{
 };
 pub use server::{BuilderServer, ServerConfig, ServerError};
 pub use socket_server::{SocketError, SocketGuard, SocketServer};
+pub use systems::SystemsResolver;
