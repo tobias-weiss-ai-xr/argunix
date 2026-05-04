@@ -73,6 +73,7 @@ in
             "tfc/pprintpp".watched_branches = [ "master" ];
             "applicative-systems/mkdocs-flake" = { };
             "applicative-systems/nixos-test-driver-manual" = { };
+            "applicative-systems/nixos-appliance-ota-update" = { };
           };
         };
         gitlab = {
