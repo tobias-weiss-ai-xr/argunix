@@ -1926,6 +1926,7 @@ name = "medusa-build"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "medusa-builders",
  "medusa-domain",
  "serde",
  "tempfile",
