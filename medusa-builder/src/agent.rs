@@ -13,13 +13,15 @@ use russh::ChannelMsg;
 use russh::client::{self, Handle, Handler, Msg as ClientMsg, Session as ClientSession};
 use russh::keys::ssh_key::{self, PrivateKey};
 use russh::keys::{Algorithm, PrivateKeyWithHashAlg};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::oneshot;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -146,6 +148,7 @@ async fn serve_one_connection(
     let handler = AgentClient {
         nix_serve_cmd: cfg.nix_serve_command.clone(),
         medusa_host_key_path: cfg.medusa_host_key_path.clone(),
+        close_signals: Arc::new(StdMutex::new(HashMap::new())),
     };
     let mut session = client::connect(client_cfg, cfg.medusa, handler)
         .await
@@ -282,10 +285,19 @@ async fn serve_one_connection(
 /// initiated) to a `nix-daemon --stdio` subprocess (or whatever
 /// `nix_serve_command` was set to) and pumps bytes between the
 /// channel and the subprocess's stdio.
+///
+/// `close_signals` works around a russh quirk: on a *server-pushed*
+/// session channel (where medusa initiates the channel into the
+/// agent), `CHANNEL_EOF` and `CHANNEL_CLOSE` are delivered only via
+/// the `Handler::channel_eof` / `Handler::channel_close` callbacks,
+/// not through the `Channel`'s mpsc that `Channel::wait()` reads.
+/// Without forwarding them into the pump, the build-channel handler
+/// would spin forever and `nix-daemon --stdio` would leak.
 #[derive(Clone)]
 struct AgentClient {
     nix_serve_cmd: Arc<Vec<String>>,
     medusa_host_key_path: Option<PathBuf>,
+    close_signals: Arc<StdMutex<HashMap<russh::ChannelId, oneshot::Sender<()>>>>,
 }
 
 impl Handler for AgentClient {
@@ -319,13 +331,53 @@ impl Handler for AgentClient {
         channel: russh::Channel<ClientMsg>,
         _session: &mut ClientSession,
     ) -> Result<(), Self::Error> {
+        let (close_tx, close_rx) = oneshot::channel::<()>();
+        self.close_signals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(channel.id(), close_tx);
         let cmd = self.nix_serve_cmd.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_build_channel(channel, cmd).await {
+            if let Err(e) = serve_build_channel(channel, cmd, close_rx).await {
                 tracing::warn!(error = %e, "build-channel proxy ended with error");
             }
         });
         Ok(())
+    }
+
+    // CHANNEL_EOF / CHANNEL_CLOSE arrive here, not through the
+    // Channel's mpsc; forward the *first* of either to the pump
+    // (whichever fires first; the second is a no-op because the
+    // map entry was already consumed).
+    async fn channel_eof(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut ClientSession,
+    ) -> Result<(), Self::Error> {
+        signal_close(&self.close_signals, channel);
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut ClientSession,
+    ) -> Result<(), Self::Error> {
+        signal_close(&self.close_signals, channel);
+        Ok(())
+    }
+}
+
+fn signal_close(
+    signals: &Arc<StdMutex<HashMap<russh::ChannelId, oneshot::Sender<()>>>>,
+    channel: russh::ChannelId,
+) {
+    let tx = signals
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&channel);
+    if let Some(tx) = tx {
+        let _ = tx.send(());
     }
 }
 
@@ -338,6 +390,7 @@ impl Handler for AgentClient {
 async fn serve_build_channel(
     mut channel: russh::Channel<ClientMsg>,
     cmd: Arc<Vec<String>>,
+    mut close_rx: oneshot::Receiver<()>,
 ) -> Result<(), std::io::Error> {
     if cmd.is_empty() {
         return Err(std::io::Error::other("nix_serve_command is empty"));
@@ -358,45 +411,71 @@ async fn serve_build_channel(
         cmd = ?cmd.as_slice(),
         "build channel opened; spawned nix subprocess",
     );
-    let mut stdin = child.stdin.take().expect("stdin piped");
+    // `stdin` is wrapped in `Option` so we can `.take()` it on close
+    // — `tokio::process::ChildStdin::shutdown()` is a no-op for pipes
+    // (it doesn't close the underlying FD); only dropping the
+    // ChildStdin closes the pipe and propagates EOF to the
+    // subprocess's read.
+    let mut stdin = Some(child.stdin.take().expect("stdin piped"));
     let mut stdout = child.stdout.take().expect("stdout piped");
 
     let mut buf = vec![0u8; 32 * 1024];
-    let mut stdin_open = true;
-    loop {
+    let mut close_received = false;
+    let exit_reason = loop {
         tokio::select! {
-            // SSH channel → subprocess stdin
+            // SSH channel → subprocess stdin (only Data flows through
+            // wait(); Eof/Close arrive via the Handler callbacks and
+            // wake `close_rx`).
             ev = channel.wait() => match ev {
                 Some(ChannelMsg::Data { data }) => {
-                    if !stdin_open {
+                    tracing::trace!(channel = channel_id, n = data.len(), "ssh→stdin");
+                    let Some(s) = stdin.as_mut() else {
+                        continue;
+                    };
+                    if s.write_all(&data).await.is_err() {
+                        stdin = None;
                         continue;
                     }
-                    if stdin.write_all(&data).await.is_err() {
-                        stdin_open = false;
-                        continue;
-                    }
-                    if stdin.flush().await.is_err() {
-                        stdin_open = false;
+                    if s.flush().await.is_err() {
+                        stdin = None;
                     }
                 }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    let _ = stdin.shutdown().await;
-                    break;
+                None => {
+                    drop(stdin.take()); // close write side → EOF to subprocess
+                    break "channel-end-of-stream";
                 }
-                Some(_) => continue,
+                Some(other) => {
+                    tracing::debug!(
+                        channel = channel_id,
+                        msg = ?std::mem::discriminant(&other),
+                        "build channel: non-data ChannelMsg ignored",
+                    );
+                    continue;
+                }
             },
             // subprocess stdout → SSH channel
             r = stdout.read(&mut buf) => match r {
-                Ok(0) => break,
+                Ok(0) => break "subprocess-stdout-eof",
                 Ok(n) => {
+                    tracing::trace!(channel = channel_id, n, "stdout→ssh");
                     if channel.data(&buf[..n]).await.is_err() {
-                        break;
+                        break "ssh-write-failed";
                     }
                 }
-                Err(_) => break,
+                Err(_) => break "subprocess-stdout-error",
+            },
+            // Handler callback fired: medusa sent CHANNEL_EOF and/or
+            // CHANNEL_CLOSE. Drop stdin so the pipe FD closes and
+            // `nix-daemon --stdio` sees EOF and exits cleanly; its
+            // stdout then EOFs through the existing branch above.
+            // The guard prevents this branch from firing twice.
+            _ = &mut close_rx, if !close_received => {
+                close_received = true;
+                tracing::debug!(channel = channel_id, "handler-close received; closing stdin pipe");
+                stdin = None;
             }
         }
-    }
+    };
     // After break: drain any remaining stdout, then half-close + close.
     while let Ok(Ok(n)) =
         tokio::time::timeout(Duration::from_millis(500), stdout.read(&mut buf)).await
@@ -416,6 +495,7 @@ async fn serve_build_channel(
         pid = pid,
         elapsed_ms = started_at.elapsed().as_millis() as u64,
         exit = ?exit.as_ref().ok().and_then(|s| s.code()),
+        reason = exit_reason,
         "build channel closed; nix subprocess exited",
     );
     Ok(())

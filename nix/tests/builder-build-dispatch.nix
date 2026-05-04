@@ -158,5 +158,15 @@ in
     # builder script, not just substituted from a cache.
     contents = medusa.succeed(f"cat {out_path}").strip()
     assert contents == "built-by-builder", f"unexpected output: {contents!r}"
+
+    # Regression guard: every opened build channel on the agent side
+    # must reach the close log too. Without forwarding russh's
+    # Handler::channel_close into the pump, channels stayed open
+    # forever and `nix-daemon --stdio` leaked.
+    builder.wait_until_succeeds(
+        "journalctl -u medusa-builder.service --no-pager"
+        " | grep -q 'build channel closed; nix subprocess exited'",
+        timeout=10,
+    )
   '';
 }

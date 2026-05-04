@@ -158,6 +158,13 @@ async fn serve_connection(
         .ok_or_else(|| DispatchError::NoSession {
             name: name.as_str().to_string(),
         })?;
+    let channel_id: u32 = channel.id().into();
+    let started_at = std::time::Instant::now();
+    tracing::info!(
+        builder = %name,
+        channel = channel_id,
+        "build proxy started",
+    );
 
     let (mut sock_read, mut sock_write) = stream.into_split();
 
@@ -166,40 +173,59 @@ async fn serve_connection(
     // way a TCP stream can — `wait()` consumes events from a
     // shared receiver — so we keep both directions in one place.
     let mut sock_buf = [0u8; 32 * 1024];
-    loop {
+    let exit_reason = loop {
         tokio::select! {
             // Unix → SSH channel
             r = sock_read.read(&mut sock_buf) => match r {
                 Ok(0) => {
                     let _ = channel.eof().await;
-                    break;
+                    break "unix-eof";
                 }
                 Ok(n) => {
+                    tracing::trace!(builder = %name, channel = channel_id, n, "unix→ssh");
                     if channel.data(&sock_buf[..n]).await.is_err() {
-                        break;
+                        break "ssh-write-failed";
                     }
                 }
                 Err(e) => {
                     tracing::debug!(builder = %name, error = %e, "unix read ended");
-                    break;
+                    break "unix-read-error";
                 }
             },
             // SSH channel → Unix
             ev = channel.wait() => match ev {
                 Some(ChannelMsg::Data { data }) => {
+                    tracing::trace!(builder = %name, channel = channel_id, n = data.len(), "ssh→unix");
                     if sock_write.write_all(&data).await.is_err() {
-                        break;
+                        break "unix-write-failed";
                     }
                     if sock_write.flush().await.is_err() {
-                        break;
+                        break "unix-flush-failed";
                     }
                 }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                Some(_) => continue,
+                Some(ChannelMsg::Eof) => break "channel-eof",
+                Some(ChannelMsg::Close) => break "channel-close",
+                None => break "channel-end-of-stream",
+                Some(other) => {
+                    tracing::debug!(
+                        builder = %name,
+                        channel = channel_id,
+                        msg = ?std::mem::discriminant(&other),
+                        "build proxy: non-data ChannelMsg ignored",
+                    );
+                    continue;
+                }
             }
         }
-    }
+    };
     let _ = channel.close().await;
     let _ = sock_write.shutdown().await;
+    tracing::info!(
+        builder = %name,
+        channel = channel_id,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        reason = exit_reason,
+        "build proxy finished",
+    );
     Ok(())
 }
