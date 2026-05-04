@@ -1,0 +1,189 @@
+//! Self-discovery of nix-side capabilities.
+//!
+//! Per `design/builders.md`: capabilities live exclusively on the
+//! builder side and are reported to medusa on every `hello`. The
+//! daemon caches the latest snapshot in `builders.systems` /
+//! `builders.features` / `builders.max_jobs` / `builders.nix_version`
+//! but treats the live channel as truth.
+//!
+//! Source of truth here is `nix show-config --json`, which the test
+//! suite stubs via a simple JSON literal.
+
+use medusa_domain::BuilderCapabilities;
+use serde::Deserialize;
+use std::process::Stdio;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CapabilitiesError {
+    #[error("spawning `nix show-config --json`: {0}")]
+    Spawn(#[source] std::io::Error),
+    #[error("`nix show-config --json` exited with status {status:?}\nstderr:\n{stderr}")]
+    NonZero { status: i32, stderr: String },
+    #[error("waiting for `nix show-config --json`: {0}")]
+    Wait(#[source] std::io::Error),
+    #[error("parsing nix show-config JSON: {0}")]
+    Parse(#[from] serde_json::Error),
+}
+
+/// Wrapper around `BuilderCapabilities` that also remembers which
+/// nix binary produced the figures. We expose only the wrapped type
+/// to callers; the binary path is for tests.
+#[derive(Debug, Clone)]
+pub struct Capabilities {
+    pub inner: BuilderCapabilities,
+}
+
+/// Run `nix show-config --json` and translate the relevant fields
+/// into `BuilderCapabilities`. The agent calls this once per
+/// `hello`, so a config change on the builder is picked up at the
+/// next reconnect / heartbeat cycle.
+pub async fn discover_capabilities(nix_bin: &str) -> Result<Capabilities, CapabilitiesError> {
+    let output = tokio::process::Command::new(nix_bin)
+        .arg("show-config")
+        .arg("--json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(CapabilitiesError::Spawn)?;
+    if !output.status.success() {
+        return Err(CapabilitiesError::NonZero {
+            status: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
+    }
+    parse_show_config(&output.stdout)
+}
+
+/// Public-for-tests: parses the JSON shape `nix show-config --json`
+/// produces. Tolerant of extra fields and missing optional ones.
+pub fn parse_show_config(json: &[u8]) -> Result<Capabilities, CapabilitiesError> {
+    // `nix show-config --json` shape (abridged):
+    // {
+    //   "system":          {"value": "x86_64-linux", ...},
+    //   "extra-platforms": {"value": ["i686-linux"], ...},
+    //   "system-features": {"value": ["kvm", "big-parallel", ...], ...},
+    //   "max-jobs":        {"value": 4, ...},
+    //   ...
+    // }
+    #[derive(Deserialize)]
+    struct StringField {
+        value: String,
+    }
+    #[derive(Deserialize)]
+    struct VecField {
+        #[serde(default)]
+        value: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct IntField {
+        value: serde_json::Value,
+    }
+    #[derive(Deserialize)]
+    struct ShowConfig {
+        system: StringField,
+        #[serde(rename = "extra-platforms", default)]
+        extra_platforms: Option<VecField>,
+        #[serde(rename = "system-features", default)]
+        system_features: Option<VecField>,
+        #[serde(rename = "max-jobs", default)]
+        max_jobs: Option<IntField>,
+        #[serde(rename = "nix-version", default)]
+        nix_version: Option<StringField>,
+    }
+    let cfg: ShowConfig = serde_json::from_slice(json)?;
+    let mut systems = vec![cfg.system.value];
+    if let Some(extra) = cfg.extra_platforms {
+        systems.extend(extra.value);
+    }
+    let features = cfg.system_features.map(|v| v.value).unwrap_or_default();
+    let max_jobs = cfg
+        .max_jobs
+        .and_then(|f| match f.value {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.parse::<u64>().ok(),
+            _ => None,
+        })
+        .unwrap_or(1)
+        .min(u32::MAX as u64) as u32;
+    let nix_version = cfg
+        .nix_version
+        .map(|f| f.value)
+        .unwrap_or_else(|| "unknown".into());
+    Ok(Capabilities {
+        inner: BuilderCapabilities {
+            systems,
+            features,
+            max_jobs: max_jobs.max(1),
+            nix_version,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_minimal_show_config() {
+        let json = br#"{
+            "system": {"value": "x86_64-linux"}
+        }"#;
+        let caps = parse_show_config(json).unwrap();
+        assert_eq!(caps.inner.systems, vec!["x86_64-linux".to_string()]);
+        assert!(caps.inner.features.is_empty());
+        assert_eq!(caps.inner.max_jobs, 1);
+        assert_eq!(caps.inner.nix_version, "unknown");
+    }
+
+    #[test]
+    fn parses_full_show_config() {
+        let json = br#"{
+            "system": {"value": "x86_64-linux"},
+            "extra-platforms": {"value": ["i686-linux"]},
+            "system-features": {"value": ["kvm", "big-parallel"]},
+            "max-jobs": {"value": 4},
+            "nix-version": {"value": "2.18.1"}
+        }"#;
+        let caps = parse_show_config(json).unwrap();
+        assert_eq!(caps.inner.systems, vec!["x86_64-linux", "i686-linux"]);
+        assert_eq!(caps.inner.features, vec!["kvm", "big-parallel"]);
+        assert_eq!(caps.inner.max_jobs, 4);
+        assert_eq!(caps.inner.nix_version, "2.18.1");
+    }
+
+    #[test]
+    fn max_jobs_zero_clamps_to_one() {
+        let json = br#"{
+            "system": {"value": "x86_64-linux"},
+            "max-jobs": {"value": 0}
+        }"#;
+        let caps = parse_show_config(json).unwrap();
+        // BuilderCapabilities.max_jobs is u32; an agent reporting 0
+        // would mean "do nothing" — meaningless. Clamp to 1 so
+        // medusa always sees a usable builder.
+        assert_eq!(caps.inner.max_jobs, 1);
+    }
+
+    #[test]
+    fn max_jobs_string_form_accepted() {
+        // Some nix builds output max-jobs as a string. Be lenient.
+        let json = br#"{
+            "system": {"value": "x86_64-linux"},
+            "max-jobs": {"value": "8"}
+        }"#;
+        let caps = parse_show_config(json).unwrap();
+        assert_eq!(caps.inner.max_jobs, 8);
+    }
+
+    #[test]
+    fn unknown_top_level_keys_are_ignored() {
+        let json = br#"{
+            "system": {"value": "x86_64-linux"},
+            "unknown-knob": {"value": "ignored"}
+        }"#;
+        let caps = parse_show_config(json).unwrap();
+        assert_eq!(caps.inner.systems, vec!["x86_64-linux".to_string()]);
+    }
+}

@@ -1937,6 +1937,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "medusa-builder"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "clap",
+ "ed25519-dalek 2.2.0",
+ "medusa-builders",
+ "medusa-domain",
+ "medusa-store",
+ "rand 0.10.1",
+ "rand 0.8.6",
+ "russh",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "medusa-builders"
 version = "0.0.1"
 dependencies = [
