@@ -1,12 +1,13 @@
 use crate::auth::AuthState;
 use crate::host_key::HostKey;
 use crate::protocol::{ControlMessage, LineFramer};
-use medusa_domain::{BuilderCapabilities, BuilderPubkey};
+use crate::registry::{BuilderRegistry, ConnState, ConnectedBuilder, RusshSession};
+use medusa_domain::{BuilderCapabilities, BuilderName, BuilderPubkey};
 use medusa_store::{BuilderStore, NewBuilder, SqlxStore};
 use russh::keys::PrivateKey;
 use russh::keys::ssh_key;
-use russh::server::{Auth, Handler, Msg, Server, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet};
+use russh::server::{Auth, Handle as SessionHandle, Handler, Msg, Server, Session};
+use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,6 +39,9 @@ pub struct ServerConfig {
     /// credentials file on a hot-reload without re-deriving anything.
     pub enrollment_token: Arc<Vec<u8>>,
     pub store: Arc<SqlxStore>,
+    /// Runtime view of which builders are currently connected. PR #7's
+    /// dispatcher reads it; medusactl reads it.
+    pub registry: Arc<BuilderRegistry>,
 }
 
 /// Marker name kept for `pub use` consumers; the actual entry point is
@@ -65,6 +69,7 @@ impl BuilderServer {
         let mut server = ServerInner {
             store: cfg.store,
             enrollment_token: cfg.enrollment_token,
+            registry: cfg.registry,
         };
         let listen = cfg.listen;
         server
@@ -82,28 +87,39 @@ impl BuilderServer {
 struct ServerInner {
     store: Arc<SqlxStore>,
     enrollment_token: Arc<Vec<u8>>,
+    registry: Arc<BuilderRegistry>,
 }
 
 impl Server for ServerInner {
     type Handler = ConnectionHandler;
     fn new_client(&mut self, _peer: Option<SocketAddr>) -> ConnectionHandler {
+        let connection_id = self.registry.next_connection_id();
         ConnectionHandler {
             store: self.store.clone(),
             enrollment_token: self.enrollment_token.clone(),
+            registry: self.registry.clone(),
+            connection_id,
             state: Arc::new(Mutex::new(AuthState::Unauthenticated)),
             offered_pubkey: Arc::new(Mutex::new(None)),
             framers: Arc::new(Mutex::new(HashMap::new())),
             control_channel: Arc::new(Mutex::new(None)),
+            registered_name: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
 
-/// One connection's worth of handler state. russh clones this per
-/// auth/channel callback, so the mutable bits live behind `Arc<Mutex<_>>`.
-#[derive(Clone)]
+/// One connection's worth of handler state. russh owns the handler;
+/// it's not cloned per callback, but the mutable bits live behind
+/// `Arc<Mutex<_>>` for symmetry with the registry's std::sync::Mutex.
 pub(crate) struct ConnectionHandler {
     store: Arc<SqlxStore>,
     enrollment_token: Arc<Vec<u8>>,
+    registry: Arc<BuilderRegistry>,
+    /// Distinguishes this connection from any other for the same
+    /// builder name; used by `BuilderRegistry::remove_if_matches` so
+    /// a stale handler dropping after a takeover can't yank the
+    /// successor's registration.
+    connection_id: u64,
     state: Arc<Mutex<AuthState>>,
     /// Captured during pubkey-offered even when the key isn't (yet) in
     /// the `builders` table — needed so `FreshEnrollment` can carry the
@@ -115,9 +131,11 @@ pub(crate) struct ConnectionHandler {
     /// until we see `\n` and only then parse the JSON.
     framers: Arc<Mutex<HashMap<ChannelId, LineFramer>>>,
     /// The first session channel the agent opens is treated as the
-    /// control channel (it's the only one used in PR #5; PR #6 will
-    /// add medusa-initiated build channels).
+    /// control channel.
     control_channel: Arc<Mutex<Option<ChannelId>>>,
+    /// Name we registered under, if `hello` succeeded. `Drop` reads
+    /// this synchronously (so it can't be a tokio Mutex).
+    registered_name: Arc<std::sync::Mutex<Option<BuilderName>>>,
 }
 
 impl ConnectionHandler {
@@ -128,6 +146,21 @@ impl ConnectionHandler {
     #[allow(dead_code)]
     pub(crate) async fn auth_state(&self) -> AuthState {
         self.state.lock().await.clone()
+    }
+}
+
+impl Drop for ConnectionHandler {
+    fn drop(&mut self) {
+        // Synchronous cleanup: take the registered name (if any) and
+        // remove it from the registry only if it still matches THIS
+        // connection's id. A takeover that already replaced this
+        // connection bumped the row's `connection_id`, so the
+        // remove_if_matches predicate evaluates false and the new
+        // registration is preserved.
+        let name = self.registered_name.lock().unwrap().take();
+        if let Some(n) = name {
+            self.registry.remove_if_matches(&n, self.connection_id);
+        }
     }
 }
 
@@ -385,6 +418,32 @@ impl ConnectionHandler {
                     builder_id = record.id.get(),
                     "builder hello accepted",
                 );
+
+                // Register in the runtime view. A takeover under the
+                // same name returns the prior session so we can fire a
+                // Kick + disconnect off-task.
+                let session_handle = Arc::new(session.handle());
+                let connected = ConnectedBuilder {
+                    builder_id: record.id,
+                    capabilities: record.capabilities.clone(),
+                    state: ConnState::Active,
+                    connected_since: chrono::Utc::now(),
+                    connection_id: self.connection_id,
+                    session: Some(RusshSession {
+                        handle: session_handle.clone(),
+                        control_channel: channel,
+                    }),
+                };
+                let displaced = self.registry.register(record.name.clone(), connected);
+                *self.registered_name.lock().unwrap() = Some(record.name.clone());
+                if let Some(prev) = displaced {
+                    if let Some(prev_session) = prev.session {
+                        let name = prev.name.clone();
+                        tokio::spawn(async move {
+                            kick_displaced(name, prev_session).await;
+                        });
+                    }
+                }
                 *self.state.lock().await = AuthState::Established(record);
             }
             ControlMessage::Heartbeat { ts, load } => {
@@ -406,20 +465,27 @@ impl ConnectionHandler {
             }
             ControlMessage::Shutdown { reason, drain } => {
                 let state = self.state.lock().await.clone();
-                let who = match state {
-                    AuthState::Established(record) => record.name.to_string(),
-                    _ => "<unauthenticated>".into(),
-                };
-                tracing::info!(
-                    builder = %who,
-                    reason = %reason,
-                    drain,
-                    "builder shutting down",
-                );
-                // PR #6 will mark the BuilderRegistry entry as
-                // Disconnecting so the dispatcher stops sending new
-                // jobs immediately. For now the connection close that
-                // follows is enough — no in-flight build channels yet.
+                if let AuthState::Established(record) = state {
+                    tracing::info!(
+                        builder = %record.name,
+                        reason = %reason,
+                        drain,
+                        "builder shutting down",
+                    );
+                    // Stop the dispatcher from sending new build
+                    // channels to this builder. The actual close
+                    // happens shortly after on the agent side; we
+                    // could keep accepting in-flight builds in the
+                    // meantime, but PR #6 has none — interrupted
+                    // recovery (PR #8) will requeue them anyway.
+                    self.registry.mark_disconnecting(&record.name);
+                } else {
+                    tracing::info!(
+                        reason = %reason,
+                        drain,
+                        "unauthenticated agent reports shutdown; ignoring",
+                    );
+                }
             }
             ControlMessage::Welcome { .. } | ControlMessage::Kick { .. } => {
                 // These are server→builder messages; receiving them
@@ -457,6 +523,31 @@ fn signing_key_to_russh(host_key: &HostKey) -> Result<PrivateKey, russh::keys::E
     let kpd = ssh_key::private::KeypairData::Ed25519(kp);
     PrivateKey::new(kpd, "medusa-builders").map_err(Into::into)
 }
+
+/// Send a Kick on the displaced builder's control channel and
+/// disconnect its session. Best-effort: russh may have already torn
+/// the connection down, in which case both calls are no-ops.
+async fn kick_displaced(name: BuilderName, session: RusshSession) {
+    let kick = ControlMessage::Kick {
+        reason: "another connection registered under the same name".into(),
+    };
+    let bytes: bytes::Bytes = kick.encode_line().into();
+    let _ = session.handle.data(session.control_channel, bytes).await;
+    let _ = session
+        .handle
+        .disconnect(
+            Disconnect::ByApplication,
+            "displaced by a new connection".into(),
+            "en".into(),
+        )
+        .await;
+    tracing::info!(builder = %name, "kicked displaced connection");
+}
+
+// Silence unused-import diagnostic in builds where SessionHandle is
+// only referenced via Arc<...> in the registry struct.
+#[allow(dead_code)]
+type _SessionHandleAlias = SessionHandle;
 
 #[cfg(test)]
 mod tests {

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use medusa_builders::{BuilderServer, ServerConfig, load_or_generate};
+use medusa_builders::{BuilderRegistry, BuilderServer, ServerConfig, load_or_generate};
 use medusa_domain::{BuilderCapabilities, BuilderName, BuilderPubkey};
 use medusa_store::{BuilderStore, NewBuilder, SqlxStore, open_in_memory};
 use russh::client::{self, Handler};
@@ -50,6 +50,7 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SqlxStore>) {
         host_key,
         enrollment_token: Arc::new(ENROLL_TOKEN.to_vec()),
         store: store.clone(),
+        registry: BuilderRegistry::new(),
     };
     tokio::spawn(async move {
         // Best-effort: the test will tear the runtime down when it's done.

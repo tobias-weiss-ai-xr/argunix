@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use medusa_builders::{BuilderServer, ControlMessage, ServerConfig, load_or_generate};
+use medusa_builders::{
+    BuilderRegistry, BuilderServer, ControlMessage, ServerConfig, load_or_generate,
+};
 use medusa_domain::{BuilderCapabilities, BuilderName, BuilderPubkey};
 use medusa_store::{BuilderStore, NewBuilder, SqlxStore, open_in_memory};
 use russh::ChannelMsg;
@@ -28,11 +30,12 @@ impl Handler for AcceptAnyHostKey {
     }
 }
 
-async fn spawn_server() -> (std::net::SocketAddr, Arc<SqlxStore>) {
+async fn spawn_server() -> (std::net::SocketAddr, Arc<SqlxStore>, Arc<BuilderRegistry>) {
     let pool = open_in_memory().await.unwrap();
     let store = Arc::new(SqlxStore::new(pool));
     let dir = tempfile::tempdir().unwrap();
     let host_key = load_or_generate(&dir.path().join("host_key")).unwrap();
+    let registry = BuilderRegistry::new();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -43,6 +46,7 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SqlxStore>) {
         host_key,
         enrollment_token: Arc::new(ENROLL_TOKEN.to_vec()),
         store: store.clone(),
+        registry: registry.clone(),
     };
     tokio::spawn(async move {
         let _ = BuilderServer::run(cfg).await;
@@ -54,7 +58,7 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SqlxStore>) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     std::mem::forget(dir);
-    (addr, store)
+    (addr, store, registry)
 }
 
 async fn connect(addr: std::net::SocketAddr) -> client::Handle<AcceptAnyHostKey> {
@@ -109,7 +113,7 @@ async fn await_welcome(channel: &mut russh::Channel<russh::client::Msg>) -> Opti
 
 #[tokio::test]
 async fn hello_after_token_auth_creates_row_and_returns_welcome() {
-    let (addr, store) = spawn_server().await;
+    let (addr, store, _registry) = spawn_server().await;
     let (client_key, expected_pubkey) = fresh_client_key();
     let mut session = connect(addr).await;
     // Offer the pubkey alongside password auth so the server can
@@ -158,7 +162,7 @@ async fn hello_after_token_auth_creates_row_and_returns_welcome() {
 
 #[tokio::test]
 async fn hello_after_pubkey_auth_refreshes_capabilities() {
-    let (addr, store) = spawn_server().await;
+    let (addr, store, _registry) = spawn_server().await;
     let (client_key, client_pubkey) = fresh_client_key();
     // Pre-seed the row with stale capabilities; after Hello the row
     // should reflect the agent's freshly-reported caps.
@@ -210,7 +214,7 @@ async fn hello_after_pubkey_auth_refreshes_capabilities() {
 
 #[tokio::test]
 async fn heartbeat_advances_last_seen() {
-    let (addr, store) = spawn_server().await;
+    let (addr, store, _registry) = spawn_server().await;
     let (client_key, client_pubkey) = fresh_client_key();
     let t0 = Utc::now() - chrono::Duration::seconds(3600);
     let _ = <SqlxStore as BuilderStore>::upsert(
@@ -274,7 +278,7 @@ async fn heartbeat_advances_last_seen() {
 
 #[tokio::test]
 async fn hello_with_mismatched_name_uses_existing_row() {
-    let (addr, store) = spawn_server().await;
+    let (addr, store, _registry) = spawn_server().await;
     let (client_key, client_pubkey) = fresh_client_key();
     let _ = <SqlxStore as BuilderStore>::upsert(
         &store,
