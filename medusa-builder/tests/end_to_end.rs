@@ -110,6 +110,7 @@ async fn token_first_then_pubkey_subsequent() {
         capabilities: caps(),
         reconnect_initial_backoff: Duration::from_millis(100),
         nix_serve_command: AgentConfig::default_nix_serve_command(),
+        medusa_host_key_path: None,
     };
     let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
     let cfg_a = cfg.clone();
@@ -152,6 +153,7 @@ async fn build_channel_round_trips_bytes_through_subprocess() {
         capabilities: caps(),
         reconnect_initial_backoff: Duration::from_millis(100),
         nix_serve_command: Arc::new(vec!["cat".into()]),
+        medusa_host_key_path: None,
     };
     let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
     let cfg_a = cfg.clone();

@@ -115,6 +115,10 @@ async fn main() -> Result<()> {
         capabilities: caps.inner,
         reconnect_initial_backoff: AgentConfig::default_backoff(),
         nix_serve_command: AgentConfig::default_nix_serve_command(),
+        // Pin medusa's SSH host key under the agent's state dir so a
+        // future server-key swap is caught at TOFU rather than
+        // silently accepted.
+        medusa_host_key_path: Some(cli.state_dir.join("medusa-host-key.pub")),
     };
 
     tracing::info!(

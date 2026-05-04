@@ -15,6 +15,7 @@ use russh::keys::ssh_key::{self, PrivateKey};
 use russh::keys::{Algorithm, PrivateKeyWithHashAlg};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +58,15 @@ pub struct AgentConfig {
     /// like `["cat"]` so the byte-pump can be exercised without a
     /// real nix store.
     pub nix_serve_command: Arc<Vec<String>>,
+    /// Path under which the agent pins medusa's SSH host key (TOFU).
+    /// First successful connect writes the presented pubkey here in
+    /// OpenSSH single-line format; subsequent connects refuse if the
+    /// presented key does not match.
+    ///
+    /// `None` disables TOFU entirely — used by the integration tests
+    /// where the daemon's host key is regenerated per VM. Production
+    /// deployments should always set this.
+    pub medusa_host_key_path: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -132,6 +142,7 @@ async fn serve_one_connection(
     let client_cfg = Arc::new(client::Config::default());
     let handler = AgentClient {
         nix_serve_cmd: cfg.nix_serve_command.clone(),
+        medusa_host_key_path: cfg.medusa_host_key_path.clone(),
     };
     let mut session = client::connect(client_cfg, cfg.medusa, handler)
         .await
@@ -270,18 +281,34 @@ async fn serve_one_connection(
 #[derive(Clone)]
 struct AgentClient {
     nix_serve_cmd: Arc<Vec<String>>,
+    medusa_host_key_path: Option<PathBuf>,
 }
 
 impl Handler for AgentClient {
     type Error = russh::Error;
-    async fn check_server_key(&mut self, _: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
-        // M13b: TOFU on the medusa host key. The agent stores the
-        // first-seen host pubkey in <state-dir>/medusa-host-key and
-        // refuses to connect if it ever changes — same trust shape
-        // as the daemon's view of the agent. Slice for that lands
-        // in a follow-up; today we accept any host key so the test
-        // harness works.
-        Ok(true)
+    async fn check_server_key(
+        &mut self,
+        presented: &ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        // TOFU on medusa's SSH host key. First successful connect
+        // pins the key under `medusa_host_key_path`; later connects
+        // refuse on mismatch. Operator recovery: delete the pinned
+        // file, then restart the agent.
+        let Some(path) = self.medusa_host_key_path.as_deref() else {
+            // Tests: TOFU disabled, accept any key.
+            return Ok(true);
+        };
+        match check_or_pin_host_key(path, presented).await {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    pinned = %path.display(),
+                    "medusa host key TOFU check failed; refusing connection",
+                );
+                Ok(false)
+            }
+        }
     }
     async fn server_channel_open_session(
         &mut self,
@@ -377,6 +404,85 @@ async fn serve_build_channel(
 #[allow(dead_code)]
 type _HandleAlias<T> = Handle<T>;
 
+#[derive(Debug, thiserror::Error)]
+enum HostKeyTofuError {
+    #[error("serialising presented host pubkey: {0}")]
+    Serialize(#[source] ssh_key::Error),
+    #[error("reading pinned host pubkey at {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("writing pinned host pubkey at {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "medusa host pubkey changed — pinned `{pinned}` but server presented `{presented}`. \
+         If this is intentional, delete the pinned file and restart the agent."
+    )]
+    Mismatch { pinned: String, presented: String },
+}
+
+/// TOFU on the medusa host key. Reads the pinned key (if present) and
+/// compares against `presented`. If absent, writes the presented key
+/// in OpenSSH single-line format so the next connect compares against it.
+async fn check_or_pin_host_key(
+    path: &Path,
+    presented: &ssh_key::PublicKey,
+) -> Result<(), HostKeyTofuError> {
+    let presented_line = presented
+        .to_openssh()
+        .map_err(HostKeyTofuError::Serialize)?;
+    let presented_line = presented_line.trim().to_string();
+
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) => {
+            let pinned = contents.trim().to_string();
+            if pinned == presented_line {
+                Ok(())
+            } else {
+                Err(HostKeyTofuError::Mismatch {
+                    pinned,
+                    presented: presented_line,
+                })
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // First-contact: pin atomically via tmp+rename so a crash
+            // mid-write doesn't leave a half-pinned key on disk.
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let tmp = path.with_extension("pub.tmp");
+            tokio::fs::write(&tmp, format!("{presented_line}\n"))
+                .await
+                .map_err(|source| HostKeyTofuError::Write {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            tokio::fs::rename(&tmp, path)
+                .await
+                .map_err(|source| HostKeyTofuError::Write {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            tracing::info!(
+                pinned = %path.display(),
+                "pinned medusa host key on first contact (TOFU)",
+            );
+            Ok(())
+        }
+        Err(e) => Err(HostKeyTofuError::Read {
+            path: path.to_path_buf(),
+            source: e,
+        }),
+    }
+}
+
 fn identity_to_russh_private_key(
     identity: &PersistedKey,
 ) -> Result<PrivateKey, russh::keys::Error> {
@@ -385,4 +491,64 @@ fn identity_to_russh_private_key(
     let kp = ssh_key::private::Ed25519Keypair::from_seed(&seed);
     let kpd = ssh_key::private::KeypairData::Ed25519(kp);
     PrivateKey::new(kpd, "medusa-builder").map_err(Into::into)
+}
+
+#[cfg(test)]
+mod host_key_tofu_tests {
+    use super::*;
+
+    fn pubkey() -> ssh_key::PublicKey {
+        // Minimal ed25519 key derived from a deterministic seed; only
+        // the bytes matter — no real authentication happens here.
+        let kp = ssh_key::private::Ed25519Keypair::from_seed(&[7u8; 32]);
+        let kpd = ssh_key::private::KeypairData::Ed25519(kp);
+        let priv_key = ssh_key::PrivateKey::new(kpd, "test").unwrap();
+        priv_key.public_key().clone()
+    }
+
+    fn other_pubkey() -> ssh_key::PublicKey {
+        let kp = ssh_key::private::Ed25519Keypair::from_seed(&[42u8; 32]);
+        let kpd = ssh_key::private::KeypairData::Ed25519(kp);
+        let priv_key = ssh_key::PrivateKey::new(kpd, "test").unwrap();
+        priv_key.public_key().clone()
+    }
+
+    #[tokio::test]
+    async fn first_contact_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("medusa-host-key.pub");
+        let key = pubkey();
+
+        check_or_pin_host_key(&path, &key).await.unwrap();
+        assert!(path.exists(), "first contact must pin the key file");
+        let pinned = tokio::fs::read_to_string(&path).await.unwrap();
+        let expected = key.to_openssh().unwrap();
+        assert_eq!(pinned.trim(), expected.trim());
+    }
+
+    #[tokio::test]
+    async fn matching_key_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("medusa-host-key.pub");
+        let key = pubkey();
+
+        check_or_pin_host_key(&path, &key).await.unwrap();
+        // Second call with the same key must succeed.
+        check_or_pin_host_key(&path, &key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mismatched_key_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("medusa-host-key.pub");
+
+        check_or_pin_host_key(&path, &pubkey()).await.unwrap();
+        let err = check_or_pin_host_key(&path, &other_pubkey())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostKeyTofuError::Mismatch { .. }),
+            "expected Mismatch, got {err:?}",
+        );
+    }
 }
