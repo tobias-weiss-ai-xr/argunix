@@ -1,9 +1,14 @@
-use crate::records::{EvalRecord, ForgeStatusRecord, JobRecord, NewEvaluation, NewJob, RepoRecord};
-use crate::traits::{EvalStore, ForgeStatusStore, JobStore, RepoStore, StoreError};
+use crate::records::{
+    BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, NewBuilder, NewEvaluation, NewJob,
+    RepoRecord,
+};
+use crate::traits::{BuilderStore, EvalStore, ForgeStatusStore, JobStore, RepoStore, StoreError};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use medusa_domain::{
-    AttrPath, EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, ShaError, Slug, SlugError,
+    AttrPath, BuilderCapabilities, BuilderId, BuilderName, BuilderNameError, BuilderPubkey,
+    BuilderPubkeyError, EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, ShaError, Slug,
+    SlugError,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqliteRow};
@@ -69,6 +74,42 @@ fn map_eval(row: &SqliteRow) -> Result<EvalRecord, StoreError> {
         started_at,
         finished_at,
         status: to_eval_status(&status)?,
+    })
+}
+
+fn map_builder(row: &SqliteRow) -> Result<BuilderRecord, StoreError> {
+    let id: i64 = row.try_get("id")?;
+    let name_s: String = row.try_get("name")?;
+    let pubkey_blob: Vec<u8> = row.try_get("pubkey")?;
+    let systems_s: String = row.try_get("systems")?;
+    let features_s: String = row.try_get("features")?;
+    let max_jobs: i64 = row.try_get("max_jobs")?;
+    let nix_version: String = row.try_get("nix_version")?;
+    let enrolled_at: DateTime<Utc> = row.try_get("enrolled_at")?;
+    let last_seen: DateTime<Utc> = row.try_get("last_seen")?;
+    let revoked_at: Option<DateTime<Utc>> = row.try_get("revoked_at")?;
+
+    let name = BuilderName::new(name_s)
+        .map_err(|e: BuilderNameError| StoreError::InvalidBuilderName { id, error: e })?;
+    let pubkey = BuilderPubkey::from_bytes(&pubkey_blob)
+        .map_err(|e: BuilderPubkeyError| StoreError::InvalidBuilderPubkey { id, error: e })?;
+    let systems: Vec<String> = serde_json::from_str(&systems_s)
+        .map_err(|e| StoreError::InvalidBuilderCapabilities { id, error: e })?;
+    let features: Vec<String> = serde_json::from_str(&features_s)
+        .map_err(|e| StoreError::InvalidBuilderCapabilities { id, error: e })?;
+    Ok(BuilderRecord {
+        id: BuilderId::new(id),
+        name,
+        pubkey,
+        capabilities: BuilderCapabilities {
+            systems,
+            features,
+            max_jobs: max_jobs.max(0) as u32,
+            nix_version,
+        },
+        enrolled_at,
+        last_seen,
+        revoked_at,
     })
 }
 
@@ -432,6 +473,136 @@ impl JobStore for SqlxStore {
 }
 
 #[async_trait]
+impl BuilderStore for SqlxStore {
+    async fn upsert(&self, new: NewBuilder, now: DateTime<Utc>) -> Result<BuilderId, StoreError> {
+        let systems_json =
+            serde_json::to_string(&new.capabilities.systems).expect("Vec<String> serialises");
+        let features_json =
+            serde_json::to_string(&new.capabilities.features).expect("Vec<String> serialises");
+        // ON CONFLICT(name): the row is the latest snapshot, so we overwrite
+        // pubkey + capabilities + last_seen and clear `revoked_at`. Operators
+        // who want to lock a builder out should `medusactl builders revoke`
+        // *and* not redistribute the enrollment token; a builder showing up
+        // with the right token after revocation is treated as a fresh enroll.
+        let row = sqlx::query(
+            "INSERT INTO builders
+                 (name, pubkey, systems, features, max_jobs, nix_version,
+                  enrolled_at, last_seen, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL)
+             ON CONFLICT(name) DO UPDATE SET
+                 pubkey       = excluded.pubkey,
+                 systems      = excluded.systems,
+                 features     = excluded.features,
+                 max_jobs     = excluded.max_jobs,
+                 nix_version  = excluded.nix_version,
+                 last_seen    = excluded.last_seen,
+                 revoked_at   = NULL
+             RETURNING id",
+        )
+        .bind(new.name.as_str())
+        .bind(new.pubkey.as_bytes().as_slice())
+        .bind(systems_json)
+        .bind(features_json)
+        .bind(new.capabilities.max_jobs as i64)
+        .bind(new.capabilities.nix_version)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        let id: i64 = row.try_get("id")?;
+        Ok(BuilderId::new(id))
+    }
+
+    async fn get(&self, id: BuilderId) -> Result<Option<BuilderRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, name, pubkey, systems, features, max_jobs, nix_version,
+                    enrolled_at, last_seen, revoked_at
+             FROM builders WHERE id = ?1",
+        )
+        .bind(id.get())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(map_builder).transpose()
+    }
+
+    async fn find_by_name(&self, name: &str) -> Result<Option<BuilderRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, name, pubkey, systems, features, max_jobs, nix_version,
+                    enrolled_at, last_seen, revoked_at
+             FROM builders WHERE name = ?1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(map_builder).transpose()
+    }
+
+    async fn find_active_by_pubkey(
+        &self,
+        pubkey: &BuilderPubkey,
+    ) -> Result<Option<BuilderRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, name, pubkey, systems, features, max_jobs, nix_version,
+                    enrolled_at, last_seen, revoked_at
+             FROM builders WHERE pubkey = ?1 AND revoked_at IS NULL",
+        )
+        .bind(pubkey.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(map_builder).transpose()
+    }
+
+    async fn mark_seen(&self, id: BuilderId, now: DateTime<Utc>) -> Result<(), StoreError> {
+        sqlx::query("UPDATE builders SET last_seen = ?1 WHERE id = ?2")
+            .bind(now)
+            .bind(id.get())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn revoke(&self, name: &str, now: DateTime<Utc>) -> Result<bool, StoreError> {
+        let r = sqlx::query("UPDATE builders SET revoked_at = ?1 WHERE name = ?2")
+            .bind(now)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    async fn rename(&self, old: &str, new: &str) -> Result<bool, StoreError> {
+        // Two-step under a transaction so we can distinguish
+        // "old missing" from "new collides" cleanly.
+        let mut tx = self.pool.begin().await?;
+        let exists_new: Option<i64> = sqlx::query_scalar("SELECT id FROM builders WHERE name = ?1")
+            .bind(new)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists_new.is_some() {
+            return Ok(false);
+        }
+        let r = sqlx::query("UPDATE builders SET name = ?1 WHERE name = ?2")
+            .bind(new)
+            .bind(old)
+            .execute(&mut *tx)
+            .await?;
+        let renamed = r.rows_affected() > 0;
+        tx.commit().await?;
+        Ok(renamed)
+    }
+
+    async fn list_all(&self) -> Result<Vec<BuilderRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, name, pubkey, systems, features, max_jobs, nix_version,
+                    enrolled_at, last_seen, revoked_at
+             FROM builders ORDER BY enrolled_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_builder).collect()
+    }
+}
+
+#[async_trait]
 impl ForgeStatusStore for SqlxStore {
     async fn upsert(
         &self,
@@ -789,5 +960,269 @@ mod tests {
             .unwrap();
         assert_eq!(pruned.len(), 0);
         assert_eq!(<SqlxStore as RepoStore>::list(&s).await.unwrap().len(), 1);
+    }
+
+    fn caps(systems: &[&str], features: &[&str], max_jobs: u32) -> BuilderCapabilities {
+        BuilderCapabilities {
+            systems: systems.iter().map(|s| s.to_string()).collect(),
+            features: features.iter().map(|s| s.to_string()).collect(),
+            max_jobs,
+            nix_version: "2.18.1".into(),
+        }
+    }
+
+    fn pubkey(seed: u8) -> BuilderPubkey {
+        BuilderPubkey::from_bytes(&[seed; 32]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn builder_first_enrollment_round_trip() {
+        let s = store().await;
+        let now = Utc::now();
+        let id = <SqlxStore as BuilderStore>::upsert(
+            &s,
+            NewBuilder {
+                name: BuilderName::new("bobs-mini").unwrap(),
+                pubkey: pubkey(1),
+                capabilities: caps(&["aarch64-darwin"], &["big-parallel"], 2),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+
+        let r = <SqlxStore as BuilderStore>::get(&s, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.name.as_str(), "bobs-mini");
+        assert_eq!(r.pubkey, pubkey(1));
+        assert_eq!(r.capabilities.systems, vec!["aarch64-darwin".to_string()]);
+        assert_eq!(r.capabilities.max_jobs, 2);
+        assert!(r.revoked_at.is_none());
+        assert_eq!(r.enrolled_at, r.last_seen);
+    }
+
+    #[tokio::test]
+    async fn builder_reconnect_overwrites_capabilities_and_clears_revocation() {
+        let s = store().await;
+        let t0 = Utc::now();
+        let id = <SqlxStore as BuilderStore>::upsert(
+            &s,
+            NewBuilder {
+                name: BuilderName::new("mac01").unwrap(),
+                pubkey: pubkey(1),
+                capabilities: caps(&["aarch64-darwin"], &[], 1),
+            },
+            t0,
+        )
+        .await
+        .unwrap();
+        // Operator revokes…
+        assert!(
+            <SqlxStore as BuilderStore>::revoke(&s, "mac01", t0)
+                .await
+                .unwrap()
+        );
+        let r = <SqlxStore as BuilderStore>::get(&s, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r.revoked_at.is_some());
+
+        // …then re-enrolls with a new key + updated caps. Same name → upsert
+        // overwrites and clears `revoked_at`.
+        let t1 = t0 + chrono::Duration::seconds(60);
+        let id2 = <SqlxStore as BuilderStore>::upsert(
+            &s,
+            NewBuilder {
+                name: BuilderName::new("mac01").unwrap(),
+                pubkey: pubkey(2),
+                capabilities: caps(&["aarch64-darwin", "x86_64-darwin"], &["kvm"], 4),
+            },
+            t1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(id, id2);
+        let r = <SqlxStore as BuilderStore>::get(&s, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.pubkey, pubkey(2));
+        assert_eq!(r.capabilities.systems.len(), 2);
+        assert_eq!(r.capabilities.features, vec!["kvm".to_string()]);
+        assert_eq!(r.capabilities.max_jobs, 4);
+        assert!(r.revoked_at.is_none());
+        assert_eq!(r.last_seen, t1);
+    }
+
+    #[tokio::test]
+    async fn pubkey_lookup_skips_revoked() {
+        let s = store().await;
+        let now = Utc::now();
+        let _ = <SqlxStore as BuilderStore>::upsert(
+            &s,
+            NewBuilder {
+                name: BuilderName::new("a").unwrap(),
+                pubkey: pubkey(7),
+                capabilities: caps(&["x86_64-linux"], &[], 1),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(
+            <SqlxStore as BuilderStore>::find_active_by_pubkey(&s, &pubkey(7))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        <SqlxStore as BuilderStore>::revoke(&s, "a", now)
+            .await
+            .unwrap();
+        // Revoked → pubkey auth must fail; agent then retries with the
+        // enrollment token (see design/builders.md auth state machine).
+        assert!(
+            <SqlxStore as BuilderStore>::find_active_by_pubkey(&s, &pubkey(7))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // But find_by_name still returns it so `medusactl builders` can
+        // show revoked rows.
+        assert!(
+            <SqlxStore as BuilderStore>::find_by_name(&s, "a")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_seen_advances_last_seen_only() {
+        let s = store().await;
+        let t0 = Utc::now();
+        let id = <SqlxStore as BuilderStore>::upsert(
+            &s,
+            NewBuilder {
+                name: BuilderName::new("a").unwrap(),
+                pubkey: pubkey(1),
+                capabilities: caps(&["x86_64-linux"], &[], 1),
+            },
+            t0,
+        )
+        .await
+        .unwrap();
+        let t1 = t0 + chrono::Duration::seconds(120);
+        <SqlxStore as BuilderStore>::mark_seen(&s, id, t1)
+            .await
+            .unwrap();
+        let r = <SqlxStore as BuilderStore>::get(&s, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.enrolled_at, t0);
+        assert_eq!(r.last_seen, t1);
+    }
+
+    #[tokio::test]
+    async fn revoke_unknown_returns_false() {
+        let s = store().await;
+        assert!(
+            !<SqlxStore as BuilderStore>::revoke(&s, "nope", Utc::now())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_happy_and_collision() {
+        let s = store().await;
+        let now = Utc::now();
+        let _ = <SqlxStore as BuilderStore>::upsert(
+            &s,
+            NewBuilder {
+                name: BuilderName::new("old").unwrap(),
+                pubkey: pubkey(1),
+                capabilities: caps(&["x86_64-linux"], &[], 1),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+        // Happy path
+        assert!(
+            <SqlxStore as BuilderStore>::rename(&s, "old", "new")
+                .await
+                .unwrap()
+        );
+        assert!(
+            <SqlxStore as BuilderStore>::find_by_name(&s, "new")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Old gone
+        assert!(
+            <SqlxStore as BuilderStore>::find_by_name(&s, "old")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Set up a collision target and try to rename onto it
+        let _ = <SqlxStore as BuilderStore>::upsert(
+            &s,
+            NewBuilder {
+                name: BuilderName::new("other").unwrap(),
+                pubkey: pubkey(2),
+                capabilities: caps(&["x86_64-linux"], &[], 1),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !<SqlxStore as BuilderStore>::rename(&s, "new", "other")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_all_includes_revoked_oldest_first() {
+        let s = store().await;
+        let t0 = Utc::now();
+        let _ = <SqlxStore as BuilderStore>::upsert(
+            &s,
+            NewBuilder {
+                name: BuilderName::new("first").unwrap(),
+                pubkey: pubkey(1),
+                capabilities: caps(&["x86_64-linux"], &[], 1),
+            },
+            t0,
+        )
+        .await
+        .unwrap();
+        let _ = <SqlxStore as BuilderStore>::upsert(
+            &s,
+            NewBuilder {
+                name: BuilderName::new("second").unwrap(),
+                pubkey: pubkey(2),
+                capabilities: caps(&["aarch64-linux"], &[], 1),
+            },
+            t0 + chrono::Duration::seconds(10),
+        )
+        .await
+        .unwrap();
+        <SqlxStore as BuilderStore>::revoke(&s, "first", t0 + chrono::Duration::seconds(20))
+            .await
+            .unwrap();
+        let all = <SqlxStore as BuilderStore>::list_all(&s).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].name.as_str(), "first");
+        assert!(all[0].revoked_at.is_some());
+        assert_eq!(all[1].name.as_str(), "second");
+        assert!(all[1].revoked_at.is_none());
     }
 }

@@ -1316,6 +1316,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "medusa-domain",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror",

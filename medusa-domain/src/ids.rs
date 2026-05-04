@@ -30,6 +30,7 @@ macro_rules! id_newtype {
 id_newtype!(RepoId);
 id_newtype!(EvalId);
 id_newtype!(JobId);
+id_newtype!(BuilderId);
 
 #[cfg(test)]
 mod tests {

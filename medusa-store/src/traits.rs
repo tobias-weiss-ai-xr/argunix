@@ -1,7 +1,10 @@
-use crate::records::{EvalRecord, ForgeStatusRecord, JobRecord, NewEvaluation, NewJob, RepoRecord};
+use crate::records::{
+    BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, NewBuilder, NewEvaluation, NewJob,
+    RepoRecord,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Slug};
+use medusa_domain::{BuilderId, BuilderPubkey, EvalId, EvalStatus, JobId, JobStatus, RepoId, Slug};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -20,6 +23,24 @@ pub enum StoreError {
         id: i64,
         #[source]
         error: medusa_domain::SlugError,
+    },
+    #[error("invalid builder name in row id={id}: {error}")]
+    InvalidBuilderName {
+        id: i64,
+        #[source]
+        error: medusa_domain::BuilderNameError,
+    },
+    #[error("invalid builder pubkey in row id={id}: {error}")]
+    InvalidBuilderPubkey {
+        id: i64,
+        #[source]
+        error: medusa_domain::BuilderPubkeyError,
+    },
+    #[error("invalid builder capabilities JSON in row id={id}: {error}")]
+    InvalidBuilderCapabilities {
+        id: i64,
+        #[source]
+        error: serde_json::Error,
     },
 }
 
@@ -108,6 +129,44 @@ pub trait JobStore: Send + Sync {
     /// Used at boot (Q79): mark every still-`running` job as `interrupted`.
     /// Returns the number of rows updated.
     async fn mark_running_interrupted(&self) -> Result<u64, StoreError>;
+}
+
+#[async_trait]
+pub trait BuilderStore: Send + Sync {
+    /// First-connect enrollment, or capabilities refresh on reconnect.
+    /// Idempotent on `name`: existing rows have their pubkey, capabilities,
+    /// and `last_seen` overwritten and `revoked_at` cleared. Returns the
+    /// row's id so the caller can register the in-memory connection.
+    async fn upsert(&self, new: NewBuilder, now: DateTime<Utc>) -> Result<BuilderId, StoreError>;
+
+    async fn get(&self, id: BuilderId) -> Result<Option<BuilderRecord>, StoreError>;
+
+    async fn find_by_name(&self, name: &str) -> Result<Option<BuilderRecord>, StoreError>;
+
+    /// Pubkey-auth lookup. Skips revoked rows so a revoked builder is forced
+    /// back through the enrollment-token path. None means "no active row
+    /// matches this pubkey" — auth fails and the agent retries with the
+    /// enrollment token (see design/builders.md).
+    async fn find_active_by_pubkey(
+        &self,
+        pubkey: &BuilderPubkey,
+    ) -> Result<Option<BuilderRecord>, StoreError>;
+
+    /// Touch `last_seen`. Called on every successful heartbeat.
+    async fn mark_seen(&self, id: BuilderId, now: DateTime<Utc>) -> Result<(), StoreError>;
+
+    /// `medusactl builders revoke <name>`. Sets `revoked_at`; subsequent
+    /// pubkey-auth attempts will fail until the builder re-enrolls with a
+    /// fresh token. Returns false if the name is unknown.
+    async fn revoke(&self, name: &str, now: DateTime<Utc>) -> Result<bool, StoreError>;
+
+    /// `medusactl builders rename`. Returns false if `old` doesn't exist or
+    /// `new` already exists.
+    async fn rename(&self, old: &str, new: &str) -> Result<bool, StoreError>;
+
+    /// All builders, oldest enrollment first. Includes revoked rows so
+    /// `medusactl builders` can show them.
+    async fn list_all(&self) -> Result<Vec<BuilderRecord>, StoreError>;
 }
 
 #[async_trait]

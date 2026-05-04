@@ -12,9 +12,12 @@ mod records;
 mod sqlite;
 mod traits;
 
-pub use records::{EvalRecord, ForgeStatusRecord, JobRecord, NewEvaluation, NewJob, RepoRecord};
+pub use records::{
+    BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, NewBuilder, NewEvaluation, NewJob,
+    RepoRecord,
+};
 pub use sqlite::SqlxStore;
-pub use traits::{EvalStore, ForgeStatusStore, JobStore, RepoStore, StoreError};
+pub use traits::{BuilderStore, EvalStore, ForgeStatusStore, JobStore, RepoStore, StoreError};
 
 use sqlx::sqlite::SqlitePool;
 use std::path::Path;
