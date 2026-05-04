@@ -342,6 +342,8 @@ async fn serve_build_channel(
     if cmd.is_empty() {
         return Err(std::io::Error::other("nix_serve_command is empty"));
     }
+    let started_at = std::time::Instant::now();
+    let channel_id: u32 = channel.id().into();
     let mut child = tokio::process::Command::new(&cmd[0])
         .args(cmd[1..].iter())
         .stdin(Stdio::piped())
@@ -349,6 +351,13 @@ async fn serve_build_channel(
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()?;
+    let pid = child.id();
+    tracing::info!(
+        channel = channel_id,
+        pid = pid,
+        cmd = ?cmd.as_slice(),
+        "build channel opened; spawned nix subprocess",
+    );
     let mut stdin = child.stdin.take().expect("stdin piped");
     let mut stdout = child.stdout.take().expect("stdout piped");
 
@@ -401,7 +410,14 @@ async fn serve_build_channel(
     }
     let _ = channel.eof().await;
     let _ = channel.close().await;
-    let _ = child.wait().await;
+    let exit = child.wait().await;
+    tracing::info!(
+        channel = channel_id,
+        pid = pid,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        exit = ?exit.as_ref().ok().and_then(|s| s.code()),
+        "build channel closed; nix subprocess exited",
+    );
     Ok(())
 }
 
