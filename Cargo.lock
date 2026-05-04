@@ -2045,6 +2045,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "medusa-pipe"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "medusa-sched"
 version = "0.0.1"
 dependencies = [

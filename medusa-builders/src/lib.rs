@@ -8,12 +8,14 @@
 //! capability protocols land in subsequent PRs.
 
 mod auth;
+mod dispatcher;
 mod host_key;
 mod protocol;
 mod registry;
 mod server;
 
 pub use auth::AuthState;
+pub use dispatcher::{BuilderDispatcher, DispatchError, DispatchedBuild};
 pub use host_key::{HostKey, HostKeyError, load_or_generate};
 pub use protocol::{ControlMessage, LineFramer, ProtocolError};
 pub use registry::{

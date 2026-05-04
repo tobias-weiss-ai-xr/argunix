@@ -1,0 +1,29 @@
+[package]
+name = "medusa-pipe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "medusa-pipe"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace tokio doesn't enable `net` (Unix sockets) or `io-std`
+# (async stdin/stdout); medusa-pipe needs both. Add them locally so the
+# rest of the workspace doesn't pay for them.
+tokio = { version = "1", features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "io-util",
+  "io-std",
+  "net",
+  "process",
+  "time",
+] }
+clap = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
