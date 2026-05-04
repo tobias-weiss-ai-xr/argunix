@@ -315,7 +315,18 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             .await?;
             return Ok(());
         }
-        let outcome = build_one(ctx, repo.id, eval_id, job_id, &spec, &caches, &cancel).await;
+        // Per-job span so every log line emitted during this
+        // build inherits `job_id` and `attr` automatically. That's
+        // how the operator correlates UI URLs (which embed
+        // `eval/<eval_id>/job/<attr>`) with daemon log lines.
+        let span = info_span!(
+            "job",
+            job_id = job_id.get(),
+            attr = %spec.attr_path,
+        );
+        let outcome = build_one(ctx, repo.id, eval_id, job_id, &spec, &caches, &cancel)
+            .instrument(span)
+            .await;
         let final_status = match outcome {
             Ok(s) => s,
             Err(e) => {
@@ -678,6 +689,13 @@ async fn build_one(
         gc_root: Some(gc_root.clone()),
         builders_arg,
     };
+    tracing::info!(
+        eval_id = eval_id.get(),
+        drv = %request.drv_path,
+        log = %log_path.display(),
+        builders = request.builders_arg.is_some(),
+        "dispatching build",
+    );
     // Q39 / Q104 / Q105: race the build against the eval's cancel
     // signal. `biased;` polls the build first — if it just resolved
     // with success we honour that even if cancel arrived in the same
@@ -699,6 +717,12 @@ async fn build_one(
         }
     };
     let log_path_str = log_path.to_string_lossy().into_owned();
+    tracing::info!(
+        eval_id = eval_id.get(),
+        drv = %drv_path,
+        status = ?outcome.status,
+        "build finished",
+    );
 
     match outcome.status {
         medusa_build::BuildStatus::Success => {
