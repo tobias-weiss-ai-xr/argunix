@@ -1201,11 +1201,24 @@ pub async fn dispatch_pool_build(
         }
     };
 
-    // 4. Drain lifecycle, racing against cancel.
+    // 4. Drain lifecycle, racing against cancel + a daemon-side wall
+    //    clock. The agent passes `--option build-timeout` to nix-store,
+    //    which only kills the *builder script*, not a wedged
+    //    `--realise` pipeline (substitution loops, hung writes to the
+    //    nix-daemon socket, agents that emit `BuildStarted` and then
+    //    silently hang). Without an outer timer, `dispatch_pool_build`
+    //    would wait on `lifecycle.recv()` forever. We give the build
+    //    `build_timeout + grace` (grace = 60s for the agent's SIGKILL
+    //    + final stderr drain), then synthesize a Killed outcome and
+    //    move on. Mirrors the local fallback's `tokio::time::timeout`
+    //    around `medusa_build::run_build`.
+    let grace = Duration::from_secs(60);
+    let timeout_deadline = tokio::time::Instant::now() + build_timeout + grace;
     let mut output_paths: Vec<String> = Vec::new();
     let mut final_status = BuildOutcomeStatus::Failure;
     let mut exit_code: Option<i32> = None;
     let mut aborted = false;
+    let mut timed_out = false;
     loop {
         tokio::select! {
             biased;
@@ -1254,16 +1267,68 @@ pub async fn dispatch_pool_build(
                 // Continue draining for the BuildFinished{Killed} that
                 // the agent will emit after SIGKILLing nix-store.
             }
+            _ = tokio::time::sleep_until(timeout_deadline), if !aborted && !timed_out => {
+                tracing::warn!(
+                    job_id = build_id,
+                    builder = %builder_name,
+                    timeout_secs = build_timeout.as_secs(),
+                    "build wall-clock timeout exceeded; sending Abort and giving the agent {}s to drain",
+                    grace.as_secs(),
+                );
+                log_buf.extend_from_slice(
+                    format!(
+                        "\nmedusa: build timed out after {}s; sending Abort to builder.\n",
+                        build_timeout.as_secs(),
+                    ).as_bytes(),
+                );
+                timed_out = true;
+                let _ = dispatcher.abort_build(builder_name, build_id).await;
+                // After Abort, give the agent up to `grace` for its
+                // BuildFinished{Killed} (and any final log chunks) to
+                // arrive — *don't* spin re-firing the timer. If the
+                // agent is unresponsive, the second timer fires and we
+                // synthesize a Killed outcome.
+                tokio::time::sleep(grace).await;
+                tracing::warn!(
+                    job_id = build_id,
+                    builder = %builder_name,
+                    "agent did not emit BuildFinished within grace window; synthesising Killed",
+                );
+                log_buf.extend_from_slice(
+                    b"medusa: agent unresponsive after Abort; synthesising Killed outcome.\n",
+                );
+                final_status = BuildOutcomeStatus::Killed;
+                break;
+            }
         }
     }
     registry.unregister_in_flight_build(builder_name, build_id);
 
-    if aborted || final_status == BuildOutcomeStatus::Killed {
+    if aborted || (final_status == BuildOutcomeStatus::Killed && !timed_out) {
+        // Operator-initiated cancel (or agent-emitted Killed before
+        // we asked) → surface as JobStatus::Cancelled via the
+        // worker's wrapper.
         if log_truncated {
             log_buf.extend_from_slice(b"\n--- log truncated by medusa ---\n");
         }
         medusa_build::write_zstd_log(log_path, log_buf).await?;
         return Ok(PoolDispatchResult::Cancelled);
+    }
+    if timed_out {
+        // Wall-clock timeout: not a user cancel, surface as Failure
+        // so the eval rolls up correctly and the job row gets the
+        // right terminal status.
+        if log_truncated {
+            log_buf.extend_from_slice(b"\n--- log truncated by medusa ---\n");
+        }
+        medusa_build::write_zstd_log(log_path, log_buf).await?;
+        return Ok(PoolDispatchResult::Outcome(medusa_build::BuildOutcome {
+            status: medusa_build::BuildStatus::Failure,
+            exit_code,
+            output_paths: Vec::new(),
+            log_path: log_path.to_path_buf(),
+            log_truncated,
+        }));
     }
 
     // 5. On success, pull the output closure into the local store.
