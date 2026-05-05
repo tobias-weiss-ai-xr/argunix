@@ -164,13 +164,10 @@ async fn run_one(
     };
 
     if !status.success() {
-        // Heuristic: nix-eval-jobs returns non-zero with empty stderr in
-        // some "no such output" cases (e.g. devShells.<system> not
-        // provided). Treat that as "no jobs" rather than a hard failure.
-        if stderr_buf.trim().is_empty() {
+        if stderr_indicates_missing_fragment(fragment, &stderr_buf) {
             tracing::debug!(
                 fragment,
-                "no output from nix-eval-jobs; treating as no jobs"
+                "flake does not provide fragment; treating as no jobs"
             );
             return Ok(Vec::new());
         }
@@ -185,6 +182,26 @@ async fn run_one(
         fragment: fragment.to_string(),
         source: e,
     })
+}
+
+/// Decide whether a non-zero exit from `nix-eval-jobs` should be treated
+/// as "the flake simply doesn't provide this fragment" (zero jobs) or as
+/// a real failure.
+///
+/// Walking the default outputs is a probe — most flakes don't expose
+/// every one of `packages` / `checks` / `devShells` for every system,
+/// and a missing fragment is normal. We recognise it from two signals:
+///
+/// - empty stderr (some older nix-eval-jobs paths emit nothing)
+/// - a `does not provide attribute '<fragment>'` line, possibly mixed
+///   with unrelated warnings like `warning: unknown setting 'allowed-users'`
+///   that nix prints ahead of the actual error.
+fn stderr_indicates_missing_fragment(fragment: &str, stderr: &str) -> bool {
+    if stderr.trim().is_empty() {
+        return true;
+    }
+    let marker = format!("does not provide attribute '{fragment}'");
+    stderr.contains(&marker)
 }
 
 #[cfg(test)]
@@ -276,5 +293,61 @@ exit 0
             .position(|a| *a == "--flake")
             .expect("--flake missing");
         assert!(flag_idx < flake_idx, "feature flag must precede --flake");
+    }
+
+    #[test]
+    fn missing_fragment_with_warnings_is_not_a_failure() {
+        // Real stderr observed against a flake that doesn't expose
+        // devShells: the "does not provide attribute" error sits below
+        // unrelated `unknown setting` warnings nix prints first.
+        let stderr = "\
+warning: unknown setting 'allowed-users'
+warning: unknown setting 'trusted-users'
+error: flake 'git+file:///var/lib/medusa/work/6?shallow=1' does not provide attribute 'devShells.x86_64-linux'
+error: worker error: error: flake 'git+file:///var/lib/medusa/work/6?shallow=1' does not provide attribute 'devShells.x86_64-linux'
+";
+        assert!(stderr_indicates_missing_fragment(
+            "devShells.x86_64-linux",
+            stderr
+        ));
+    }
+
+    #[test]
+    fn empty_stderr_is_treated_as_missing_fragment() {
+        assert!(stderr_indicates_missing_fragment("checks.x86_64-linux", ""));
+        assert!(stderr_indicates_missing_fragment(
+            "checks.x86_64-linux",
+            "   \n  \t\n"
+        ));
+    }
+
+    #[test]
+    fn real_eval_error_is_not_swallowed() {
+        // A genuine evaluation failure (syntax error, undefined var)
+        // must still surface as a hard failure even though stderr is
+        // non-empty — i.e. the classifier must NOT treat any non-empty
+        // stderr as "missing fragment".
+        let stderr = "\
+error: undefined variable 'foo'
+       at /nix/store/.../flake.nix:42:5
+";
+        assert!(!stderr_indicates_missing_fragment(
+            "packages.x86_64-linux",
+            stderr
+        ));
+    }
+
+    #[test]
+    fn missing_attribute_for_a_different_fragment_is_not_swallowed() {
+        // Defensive: if nix reports a missing attribute that isn't the
+        // fragment we asked for, that's a real bug in the flake's eval
+        // — don't classify it as "this fragment is just absent".
+        let stderr = "\
+error: flake '...' does not provide attribute 'packages.x86_64-linux.tool'
+";
+        assert!(!stderr_indicates_missing_fragment(
+            "packages.x86_64-linux",
+            stderr
+        ));
     }
 }
