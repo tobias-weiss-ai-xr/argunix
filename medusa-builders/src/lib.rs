@@ -8,6 +8,7 @@
 //! capability protocols land in subsequent PRs.
 
 mod auth;
+mod closure_xfer;
 mod dispatcher;
 mod host_key;
 mod protocol;
@@ -18,6 +19,7 @@ mod socket_server;
 mod systems;
 
 pub use auth::AuthState;
+pub use closure_xfer::{ClosureXferError, ClosureXferOutcome, export_closure, import_closure};
 pub use dispatcher::{BuilderDispatcher, DispatchError, DispatchedBuild};
 pub use host_key::{HostKey, HostKeyError, load_or_generate};
 pub use protocol::{BuildOutcomeStatus, ControlMessage, LineFramer, ProtocolError};
