@@ -21,6 +21,7 @@ let
   };
 
   rust = naersk.buildPackage {
+    name = "medusa";
     inherit src;
     # Askama compiles templates into the binary; nothing on disk at
     # runtime depends on the template directory. Static assets are
