@@ -32,6 +32,17 @@ enum Command {
     /// Manage the dynamic builder pool (M13).
     #[command(subcommand)]
     Builders(BuildersCommand),
+    /// Test-only: dispatch a local drv path to the named builder over
+    /// the M14b side-channel transport. Used by the NixOS test that
+    /// exercises the dynamic-pool path without standing up a fake
+    /// forge. Not part of the operator surface.
+    #[command(name = "test-dispatch-drv", hide = true)]
+    TestDispatchDrv {
+        #[arg(long, value_name = "BUILDER")]
+        builder: String,
+        /// Path to the .drv to realise on the builder.
+        drv: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -76,6 +87,10 @@ async fn main() -> ExitCode {
         Command::Builders(BuildersCommand::Rename { old, new }) => {
             Request::BuildersRename { old, new }
         }
+        Command::TestDispatchDrv { builder, drv } => Request::TestDispatchDrv {
+            drv_path: drv,
+            builder,
+        },
     };
 
     match medusa_control::send(&cli.socket, &req).await {

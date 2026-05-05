@@ -1972,7 +1972,6 @@ name = "medusa-build"
 version = "0.0.1"
 dependencies = [
  "chrono",
- "medusa-builders",
  "medusa-domain",
  "serde",
  "tempfile",
@@ -1987,6 +1986,7 @@ name = "medusa-builder"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "chrono",
  "clap",
@@ -2117,16 +2117,6 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
-]
-
-[[package]]
-name = "medusa-pipe"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "clap",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

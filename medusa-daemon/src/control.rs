@@ -34,6 +34,10 @@ pub struct ControlContext {
     /// `builder_enrollment` isn't configured. Held as Arc so it can
     /// also be shared with the BuilderServer once PR #8b wires it up.
     pub builder_registry: Arc<BuilderRegistry>,
+    /// Path to local `nix-store` (used by the M14b test-dispatch path).
+    pub nix_store_bin: PathBuf,
+    /// Wall-clock cap for a single test-dispatched build.
+    pub build_timeout: std::time::Duration,
 }
 
 pub fn spawn(ctx: ControlContext) -> tokio::task::JoinHandle<()> {
@@ -123,6 +127,63 @@ async fn dispatch(req: Request, ctx: &ControlContext) -> Response {
                 Ok(v) => Response::ok_with(v),
                 Err(e) => Response::error(format!("{e:#}")),
             }
+        }
+        Request::TestDispatchDrv { drv_path, builder } => {
+            match handle_test_dispatch_drv(&drv_path, &builder, ctx).await {
+                Ok(v) => Response::ok_with(v),
+                Err(e) => Response::error(format!("{e:#}")),
+            }
+        }
+    }
+}
+
+/// M14b VM test driver: dispatch one drv to a named builder via the
+/// dynamic pool. Bypasses the worker's eval pipeline so a NixOS test
+/// can exercise the transport without standing up a fake forge.
+async fn handle_test_dispatch_drv(
+    drv_path: &str,
+    builder: &str,
+    ctx: &ControlContext,
+) -> anyhow::Result<serde_json::Value> {
+    use medusa_domain::BuilderName;
+    let name = BuilderName::new(builder)
+        .map_err(|e| anyhow::anyhow!("invalid builder name `{builder}`: {e}"))?;
+    if ctx.builder_registry.snapshot(&name).is_none() {
+        anyhow::bail!("builder `{builder}` is not currently connected");
+    }
+    // Synthetic build_id: epoch nanos so two concurrent test dispatches
+    // (unlikely but cheap to defend) don't collide.
+    let build_id: i64 = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_micros());
+    let test_dir = ctx.gc_root_dir.join("test-dispatch");
+    let _ = tokio::fs::create_dir_all(&test_dir).await;
+    let log_path = test_dir.join(format!("{build_id}.log.zst"));
+    let gc_root = test_dir.join(format!("{build_id}"));
+
+    let spec = crate::worker::PoolDispatchSpec {
+        registry: ctx.builder_registry.clone(),
+        builder_name: &name,
+        build_id,
+        drv_path,
+        gc_root: &gc_root,
+        log_path: &log_path,
+        log_limit: medusa_build::LogCaptureLimit::default(),
+        build_timeout: ctx.build_timeout,
+        nix_store_bin: &ctx.nix_store_bin,
+    };
+    match crate::worker::dispatch_pool_build(spec, None).await? {
+        crate::worker::PoolDispatchResult::Outcome(o) => Ok(serde_json::json!({
+            "status": match o.status {
+                medusa_build::BuildStatus::Success => "success",
+                medusa_build::BuildStatus::Failure => "failure",
+            },
+            "output_paths": o.output_paths,
+            "log_path": o.log_path.to_string_lossy(),
+            "log_truncated": o.log_truncated,
+        })),
+        crate::worker::PoolDispatchResult::Cancelled => {
+            anyhow::bail!("test dispatch cancelled (unexpected — no cancel token)");
         }
     }
 }

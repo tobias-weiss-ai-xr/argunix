@@ -1,19 +1,27 @@
-# M13b NixOS test: end-to-end build dispatch through the dynamic
-# builder pool.
+# M14b NixOS test: end-to-end build dispatch through the dynamic
+# builder pool over side channels.
 #
 # Forces dispatch by giving the test derivation a `requiredSystemFeatures`
 # that only the builder advertises. Without dispatch through the pool,
-# the medusa node literally cannot build the derivation. So a
-# successful realise via `--builders ssh-ng://...?ssh-command=medusa-pipe`
-# proves the full transport works end-to-end:
+# the medusa node literally cannot build the derivation. So a successful
+# realise via the side-channel transport proves the full wire protocol:
 #
-#   nix-store --realise            (medusa node, as `medusa` user)
-#     -> spawns medusa-pipe        (per the ssh-command= URI param)
-#     -> connects to /run/medusa/builders/smoke-builder.sock
-#     -> medusa daemon opens a fresh SSH build channel into the agent
-#     -> agent spawns `nix-daemon --stdio`
-#     -> nix daemon protocol round-trips
-#     -> built path streamed back into the medusa store
+#   medusactl test-dispatch-drv --builder smoke-builder <drv>
+#     -> daemon: nix-store --query --requisites <drv> (compute closure)
+#     -> daemon: open SSH session channel into agent (ClosurePush)
+#     -> daemon: write side-channel header + nix-store --export bytes
+#     -> agent:  read header, run nix-store --import (drv + deps land in builder store)
+#     -> daemon: send Build over control channel
+#     -> agent:  spawn nix-store --realise <drv>, stream stderr as BuildLogChunk frames
+#     -> agent:  send BuildFinished{Success, output_paths=[...]}
+#     -> daemon: open another SSH session channel (ClosurePull)
+#     -> daemon: write header asking for output_paths
+#     -> agent:  run nix-store --export <output_paths>, stream stdout
+#     -> daemon: pipe bytes into local nix-store --import
+#     -> daemon: nix-store --add-root <gcroot> --indirect --realise <output>
+#
+# The test then asserts the realised path is in the daemon's local
+# store with the expected contents — proof every byte made the round-trip.
 { pkgs, ... }:
 
 let
@@ -95,20 +103,18 @@ in
   };
 
   testScript = ''
+    import json
+
     start_all()
     medusa.wait_for_unit("medusa.service")
     medusa.wait_for_open_port(2222)
     builder.wait_for_unit("medusa-builder.service")
 
-    # Wait for the agent to enrol and the per-builder socket to land.
+    # Wait for the agent to enrol and announce its capabilities.
     medusa.wait_until_succeeds(
         "medusactl --socket /run/medusa/control.sock builders list --json"
         " | tr -d ' \\n' | grep -q '\"connected\":true'",
         timeout=30,
-    )
-    medusa.wait_until_succeeds(
-        "test -S /run/medusa/builders/smoke-builder.sock",
-        timeout=10,
     )
     # Builder must have advertised "medusa-test" via its hello.
     medusa.succeed(
@@ -116,56 +122,53 @@ in
         " | tr -d ' \\n' | grep -q 'medusa-test'",
     )
 
-    # Compose the `--builders` arg in the same shape medusa-build's
-    # compose_builders_arg produces. We reproduce it here rather than
-    # asking medusa to dispatch a build — the daemon's worker is
-    # gated behind a webhook, which would require a real forge to
-    # mock. Going through nix directly proves the wire protocol.
-    pipe = "${pkgs.medusa}/bin/medusa-pipe"
-    # Authority `localhost` triggers nix's `fakeSSH=true` which skips
-    # the `ssh user@host …` prefix and exec's `remote-program`
-    # directly. nix tokenises remote-program on whitespace, so
-    # `pipe%20smoke-builder` becomes argv `[pipe, smoke-builder]`,
-    # and nix appends `--stdio` afterwards.
-    builders_arg = (
-        f"ssh-ng://localhost?remote-program={pipe}"
-        + "%20smoke-builder x86_64-linux - 1 1 medusa-test -"
-    )
-
-    # Instantiate the test derivation.
+    # Instantiate the test derivation locally on the medusa node.
     drv = medusa.succeed(
         "nix-instantiate ${derivExpr}"
     ).strip()
     assert drv.endswith(".drv"), f"unexpected nix-instantiate output: {drv!r}"
 
-    # Negative control: without --builders, the realise must fail
-    # (medusa node lacks the gating feature). This proves the
-    # follow-up succeeded *via* dispatch.
+    # Negative control: a bare `nix-store --realise <drv>` on the
+    # medusa node must fail — the host doesn't advertise "medusa-test"
+    # and we've removed the legacy --builders fallback. This proves
+    # the follow-up succeeded *via* dispatch.
     rc, _ = medusa.execute(
         f"sudo -u medusa nix-store --realise {drv} 2>&1"
     )
     assert rc != 0, "medusa node should NOT be able to build medusa-test deriv locally"
 
-    # Positive: realise via the dynamic pool. medusa-pipe forks per
-    # connect; the daemon proxies to the agent's nix-daemon --stdio.
-    out_path = medusa.succeed(
-        f"sudo -u medusa nix-store --realise {drv} "
-        f"--builders '{builders_arg}'"
-    ).strip()
-    assert out_path.startswith("/nix/store/"), f"unexpected output path: {out_path!r}"
+    # Positive: dispatch via the pool. medusactl drives the daemon's
+    # side-channel transport end-to-end. The daemon allocates a
+    # synthetic build_id, pushes the drv closure, sends Build, drains
+    # the lifecycle, pulls the output closure, and registers a gcroot.
+    raw = medusa.succeed(
+        f"medusactl --socket /run/medusa/control.sock test-dispatch-drv"
+        f" --builder smoke-builder {drv}"
+    )
+    payload = json.loads(raw)
+    assert payload.get("status") == "success", (
+        f"test-dispatch-drv reported non-success: {payload!r}"
+    )
+    output_paths = payload.get("output_paths") or []
+    assert output_paths, f"no output paths reported: {payload!r}"
+    out_path = output_paths[0]
+    assert out_path.startswith("/nix/store/"), (
+        f"unexpected output path: {out_path!r}"
+    )
 
-    # Sanity-check the build artefact: contents prove we ran the
-    # builder script, not just substituted from a cache.
+    # The output must now be present in the medusa node's local
+    # store — the daemon-side `nix-store --import` for the pull
+    # channel imported it. Read it back and verify the contents.
     contents = medusa.succeed(f"cat {out_path}").strip()
-    assert contents == "built-by-builder", f"unexpected output: {contents!r}"
+    assert contents == "built-by-builder", (
+        f"unexpected output: {contents!r}"
+    )
 
-    # Regression guard: every opened build channel on the agent side
-    # must reach the close log too. Without forwarding russh's
-    # Handler::channel_close into the pump, channels stayed open
-    # forever and `nix-daemon --stdio` leaked.
+    # Regression guard: the agent must log the build lifecycle so an
+    # operator debugging a flaky pool dispatch can correlate.
     builder.wait_until_succeeds(
         "journalctl -u medusa-builder.service --no-pager"
-        " | grep -q 'build channel closed; nix subprocess exited'",
+        " | grep -q 'side channel finished'",
         timeout=10,
     )
   '';

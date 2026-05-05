@@ -49,7 +49,6 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SqlxStore>, Arc<BuilderReg
         enrollment_token: Arc::new(ENROLL_TOKEN.to_vec()),
         store: store.clone(),
         registry: registry.clone(),
-        socket_server: None,
     };
     tokio::spawn(async move {
         let _ = BuilderServer::run(cfg).await;

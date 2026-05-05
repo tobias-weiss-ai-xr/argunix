@@ -1,26 +1,24 @@
 //! Build-channel dispatcher.
 //!
 //! The piece that — given `(system, features, exclude_set)` — picks a
-//! connected builder and opens a fresh SSH session channel into it, on
-//! which medusa will speak `nix-store --serve --write`.
+//! connected builder and opens a fresh SSH session channel into it. In
+//! M14b the channel is used for one of the side-channel directions
+//! (`ClosurePush` from daemon, `ClosurePull` from agent) or for sending
+//! a `Build` control message; see [`crate::side_channel`].
 //!
-//! **Note on `in_flight`** (M14). The dispatcher used to inc/dec
-//! `BuilderRegistry::in_flight` around each opened channel, which made
-//! `in_flight` a count of *open SSH channels* rather than running
-//! builds. nix's ssh-ng store opens multiple channels per realise call
-//! (substitution probes, path queries, the actual build), so the count
-//! routinely overstated the real load — the status page showed e.g. 9
-//! "in flight" while only 1 derivation was building. The counter is
-//! now owned by the build worker and incremented exactly once per
-//! dispatched derivation; the channel layer (this file +
-//! `socket_server`) leaves it alone.
+//! **Note on `in_flight`** (M14). The dispatcher does not touch
+//! `BuilderRegistry::in_flight`; the worker owns that counter and
+//! increments exactly once per dispatched derivation so the status
+//! page reflects running *builds* rather than open channels.
 
-use crate::registry::BuilderRegistry;
+use crate::protocol::ControlMessage;
+use crate::registry::{BuildLifecycle, BuilderRegistry};
 use medusa_domain::BuilderName;
 use russh::Channel;
 use russh::server::Msg;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
@@ -108,14 +106,12 @@ impl BuilderDispatcher {
     }
 
     /// Open a fresh SSH session channel into a *specific* builder.
-    /// Used by the socket-server proxy: when the build worker has
-    /// already picked the builder, the proxy forwards `medusa-pipe`
-    /// bytes onto a fresh channel without an `eligible` walk.
+    /// The M14b daemon-side worker uses this to open a `ClosurePush`
+    /// channel (to ship the drv closure) and a `ClosurePull` channel
+    /// (to fetch the built outputs); see [`crate::side_channel`] for
+    /// the framing.
     ///
-    /// Does not touch `in_flight` — see the file-level note. The
-    /// worker is responsible for the counter; one realise call may
-    /// open multiple channels for substitution / path-query / build,
-    /// and counting them all would over-report load.
+    /// Does not touch `in_flight` — see the file-level note.
     pub async fn open_channel(&self, name: &BuilderName) -> Result<DispatchedBuild, DispatchError> {
         let session = self
             .registry
@@ -133,6 +129,86 @@ impl BuilderDispatcher {
                 source: e,
             }),
         }
+    }
+
+    /// M14b: register a build in the registry's in-flight map and send
+    /// a `Build` control message on the named builder's control
+    /// channel. Returns the lifecycle receiver. The worker drains it
+    /// (BuildStarted → BuildLogChunk* → BuildFinished) and is
+    /// responsible for calling [`BuilderRegistry::unregister_in_flight_build`]
+    /// (or [`Self::abort_build`]) on completion / cancellation.
+    ///
+    /// Registration happens *before* the wire write so a fast agent
+    /// can never produce a BuildStarted that arrives at the
+    /// connection handler before the worker's mpsc is in place.
+    pub async fn dispatch_build(
+        &self,
+        name: &BuilderName,
+        build_id: i64,
+        drv_path: String,
+        gc_root: Option<String>,
+        timeout_secs: u64,
+        max_log_bytes: u64,
+    ) -> Result<mpsc::Receiver<BuildLifecycle>, DispatchError> {
+        let session = self
+            .registry
+            .session(name)
+            .ok_or_else(|| DispatchError::NotRegistered {
+                name: name.as_str().to_string(),
+            })?;
+
+        let rx = self
+            .registry
+            .register_in_flight_build(name.clone(), build_id);
+
+        let msg = ControlMessage::Build {
+            build_id,
+            drv_path,
+            gc_root,
+            timeout_secs,
+            max_log_bytes,
+        };
+        let bytes: bytes::Bytes = msg.encode_line().into();
+        if session
+            .handle
+            .data(session.control_channel, bytes)
+            .await
+            .is_err()
+        {
+            // Couldn't write the message — undo the registration so
+            // the registry doesn't leak a sender that never gets
+            // unregistered by a worker that won't run.
+            self.registry.unregister_in_flight_build(name, build_id);
+            return Err(DispatchError::OpenFailed {
+                name: name.as_str().to_string(),
+                source: russh::Error::SendError,
+            });
+        }
+        Ok(rx)
+    }
+
+    /// M14b: send an `Abort` control message on the named builder's
+    /// control channel and unregister the in-flight entry. The
+    /// worker should still drain its lifecycle receiver until
+    /// `Finished{Killed}` arrives so `BuildSlot` accounting closes.
+    /// Idempotent: returns Ok even if the build was already
+    /// unregistered (e.g. a race with the worker's own success path).
+    pub async fn abort_build(
+        &self,
+        name: &BuilderName,
+        build_id: i64,
+    ) -> Result<(), DispatchError> {
+        let session = self
+            .registry
+            .session(name)
+            .ok_or_else(|| DispatchError::NotRegistered {
+                name: name.as_str().to_string(),
+            })?;
+        let bytes: bytes::Bytes = ControlMessage::Abort { build_id }.encode_line().into();
+        // Best-effort send; if the channel is already torn down,
+        // unregistering will let the worker observe a closed mpsc.
+        let _ = session.handle.data(session.control_channel, bytes).await;
+        Ok(())
     }
 }
 

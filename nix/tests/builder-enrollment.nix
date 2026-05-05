@@ -84,16 +84,5 @@ in
         " | tr -d ' \\n' | grep -q '\"connected\":true'",
         timeout=30,
     )
-
-    # SocketServer side: the per-builder unix socket exists for the
-    # lifetime of the Active connection. medusa-pipe will connect to
-    # this socket on every dispatch. Owned by the medusa user.
-    medusa.wait_until_succeeds(
-        "test -S /run/medusa/builders/smoke-builder.sock",
-        timeout=10,
-    )
-    medusa.succeed(
-        "stat -c '%U' /run/medusa/builders/smoke-builder.sock | grep -q '^medusa$'",
-    )
   '';
 }

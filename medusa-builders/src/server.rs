@@ -1,8 +1,8 @@
 use crate::auth::AuthState;
 use crate::host_key::HostKey;
 use crate::protocol::{ControlMessage, LineFramer};
-use crate::registry::{BuilderRegistry, ConnState, ConnectedBuilder, RusshSession};
-use crate::socket_server::{SocketGuard, SocketServer};
+use crate::registry::{BuildLifecycle, BuilderRegistry, ConnState, ConnectedBuilder, RusshSession};
+use base64::Engine as _;
 use medusa_domain::{BuilderCapabilities, BuilderName, BuilderPubkey};
 use medusa_store::{BuilderStore, NewBuilder, SqlxStore};
 use russh::keys::PrivateKey;
@@ -43,12 +43,6 @@ pub struct ServerConfig {
     /// Runtime view of which builders are currently connected. PR #7's
     /// dispatcher reads it; medusactl reads it.
     pub registry: Arc<BuilderRegistry>,
-    /// When set, every successful `hello` opens a per-builder Unix
-    /// socket via [`SocketServer::listen_for`]; the connection's drop
-    /// path tears the socket down. `None` skips the socket lifecycle —
-    /// used in tests and in deployments that haven't enabled the
-    /// dynamic builder pool yet.
-    pub socket_server: Option<Arc<SocketServer>>,
 }
 
 /// Marker name kept for `pub use` consumers; the actual entry point is
@@ -77,7 +71,6 @@ impl BuilderServer {
             store: cfg.store,
             enrollment_token: cfg.enrollment_token,
             registry: cfg.registry,
-            socket_server: cfg.socket_server,
         };
         let listen = cfg.listen;
         server
@@ -96,7 +89,6 @@ struct ServerInner {
     store: Arc<SqlxStore>,
     enrollment_token: Arc<Vec<u8>>,
     registry: Arc<BuilderRegistry>,
-    socket_server: Option<Arc<SocketServer>>,
 }
 
 impl Server for ServerInner {
@@ -107,14 +99,12 @@ impl Server for ServerInner {
             store: self.store.clone(),
             enrollment_token: self.enrollment_token.clone(),
             registry: self.registry.clone(),
-            socket_server: self.socket_server.clone(),
             connection_id,
             state: Arc::new(Mutex::new(AuthState::Unauthenticated)),
             offered_pubkey: Arc::new(Mutex::new(None)),
             framers: Arc::new(Mutex::new(HashMap::new())),
             control_channel: Arc::new(Mutex::new(None)),
             registered_name: Arc::new(std::sync::Mutex::new(None)),
-            socket_guard: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -126,7 +116,6 @@ pub(crate) struct ConnectionHandler {
     store: Arc<SqlxStore>,
     enrollment_token: Arc<Vec<u8>>,
     registry: Arc<BuilderRegistry>,
-    socket_server: Option<Arc<SocketServer>>,
     /// Distinguishes this connection from any other for the same
     /// builder name; used by `BuilderRegistry::remove_if_matches` so
     /// a stale handler dropping after a takeover can't yank the
@@ -148,10 +137,6 @@ pub(crate) struct ConnectionHandler {
     /// Name we registered under, if `hello` succeeded. `Drop` reads
     /// this synchronously (so it can't be a tokio Mutex).
     registered_name: Arc<std::sync::Mutex<Option<BuilderName>>>,
-    /// Per-connection Unix socket in `<socket_dir>/<name>.sock`.
-    /// Created on Hello acceptance when `socket_server` is Some;
-    /// `Drop` removes it synchronously.
-    socket_guard: Arc<std::sync::Mutex<Option<SocketGuard>>>,
 }
 
 impl ConnectionHandler {
@@ -177,9 +162,6 @@ impl Drop for ConnectionHandler {
         if let Some(n) = name {
             self.registry.remove_if_matches(&n, self.connection_id);
         }
-        // Drop the SocketGuard — its own Drop aborts the accept task
-        // and removes the socket file synchronously.
-        let _ = self.socket_guard.lock().unwrap().take();
     }
 }
 
@@ -313,6 +295,28 @@ impl Handler for ConnectionHandler {
 }
 
 impl ConnectionHandler {
+    /// M14b: forward a build lifecycle event onto the registry's
+    /// per-(builder, build_id) mpsc, if a worker has registered one.
+    /// Silently no-ops if the event arrives for an unknown build —
+    /// most likely the worker already gave up (cancel / disconnect)
+    /// and unregistered, or a misbehaving agent is sending build_ids
+    /// it never received a `Build` for.
+    async fn forward_lifecycle(&self, build_id: i64, event: BuildLifecycle) {
+        let name = self.registered_name.lock().unwrap().clone();
+        let Some(name) = name else {
+            tracing::warn!(build_id, "build-lifecycle message before hello; dropping",);
+            return;
+        };
+        let delivered = self.registry.forward_build_event(&name, build_id, event);
+        if !delivered {
+            tracing::debug!(
+                builder = %name,
+                build_id,
+                "build-lifecycle message for unregistered build; dropping",
+            );
+        }
+    }
+
     async fn handle_control(
         &self,
         channel: ChannelId,
@@ -464,27 +468,6 @@ impl ConnectionHandler {
                     }
                 }
 
-                // Bring up the per-builder Unix socket if the daemon
-                // is configured for the dynamic builder pool. nix
-                // will start invoking `medusa-pipe <name>` against
-                // this socket as soon as the dispatcher includes the
-                // builder in its `--builders` arg.
-                if let Some(sock) = self.socket_server.as_ref() {
-                    match sock.listen_for(record.name.clone()).await {
-                        Ok(guard) => {
-                            *self.socket_guard.lock().unwrap() = Some(guard);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                builder = %record.name,
-                                error = %e,
-                                "could not open per-builder socket; \
-                                 dispatch will skip this builder until \
-                                 it reconnects",
-                            );
-                        }
-                    }
-                }
                 *self.state.lock().await = AuthState::Established(record);
             }
             ControlMessage::Heartbeat { ts, load } => {
@@ -538,21 +521,43 @@ impl ConnectionHandler {
                     "control channel: server-only message received from builder; ignoring",
                 );
             }
-            ControlMessage::BuildStarted { .. }
-            | ControlMessage::BuildLogChunk { .. }
-            | ControlMessage::BuildFinished { .. } => {
-                // M14b: builder→daemon build-lifecycle messages. Wiring
-                // these into the worker's dispatch path lands in a
-                // follow-up slice (the daemon needs a per-builder build
-                // state machine to correlate `build_id` against in-flight
-                // jobs and forward log bytes into the existing
-                // `LogCaptureLimit` writer). For now: ignore so an
-                // agent that ships ahead of the daemon doesn't crash
-                // the connection.
-                tracing::debug!(
-                    "control channel: build-lifecycle message received but daemon-side \
-                     dispatch path not yet wired; ignoring (M14b follow-up)",
-                );
+            ControlMessage::BuildStarted { build_id, pid } => {
+                self.forward_lifecycle(build_id, BuildLifecycle::Started { pid })
+                    .await;
+            }
+            ControlMessage::BuildLogChunk {
+                build_id,
+                bytes_b64,
+            } => match base64::engine::general_purpose::STANDARD.decode(&bytes_b64) {
+                Ok(bytes) => {
+                    self.forward_lifecycle(build_id, BuildLifecycle::LogChunk { bytes })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        build_id,
+                        "control channel: BuildLogChunk base64 invalid; dropping",
+                    );
+                }
+            },
+            ControlMessage::BuildFinished {
+                build_id,
+                status,
+                exit_code,
+                output_paths,
+                log_truncated,
+            } => {
+                self.forward_lifecycle(
+                    build_id,
+                    BuildLifecycle::Finished {
+                        status,
+                        exit_code,
+                        output_paths,
+                        log_truncated,
+                    },
+                )
+                .await;
             }
         }
         Ok(())

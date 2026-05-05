@@ -12,7 +12,6 @@ members = [
   "medusa-control",
   "medusa-builders",
   "medusa-builder",
-  "medusa-pipe",
   "medusa-daemon",
   "medusactl",
 ]

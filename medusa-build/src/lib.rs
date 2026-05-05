@@ -16,13 +16,11 @@
 //!
 //! Cache push (Q17) is async-background and lands with the scheduler in M4.
 
-mod builders_arg;
 mod cache;
 mod gc_root;
 mod log_capture;
 mod runner;
 
-pub use builders_arg::{compose_builders_arg, compose_builders_arg_for_one};
 pub use cache::{CacheCheckResult, CacheRef, check_cache};
 pub use gc_root::{add_gc_root, gc_root_path};
 pub use log_capture::{LogCaptureLimit, write_zstd_log};

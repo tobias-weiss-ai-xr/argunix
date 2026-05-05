@@ -13,11 +13,41 @@
 //! caller is responsible for having read or written the
 //! [`crate::side_channel::SideChannelHeader`] first.
 
+use crate::channel_io::with_channel_io;
 use crate::protocol::BuildOutcomeStatus;
+use crate::side_channel::{SideChannelError, SideChannelHeader, SideChannelKind, write_header};
+use russh::Channel;
+use russh::server::Msg as ServerMsg;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
+
+/// `Command::spawn` wrapper that retries `ETXTBSY` ("Text file busy")
+/// for up to 200 ms before giving up. ETXTBSY happens transiently when
+/// a sibling thread's `fork()` inherits a writable fd to a recently-
+/// written executable; the kernel closes the inherited fd as soon as
+/// that child `exec`s (FD_CLOEXEC) but a few-millisecond window
+/// remains. Without this retry, parallel `cargo test` runs across
+/// subprocess-heavy tests flake intermittently.
+fn spawn_retrying_etxtbsy(cmd: &mut Command) -> std::io::Result<tokio::process::Child> {
+    // 26 == ETXTBSY on Linux; stable across kernels. Avoids pulling
+    // in `libc` for a single constant. (Stable since 1.83 there is
+    // also `ErrorKind::ExecutableFileBusy`, but we keep the raw-os
+    // form for the older toolchain on the build server.)
+    const ETXTBSY: i32 = 26;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    loop {
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// Outcome of a closure-import or closure-export subprocess run.
 #[derive(Debug)]
@@ -52,6 +82,12 @@ pub enum ClosureXferError {
     StderrRead(#[source] std::io::Error),
     #[error("waiting for nix-store: {0}")]
     Wait(#[source] std::io::Error),
+    #[error("writing side-channel header: {0}")]
+    Header(#[from] SideChannelError),
+    #[error("running `nix-store --query --requisites`: {0}")]
+    QueryRequisites(#[source] std::io::Error),
+    #[error("`nix-store --query --requisites` exited {code:?}: {stderr}")]
+    QueryRequisitesFailed { code: Option<i32>, stderr: String },
 }
 
 /// Run `<nix_store_bin> --import` and pipe `reader` into its stdin
@@ -74,18 +110,17 @@ pub async fn import_closure<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut child = Command::new(nix_store_bin)
-        .arg("--import")
+    let mut cmd = Command::new(nix_store_bin);
+    cmd.arg("--import")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|source| ClosureXferError::Spawn {
-            bin: nix_store_bin.display().to_string(),
-            op: "--import",
-            source,
-        })?;
+        .kill_on_drop(true);
+    let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|source| ClosureXferError::Spawn {
+        bin: nix_store_bin.display().to_string(),
+        op: "--import",
+        source,
+    })?;
 
     let mut stdin = child.stdin.take().expect("stdin piped");
     let mut stderr = child.stderr.take().expect("stderr piped");
@@ -157,19 +192,18 @@ pub async fn export_closure<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut child = Command::new(nix_store_bin)
-        .arg("--export")
+    let mut cmd = Command::new(nix_store_bin);
+    cmd.arg("--export")
         .args(paths)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|source| ClosureXferError::Spawn {
-            bin: nix_store_bin.display().to_string(),
-            op: "--export",
-            source,
-        })?;
+        .kill_on_drop(true);
+    let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|source| ClosureXferError::Spawn {
+        bin: nix_store_bin.display().to_string(),
+        op: "--export",
+        source,
+    })?;
 
     let mut stdout = child.stdout.take().expect("stdout piped");
     let mut stderr = child.stderr.take().expect("stderr piped");
@@ -217,6 +251,107 @@ where
     })
 }
 
+/// Compute the closure (transitive `--requisites`) of `drv_path` by
+/// shelling out to `<nix_store_bin> --query --requisites <drv_path>`.
+/// Used by the daemon before pushing a drv to a builder: the agent
+/// runs `--realise` on the drv but needs every drv + source it
+/// depends on to be present in its local store first.
+pub async fn query_requisites(
+    nix_store_bin: &Path,
+    drv_path: &str,
+) -> Result<Vec<String>, ClosureXferError> {
+    let mut cmd = Command::new(nix_store_bin);
+    cmd.arg("--query")
+        .arg("--requisites")
+        .arg(drv_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = spawn_retrying_etxtbsy(&mut cmd).map_err(ClosureXferError::QueryRequisites)?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(ClosureXferError::QueryRequisites)?;
+    if !output.status.success() {
+        return Err(ClosureXferError::QueryRequisitesFailed {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Daemon-side: open the supplied russh channel, write a `ClosurePush`
+/// header and then stream `<nix_store_bin> --export <paths>` bytes
+/// onto the channel. The agent's [`crate::dispatch_inbound`] decodes
+/// the header and pipes the rest into its own `nix-store --import`.
+///
+/// Takes ownership of `channel` and closes it cleanly on return.
+pub async fn push_closure_over_channel(
+    channel: Channel<ServerMsg>,
+    build_id: i64,
+    paths: Vec<String>,
+    nix_store_bin: &Path,
+) -> Result<ClosureXferOutcome, ClosureXferError> {
+    let header = SideChannelHeader {
+        kind: SideChannelKind::ClosurePush,
+        build_id,
+        paths: paths.clone(),
+    };
+    let nix_store_bin = nix_store_bin.to_path_buf();
+    let outcome = with_channel_io(channel, None, |io| async move {
+        let (_reader, mut writer) = tokio::io::split(io);
+        write_header(&mut writer, &header).await?;
+        let outcome = export_closure(&nix_store_bin, &paths, &mut writer).await?;
+        // Drop our writer so the channel pump signals EOF on the
+        // remote side (agent's `nix-store --import` exits on EOF).
+        drop(writer);
+        Ok::<ClosureXferOutcome, ClosureXferError>(outcome)
+    })
+    .await;
+    outcome
+}
+
+/// Daemon-side: open the supplied russh channel, write a `ClosurePull`
+/// header asking the agent to export `paths`, and pipe the agent's
+/// stdout (the NAR archive) into a local `<nix_store_bin> --import`
+/// subprocess. Used to materialise a builder's output paths into the
+/// daemon's local store after a successful build.
+pub async fn pull_closure_over_channel(
+    channel: Channel<ServerMsg>,
+    build_id: i64,
+    paths: Vec<String>,
+    nix_store_bin: &Path,
+) -> Result<ClosureXferOutcome, ClosureXferError> {
+    let header = SideChannelHeader {
+        kind: SideChannelKind::ClosurePull,
+        build_id,
+        paths: paths.clone(),
+    };
+    let nix_store_bin = nix_store_bin.to_path_buf();
+    let outcome = with_channel_io(channel, None, |io| async move {
+        let (mut reader, mut writer) = tokio::io::split(io);
+        write_header(&mut writer, &header).await?;
+        // Half-close our write side so the agent doesn't wait for
+        // more bytes after seeing the header. (russh's `Channel::eof`
+        // would do this on the channel; here we just stop writing —
+        // the channel stays open for the agent's stdout to flow back.)
+        let _ = writer.flush().await;
+        drop(writer);
+        // Stream the agent's `--export` stdout straight into our
+        // local `nix-store --import`.
+        let outcome = import_closure(&nix_store_bin, &mut reader).await?;
+        Ok::<ClosureXferOutcome, ClosureXferError>(outcome)
+    })
+    .await;
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,10 +363,28 @@ mod tests {
     /// Lay down a fake `nix-store` that handles `--import` (cat
     /// stdin to sink) and `--export <paths...>` (record argv +
     /// emit canned bytes from a fixture file).
+    /// Atomically install an executable script at `path`. Writes to a
+    /// sibling `.tmp` path (chmod'd while still under that name) and
+    /// renames into place — so the final path never had a writable
+    /// fd opened on it. Without this, a sibling thread's fork() can
+    /// briefly inherit our writable fd; the child then exec's *its*
+    /// own script and Linux returns ETXTBSY because the inherited fd
+    /// (still pointing at our path) is now seen as in-use.
+    fn install_script_atomic(path: &Path, body: &str) {
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perm).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
     fn fake_nix_store(path: &Path, sink_path: &Path, argv_path: &Path, payload_path: &Path) {
-        let mut f = std::fs::File::create(path).unwrap();
-        writeln!(
-            f,
+        let body = format!(
             r#"#!/bin/sh
 case "$1" in
   --import)
@@ -250,30 +403,17 @@ exit 99
             sink = sink_path.display(),
             argv = argv_path.display(),
             payload = payload_path.display(),
-        )
-        .unwrap();
-        f.sync_all().unwrap();
-        let mut perm = std::fs::metadata(path).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(path, perm).unwrap();
+        );
+        install_script_atomic(path, &body);
     }
 
     fn fake_nix_store_failing(path: &Path, exit_code: i32, stderr_msg: &str) {
-        let mut f = std::fs::File::create(path).unwrap();
-        writeln!(
-            f,
-            r#"#!/bin/sh
-printf '%s' "{msg}" >&2
-exit {code}
-"#,
+        let body = format!(
+            "#!/bin/sh\nprintf '%s' \"{msg}\" >&2\nexit {code}\n",
             msg = stderr_msg,
             code = exit_code,
-        )
-        .unwrap();
-        f.sync_all().unwrap();
-        let mut perm = std::fs::metadata(path).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(path, perm).unwrap();
+        );
+        install_script_atomic(path, &body);
     }
 
     #[tokio::test]

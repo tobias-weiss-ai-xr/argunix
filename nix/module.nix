@@ -229,8 +229,6 @@ in
           (toString settingsFile)
           "--listen"
           cfg.listen
-          "--medusa-pipe-path"
-          (lib.getExe' cfg.package "medusa-pipe")
         ];
         ExecReload = lib.concatStringsSep " " [
           (lib.getExe' cfg.package "medusactl")

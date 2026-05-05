@@ -51,6 +51,16 @@ pub enum Request {
     /// Rename `old → new`. Fails if `old` doesn't exist or if `new`
     /// already exists.
     BuildersRename { old: String, new: String },
+    /// Test-only (M14b VM test driver): take an existing local drv
+    /// path, push its closure to the named builder over a side
+    /// channel, send a `Build` control message, drain the lifecycle,
+    /// pull the output closure back, and register a transient
+    /// gcroot. Returns the realised output paths on success.
+    ///
+    /// Not intended for operator use — the read-only worker pipeline
+    /// is the supported path. Used by the NixOS test that exercises
+    /// the dynamic-pool transport without standing up a fake forge.
+    TestDispatchDrv { drv_path: String, builder: String },
 }
 
 /// One row of the `medusactl builders` output.

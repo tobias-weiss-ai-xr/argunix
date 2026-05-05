@@ -7,17 +7,18 @@
 //!   - shutdown signal sends a `Shutdown` control message and
 //!     transitions the registry entry to `Disconnecting`.
 
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use medusa_builder_agent::{AgentConfig, PersistedKey, run};
 use medusa_builders::{
-    BuilderDispatcher, BuilderRegistry, BuilderServer, ConnState, ServerConfig,
-    load_or_generate as load_host_key,
+    BuilderDispatcher, BuilderRegistry, BuilderServer, ConnState, ServerConfig, SideChannelHeader,
+    SideChannelKind, load_or_generate as load_host_key,
 };
 use medusa_domain::{BuilderCapabilities, BuilderName};
 use medusa_store::{BuilderStore, SqlxStore, open_in_memory};
-use russh::ChannelMsg;
 
 const ENROLL_TOKEN: &[u8] = b"agent-e2e-token";
 
@@ -38,7 +39,6 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SqlxStore>, Arc<BuilderReg
         enrollment_token: Arc::new(ENROLL_TOKEN.to_vec()),
         store: store.clone(),
         registry: registry.clone(),
-        socket_server: None,
     };
     tokio::spawn(async move {
         let _ = BuilderServer::run(cfg).await;
@@ -109,7 +109,7 @@ async fn token_first_then_pubkey_subsequent() {
         name: BuilderName::new("agent-test").unwrap(),
         capabilities: caps(),
         reconnect_initial_backoff: Duration::from_millis(100),
-        nix_serve_command: AgentConfig::default_nix_serve_command(),
+        nix_store_bin: AgentConfig::default_nix_store_bin(),
         medusa_host_key_path: None,
     };
     let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
@@ -136,23 +136,65 @@ async fn token_first_then_pubkey_subsequent() {
     let _ = tokio::time::timeout(Duration::from_secs(3), agent_handle).await;
 }
 
+/// Lay down a fake `nix-store` shell script at `path` that, on
+/// `--import`, pipes stdin into a sink file and exits 0. Used to
+/// verify the agent's side-channel handler runs the right
+/// subprocess and forwards bytes byte-for-byte from the daemon.
+fn fake_nix_store_import(path: &Path, sink: &Path) {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    // Atomic-rename install: dodge ETXTBSY under parallel cargo-test
+    // fork pressure by ensuring the final path never had a writable
+    // fd opened on it.
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        writeln!(
+            f,
+            r#"#!/bin/sh
+if [ "$1" = "--import" ]; then
+  cat > "{sink}"
+  exit 0
+fi
+exit 99
+"#,
+            sink = sink.display(),
+        )
+        .unwrap();
+        f.sync_all().unwrap();
+    }
+    let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&tmp, perm).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+/// M14b end-to-end: spawn a real medusa server + a real agent over
+/// SSH, open a session channel from the daemon side, write a
+/// `ClosurePush` side-channel header + binary payload, and assert
+/// the agent's fake `nix-store --import` received every byte. This
+/// is the legacy `cat` round-trip test (M13) replaced for the new
+/// transport.
 #[tokio::test]
-async fn build_channel_round_trips_bytes_through_subprocess() {
+async fn closure_push_side_channel_end_to_end() {
     let (addr, _store, registry) = spawn_server().await;
     let identity = fresh_identity();
 
-    // Stub the per-build subprocess with `cat` so anything medusa
-    // writes on the channel comes straight back through the
-    // subprocess's stdin→stdout. That's enough to verify the
-    // bidirectional pump end-to-end without bringing in real nix.
+    // Fake `nix-store` so we don't need a real nix install just to
+    // exercise the channel plumbing. `--import` cats stdin → sink.
+    let bin_dir = tempfile::tempdir().unwrap();
+    let fake_bin = bin_dir.path().join("nix-store");
+    let import_sink = bin_dir.path().join("imp-sink.bin");
+    fake_nix_store_import(&fake_bin, &import_sink);
+
     let cfg = AgentConfig {
         medusa: addr,
         identity: identity.clone(),
         enrollment_token: Some(Arc::new(ENROLL_TOKEN.to_vec())),
-        name: BuilderName::new("cat-builder").unwrap(),
+        name: BuilderName::new("xfer-builder").unwrap(),
         capabilities: caps(),
         reconnect_initial_backoff: Duration::from_millis(100),
-        nix_serve_command: Arc::new(vec!["cat".into()]),
+        nix_store_bin: PathBuf::from(&fake_bin),
         medusa_host_key_path: None,
     };
     let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
@@ -164,31 +206,63 @@ async fn build_channel_round_trips_bytes_through_subprocess() {
         .await;
     });
 
-    wait_for_active(&registry, "cat-builder").await;
+    wait_for_active(&registry, "xfer-builder").await;
 
-    // Open a build channel from medusa side and round-trip bytes.
+    // Open a side channel from the daemon side. `BuilderDispatcher`
+    // owns the russh server-side `Channel<ServerMsg>`.
     let dispatcher = BuilderDispatcher::new(registry.clone());
     let mut dispatched = dispatcher
-        .open_channel(&BuilderName::new("cat-builder").unwrap())
+        .open_channel(&BuilderName::new("xfer-builder").unwrap())
         .await
-        .expect("dispatch must succeed");
-    let mut channel = dispatched.take_channel().expect("channel present");
+        .expect("open_channel must succeed");
+    let channel = dispatched.take_channel().expect("channel present");
 
-    let payload = b"medusa-says-hi\n";
+    // Daemon-side write: header + binary payload.
+    let header = SideChannelHeader {
+        kind: SideChannelKind::ClosurePush,
+        build_id: 1234,
+        paths: vec!["/nix/store/aaa-foo.drv".into()],
+    };
+    let payload: Vec<u8> = (0u8..=255).chain(std::iter::once(b'X')).collect();
+
+    // Hack: the daemon side has `Channel::data` which writes bytes
+    // out, but no AsyncWrite adapter yet (that's the next slice on
+    // the daemon side). For the test we use the russh `data()` API
+    // directly — same byte stream the AsyncWrite adapter would
+    // produce.
+    let mut header_bytes = header.encode_line();
+    channel.data(&header_bytes[..]).await.unwrap();
+    header_bytes.clear(); // drop reference
     channel.data(&payload[..]).await.unwrap();
+    // Half-close the channel so the agent's import subprocess sees
+    // EOF on stdin and exits.
+    channel.eof().await.unwrap();
 
-    let mut got = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while got.len() < payload.len() && tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(200), channel.wait()).await {
-            Ok(Some(ChannelMsg::Data { data })) => got.extend_from_slice(&data),
-            Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) | Ok(None) => break,
-            _ => continue,
+    // Wait until the fake nix-store has written everything to the
+    // sink. The agent runs the subprocess + waits for it; we poll
+    // the sink file size.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_len = 0usize;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(meta) = std::fs::metadata(&import_sink) {
+            let len = meta.len() as usize;
+            if len == payload.len() {
+                last_len = len;
+                break;
+            }
+            last_len = len;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(
-        &got, payload,
-        "bytes sent on the build channel must be echoed by `cat`",
+        last_len,
+        payload.len(),
+        "fake `nix-store --import` should have received the full payload",
+    );
+    let written = std::fs::read(&import_sink).expect("sink readable");
+    assert_eq!(
+        written, payload,
+        "every byte of the daemon's payload must reach the agent's `nix-store --import`",
     );
 
     drop(channel);

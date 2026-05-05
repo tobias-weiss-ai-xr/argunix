@@ -56,13 +56,12 @@ struct ServeArgs {
     /// here). Default: `/run/medusa/control.sock`.
     #[arg(long, value_name = "PATH")]
     control_socket: Option<PathBuf>,
-    /// Absolute path to the `medusa-pipe` shim. Embedded into the
-    /// `--builders ssh-ng://x@local?ssh-command=…` URI for every
-    /// build dispatch. Defaults to `medusa-pipe` (resolved on the
-    /// daemon's PATH) — the NixOS module pins it to the absolute
-    /// path inside `pkgs.medusa`.
-    #[arg(long, value_name = "PATH", default_value = "medusa-pipe")]
-    medusa_pipe_path: String,
+    /// Path to the local `nix-store` binary used for computing drv
+    /// closures (`--query --requisites`), exporting closures to
+    /// builders, and importing output closures from builders. Default
+    /// resolves on PATH; the NixOS module pins it to an absolute path.
+    #[arg(long, value_name = "PATH", default_value = "nix-store")]
+    nix_store_bin: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -244,7 +243,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         pauses: pauses.clone(),
         cancellations: cancellations.clone(),
         builder_registry: builder_registry.clone(),
-        medusa_pipe_path: args.medusa_pipe_path.clone(),
+        nix_store_bin: args.nix_store_bin.clone(),
         // M14: parallelise per-eval builds. Default 16 — comfortably
         // above the typical sum of `max_jobs` across a small builder
         // pool, so the global cap doesn't bottleneck before per-builder
@@ -328,6 +327,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         config_path: args.config.clone(),
         skip_secret_check: args.skip_secret_check,
         builder_registry,
+        nix_store_bin: args.nix_store_bin.clone(),
+        build_timeout: Duration::from_secs(7200),
     });
 
     // Tell systemd we're ready (so `Type=notify-reload` can sequence
@@ -732,7 +733,6 @@ async fn build_one_job(
         // The single-shot `medusa build` CLI runs locally — no
         // dynamic pool involvement. Falls through to the host's
         // `nix.buildMachines` like before.
-        builders_arg: None,
     };
     let outcome = medusa_build::run_build(&request)
         .await
@@ -887,22 +887,12 @@ async fn spawn_builder_server_if_configured(
         })?;
     let token = Arc::new(strip_trailing_newlines(token_bytes));
 
-    // Per-builder unix sockets at `<runtime>/builders/<name>.sock`.
-    // The BuilderServer's per-connection handler calls
-    // `SocketServer::listen_for(name)` on Hello acceptance and holds
-    // the returned guard for the connection's lifetime, so the file
-    // is gone the moment the builder disconnects.
-    let socket_dir = PathBuf::from("/run/medusa/builders");
-    let dispatcher = Arc::new(medusa_builders::BuilderDispatcher::new(registry.clone()));
-    let socket_server = Arc::new(medusa_builders::SocketServer::new(socket_dir, dispatcher));
-
     let server_cfg = medusa_builders::ServerConfig {
         listen,
         host_key,
         enrollment_token: token,
         store: Arc::new(store.clone()),
         registry,
-        socket_server: Some(socket_server),
     };
 
     let handle = tokio::spawn(async move {

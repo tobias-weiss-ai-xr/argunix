@@ -13,14 +13,20 @@
 //! agent's dispatcher can branch unambiguously on the first line
 //! without parsing nix's wire format.
 //!
-//! This module owns the **codec only** — encoding, decoding, and
-//! the IO helpers to read/write a header from/to an `AsyncRead` /
-//! `AsyncWrite`. The actual `nix-store --import` / `--export` work
-//! lives on the agent (`medusa-builder`) and the daemon
-//! (`medusa-build`) respectively, since each side only needs one
-//! direction's subprocess plumbing.
+//! This module owns the **codec** (encoding, decoding, the IO
+//! helpers to read/write a header from/to an `AsyncRead` /
+//! `AsyncWrite`) and the agent-side **dispatcher**
+//! ([`dispatch_inbound`]), which composes the codec with
+//! [`crate::closure_xfer::import_closure`] /
+//! [`crate::closure_xfer::export_closure`] to handle a complete
+//! side-channel transfer. The russh wiring — adapting a
+//! `russh::Channel` into `AsyncRead`+`AsyncWrite` — lives in a
+//! separate adapter so this module stays unit-testable through
+//! `tokio::io::duplex`.
 
+use crate::closure_xfer::{ClosureXferError, ClosureXferOutcome, export_closure, import_closure};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Header that prefaces every M14b side channel. Always exactly one
@@ -130,6 +136,77 @@ where
     writer.write_all(&line).await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Outcome of a side-channel dispatch — either a closure was
+/// imported (push direction) or exported (pull direction). Both
+/// arms carry the underlying [`ClosureXferOutcome`] so callers can
+/// log byte counts and forward stderr to the daemon.
+#[derive(Debug)]
+pub enum DispatchOutcome {
+    /// Daemon → agent direction completed. The agent imported the
+    /// drv closure into its local nix store.
+    ClosurePushed {
+        build_id: i64,
+        paths: Vec<String>,
+        import: ClosureXferOutcome,
+    },
+    /// Agent → daemon direction completed. The agent exported the
+    /// requested paths onto the channel; the daemon will read them
+    /// on the other end.
+    ClosurePulled {
+        build_id: i64,
+        paths: Vec<String>,
+        export: ClosureXferOutcome,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    #[error("reading side-channel header: {0}")]
+    Header(#[from] SideChannelError),
+    #[error("running nix-store subprocess for transfer: {0}")]
+    Xfer(#[from] ClosureXferError),
+}
+
+/// Agent-side responder: read a side-channel header from `reader`,
+/// branch on `kind`, and either pipe `reader`'s remaining bytes
+/// into `nix-store --import` (`ClosurePush`) or run
+/// `nix-store --export <paths>` and stream its stdout onto `writer`
+/// (`ClosurePull`). The header is parsed first, so a malformed
+/// header surfaces as a typed error before any subprocess spawns.
+///
+/// `nix_store_bin` is taken explicitly so unit tests can inject a
+/// fake binary without mutating `PATH` (same convention as
+/// `closure_xfer`).
+pub async fn dispatch_inbound<R, W>(
+    nix_store_bin: &Path,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<DispatchOutcome, DispatchError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let header = read_header(reader).await?;
+    match header.kind {
+        SideChannelKind::ClosurePush => {
+            let import = import_closure(nix_store_bin, reader).await?;
+            Ok(DispatchOutcome::ClosurePushed {
+                build_id: header.build_id,
+                paths: header.paths,
+                import,
+            })
+        }
+        SideChannelKind::ClosurePull => {
+            let export = export_closure(nix_store_bin, &header.paths, writer).await?;
+            Ok(DispatchOutcome::ClosurePulled {
+                build_id: header.build_id,
+                paths: header.paths,
+                export,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -250,5 +327,222 @@ mod tests {
         let mut reader = BufReader::new(rx);
         let parsed = read_header(&mut reader).await.unwrap();
         assert_eq!(parsed, h);
+    }
+
+    // ---------- dispatch_inbound tests ----------
+    //
+    // These drive the full agent-side responder through
+    // `tokio::io::duplex`: the test spawns the dispatcher on one
+    // end and a fake "daemon" on the other that writes a header
+    // and binary payload (push) or reads them (pull). Same shape
+    // the russh wiring will take, just without russh.
+    //
+    // The fake nix-store binary follows the same convention as
+    // `closure_xfer::tests`: a tiny shell script handling
+    // `--import` (cat stdin → sink) and `--export <paths>` (record
+    // argv + emit canned bytes from a fixture file).
+
+    use crate::protocol::BuildOutcomeStatus;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn fake_nix_store(path: &Path, sink: &Path, argv: &Path, payload: &Path) {
+        // Atomic-rename install. Under parallel cargo-test fork
+        // pressure, sibling threads' forks can briefly inherit a
+        // writable fd to this script before the parent thread closes
+        // it; the next exec attempt then sees ETXTBSY. Writing to
+        // `.tmp` + chmod + rename means the final path never had a
+        // writable fd opened on it.
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            writeln!(
+                f,
+                r#"#!/bin/sh
+case "$1" in
+  --import)
+    cat > "{sink}"
+    exit 0
+    ;;
+  --export)
+    : > "{argv}"
+    for a in "$@"; do printf '%s\n' "$a" >> "{argv}"; done
+    cat "{payload}"
+    exit 0
+    ;;
+esac
+exit 99
+"#,
+                sink = sink.display(),
+                argv = argv.display(),
+                payload = payload.display(),
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perm).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_inbound_handles_closure_push_end_to_end() {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("nix-store");
+        let sink = dir.path().join("imp-sink.bin");
+        let argv = dir.path().join("imp-argv.txt");
+        let payload = dir.path().join("imp-payload.bin");
+        std::fs::write(&payload, b"unused").unwrap();
+        fake_nix_store(&bin, &sink, &argv, &payload);
+
+        // Daemon-side fixture: a header + binary payload that the
+        // agent's dispatcher must consume, parse, and feed into
+        // `nix-store --import`.
+        let header = SideChannelHeader {
+            kind: SideChannelKind::ClosurePush,
+            build_id: 17,
+            paths: vec!["/nix/store/aaa.drv".into(), "/nix/store/bbb-dep".into()],
+        };
+        let nar_payload: Vec<u8> = (0u8..=255).chain(std::iter::once(b'X')).collect();
+
+        let (mut daemon_tx_to_agent, mut agent_rx) = {
+            let (rx, tx) = tokio::io::duplex(8 * 1024);
+            (tx, rx)
+        };
+        let (mut _unused_agent_writer, mut _daemon_reader) = tokio::io::duplex(64);
+
+        // Daemon-side: write header + payload, then drop the
+        // writer so the agent sees EOF and `import` finishes.
+        let nar_clone = nar_payload.clone();
+        let daemon_task = tokio::spawn(async move {
+            write_header(&mut daemon_tx_to_agent, &header)
+                .await
+                .unwrap();
+            daemon_tx_to_agent.write_all(&nar_clone).await.unwrap();
+            daemon_tx_to_agent.shutdown().await.unwrap();
+        });
+
+        let outcome = dispatch_inbound(&bin, &mut agent_rx, &mut _unused_agent_writer)
+            .await
+            .expect("dispatch should succeed for closure_push");
+        daemon_task.await.unwrap();
+
+        match outcome {
+            DispatchOutcome::ClosurePushed {
+                build_id,
+                paths,
+                import,
+            } => {
+                assert_eq!(build_id, 17);
+                assert_eq!(paths, vec!["/nix/store/aaa.drv", "/nix/store/bbb-dep"]);
+                assert_eq!(import.status, BuildOutcomeStatus::Success);
+                assert_eq!(import.bytes_transferred, nar_payload.len() as u64);
+            }
+            other => panic!("expected ClosurePushed, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&sink).unwrap(),
+            nar_payload,
+            "every byte of the payload must reach `nix-store --import` stdin",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_inbound_handles_closure_pull_end_to_end() {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("nix-store");
+        let sink = dir.path().join("imp-sink.bin");
+        let argv = dir.path().join("exp-argv.txt");
+        let payload = dir.path().join("exp-payload.bin");
+        let canned: Vec<u8> = (0u8..200).cycle().take(50_000).collect();
+        std::fs::write(&payload, &canned).unwrap();
+        fake_nix_store(&bin, &sink, &argv, &payload);
+
+        // Daemon-side fixture: write a Pull header asking for two
+        // output paths, then read back what the agent sends.
+        let header = SideChannelHeader {
+            kind: SideChannelKind::ClosurePull,
+            build_id: 23,
+            paths: vec!["/nix/store/zzz-out".into(), "/nix/store/yyy-out-dev".into()],
+        };
+
+        let (rx_daemon_to_agent, mut tx_daemon_to_agent) = tokio::io::duplex(64 * 1024);
+        let (mut rx_agent_to_daemon, tx_agent_to_daemon) = tokio::io::duplex(64 * 1024);
+        let mut agent_reader = BufReader::new(rx_daemon_to_agent);
+        let mut agent_writer = tx_agent_to_daemon;
+
+        let header_clone = header.clone();
+        let daemon_task = tokio::spawn(async move {
+            write_header(&mut tx_daemon_to_agent, &header_clone)
+                .await
+                .unwrap();
+            tx_daemon_to_agent.shutdown().await.unwrap();
+
+            // Read everything the agent emits.
+            let mut buf = Vec::new();
+            rx_agent_to_daemon.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        let outcome = dispatch_inbound(&bin, &mut agent_reader, &mut agent_writer)
+            .await
+            .expect("dispatch should succeed for closure_pull");
+        // Drop the agent writer so the daemon's read_to_end can finish.
+        drop(agent_writer);
+        let received = daemon_task.await.unwrap();
+
+        match outcome {
+            DispatchOutcome::ClosurePulled {
+                build_id,
+                paths,
+                export,
+            } => {
+                assert_eq!(build_id, 23);
+                assert_eq!(paths, header.paths);
+                assert_eq!(export.status, BuildOutcomeStatus::Success);
+                assert_eq!(export.bytes_transferred, canned.len() as u64);
+            }
+            other => panic!("expected ClosurePulled, got {other:?}"),
+        }
+        assert_eq!(
+            received, canned,
+            "agent's `nix-store --export` stdout must reach the daemon-side reader byte-for-byte",
+        );
+
+        // Argv shape: the dispatcher must hand `--export` exactly
+        // the path list from the header, in order.
+        let argv_lines = std::fs::read_to_string(&argv).unwrap();
+        let lines: Vec<&str> = argv_lines.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["--export", "/nix/store/zzz-out", "/nix/store/yyy-out-dev"],
+            "subprocess argv must mirror header.paths",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_inbound_surfaces_header_parse_error_before_spawning() {
+        // A garbage header must fail fast — no subprocess spawn,
+        // no nix-store invocation. We point the dispatcher at a
+        // path that doesn't exist; if it tried to spawn we'd get a
+        // Spawn error, but we expect a Header error instead.
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("does-not-exist");
+
+        let mut wire: Vec<u8> = b"this is not json\n".to_vec();
+        wire.extend_from_slice(b"binary-payload");
+        let mut reader = BufReader::new(&wire[..]);
+        let mut writer = Vec::new();
+
+        let err = dispatch_inbound(&bin, &mut reader, &mut writer)
+            .await
+            .expect_err("malformed header must error");
+        assert!(
+            matches!(err, DispatchError::Header(_)),
+            "expected Header error, got {err:?}",
+        );
     }
 }

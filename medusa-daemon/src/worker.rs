@@ -23,6 +23,10 @@
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use chrono::Utc;
+use medusa_builders::{
+    BuildLifecycle, BuildOutcomeStatus, BuilderDispatcher, ClosureXferError,
+    pull_closure_over_channel, push_closure_over_channel, query_requisites,
+};
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
 use medusa_forge::{CheckPost, CheckState, ForgeError, Provider};
 use medusa_store::{EvalStore, JobStore, RepoStore, SqlxStore};
@@ -77,15 +81,20 @@ pub struct WorkerContext {
     pub systems: Vec<String>,
     pub pauses: Arc<PauseRegistry>,
     pub cancellations: Arc<CancelRegistry>,
-    /// Snapshot of the dynamic builder pool. Per-build, the worker
-    /// composes a `--builders` argument from currently-Active entries
-    /// and hands it to `run_build`. `None` (or no Active entries)
-    /// means the host's `nix.buildMachines` is used unchanged.
+    /// Shared registry of currently-connected builders. The worker
+    /// picks one per derivation via `pick_builder_for_spec`; on a
+    /// match, dispatch goes through M14b side channels (push closure
+    /// → `Build` control message → drain lifecycle → pull outputs).
+    /// On no match, the worker falls back to a local `nix-store
+    /// --realise` (which itself may use the host's `nix.buildMachines`).
     pub builder_registry: Arc<medusa_builders::BuilderRegistry>,
-    /// Absolute path to the `medusa-pipe` shim. Embedded into every
-    /// `--builders ssh-ng://x@local?ssh-command=…` URI so nix can
-    /// fork it for each dispatch.
-    pub medusa_pipe_path: String,
+    /// Path to the local `nix-store` binary. Used by the M14b
+    /// side-channel transport to compute drv closures
+    /// (`nix-store --query --requisites`), export drv closures to
+    /// the agent, and import the agent's output closure back into
+    /// the daemon's local store. Tests inject a fake binary; in
+    /// production, `PathBuf::from("nix-store")` resolves on PATH.
+    pub nix_store_bin: PathBuf,
     /// Maximum number of derivations to build in parallel across the
     /// whole evaluation (M14). Per-builder concurrency is additionally
     /// gated by each builder's advertised `max_jobs`. Defaults to 16
@@ -550,10 +559,10 @@ fn summarise_for_check(err: &str, max_chars: usize) -> String {
 /// - no connected builder advertises the system *and* every required
 ///   feature *and* has free `max_jobs` capacity right now.
 ///
-/// In the second case the caller falls through to the multi-builder
-/// `compose_builders_arg`, letting nix's own scheduler retry against
-/// the full pool. The pre-flight earlier in `build_one` has already
-/// failed-fast for the unsatisfiable-features subset.
+/// In the second case the caller falls through to a local
+/// `nix-store --realise` (no `--builders`), which honours the host's
+/// `nix.buildMachines` if any. The pre-flight earlier in `build_one`
+/// has already failed-fast for the unsatisfiable-features subset.
 fn pick_builder_for_spec(
     registry: &medusa_builders::BuilderRegistry,
     spec: &medusa_eval::JobSpec,
@@ -916,30 +925,10 @@ async fn build_one(
             tracing::warn!(error = %e, dir = %parent.display(), "failed to create gcroot parent dir; build will run without a gcroot");
         }
     }
-    let builders_arg = match &chosen {
-        Some(b) => Some(medusa_build::compose_builders_arg_for_one(
-            &b.name,
-            &b.capabilities,
-            &ctx.medusa_pipe_path,
-        )),
-        // No specific builder chosen: snapshot the full pool so nix's
-        // own scheduler still has options. Builders that connected
-        // after this snapshot will be picked up on the next build.
-        None => medusa_build::compose_builders_arg(&ctx.builder_registry, &ctx.medusa_pipe_path),
-    };
-    let request = medusa_build::BuildRequest {
-        drv_path: drv_path.clone(),
-        log_path: log_path.clone(),
-        timeout: ctx.build_timeout,
-        log_limit: medusa_build::LogCaptureLimit::default(),
-        gc_root: Some(gc_root.clone()),
-        builders_arg,
-    };
     tracing::info!(
         eval_id = eval_id.get(),
-        drv = %request.drv_path,
+        drv = %drv_path,
         log = %log_path.display(),
-        builders = request.builders_arg.is_some(),
         pinned_builder = chosen.as_ref().map(|b| b.name.as_str()),
         "dispatching build",
     );
@@ -947,20 +936,55 @@ async fn build_one(
     // signal. `biased;` polls the build first — if it just resolved
     // with success we honour that even if cancel arrived in the same
     // event-loop tick (Q105). On cancel-wins we drop the build future;
-    // medusa-build's `Command::kill_on_drop(true)` reaps the child.
-    let outcome = tokio::select! {
-        biased;
-        res = medusa_build::run_build(&request) => res?,
-        _ = cancel.cancelled() => {
-            tracing::info!(
-                job_id = job_id.get(),
-                attr = %spec.attr_path,
-                "build cancelled by new push (Q39); killing nix-store",
-            );
-            <SqlxStore as JobStore>::finish(
-                &ctx.store, job_id, JobStatus::Cancelled, Utc::now(), None, None
-            ).await?;
-            return Ok(JobStatus::Cancelled);
+    // for the local fallback path, `Command::kill_on_drop(true)` reaps
+    // the child; for the remote (pool) path, `dispatch_build_via_pool`
+    // sends an `Abort` control message and drains the resulting
+    // `BuildFinished{Killed}` itself.
+    let outcome = match &chosen {
+        Some(b) => {
+            // M14b: dispatch via the dynamic builder pool through
+            // side channels. The helper drives push-closure → Build
+            // → drain lifecycle → pull-closure → register-gcroot
+            // entirely; the `cancel` token is honoured inside.
+            dispatch_build_via_pool(
+                ctx,
+                &b.name,
+                job_id,
+                &drv_path,
+                &gc_root,
+                &log_path,
+                medusa_build::LogCaptureLimit::default(),
+                cancel,
+            )
+            .await?
+        }
+        None => {
+            // No matching connected builder: fall back to a local
+            // `nix-store --realise` (no `--builders`). The host's
+            // `nix.buildMachines`, if any, is honoured natively; if
+            // not, the build runs locally.
+            let request = medusa_build::BuildRequest {
+                drv_path: drv_path.clone(),
+                log_path: log_path.clone(),
+                timeout: ctx.build_timeout,
+                log_limit: medusa_build::LogCaptureLimit::default(),
+                gc_root: Some(gc_root.clone()),
+            };
+            tokio::select! {
+                biased;
+                res = medusa_build::run_build(&request) => res?,
+                _ = cancel.cancelled() => {
+                    tracing::info!(
+                        job_id = job_id.get(),
+                        attr = %spec.attr_path,
+                        "build cancelled by new push (Q39); killing nix-store",
+                    );
+                    <SqlxStore as JobStore>::finish(
+                        &ctx.store, job_id, JobStatus::Cancelled, Utc::now(), None, None
+                    ).await?;
+                    return Ok(JobStatus::Cancelled);
+                }
+            }
         }
     };
     let log_path_str = log_path.to_string_lossy().into_owned();
@@ -1004,6 +1028,349 @@ async fn build_one(
             Ok(JobStatus::Failure)
         }
     }
+}
+
+/// Bundle of the small bits `dispatch_pool_build` reads. Lifted out
+/// of `WorkerContext` so the same orchestration can also be invoked
+/// from the control socket's `TestDispatchDrv` handler without
+/// constructing a full WorkerContext.
+pub struct PoolDispatchSpec<'a> {
+    pub registry: Arc<medusa_builders::BuilderRegistry>,
+    pub builder_name: &'a medusa_domain::BuilderName,
+    pub build_id: i64,
+    pub drv_path: &'a str,
+    pub gc_root: &'a Path,
+    pub log_path: &'a Path,
+    pub log_limit: medusa_build::LogCaptureLimit,
+    pub build_timeout: Duration,
+    pub nix_store_bin: &'a Path,
+}
+
+/// Distinguishes "build cancelled by caller" from "build finished
+/// (success or failure) with this BuildOutcome". The worker's
+/// `build_one` translates `Cancelled` into a `JobStatus::Cancelled`
+/// row update and a `JobStatus::Cancelled` return value; the test
+/// dispatch path never sees `Cancelled` (no cancel token is wired in).
+pub enum PoolDispatchResult {
+    Outcome(medusa_build::BuildOutcome),
+    Cancelled,
+}
+
+/// Worker-side wrapper that translates `PoolDispatchResult::Cancelled`
+/// into a `JobStore` row update + the `JobStatus::Cancelled` return.
+async fn dispatch_build_via_pool(
+    ctx: &WorkerContext,
+    builder_name: &medusa_domain::BuilderName,
+    job_id: JobId,
+    drv_path: &str,
+    gc_root: &Path,
+    log_path: &Path,
+    log_limit: medusa_build::LogCaptureLimit,
+    cancel: &medusa_web::CancelToken,
+) -> anyhow::Result<medusa_build::BuildOutcome> {
+    let spec = PoolDispatchSpec {
+        registry: ctx.builder_registry.clone(),
+        builder_name,
+        build_id: job_id.get(),
+        drv_path,
+        gc_root,
+        log_path,
+        log_limit,
+        build_timeout: ctx.build_timeout,
+        nix_store_bin: &ctx.nix_store_bin,
+    };
+    match dispatch_pool_build(spec, Some(cancel)).await? {
+        PoolDispatchResult::Outcome(o) => Ok(o),
+        PoolDispatchResult::Cancelled => {
+            <SqlxStore as JobStore>::finish(
+                &ctx.store,
+                job_id,
+                JobStatus::Cancelled,
+                Utc::now(),
+                Some(&log_path.to_string_lossy()),
+                None,
+            )
+            .await?;
+            Err(anyhow!("build cancelled"))
+        }
+    }
+}
+
+/// M14b daemon-side build orchestration.
+///
+/// Drives one derivation through the pool: push the drv's input
+/// closure to the chosen builder over a `ClosurePush` side channel,
+/// send a `Build` control message, drain the resulting
+/// `BuildStarted` / `BuildLogChunk*` / `BuildFinished` lifecycle
+/// (raced against an optional `cancel` token), pull the output
+/// closure over a `ClosurePull` side channel, and register the
+/// gcroot for the daemon-side copy of the first output.
+///
+/// Returns a [`PoolDispatchResult`]: either `Outcome(BuildOutcome)`
+/// for the normal (success / failure) cases or `Cancelled` if the
+/// caller's `cancel` token fired. The Cancelled-row update on
+/// `JobStore` is the worker's responsibility — see the
+/// [`dispatch_build_via_pool`] thin wrapper above.
+pub async fn dispatch_pool_build(
+    spec: PoolDispatchSpec<'_>,
+    cancel: Option<&medusa_web::CancelToken>,
+) -> anyhow::Result<PoolDispatchResult> {
+    let PoolDispatchSpec {
+        registry,
+        builder_name,
+        build_id,
+        drv_path,
+        gc_root,
+        log_path,
+        log_limit,
+        build_timeout,
+        nix_store_bin,
+    } = spec;
+    let dispatcher = BuilderDispatcher::new(registry.clone());
+    let cap = log_limit.max_raw_bytes;
+
+    let mut log_buf: Vec<u8> = Vec::new();
+    let mut log_truncated = false;
+
+    let early_failure = |log_buf: Vec<u8>, log_path: PathBuf| async move {
+        medusa_build::write_zstd_log(&log_path, log_buf).await?;
+        Ok::<_, anyhow::Error>(PoolDispatchResult::Outcome(medusa_build::BuildOutcome {
+            status: medusa_build::BuildStatus::Failure,
+            exit_code: None,
+            output_paths: Vec::new(),
+            log_path,
+            log_truncated: false,
+        }))
+    };
+
+    // 1. Compute the drv's input closure on the daemon side.
+    //    `nix-store --query --requisites <drv>` returns the drv plus
+    //    every input drv it transitively depends on, plus any source
+    //    paths referenced by builtins. That's exactly what the agent
+    //    needs to be able to run `--realise` on the drv.
+    let closure = match query_requisites(nix_store_bin, drv_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(job_id = %build_id, error = %e, "could not compute drv closure");
+            log_buf.extend_from_slice(
+                format!("medusa: could not compute drv closure: {e}\n").as_bytes(),
+            );
+            return early_failure(log_buf, log_path.to_path_buf()).await;
+        }
+    };
+
+    // 2. Push closure to the builder.
+    let push_chan = match dispatcher.open_channel(builder_name).await {
+        Ok(mut d) => d.take_channel(),
+        Err(e) => {
+            tracing::warn!(builder = %builder_name, error = %e, "open ClosurePush channel failed");
+            log_buf.extend_from_slice(
+                format!("medusa: could not open builder channel: {e}\n").as_bytes(),
+            );
+            return early_failure(log_buf, log_path.to_path_buf()).await;
+        }
+    };
+    let push_chan = push_chan.expect("dispatcher returned channel");
+    if let Err(e) = push_closure_over_channel(push_chan, build_id, closure, nix_store_bin).await {
+        tracing::warn!(error = %e, "push_closure_over_channel failed");
+        log_buf.extend_from_slice(format!("medusa: pushing drv closure failed: {e}\n").as_bytes());
+        return early_failure(log_buf, log_path.to_path_buf()).await;
+    }
+
+    // 3. Send Build over the control channel; subscribe to lifecycle.
+    let mut lifecycle = match dispatcher
+        .dispatch_build(
+            builder_name,
+            build_id,
+            drv_path.to_string(),
+            // gcroot is daemon-side — we register it after the pull
+            // closure lands locally. Asking the agent to add a gcroot
+            // on the builder host would protect the agent's copy, not
+            // ours.
+            None,
+            build_timeout.as_secs(),
+            cap as u64,
+        )
+        .await
+    {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::warn!(error = %e, "dispatch_build failed");
+            log_buf.extend_from_slice(format!("medusa: dispatch_build failed: {e}\n").as_bytes());
+            return early_failure(log_buf, log_path.to_path_buf()).await;
+        }
+    };
+
+    // 4. Drain lifecycle, racing against cancel.
+    let mut output_paths: Vec<String> = Vec::new();
+    let mut final_status = BuildOutcomeStatus::Failure;
+    let mut exit_code: Option<i32> = None;
+    let mut aborted = false;
+    loop {
+        tokio::select! {
+            biased;
+            ev = lifecycle.recv() => {
+                match ev {
+                    Some(BuildLifecycle::Started { pid }) => {
+                        tracing::info!(job_id = build_id, ?pid, builder = %builder_name, "agent started build");
+                    }
+                    Some(BuildLifecycle::LogChunk { bytes }) => {
+                        if log_buf.len() < cap {
+                            let remaining = cap - log_buf.len();
+                            if bytes.len() <= remaining {
+                                log_buf.extend_from_slice(&bytes);
+                            } else {
+                                log_buf.extend_from_slice(&bytes[..remaining]);
+                                log_truncated = true;
+                            }
+                        } else {
+                            log_truncated = true;
+                        }
+                    }
+                    Some(BuildLifecycle::Finished {
+                        status,
+                        exit_code: code,
+                        output_paths: outs,
+                        log_truncated: t,
+                    }) => {
+                        final_status = status;
+                        exit_code = code;
+                        output_paths = outs;
+                        log_truncated = log_truncated || t;
+                        break;
+                    }
+                    None => {
+                        tracing::warn!(job_id = build_id, builder = %builder_name, "lifecycle channel closed before BuildFinished");
+                        log_buf.extend_from_slice(b"\nmedusa: builder disconnected mid-build.\n");
+                        final_status = BuildOutcomeStatus::Failure;
+                        break;
+                    }
+                }
+            }
+            _ = wait_cancelled(cancel), if !aborted => {
+                aborted = true;
+                tracing::info!(job_id = build_id, builder = %builder_name, "cancel: sending Abort to builder");
+                let _ = dispatcher.abort_build(builder_name, build_id).await;
+                // Continue draining for the BuildFinished{Killed} that
+                // the agent will emit after SIGKILLing nix-store.
+            }
+        }
+    }
+    registry.unregister_in_flight_build(builder_name, build_id);
+
+    if aborted || final_status == BuildOutcomeStatus::Killed {
+        if log_truncated {
+            log_buf.extend_from_slice(b"\n--- log truncated by medusa ---\n");
+        }
+        medusa_build::write_zstd_log(log_path, log_buf).await?;
+        return Ok(PoolDispatchResult::Cancelled);
+    }
+
+    // 5. On success, pull the output closure into the local store.
+    if final_status == BuildOutcomeStatus::Success && !output_paths.is_empty() {
+        let pull_chan = match dispatcher.open_channel(builder_name).await {
+            Ok(mut d) => d.take_channel(),
+            Err(e) => {
+                tracing::warn!(error = %e, "open ClosurePull channel failed");
+                log_buf.extend_from_slice(
+                    format!("\nmedusa: could not open pull channel: {e}\n").as_bytes(),
+                );
+                final_status = BuildOutcomeStatus::Failure;
+                None
+            }
+        };
+        if let Some(chan) = pull_chan {
+            match pull_closure_over_channel(chan, build_id, output_paths.clone(), nix_store_bin)
+                .await
+            {
+                Ok(o) if o.status == BuildOutcomeStatus::Success => {
+                    // 6. Register gcroot on the first output (matches
+                    //    the local path's atomic --add-root semantics
+                    //    as closely as we can post-hoc).
+                    if let Some(first) = output_paths.first() {
+                        if let Err(e) = add_indirect_gcroot(nix_store_bin, gc_root, first).await {
+                            tracing::warn!(
+                                error = %e,
+                                gc_root = %gc_root.display(),
+                                output = %first,
+                                "registering gcroot failed; output may be GC'd",
+                            );
+                        }
+                    }
+                }
+                Ok(o) => {
+                    tracing::warn!(
+                        status = ?o.status,
+                        stderr = %String::from_utf8_lossy(&o.stderr),
+                        "pulling output closure failed",
+                    );
+                    log_buf.extend_from_slice(b"\nmedusa: pulling output closure failed:\n");
+                    log_buf.extend_from_slice(&o.stderr);
+                    log_buf.push(b'\n');
+                    final_status = BuildOutcomeStatus::Failure;
+                }
+                Err(ClosureXferError::Spawn { .. }) | Err(_) => {
+                    log_buf.extend_from_slice(b"\nmedusa: pulling output closure errored.\n");
+                    final_status = BuildOutcomeStatus::Failure;
+                }
+            }
+        }
+    }
+
+    if log_truncated {
+        log_buf.extend_from_slice(b"\n--- log truncated by medusa ---\n");
+    }
+    medusa_build::write_zstd_log(log_path, log_buf).await?;
+
+    Ok(PoolDispatchResult::Outcome(medusa_build::BuildOutcome {
+        status: match final_status {
+            BuildOutcomeStatus::Success => medusa_build::BuildStatus::Success,
+            _ => medusa_build::BuildStatus::Failure,
+        },
+        exit_code,
+        output_paths,
+        log_path: log_path.to_path_buf(),
+        log_truncated,
+    }))
+}
+
+/// Wait on an optional cancel token. Returns immediately when fired;
+/// stays pending forever when `cancel` is `None`.
+async fn wait_cancelled(cancel: Option<&medusa_web::CancelToken>) {
+    match cancel {
+        Some(c) => c.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Run `<nix_store_bin> --add-root <gc_root> --indirect <output>`
+/// after pulling the output closure. Best-effort: nix-store will print
+/// to stderr on failure but the build is otherwise complete.
+async fn add_indirect_gcroot(
+    nix_store_bin: &Path,
+    gc_root: &Path,
+    output: &str,
+) -> anyhow::Result<()> {
+    let out = Command::new(nix_store_bin)
+        .arg("--add-root")
+        .arg(gc_root)
+        .arg("--indirect")
+        .arg("--realise")
+        .arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "nix-store --add-root --indirect --realise {} exited {:?}: {}",
+            output,
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ));
+    }
+    Ok(())
 }
 
 async fn clone_repo(
