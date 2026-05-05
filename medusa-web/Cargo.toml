@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+medusa-builders = { path = "../medusa-builders" }
 medusa-config = { workspace = true }
 medusa-domain = { workspace = true }
 medusa-forge = { path = "../medusa-forge" }

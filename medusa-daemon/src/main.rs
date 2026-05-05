@@ -291,6 +291,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         coalesce,
         pauses,
         cancellations,
+        builder_registry: builder_registry.clone(),
         started_at: std::time::Instant::now(),
     };
     let app_state = std::sync::Arc::new(inner);

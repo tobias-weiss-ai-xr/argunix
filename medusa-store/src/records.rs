@@ -66,6 +66,18 @@ pub struct JobRecord {
     pub failure_reason: Option<String>,
 }
 
+/// A job row joined with its evaluation and repo. Used by the status
+/// page to render "what is the cluster doing right now?" without the
+/// caller having to do N+1 lookups against the eval/repo tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobWithContext {
+    pub job: JobRecord,
+    pub forge: String,
+    pub slug: Slug,
+    pub git_ref: String,
+    pub short_sha: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeStatusRecord {
     pub eval_id: EvalId,

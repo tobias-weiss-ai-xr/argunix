@@ -1,7 +1,7 @@
 {% extends "base.html" %} {% block title %}{{ forge }}/{{ slug }} — argunix{% endblock %} {% block content %}
 <h1 class="text-2xl font-semibold mb-2">{{ forge }} / {{ slug }}</h1>
 <p class="mb-4">
-  <a class="text-blue-600 hover:underline" href="/">← all repos</a>
+  <a class="text-blue-600 hover:underline" href="/repos">← all repos</a>
 </p>
 {% if evals.is_empty() %}
 <p class="text-slate-500">No evaluations yet.</p>

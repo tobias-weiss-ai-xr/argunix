@@ -22,8 +22,70 @@ use askama::Template;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
+use medusa_builders::ConnState;
 use medusa_domain::{EvalId, EvalStatus, JobStatus, Slug};
-use medusa_store::{EvalStore, JobStore, RepoStore};
+use medusa_store::{BuilderStore, EvalStore, JobStore, RepoStore};
+use std::collections::HashMap;
+
+#[derive(Template)]
+#[template(path = "status.html")]
+struct StatusTemplate {
+    totals: ClusterTotals,
+    builders: Vec<BuilderRow>,
+    running: Vec<RunningRow>,
+    queued: Vec<QueuedRow>,
+    queued_shown: usize,
+    queued_truncated: bool,
+}
+
+struct ClusterTotals {
+    builders_online: usize,
+    builders_known: usize,
+    in_flight: u32,
+    total_slots: u32,
+    utilization_pct: u32,
+    running: usize,
+    queued_total: usize,
+}
+
+struct BuilderRow {
+    name: String,
+    status: &'static str,
+    status_class: &'static str,
+    is_online: bool,
+    in_flight: u32,
+    max_jobs: u32,
+    systems: String,
+    features: String,
+    nix_version: String,
+    last_seen: String,
+}
+
+struct RunningRow {
+    forge: String,
+    slug: String,
+    eval_id: i64,
+    attr_path: String,
+    system: String,
+    git_ref: String,
+    short_sha: String,
+    builder: String,
+    started: String,
+}
+
+struct QueuedRow {
+    forge: String,
+    slug: String,
+    eval_id: i64,
+    attr_path: String,
+    system: String,
+    git_ref: String,
+    short_sha: String,
+}
+
+/// Hard cap on the upcoming-jobs table — keeps the page bounded under
+/// large queues. Anything beyond this just gets summarised in the count.
+const QUEUED_DISPLAY_LIMIT: u32 = 50;
 
 #[derive(Template)]
 #[template(path = "index.html")]
@@ -106,6 +168,198 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiErro
         })
         .collect();
     Ok(Html(render(&IndexTemplate { repos })?))
+}
+
+/// Cluster status overview — at-a-glance view of every known builder
+/// and what the cluster is doing right now. Auto-refreshes via meta tag
+/// (see `templates/status.html`).
+pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiError> {
+    // Persistent roster: every builder ever enrolled, including offline
+    // / revoked ones. Live registry is the runtime overlay.
+    let roster = <medusa_store::SqlxStore as BuilderStore>::list_all(&state.store).await?;
+    let live = state.builder_registry.list();
+    let live_by_name: HashMap<String, &medusa_builders::BuilderSnapshot> = live
+        .iter()
+        .map(|s| (s.name.as_str().to_string(), s))
+        .collect();
+
+    let now = chrono::Utc::now();
+    let builders: Vec<BuilderRow> = roster
+        .iter()
+        .map(|row| build_builder_row(row, live_by_name.get(row.name.as_str()).copied(), now))
+        .collect();
+
+    let builders_online = live.iter().filter(|b| b.state == ConnState::Active).count();
+    let in_flight: u32 = live.iter().map(|b| b.in_flight).sum();
+    let total_slots: u32 = live
+        .iter()
+        .filter(|b| b.state == ConnState::Active)
+        .map(|b| b.capabilities.max_jobs)
+        .sum();
+    let utilization_pct = if total_slots == 0 {
+        0
+    } else {
+        ((in_flight as u64 * 100) / total_slots as u64) as u32
+    };
+
+    // BuilderId → display name map so running rows can show the operator
+    // name rather than the opaque numeric id stored on the job row.
+    let builder_id_to_name: HashMap<i64, String> = roster
+        .iter()
+        .map(|r| (r.id.get(), r.name.as_str().to_string()))
+        .collect();
+
+    let running_jobs = <medusa_store::SqlxStore as JobStore>::list_running(&state.store).await?;
+    let running: Vec<RunningRow> = running_jobs
+        .into_iter()
+        .map(|j| RunningRow {
+            forge: j.forge,
+            slug: j.slug.as_str().to_string(),
+            eval_id: j.job.eval_id.get(),
+            attr_path: j.job.attr_path.to_string(),
+            system: j.job.system,
+            git_ref: j.git_ref,
+            short_sha: j.short_sha,
+            builder: j
+                .job
+                .builder_id
+                .and_then(|id| builder_id_to_name.get(&id.get()).cloned())
+                .unwrap_or_else(|| "—".to_string()),
+            started: fmt_opt_time(j.job.started_at),
+        })
+        .collect();
+
+    // Pull `LIMIT + 1` so we can tell whether the queue extends past the
+    // display cap without an extra COUNT round-trip.
+    let queued_jobs =
+        <medusa_store::SqlxStore as JobStore>::list_queued(&state.store, QUEUED_DISPLAY_LIMIT + 1)
+            .await?;
+    let queued_truncated = queued_jobs.len() as u32 > QUEUED_DISPLAY_LIMIT;
+    let queued_total = queued_jobs.len();
+    let queued: Vec<QueuedRow> = queued_jobs
+        .into_iter()
+        .take(QUEUED_DISPLAY_LIMIT as usize)
+        .map(|j| QueuedRow {
+            forge: j.forge,
+            slug: j.slug.as_str().to_string(),
+            eval_id: j.job.eval_id.get(),
+            attr_path: j.job.attr_path.to_string(),
+            system: j.job.system,
+            git_ref: j.git_ref,
+            short_sha: j.short_sha,
+        })
+        .collect();
+    let queued_shown = queued.len();
+
+    let totals = ClusterTotals {
+        builders_online,
+        builders_known: roster.len(),
+        in_flight,
+        total_slots,
+        utilization_pct,
+        running: running.len(),
+        // queued_jobs was capped at LIMIT+1, so we report ≥ truthfully.
+        // For >LIMIT queues we show "LIMIT+" using the truncated flag.
+        queued_total,
+    };
+
+    Ok(Html(render(&StatusTemplate {
+        totals,
+        builders,
+        running,
+        queued,
+        queued_shown,
+        queued_truncated,
+    })?))
+}
+
+fn build_builder_row(
+    row: &medusa_store::BuilderRecord,
+    live: Option<&medusa_builders::BuilderSnapshot>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BuilderRow {
+    // The live registry is the authoritative source for in_flight and
+    // for whether this builder is *currently* online. The persistent
+    // row is the source for capabilities snapshot, last_seen, and
+    // revocation. We prefer the live capabilities when available since
+    // the agent might have re-reported with new `max_jobs`/features
+    // before the row was overwritten on the next reconnect.
+    let (status, status_class, is_online, in_flight, caps) = if row.revoked_at.is_some() {
+        (
+            "revoked",
+            "bg-rose-100 text-rose-800",
+            false,
+            0u32,
+            &row.capabilities,
+        )
+    } else if let Some(snap) = live {
+        match snap.state {
+            ConnState::Active => (
+                "online",
+                "bg-emerald-100 text-emerald-800",
+                true,
+                snap.in_flight,
+                &snap.capabilities,
+            ),
+            ConnState::Disconnecting => (
+                "draining",
+                "bg-amber-100 text-amber-800",
+                true,
+                snap.in_flight,
+                &snap.capabilities,
+            ),
+        }
+    } else {
+        (
+            "offline",
+            "bg-slate-200 text-slate-700",
+            false,
+            0u32,
+            &row.capabilities,
+        )
+    };
+
+    BuilderRow {
+        name: row.name.as_str().to_string(),
+        status,
+        status_class,
+        is_online,
+        in_flight,
+        max_jobs: caps.max_jobs,
+        systems: caps.systems.join(", "),
+        features: if caps.features.is_empty() {
+            "—".to_string()
+        } else {
+            caps.features.join(", ")
+        },
+        nix_version: caps.nix_version.clone(),
+        last_seen: humanize_last_seen(row.last_seen, now),
+    }
+}
+
+/// "5s ago" / "2m ago" / "3h ago" / "yesterday" / absolute timestamp for
+/// anything older than a day. Goal is at-a-glance — when a builder
+/// disappeared 12 minutes ago, "12m ago" is more useful than the UTC
+/// timestamp.
+fn humanize_last_seen(
+    t: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let delta = now.signed_duration_since(t);
+    let secs = delta.num_seconds();
+    if secs < 0 {
+        // Clock skew. Just show the raw stamp.
+        return t.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    }
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        t.format("%Y-%m-%d %H:%M UTC").to_string()
+    }
 }
 
 /// Single catch-all for everything under `/r/<forge>/...`. Parses the
@@ -444,6 +698,43 @@ impl IntoResponse for UiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_template_renders_empty_cluster() {
+        // Smoke: no builders, nothing running, nothing queued. Verifies
+        // the template's empty-state branches all compile + render.
+        let tmpl = StatusTemplate {
+            totals: ClusterTotals {
+                builders_online: 0,
+                builders_known: 0,
+                in_flight: 0,
+                total_slots: 0,
+                utilization_pct: 0,
+                running: 0,
+                queued_total: 0,
+            },
+            builders: vec![],
+            running: vec![],
+            queued: vec![],
+            queued_shown: 0,
+            queued_truncated: false,
+        };
+        let html = tmpl.render().unwrap();
+        assert!(html.contains("cluster status"));
+        assert!(html.contains("No builders enrolled yet"));
+        assert!(html.contains("Nothing is building"));
+        assert!(html.contains("Queue is empty"));
+    }
+
+    #[test]
+    fn humanize_last_seen_picks_appropriate_grain() {
+        let now = chrono::Utc::now();
+        assert!(humanize_last_seen(now - chrono::Duration::seconds(5), now).contains("s ago"));
+        assert!(humanize_last_seen(now - chrono::Duration::minutes(7), now).contains("m ago"));
+        assert!(humanize_last_seen(now - chrono::Duration::hours(4), now).contains("h ago"));
+        // > 1 day → absolute stamp.
+        assert!(humanize_last_seen(now - chrono::Duration::days(3), now).contains("UTC"));
+    }
 
     #[test]
     fn parse_repo_only() {

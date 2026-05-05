@@ -1,6 +1,6 @@
 use crate::records::{
-    BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, NewBuilder, NewEvaluation, NewJob,
-    RepoRecord,
+    BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, JobWithContext, NewBuilder,
+    NewEvaluation, NewJob, RepoRecord,
 };
 use crate::traits::{
     BuilderStore, EvalStore, ForgeStatusStore, InterruptOutcome, JobStore, MAX_INTERRUPTIONS,
@@ -113,6 +113,27 @@ fn map_builder(row: &SqliteRow) -> Result<BuilderRecord, StoreError> {
         enrolled_at,
         last_seen,
         revoked_at,
+    })
+}
+
+fn map_job_with_context(row: &SqliteRow) -> Result<JobWithContext, StoreError> {
+    let job = map_job(row)?;
+    let forge: String = row.try_get("r_forge")?;
+    let slug_s: String = row.try_get("r_slug")?;
+    let git_ref: String = row.try_get("e_git_ref")?;
+    let sha: String = row.try_get("e_sha")?;
+    let slug = to_slug(job.eval_id.get(), slug_s)?;
+    let short_sha = if sha.len() >= 7 {
+        sha[..7].to_string()
+    } else {
+        sha
+    };
+    Ok(JobWithContext {
+        job,
+        forge,
+        slug,
+        git_ref,
+        short_sha,
     })
 }
 
@@ -438,6 +459,45 @@ impl JobStore for SqlxStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(map_job).collect()
+    }
+
+    async fn list_running(&self) -> Result<Vec<JobWithContext>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT j.id, j.eval_id, j.attr_path, j.drv_path, j.system,
+                    j.started_at, j.finished_at, j.status, j.log_path, j.output_path,
+                    j.builder_id, j.interrupt_count, j.failure_reason,
+                    r.forge AS r_forge, r.slug AS r_slug,
+                    e.git_ref AS e_git_ref, e.sha AS e_sha
+             FROM jobs j
+             JOIN evaluations e ON j.eval_id = e.id
+             JOIN repos r ON e.repo_id = r.id
+             WHERE j.status = 'running'
+             ORDER BY j.started_at ASC, j.id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_job_with_context).collect()
+    }
+
+    async fn list_queued(&self, limit: u32) -> Result<Vec<JobWithContext>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT j.id, j.eval_id, j.attr_path, j.drv_path, j.system,
+                    j.started_at, j.finished_at, j.status, j.log_path, j.output_path,
+                    j.builder_id, j.interrupt_count, j.failure_reason,
+                    r.forge AS r_forge, r.slug AS r_slug,
+                    e.git_ref AS e_git_ref, e.sha AS e_sha
+             FROM jobs j
+             JOIN evaluations e ON j.eval_id = e.id
+             JOIN repos r ON e.repo_id = r.id
+             WHERE j.status = 'queued'
+               AND e.status IN ('queued', 'evaluating', 'building')
+             ORDER BY j.id ASC
+             LIMIT ?1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_job_with_context).collect()
     }
 
     async fn set_status(&self, id: JobId, status: JobStatus) -> Result<(), StoreError> {
@@ -1556,6 +1616,106 @@ mod tests {
             .unwrap();
         assert_eq!(j.status, JobStatus::Interrupted);
         assert_eq!(j.interrupt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn list_running_and_queued_join_repo_and_eval() {
+        let s = store().await;
+        let repo_id = <SqlxStore as RepoStore>::upsert(&s, "github", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        let eval_id = <SqlxStore as EvalStore>::create(
+            &s,
+            NewEvaluation {
+                repo_id,
+                trigger: "push".into(),
+                git_ref: "refs/heads/main".into(),
+                sha: Sha::new("abcdef0123456789abcdef0123456789abcdef01").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        <SqlxStore as EvalStore>::set_status(&s, eval_id, EvalStatus::Building)
+            .await
+            .unwrap();
+        let running_id = <SqlxStore as JobStore>::create(
+            &s,
+            NewJob {
+                eval_id,
+                attr_path: AttrPath::new("packages.x86_64-linux.run"),
+                drv_path: None,
+                system: "x86_64-linux".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let queued_id = <SqlxStore as JobStore>::create(
+            &s,
+            NewJob {
+                eval_id,
+                attr_path: AttrPath::new("packages.x86_64-linux.next"),
+                drv_path: None,
+                system: "x86_64-linux".into(),
+            },
+        )
+        .await
+        .unwrap();
+        <SqlxStore as JobStore>::start(&s, running_id, Utc::now())
+            .await
+            .unwrap();
+
+        let running = <SqlxStore as JobStore>::list_running(&s).await.unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].job.id, running_id);
+        assert_eq!(running[0].forge, "github");
+        assert_eq!(running[0].slug.as_str(), "a/b");
+        assert_eq!(running[0].short_sha, "abcdef0");
+        assert_eq!(running[0].git_ref, "refs/heads/main");
+
+        let queued = <SqlxStore as JobStore>::list_queued(&s, 50).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].job.id, queued_id);
+    }
+
+    #[tokio::test]
+    async fn list_queued_skips_jobs_under_terminal_evals() {
+        // Cancelled / Done / EvaluationFailed evals can leave queued job
+        // rows behind (cancellation doesn't reap them). Those aren't real
+        // upcoming work — list_queued must filter them out.
+        let s = store().await;
+        let repo_id = <SqlxStore as RepoStore>::upsert(&s, "github", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        let cancelled_eval = <SqlxStore as EvalStore>::create(
+            &s,
+            NewEvaluation {
+                repo_id,
+                trigger: "push".into(),
+                git_ref: "refs/heads/main".into(),
+                sha: Sha::new("0".repeat(40)).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = <SqlxStore as JobStore>::create(
+            &s,
+            NewJob {
+                eval_id: cancelled_eval,
+                attr_path: AttrPath::new("packages.x86_64-linux.zombie"),
+                drv_path: None,
+                system: "x86_64-linux".into(),
+            },
+        )
+        .await
+        .unwrap();
+        <SqlxStore as EvalStore>::finish(&s, cancelled_eval, EvalStatus::Cancelled, Utc::now())
+            .await
+            .unwrap();
+        let queued = <SqlxStore as JobStore>::list_queued(&s, 50).await.unwrap();
+        assert!(
+            queued.is_empty(),
+            "queued job under cancelled eval must not surface as upcoming work",
+        );
     }
 
     #[tokio::test]

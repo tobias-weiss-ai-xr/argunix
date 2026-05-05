@@ -38,6 +38,11 @@ pub struct AppStateInner {
     pub pauses: Arc<PauseRegistry>,
     /// Per-eval cancellation tokens for cancel-on-new-push (Q39).
     pub cancellations: Arc<crate::cancel::CancelRegistry>,
+    /// Live SSH-side registry of currently-connected builders. Read by
+    /// the status page to surface online/offline/in-flight per builder;
+    /// the persistent `builders` table is the roster, this is the
+    /// runtime layer over it.
+    pub builder_registry: Arc<medusa_builders::BuilderRegistry>,
     /// Daemon start time for `medusactl status` uptime reporting.
     pub started_at: std::time::Instant,
 }

@@ -38,7 +38,8 @@ pub fn router(state: AppState) -> Router {
     let static_dir = state.current.load_full().config.web.static_dir.clone();
 
     Router::new()
-        .route("/", get(ui::index))
+        .route("/", get(ui::status))
+        .route("/repos", get(ui::index))
         .route("/healthz", get(healthz))
         .route("/r/{forge}/{*tail}", get(ui::dispatch_repo))
         .route("/webhook/{forge_kind}", post(webhook::handle))

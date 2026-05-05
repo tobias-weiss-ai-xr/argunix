@@ -1,6 +1,6 @@
 use crate::records::{
-    BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, NewBuilder, NewEvaluation, NewJob,
-    RepoRecord,
+    BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, JobWithContext, NewBuilder,
+    NewEvaluation, NewJob, RepoRecord,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -124,6 +124,17 @@ pub trait JobStore: Send + Sync {
     async fn create(&self, new: NewJob) -> Result<JobId, StoreError>;
     async fn get(&self, id: JobId) -> Result<Option<JobRecord>, StoreError>;
     async fn list_by_eval(&self, eval_id: EvalId) -> Result<Vec<JobRecord>, StoreError>;
+    /// Every job currently in `Running` state across the cluster, joined
+    /// with its evaluation and repo so the status page can render it
+    /// without N+1 lookups. Oldest-started first (so "longest in flight"
+    /// floats to the top).
+    async fn list_running(&self) -> Result<Vec<JobWithContext>, StoreError>;
+    /// Up to `limit` jobs in `Queued` state, oldest first. Same join shape
+    /// as `list_running`. Jobs whose eval is in a terminal state are
+    /// filtered out — they're queue rows the dispatcher hasn't reaped yet
+    /// (Cancelled evals leave queued job rows behind) and surfacing them
+    /// would lie about real upcoming work.
+    async fn list_queued(&self, limit: u32) -> Result<Vec<JobWithContext>, StoreError>;
     async fn set_status(&self, id: JobId, status: JobStatus) -> Result<(), StoreError>;
     /// Mark a job as `Running` and stamp `started_at`.
     async fn start(&self, id: JobId, started_at: DateTime<Utc>) -> Result<(), StoreError>;

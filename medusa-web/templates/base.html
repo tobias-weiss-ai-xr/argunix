@@ -5,9 +5,10 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>{% block title %}argunix{% endblock %}</title>
     <link rel="stylesheet" href="/static/ui.css" />
+    {% block head_extra %}{% endblock %}
   </head>
   <body class="bg-slate-50 text-slate-900 font-sans">
-    <header class="max-w-5xl mx-auto px-4 pt-6 pb-2">
+    <header class="max-w-5xl mx-auto px-4 pt-6 pb-2 flex items-center justify-between">
       <a class="flex items-center gap-3 no-underline text-slate-900" href="/">
         <img
           src="/static/img/argunix.svg"
@@ -16,6 +17,10 @@
         />
         <span class="text-xl font-semibold">argunix</span>
       </a>
+      <nav class="text-sm flex items-center gap-4">
+        <a class="text-blue-600 hover:underline" href="/">status</a>
+        <a class="text-blue-600 hover:underline" href="/repos">repos</a>
+      </nav>
     </header>
     <main class="max-w-5xl mx-auto px-4 py-6">
       {% block content %}{% endblock %}

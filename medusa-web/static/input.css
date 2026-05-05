@@ -7,4 +7,14 @@
  * `static/ui.css` checked into the repo is overwritten there. */
 @import "tailwindcss";
 
-@source "../templates";
+/* Explicit globs so Tailwind v4's source detection works in clean build
+ * environments (e.g. our nix derivation, where there's no .git or
+ * package.json near input.css for the automatic root-walking heuristic
+ * to latch onto). */
+@source "../templates/**/*.html";
+/* Status-badge colour classes (`bg-emerald-100`, `bg-rose-100`, …) are
+ * built in Rust handlers and only ever appear in the rendered HTML at
+ * runtime — Tailwind can't see them in the templates. Pointing the
+ * scanner at the crate's src/ too lets it pick those literals up from
+ * the .rs files. */
+@source "../src/**/*.rs";
