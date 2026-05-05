@@ -13,8 +13,10 @@
 
 mod agent;
 mod capabilities;
+mod closure_import;
 mod identity;
 
 pub use agent::{AgentConfig, AgentError, run};
 pub use capabilities::{Capabilities, CapabilitiesError, discover_capabilities};
+pub use closure_import::{ImportError, ImportOutcome, import_closure};
 pub use identity::{IdentityError, PersistedKey, load_or_generate};

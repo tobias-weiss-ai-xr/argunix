@@ -13,6 +13,7 @@ mod host_key;
 mod protocol;
 mod registry;
 mod server;
+mod side_channel;
 mod socket_server;
 mod systems;
 
@@ -25,5 +26,9 @@ pub use registry::{
     RusshSession,
 };
 pub use server::{BuilderServer, ServerConfig, ServerError};
+pub use side_channel::{
+    MAX_HEADER_BYTES, SideChannelError, SideChannelHeader, SideChannelKind, read_header,
+    write_header,
+};
 pub use socket_server::{SocketError, SocketGuard, SocketServer};
 pub use systems::SystemsResolver;
