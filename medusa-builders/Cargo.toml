@@ -8,6 +8,7 @@ license.workspace = true
 medusa-domain = { workspace = true }
 medusa-store = { workspace = true }
 
+base64 = { workspace = true }
 russh = { workspace = true }
 ed25519-dalek = { workspace = true }
 

@@ -239,20 +239,24 @@ async fn unix_socket_proxies_bytes_to_builder_channel() {
         .unwrap();
     assert_eq!(got_big, big);
 
-    // While at least one client is connected, in_flight is 1.
+    // M14: proxy connections do NOT count against in_flight. The
+    // counter is owned by the build worker now (one increment per
+    // dispatched derivation, not per channel) — the proxy is just
+    // bytes through a pipe.
     let snap = registry
         .snapshot(&BuilderName::new("echo-builder").unwrap())
         .unwrap();
-    assert_eq!(snap.in_flight, 1, "active proxy reflects as 1 in_flight");
+    assert_eq!(
+        snap.in_flight, 0,
+        "proxy traffic does not touch in_flight (M14: counter is worker-owned)",
+    );
 
     drop(client);
-    // Allow a moment for the proxy task to observe the EOF + drop the
-    // DispatchedBuild guard.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let snap = registry
         .snapshot(&BuilderName::new("echo-builder").unwrap())
         .unwrap();
-    assert_eq!(snap.in_flight, 0, "client drop releases the slot");
+    assert_eq!(snap.in_flight, 0, "still 0 after disconnect");
 
     guard.close().await;
     assert!(

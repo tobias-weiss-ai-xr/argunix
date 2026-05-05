@@ -2012,6 +2012,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "ed25519-dalek 2.2.0",

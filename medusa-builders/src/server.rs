@@ -528,11 +528,30 @@ impl ConnectionHandler {
                     );
                 }
             }
-            ControlMessage::Welcome { .. } | ControlMessage::Kick { .. } => {
+            ControlMessage::Welcome { .. }
+            | ControlMessage::Kick { .. }
+            | ControlMessage::Build { .. }
+            | ControlMessage::Abort { .. } => {
                 // These are server→builder messages; receiving them
                 // from the builder is a protocol violation.
                 tracing::warn!(
                     "control channel: server-only message received from builder; ignoring",
+                );
+            }
+            ControlMessage::BuildStarted { .. }
+            | ControlMessage::BuildLogChunk { .. }
+            | ControlMessage::BuildFinished { .. } => {
+                // M14b: builder→daemon build-lifecycle messages. Wiring
+                // these into the worker's dispatch path lands in a
+                // follow-up slice (the daemon needs a per-builder build
+                // state machine to correlate `build_id` against in-flight
+                // jobs and forward log bytes into the existing
+                // `LogCaptureLimit` writer). For now: ignore so an
+                // agent that ships ahead of the daemon doesn't crash
+                // the connection.
+                tracing::debug!(
+                    "control channel: build-lifecycle message received but daemon-side \
+                     dispatch path not yet wired; ignoring (M14b follow-up)",
                 );
             }
         }

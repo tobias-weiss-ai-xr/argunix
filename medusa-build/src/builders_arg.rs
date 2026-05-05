@@ -55,6 +55,20 @@ pub fn compose_builders_arg(registry: &BuilderRegistry, medusa_pipe_path: &str) 
     Some(lines.join("\n"))
 }
 
+/// Compose a `--builders` argument that pins to a single builder. Used
+/// (M14) when the worker has already chosen which builder runs this
+/// derivation and wants nix to dispatch there rather than running its
+/// own selection over the full pool.
+///
+/// Same line format as `compose_builders_arg`, just one entry.
+pub fn compose_builders_arg_for_one(
+    name: &medusa_domain::BuilderName,
+    capabilities: &medusa_domain::BuilderCapabilities,
+    medusa_pipe_path: &str,
+) -> String {
+    format_one(name, capabilities, medusa_pipe_path)
+}
+
 fn format_one(
     name: &medusa_domain::BuilderName,
     caps: &medusa_domain::BuilderCapabilities,
@@ -202,6 +216,27 @@ mod tests {
         );
         let got = compose_builders_arg(&reg, "/usr/bin/medusa-pipe").unwrap();
         assert!(got.contains("aarch64-darwin,x86_64-darwin"));
+    }
+
+    #[test]
+    fn compose_for_one_renders_exactly_one_line() {
+        let caps = caps(&["x86_64-linux"], &["kvm"], 4);
+        let name = BuilderName::new("solo").unwrap();
+        let got = compose_builders_arg_for_one(&name, &caps, "/usr/bin/medusa-pipe");
+        assert!(
+            !got.contains('\n'),
+            "single-builder arg must be one line; got: {got:?}"
+        );
+        assert!(
+            got.contains("remote-program=/usr/bin/medusa-pipe%20solo"),
+            "must encode the chosen builder's name in the URI; got: {got}",
+        );
+        assert!(got.contains("x86_64-linux"));
+        assert!(got.contains("kvm"));
+        assert!(
+            got.contains(" 4 1 "),
+            "max_jobs/speed slots present; got: {got}"
+        );
     }
 
     #[test]

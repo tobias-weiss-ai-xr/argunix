@@ -245,6 +245,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         cancellations: cancellations.clone(),
         builder_registry: builder_registry.clone(),
         medusa_pipe_path: args.medusa_pipe_path.clone(),
+        // M14: parallelise per-eval builds. Default 16 — comfortably
+        // above the typical sum of `max_jobs` across a small builder
+        // pool, so the global cap doesn't bottleneck before per-builder
+        // caps do. Operator-tunable knob in YAML is a follow-up.
+        build_concurrency: 16,
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
 

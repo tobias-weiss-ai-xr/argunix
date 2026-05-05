@@ -35,6 +35,31 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{Instrument, info_span};
 
+/// RAII guard that reserves an `in_flight` slot on a specific builder
+/// for the lifetime of one dispatched derivation (M14). Increments
+/// on construction; decrements on drop (including when the build
+/// future is dropped due to cancellation).
+struct BuilderSlot {
+    registry: Arc<medusa_builders::BuilderRegistry>,
+    name: medusa_domain::BuilderName,
+}
+
+impl BuilderSlot {
+    fn reserve(
+        registry: Arc<medusa_builders::BuilderRegistry>,
+        name: medusa_domain::BuilderName,
+    ) -> Self {
+        registry.inc_in_flight(&name);
+        Self { registry, name }
+    }
+}
+
+impl Drop for BuilderSlot {
+    fn drop(&mut self) {
+        self.registry.dec_in_flight(&self.name);
+    }
+}
+
 /// State the worker needs to process evaluations end-to-end.
 #[derive(Clone)]
 pub struct WorkerContext {
@@ -61,6 +86,11 @@ pub struct WorkerContext {
     /// `--builders ssh-ng://x@local?ssh-command=…` URI so nix can
     /// fork it for each dispatch.
     pub medusa_pipe_path: String,
+    /// Maximum number of derivations to build in parallel across the
+    /// whole evaluation (M14). Per-builder concurrency is additionally
+    /// gated by each builder's advertised `max_jobs`. Defaults to 16
+    /// in `main.rs`; clamped to ≥1 at use.
+    pub build_concurrency: usize,
 }
 
 /// Spawn the worker on the current tokio runtime. Returns a `JoinHandle`
@@ -300,33 +330,105 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     let mut tally = JobTally::default();
     let summary_debounce = std::time::Duration::from_secs(2);
     let mut last_summary_post: Option<std::time::Instant> = None;
-    for (spec, job_id) in persisted {
-        if cancel.is_cancelled() {
-            tracing::info!(
-                remaining_jobs = tally.success + tally.cached + tally.failure,
-                "evaluation cancelled mid-build-loop (Q39); skipping remaining jobs",
-            );
-            <SqlxStore as EvalStore>::finish(
-                &ctx.store,
-                eval_id,
-                EvalStatus::Cancelled,
-                Utc::now(),
-            )
-            .await?;
-            return Ok(());
+
+    // M14: parallelise the per-eval build loop. Up to
+    // `ctx.build_concurrency` derivations build in parallel; per-builder
+    // capacity is gated separately by each builder's `max_jobs` (read
+    // inside `pick_builder_for_spec` via `BuilderRegistry::eligible`).
+    // When the pool is saturated, `pick_builder_for_spec` returns None
+    // and `build_one` falls back to a multi-builder `--builders`
+    // snapshot, so over-cap dispatches don't deadlock — they go
+    // through nix's own scheduler instead.
+    let global_sem = Arc::new(tokio::sync::Semaphore::new(ctx.build_concurrency.max(1)));
+    let mut set: tokio::task::JoinSet<(JobId, medusa_eval::JobSpec, anyhow::Result<JobStatus>)> =
+        tokio::task::JoinSet::new();
+    let mut work_iter = persisted.into_iter();
+    let mut work_drained = false;
+
+    'outer: loop {
+        // Spawn while we have permits and still have jobs to dispatch.
+        if !work_drained && !cancel.is_cancelled() {
+            loop {
+                let permit = match global_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => break, // No global permits free.
+                };
+                let Some((spec, job_id)) = work_iter.next() else {
+                    drop(permit);
+                    work_drained = true;
+                    break;
+                };
+                let ctx_c = ctx.clone();
+                let cancel_c = cancel.clone();
+                let caches_c = caches.clone();
+                let repo_id = repo.id;
+                let span = info_span!(
+                    "job",
+                    job_id = job_id.get(),
+                    attr = %spec.attr_path,
+                );
+                set.spawn(async move {
+                    let _permit = permit; // released on drop
+                    let res = build_one(
+                        &ctx_c, repo_id, eval_id, job_id, &spec, &caches_c, &cancel_c,
+                    )
+                    .instrument(span)
+                    .await;
+                    (job_id, spec, res)
+                });
+            }
         }
-        // Per-job span so every log line emitted during this
-        // build inherits `job_id` and `attr` automatically. That's
-        // how the operator correlates UI URLs (which embed
-        // `eval/<eval_id>/job/<attr>`) with daemon log lines.
-        let span = info_span!(
-            "job",
-            job_id = job_id.get(),
-            attr = %spec.attr_path,
-        );
-        let outcome = build_one(ctx, repo.id, eval_id, job_id, &spec, &caches, &cancel)
-            .instrument(span)
-            .await;
+
+        // Termination: nothing in flight and nothing left to dispatch.
+        if work_drained && set.is_empty() {
+            break 'outer;
+        }
+        // Cancel arrived but nothing in flight either — fall through
+        // to the cancelled-finish below.
+        if cancel.is_cancelled() && set.is_empty() {
+            break 'outer;
+        }
+
+        // Wait for either a build to finish or a cancel signal. On
+        // cancel, abort everything in flight; build_one's
+        // `kill_on_drop(true)` reaps the nix-store children.
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                tracing::info!(
+                    in_flight = set.len(),
+                    remaining_done = tally.success + tally.cached + tally.failure,
+                    "evaluation cancelled mid-build-loop (Q39); aborting in-flight builds",
+                );
+                set.abort_all();
+                // Drain the JoinSet so spawned tasks observe the abort
+                // and run their drop logic (BuilderSlot release).
+                while set.join_next().await.is_some() {}
+                <SqlxStore as EvalStore>::finish(
+                    &ctx.store,
+                    eval_id,
+                    EvalStatus::Cancelled,
+                    Utc::now(),
+                )
+                .await?;
+                return Ok(());
+            }
+            r = set.join_next() => r,
+        };
+        let Some(joined) = next else {
+            continue;
+        };
+        let (_job_id, spec, outcome) = match joined {
+            Ok(t) => t,
+            Err(join_err) => {
+                // A spawned task panicked or was cancelled; treat as
+                // a pipeline error so the overall eval still finishes
+                // with a meaningful tally.
+                tracing::error!(error = %join_err, "build task panicked");
+                tally.record(JobStatus::Failure);
+                continue;
+            }
+        };
         let final_status = match outcome {
             Ok(s) => s,
             Err(e) => {
@@ -437,6 +539,32 @@ fn summarise_for_check(err: &str, max_chars: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// Pick the builder this derivation should run on (M14). Walks
+/// `BuilderRegistry::eligible(system, required_features, exclude={})`
+/// and takes the first entry — which `eligible()` already sorts
+/// least-loaded-first. Returns `None` when:
+///
+/// - the spec has no `system` (we can't filter and shouldn't guess);
+/// - no connected builder advertises the system *and* every required
+///   feature *and* has free `max_jobs` capacity right now.
+///
+/// In the second case the caller falls through to the multi-builder
+/// `compose_builders_arg`, letting nix's own scheduler retry against
+/// the full pool. The pre-flight earlier in `build_one` has already
+/// failed-fast for the unsatisfiable-features subset.
+fn pick_builder_for_spec(
+    registry: &medusa_builders::BuilderRegistry,
+    spec: &medusa_eval::JobSpec,
+) -> Option<medusa_builders::BuilderSnapshot> {
+    let system = spec.system.as_deref()?;
+    let eligible = registry.eligible(
+        system,
+        &spec.required_system_features,
+        &std::collections::HashSet::new(),
+    );
+    eligible.into_iter().next()
 }
 
 /// Build the synthetic stderr written into the job's log file when
@@ -754,7 +882,31 @@ async fn build_one(
         }
     }
 
+    // M14: pick a specific builder for this derivation and pin nix to
+    // it. `eligible()` already returns least-loaded-first, filtered by
+    // (system, requiredSystemFeatures, max_jobs cap). We reserve the
+    // slot before recording dispatch + starting the build so a
+    // concurrent worker task sees the up-to-date in_flight number.
+    //
+    // If `eligible` returns nothing — either no connected builders at
+    // all, or none match this derivation's system/features — we fall
+    // through to the legacy multi-builder `--builders` arg (or to the
+    // host's `nix.buildMachines` if that's also empty). Pre-flight
+    // for required-feature jobs already short-circuits the
+    // "connected pool exists but nothing matches" case above.
+    let chosen = pick_builder_for_spec(&ctx.builder_registry, spec);
+    let _slot = chosen
+        .as_ref()
+        .map(|b| BuilderSlot::reserve(ctx.builder_registry.clone(), b.name.clone()));
+
     <SqlxStore as JobStore>::start(&ctx.store, job_id, Utc::now()).await?;
+    if let Some(b) = &chosen {
+        // Surfaces the chosen builder in the read-only UI's running
+        // table and lets future M14 work (per-builder running counts
+        // grouped from the DB) be honest.
+        <SqlxStore as JobStore>::dispatch(&ctx.store, job_id, b.builder_id, Utc::now()).await?;
+    }
+
     // Pre-create the gcroot parent dir so `nix-store --add-root` can drop
     // the symlink atomically with the build (otherwise it ENOENTs and the
     // realise call fails before any building happens).
@@ -764,10 +916,17 @@ async fn build_one(
             tracing::warn!(error = %e, dir = %parent.display(), "failed to create gcroot parent dir; build will run without a gcroot");
         }
     }
-    // Snapshot the registry just before dispatch — builders that
-    // connected after this point will be picked up on the next build.
-    let builders_arg =
-        medusa_build::compose_builders_arg(&ctx.builder_registry, &ctx.medusa_pipe_path);
+    let builders_arg = match &chosen {
+        Some(b) => Some(medusa_build::compose_builders_arg_for_one(
+            &b.name,
+            &b.capabilities,
+            &ctx.medusa_pipe_path,
+        )),
+        // No specific builder chosen: snapshot the full pool so nix's
+        // own scheduler still has options. Builders that connected
+        // after this snapshot will be picked up on the next build.
+        None => medusa_build::compose_builders_arg(&ctx.builder_registry, &ctx.medusa_pipe_path),
+    };
     let request = medusa_build::BuildRequest {
         drv_path: drv_path.clone(),
         log_path: log_path.clone(),
@@ -781,6 +940,7 @@ async fn build_one(
         drv = %request.drv_path,
         log = %log_path.display(),
         builders = request.builders_arg.is_some(),
+        pinned_builder = chosen.as_ref().map(|b| b.name.as_str()),
         "dispatching build",
     );
     // Q39 / Q104 / Q105: race the build against the eval's cancel
@@ -927,10 +1087,126 @@ impl Drop for CancelGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        JobTally, collapsed_progress, summarise_for_check, synthesize_no_eligible_builder_log,
+        BuilderSlot, JobTally, collapsed_progress, pick_builder_for_spec, summarise_for_check,
+        synthesize_no_eligible_builder_log,
     };
-    use medusa_builders::BuilderRegistry;
-    use medusa_domain::JobStatus;
+    use medusa_builders::{BuilderRegistry, ConnState, ConnectedBuilder};
+    use medusa_domain::{AttrPath, BuilderCapabilities, BuilderId, BuilderName, JobStatus};
+
+    fn caps(systems: &[&str], features: &[&str], max_jobs: u32) -> BuilderCapabilities {
+        BuilderCapabilities {
+            systems: systems.iter().map(|s| s.to_string()).collect(),
+            features: features.iter().map(|s| s.to_string()).collect(),
+            max_jobs,
+            nix_version: "test".into(),
+        }
+    }
+
+    fn register(reg: &BuilderRegistry, name: &str, builder_id: i64, c: BuilderCapabilities) {
+        let _ = reg.register(
+            BuilderName::new(name).unwrap(),
+            ConnectedBuilder {
+                builder_id: BuilderId::new(builder_id),
+                capabilities: c,
+                state: ConnState::Active,
+                connected_since: chrono::Utc::now(),
+                connection_id: reg.next_connection_id(),
+                session: None,
+            },
+        );
+    }
+
+    fn spec(system: Option<&str>, required: &[&str]) -> medusa_eval::JobSpec {
+        medusa_eval::JobSpec {
+            attr_path: AttrPath::new("packages.x86_64-linux.foo"),
+            drv_path: Some("/nix/store/xxx-foo.drv".into()),
+            system: system.map(str::to_string),
+            error: None,
+            outputs: Default::default(),
+            meta: serde_json::Value::Null,
+            is_cached: false,
+            required_system_features: required.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn builder_slot_increments_and_decrements_in_flight() {
+        let reg = BuilderRegistry::new();
+        let name = BuilderName::new("solo").unwrap();
+        register(&reg, "solo", 1, caps(&["x86_64-linux"], &[], 4));
+        assert_eq!(reg.snapshot(&name).unwrap().in_flight, 0);
+
+        let slot = BuilderSlot::reserve(reg.clone(), name.clone());
+        assert_eq!(
+            reg.snapshot(&name).unwrap().in_flight,
+            1,
+            "reserve must increment the per-builder in-flight count",
+        );
+        drop(slot);
+        assert_eq!(
+            reg.snapshot(&name).unwrap().in_flight,
+            0,
+            "drop must release the slot — even on cancellation paths",
+        );
+    }
+
+    #[test]
+    fn pick_builder_returns_none_when_pool_empty() {
+        let reg = BuilderRegistry::new();
+        assert!(pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[])).is_none());
+    }
+
+    #[test]
+    fn pick_builder_returns_none_when_no_system_match() {
+        let reg = BuilderRegistry::new();
+        register(&reg, "darwin", 1, caps(&["aarch64-darwin"], &[], 4));
+        assert!(pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[])).is_none());
+    }
+
+    #[test]
+    fn pick_builder_picks_least_loaded_eligible() {
+        let reg = BuilderRegistry::new();
+        register(&reg, "busy", 1, caps(&["x86_64-linux"], &[], 4));
+        register(&reg, "idle", 2, caps(&["x86_64-linux"], &[], 4));
+        // Saturate "busy" with one slot taken.
+        let _slot = BuilderSlot::reserve(reg.clone(), BuilderName::new("busy").unwrap());
+
+        let chosen = pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]))
+            .expect("eligible builder should be returned");
+        assert_eq!(
+            chosen.name.as_str(),
+            "idle",
+            "must prefer the builder with fewer in-flight slots",
+        );
+    }
+
+    #[test]
+    fn pick_builder_filters_by_required_features() {
+        let reg = BuilderRegistry::new();
+        register(&reg, "plain", 1, caps(&["x86_64-linux"], &[], 4));
+        register(&reg, "kvm", 2, caps(&["x86_64-linux"], &["kvm"], 4));
+
+        let chosen = pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &["kvm"]))
+            .expect("kvm-capable builder exists");
+        assert_eq!(
+            chosen.name.as_str(),
+            "kvm",
+            "must filter out builders missing required features",
+        );
+    }
+
+    #[test]
+    fn pick_builder_returns_none_when_at_max_jobs() {
+        let reg = BuilderRegistry::new();
+        register(&reg, "tiny", 1, caps(&["x86_64-linux"], &[], 1));
+        let _slot = BuilderSlot::reserve(reg.clone(), BuilderName::new("tiny").unwrap());
+
+        assert!(
+            pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[])).is_none(),
+            "saturated builder must not be chosen — caller falls back to multi-builder \
+             arg so nix's own scheduler can retry against the full pool",
+        );
+    }
 
     #[test]
     fn no_eligible_builder_log_lists_drv_attr_features_and_builders() {

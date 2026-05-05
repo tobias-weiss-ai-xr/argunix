@@ -226,21 +226,27 @@ async fn dispatch_opens_channel_to_eligible_builder() {
     }
     assert_eq!(&got, payload, "echoed bytes should round-trip");
 
-    // Verify in_flight ticked up.
+    // M14: opening a channel must NOT touch in_flight. The counter is
+    // owned by the build worker now; the channel layer is transparent.
     let snap = registry
         .snapshot(&BuilderName::new("echo-builder").unwrap())
         .unwrap();
-    assert_eq!(snap.in_flight, 1, "in_flight reflects the dispatched build");
+    assert_eq!(
+        snap.in_flight, 0,
+        "channel open does not increment in_flight (M14: counter is worker-owned)"
+    );
 
     drop(medusa_channel);
-    drop(dispatched); // dec_in_flight on drop
+    drop(dispatched);
     let _ = echo_task.await;
 
-    // After drop, in_flight returns to 0.
     let snap = registry
         .snapshot(&BuilderName::new("echo-builder").unwrap())
         .unwrap();
-    assert_eq!(snap.in_flight, 0, "drop releases capacity");
+    assert_eq!(
+        snap.in_flight, 0,
+        "channel drop does not decrement in_flight either",
+    );
 }
 
 #[tokio::test]

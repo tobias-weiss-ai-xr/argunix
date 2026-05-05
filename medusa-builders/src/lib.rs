@@ -19,7 +19,7 @@ mod systems;
 pub use auth::AuthState;
 pub use dispatcher::{BuilderDispatcher, DispatchError, DispatchedBuild};
 pub use host_key::{HostKey, HostKeyError, load_or_generate};
-pub use protocol::{ControlMessage, LineFramer, ProtocolError};
+pub use protocol::{BuildOutcomeStatus, ControlMessage, LineFramer, ProtocolError};
 pub use registry::{
     BuilderRegistry, BuilderSnapshot, ConnState, ConnectedBuilder, DisplacedConnection,
     RusshSession,

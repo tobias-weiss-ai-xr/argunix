@@ -2,9 +2,18 @@
 //!
 //! The piece that — given `(system, features, exclude_set)` — picks a
 //! connected builder and opens a fresh SSH session channel into it, on
-//! which medusa will speak `nix-store --serve --write`. PR #8 will
-//! wire this into the build worker; PR #7 (this) is the standalone
-//! mechanism + tests.
+//! which medusa will speak `nix-store --serve --write`.
+//!
+//! **Note on `in_flight`** (M14). The dispatcher used to inc/dec
+//! `BuilderRegistry::in_flight` around each opened channel, which made
+//! `in_flight` a count of *open SSH channels* rather than running
+//! builds. nix's ssh-ng store opens multiple channels per realise call
+//! (substitution probes, path queries, the actual build), so the count
+//! routinely overstated the real load — the status page showed e.g. 9
+//! "in flight" while only 1 derivation was building. The counter is
+//! now owned by the build worker and incremented exactly once per
+//! dispatched derivation; the channel layer (this file +
+//! `socket_server`) leaves it alone.
 
 use crate::registry::BuilderRegistry;
 use medusa_domain::BuilderName;
@@ -40,15 +49,18 @@ impl BuilderDispatcher {
         Self { registry }
     }
 
-    /// Pick the least-loaded eligible builder, open a fresh SSH session
-    /// channel into it, and return a [`DispatchedBuild`] guard. The
-    /// guard decrements the builder's `in_flight` count on drop, so
-    /// callers don't have to remember to release capacity.
+    /// Pick the least-loaded eligible builder and open a fresh SSH
+    /// session channel into it. Returns a [`DispatchedBuild`] holding
+    /// the channel.
     ///
     /// On `channel_open_session` failure (builder dropped between
     /// eligibility check and open, or rejected the open), we walk to
     /// the next eligible candidate. Only when every candidate has been
     /// tried do we return `Err`.
+    ///
+    /// `in_flight` accounting is the worker's responsibility (M14):
+    /// the worker increments before calling here and decrements when
+    /// the build finishes. This function does not touch the counter.
     pub async fn dispatch(
         &self,
         system: &str,
@@ -68,22 +80,15 @@ impl BuilderDispatcher {
                 // here. Try the next candidate.
                 continue;
             };
-            // Reserve capacity before awaiting the open. A concurrent
-            // dispatch on the same builder would otherwise see stale
-            // in_flight counts and over-subscribe. If the open fails
-            // we decrement back.
-            self.registry.inc_in_flight(&snap.name);
             match session.handle.channel_open_session().await {
                 Ok(channel) => {
                     tracing::debug!(builder = %snap.name, "build channel opened");
                     return Ok(DispatchedBuild {
-                        registry: self.registry.clone(),
                         name: snap.name,
                         channel: Some(channel),
                     });
                 }
                 Err(e) => {
-                    self.registry.dec_in_flight(&snap.name);
                     tracing::warn!(
                         builder = %snap.name,
                         error = %e,
@@ -103,10 +108,14 @@ impl BuilderDispatcher {
     }
 
     /// Open a fresh SSH session channel into a *specific* builder.
-    /// Used by the socket-server proxy: nix's `--builders` arg lists
-    /// every connected builder, nix picks one, then invokes
-    /// `medusa-pipe <name>` for the chosen one — at which point we
-    /// already know the builder, no `eligible` walk needed.
+    /// Used by the socket-server proxy: when the build worker has
+    /// already picked the builder, the proxy forwards `medusa-pipe`
+    /// bytes onto a fresh channel without an `eligible` walk.
+    ///
+    /// Does not touch `in_flight` — see the file-level note. The
+    /// worker is responsible for the counter; one realise call may
+    /// open multiple channels for substitution / path-query / build,
+    /// and counting them all would over-report load.
     pub async fn open_channel(&self, name: &BuilderName) -> Result<DispatchedBuild, DispatchError> {
         let session = self
             .registry
@@ -114,45 +123,32 @@ impl BuilderDispatcher {
             .ok_or_else(|| DispatchError::NotRegistered {
                 name: name.as_str().to_string(),
             })?;
-        // Reserve before await so concurrent dispatches see the
-        // pending count.
-        self.registry.inc_in_flight(name);
         match session.handle.channel_open_session().await {
             Ok(channel) => Ok(DispatchedBuild {
-                registry: self.registry.clone(),
                 name: name.clone(),
                 channel: Some(channel),
             }),
-            Err(e) => {
-                self.registry.dec_in_flight(name);
-                Err(DispatchError::OpenFailed {
-                    name: name.as_str().to_string(),
-                    source: e,
-                })
-            }
+            Err(e) => Err(DispatchError::OpenFailed {
+                name: name.as_str().to_string(),
+                source: e,
+            }),
         }
     }
 }
 
-/// RAII handle for a build channel held against a registered builder.
-/// Drop releases the builder's in-flight capacity.
+/// Owner of an opened build channel against a registered builder.
+/// In M13 this also held an `in_flight` slot via Drop; M14 moved that
+/// accounting to the worker, so this struct is now just a typed
+/// channel-plus-name wrapper.
 pub struct DispatchedBuild {
-    registry: Arc<BuilderRegistry>,
     pub name: BuilderName,
     channel: Option<Channel<Msg>>,
 }
 
 impl DispatchedBuild {
-    /// Take the SSH channel out of the guard. The guard still
-    /// decrements in_flight on drop; the channel is the caller's
-    /// concern thereafter.
+    /// Take the SSH channel out of the wrapper. The caller is
+    /// responsible for closing it; nothing else happens on drop.
     pub fn take_channel(&mut self) -> Option<Channel<Msg>> {
         self.channel.take()
-    }
-}
-
-impl Drop for DispatchedBuild {
-    fn drop(&mut self) {
-        self.registry.dec_in_flight(&self.name);
     }
 }

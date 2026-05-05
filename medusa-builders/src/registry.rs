@@ -206,7 +206,18 @@ impl BuilderRegistry {
             .and_then(|c| c.session.clone())
     }
 
-    /// PR #7 will call these around each dispatched build channel.
+    /// Bump the per-builder in-flight build count. Called by the build
+    /// worker (M14) once per dispatched derivation: increment before
+    /// the build starts, decrement when it returns. This is the
+    /// authoritative "how busy is this builder" gauge that drives both
+    /// `eligible()`'s capacity check and the status page's per-builder
+    /// counter.
+    ///
+    /// The channel layer (`BuilderDispatcher`, `socket_server`) does
+    /// **not** call these. nix's ssh-ng store opens several channels
+    /// per realise call (substitute probes, path queries, builds);
+    /// counting channels conflates connection-pool size with build
+    /// load and over-reports.
     pub fn inc_in_flight(&self, name: &BuilderName) {
         *self
             .in_flight
