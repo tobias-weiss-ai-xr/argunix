@@ -21,8 +21,9 @@ mod systems;
 pub use auth::AuthState;
 pub use channel_io::{ChannelSide, with_channel_io};
 pub use closure_xfer::{
-    ClosureXferError, ClosureXferOutcome, export_closure, import_closure,
-    pull_closure_over_channel, push_closure_over_channel, query_requisites,
+    ClosureXferError, ClosureXferOutcome, check_invalid_paths, export_closure, import_closure,
+    pull_closure_over_channel, push_closure_over_channel, query_invalid_over_channel,
+    query_requisites,
 };
 pub use dispatcher::{BuilderDispatcher, DispatchError, DispatchedBuild};
 pub use host_key::{HostKey, HostKeyError, load_or_generate};
@@ -35,6 +36,7 @@ pub use server::{BuilderServer, ServerConfig, ServerError};
 pub use side_channel::{
     ClosurePushReply, DispatchError as SideChannelDispatchError,
     DispatchOutcome as SideChannelDispatchOutcome, MAX_HEADER_BYTES, SideChannelError,
-    SideChannelHeader, SideChannelKind, dispatch_inbound, read_header, write_header,
+    SideChannelHeader, SideChannelKind, ValidPathsReply, dispatch_inbound, read_header,
+    write_header,
 };
 pub use systems::SystemsResolver;

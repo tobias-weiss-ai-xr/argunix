@@ -25,7 +25,8 @@ use arc_swap::ArcSwap;
 use chrono::Utc;
 use medusa_builders::{
     BuildLifecycle, BuildOutcomeStatus, BuilderDispatcher, ClosureXferError,
-    pull_closure_over_channel, push_closure_over_channel, query_requisites,
+    pull_closure_over_channel, push_closure_over_channel, query_invalid_over_channel,
+    query_requisites,
 };
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
 use medusa_forge::{CheckPost, CheckState, ForgeError, Provider};
@@ -1227,47 +1228,104 @@ pub async fn dispatch_pool_build(
         }
     };
 
-    // 2. Push closure to the builder.
-    let push_chan = match dispatcher.open_channel(builder_name).await {
-        Ok(mut d) => d.take_channel(),
+    // 2a. Probe the builder for which closure paths it already has,
+    //     so we can ship only the missing subset. Opens a side
+    //     channel, sends `QueryValidPaths`, reads the reply, and
+    //     filters. On *any* probe error we fall back to pushing the
+    //     full closure — the optimization must never break a build,
+    //     and it lets us interoperate with older agents that don't
+    //     know the new header kind.
+    let full_closure_count = closure.len();
+    let to_push: Vec<String> = match dispatcher.open_channel(builder_name).await {
+        Ok(mut d) => {
+            let probe_chan = d.take_channel().expect("dispatcher returned channel");
+            match query_invalid_over_channel(probe_chan, build_id, closure.clone()).await {
+                Ok(invalid) => {
+                    tracing::debug!(
+                        builder = %builder_name,
+                        build_id,
+                        queried = full_closure_count,
+                        invalid = invalid.len(),
+                        "valid-paths probe succeeded",
+                    );
+                    invalid
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        builder = %builder_name,
+                        build_id,
+                        error = %e,
+                        "valid-paths probe failed; falling back to full push",
+                    );
+                    closure
+                }
+            }
+        }
         Err(e) => {
-            tracing::warn!(builder = %builder_name, error = %e, "open ClosurePush channel failed");
+            tracing::warn!(
+                builder = %builder_name,
+                build_id,
+                error = %e,
+                "could not open probe channel; falling back to full push",
+            );
+            closure
+        }
+    };
+
+    // 2b. If the builder already has every path, skip the push
+    //     entirely — `nix-store --export` with no paths errors out,
+    //     and there's nothing to ship anyway.
+    if to_push.is_empty() {
+        tracing::info!(
+            builder = %builder_name,
+            build_id,
+            queried = full_closure_count,
+            "builder has full closure; skipping ClosurePush",
+        );
+    } else {
+        // 2c. Push the (filtered) closure to the builder.
+        let push_chan = match dispatcher.open_channel(builder_name).await {
+            Ok(mut d) => d.take_channel(),
+            Err(e) => {
+                tracing::warn!(builder = %builder_name, error = %e, "open ClosurePush channel failed");
+                log_buf.extend_from_slice(
+                    format!("medusa: could not open builder channel: {e}\n").as_bytes(),
+                );
+                return early_failure(log_buf, log_path.to_path_buf()).await;
+            }
+        };
+        let push_chan = push_chan.expect("dispatcher returned channel");
+        let closure_path_count = to_push.len();
+        if let Err(e) = push_closure_over_channel(push_chan, build_id, to_push, nix_store_bin).await
+        {
+            tracing::warn!(
+                error = %e,
+                builder = %builder_name,
+                build_id,
+                drv = drv_path,
+                closure_paths = closure_path_count,
+                "push_closure_over_channel failed",
+            );
+            // Surface the failure in the build log. `e`'s Display already
+            // includes the agent's stderr when the failure was an import
+            // rejection (see `ClosureXferError::AgentImportFailed`); for
+            // pure transport errors (BrokenPipe, channel teardown) we
+            // additionally hint where to look on the agent side.
             log_buf.extend_from_slice(
-                format!("medusa: could not open builder channel: {e}\n").as_bytes(),
+                format!(
+                    "medusa: pushing drv closure to `{builder}` failed:\n\
+                     {e}\n\
+                     medusa: drv={drv_path}, closure_paths={closure_path_count}\n\
+                     medusa: if no agent stderr is shown above, the channel was\n\
+                     medusa: torn down before the agent could reply — check the\n\
+                     medusa: builder's `journalctl -u medusa-builder.service` for\n\
+                     medusa: a `side channel ended with error` line near build_id={build_id}.\n",
+                    builder = builder_name,
+                )
+                .as_bytes(),
             );
             return early_failure(log_buf, log_path.to_path_buf()).await;
         }
-    };
-    let push_chan = push_chan.expect("dispatcher returned channel");
-    let closure_path_count = closure.len();
-    if let Err(e) = push_closure_over_channel(push_chan, build_id, closure, nix_store_bin).await {
-        tracing::warn!(
-            error = %e,
-            builder = %builder_name,
-            build_id,
-            drv = drv_path,
-            closure_paths = closure_path_count,
-            "push_closure_over_channel failed",
-        );
-        // Surface the failure in the build log. `e`'s Display already
-        // includes the agent's stderr when the failure was an import
-        // rejection (see `ClosureXferError::AgentImportFailed`); for
-        // pure transport errors (BrokenPipe, channel teardown) we
-        // additionally hint where to look on the agent side.
-        log_buf.extend_from_slice(
-            format!(
-                "medusa: pushing drv closure to `{builder}` failed:\n\
-                 {e}\n\
-                 medusa: drv={drv_path}, closure_paths={closure_path_count}\n\
-                 medusa: if no agent stderr is shown above, the channel was\n\
-                 medusa: torn down before the agent could reply — check the\n\
-                 medusa: builder's `journalctl -u medusa-builder.service` for\n\
-                 medusa: a `side channel ended with error` line near build_id={build_id}.\n",
-                builder = builder_name,
-            )
-            .as_bytes(),
-        );
-        return early_failure(log_buf, log_path.to_path_buf()).await;
     }
 
     // 3. Send Build over the control channel; subscribe to lifecycle.

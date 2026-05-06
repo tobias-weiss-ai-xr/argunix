@@ -715,6 +715,21 @@ async fn serve_side_channel(
                 "side channel finished",
             );
         }
+        Ok(SideChannelDispatchOutcome::ValidPathsQueried {
+            build_id,
+            queried,
+            invalid,
+        }) => {
+            tracing::info!(
+                channel = channel_id,
+                elapsed_ms,
+                kind = "query_valid_paths",
+                build_id,
+                queried,
+                invalid,
+                "side channel finished",
+            );
+        }
         Err(e) => {
             tracing::warn!(
                 channel = channel_id,

@@ -16,7 +16,8 @@
 use crate::channel_io::with_channel_io;
 use crate::protocol::BuildOutcomeStatus;
 use crate::side_channel::{
-    ClosurePushReply, SideChannelError, SideChannelHeader, SideChannelKind, write_header,
+    ClosurePushReply, SideChannelError, SideChannelHeader, SideChannelKind, ValidPathsReply,
+    write_header,
 };
 use russh::Channel;
 use russh::server::Msg as ServerMsg;
@@ -91,6 +92,16 @@ pub enum ClosureXferError {
     QueryRequisites(#[source] std::io::Error),
     #[error("`nix-store --query --requisites` exited {code:?}: {stderr}")]
     QueryRequisitesFailed { code: Option<i32>, stderr: String },
+    #[error("running `nix-store --check-validity --print-invalid`: {0}")]
+    CheckValidity(#[source] std::io::Error),
+    #[error("`nix-store --check-validity --print-invalid` exited {code:?}: {stderr}")]
+    CheckValidityFailed { code: Option<i32>, stderr: String },
+    #[error("reading valid-paths reply trailer: {0}")]
+    ValidPathsReplyIo(#[source] std::io::Error),
+    #[error("decoding valid-paths reply trailer JSON: {0}")]
+    ValidPathsReplyJson(#[source] serde_json::Error),
+    #[error("valid-paths reply trailer was empty (agent did not respond)")]
+    ValidPathsReplyEmpty,
     /// Agent's `nix-store --import` returned a non-success outcome.
     /// Daemon-side surfaces this when the side-channel reply trailer
     /// from the agent says `ok: false`, OR when a daemon-side IO
@@ -314,6 +325,98 @@ pub async fn query_requisites(
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect())
+}
+
+/// Agent-side: ask the local nix store which of `paths` are NOT
+/// already valid here. Returns the subset that's missing — that's
+/// exactly what the daemon then needs to ship over a `ClosurePush`.
+///
+/// `nix-store --check-validity --print-invalid <paths>` always exits
+/// 0 and prints invalid paths one per line; an empty stdout means
+/// the builder already has everything. Empty input → empty output
+/// without spawning (avoids an empty argv).
+pub async fn check_invalid_paths(
+    nix_store_bin: &Path,
+    paths: &[String],
+) -> Result<Vec<String>, ClosureXferError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cmd = Command::new(nix_store_bin);
+    cmd.arg("--check-validity").arg("--print-invalid");
+    for p in paths {
+        cmd.arg(p);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = spawn_retrying_etxtbsy(&mut cmd).map_err(ClosureXferError::CheckValidity)?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(ClosureXferError::CheckValidity)?;
+    if !output.status.success() {
+        return Err(ClosureXferError::CheckValidityFailed {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Daemon-side: open the supplied russh channel, write a
+/// `QueryValidPaths` header listing the closure, and read the
+/// agent's `ValidPathsReply` trailer to find out which paths are
+/// missing on the builder. The daemon uses this to ship only the
+/// missing subset over the subsequent `ClosurePush`.
+///
+/// Takes ownership of `channel` and closes it cleanly on return.
+/// Errors here are recoverable at the call site: on any failure the
+/// caller should fall back to pushing the full closure (correctness
+/// over savings — the optimization must never break a build).
+pub async fn query_invalid_over_channel(
+    channel: Channel<ServerMsg>,
+    build_id: i64,
+    paths: Vec<String>,
+) -> Result<Vec<String>, ClosureXferError> {
+    let header = SideChannelHeader {
+        kind: SideChannelKind::QueryValidPaths,
+        build_id,
+        paths,
+    };
+    let outcome = with_channel_io(channel, None, |io| async move {
+        let (mut reader, mut writer) = tokio::io::split(io);
+        write_header(&mut writer, &header).await?;
+        // Half-close our write side so the agent doesn't wait for
+        // more bytes after seeing the header. (Same trick as
+        // ClosurePull below.)
+        let _ = writer.flush().await;
+        drop(writer);
+
+        // Read the reply trailer. A healthy agent answers in
+        // milliseconds; bound the wait so a wedged agent can't hang
+        // dispatch.
+        let mut reply_buf = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(60), reader.read_to_end(&mut reply_buf)).await;
+        if reply_buf.is_empty() {
+            return Err(ClosureXferError::ValidPathsReplyEmpty);
+        }
+        let line = reply_buf.split(|&b| b == b'\n').next().unwrap_or(&[]);
+        if line.is_empty() {
+            return Err(ClosureXferError::ValidPathsReplyEmpty);
+        }
+        let reply: ValidPathsReply =
+            serde_json::from_slice(line).map_err(ClosureXferError::ValidPathsReplyJson)?;
+        Ok::<Vec<String>, ClosureXferError>(reply.invalid)
+    })
+    .await;
+    outcome
 }
 
 /// Daemon-side: open the supplied russh channel, write a `ClosurePush`

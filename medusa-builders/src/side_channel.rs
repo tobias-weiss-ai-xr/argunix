@@ -25,7 +25,8 @@
 //! `tokio::io::duplex`.
 
 use crate::closure_xfer::{
-    ClosureXferError, ClosureXferOutcome, export_closure, import_closure, query_requisites,
+    ClosureXferError, ClosureXferOutcome, check_invalid_paths, export_closure, import_closure,
+    query_requisites,
 };
 use crate::protocol::BuildOutcomeStatus;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,13 @@ pub enum SideChannelKind {
     /// stream of the build output paths; daemon pipes it into
     /// `nix-store --import`.
     ClosurePull,
+    /// Daemon → agent (probe). No binary payload; the header's
+    /// `paths` field is the candidate set. Agent runs
+    /// `nix-store --check-validity --print-invalid` and replies
+    /// with a [`ValidPathsReply`] trailer naming the missing
+    /// subset. Daemon then pushes only that subset over a
+    /// subsequent `ClosurePush` channel.
+    QueryValidPaths,
 }
 
 /// Trailer the agent writes back on a `ClosurePush` channel after its
@@ -88,6 +96,16 @@ pub struct ClosurePushReply {
     /// lossy on the wire; binary noise is rare in nix output.
     #[serde(default)]
     pub stderr: String,
+}
+
+/// Trailer the agent writes back on a `QueryValidPaths` channel.
+/// `invalid` is the subset of the header's `paths` that the builder
+/// does NOT already have — i.e. exactly what the daemon needs to
+/// ship in the follow-up `ClosurePush`. An empty list means the
+/// builder already has the full closure and the push can be skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidPathsReply {
+    pub invalid: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -196,6 +214,15 @@ pub enum DispatchOutcome {
         paths: Vec<String>,
         export: ClosureXferOutcome,
     },
+    /// Agent answered a `QueryValidPaths` probe. `queried` is the
+    /// number of candidate paths the daemon asked about; `invalid`
+    /// is the count it had to report missing. Carrying counts (not
+    /// the full lists) keeps this enum cheap to Debug-format.
+    ValidPathsQueried {
+        build_id: i64,
+        queried: usize,
+        invalid: usize,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -274,6 +301,30 @@ where
                 // 200 transitive deps we shipped".
                 paths: header.paths,
                 export,
+            })
+        }
+        SideChannelKind::QueryValidPaths => {
+            // No binary payload — the header carries the candidate
+            // set in `paths`, and the agent's whole job is to answer
+            // which of those it does NOT already have.
+            let queried = header.paths.len();
+            let invalid_paths = check_invalid_paths(nix_store_bin, &header.paths).await?;
+            let invalid = invalid_paths.len();
+            let reply = ValidPathsReply {
+                invalid: invalid_paths,
+            };
+            // Best-effort write of the trailer; if the channel is
+            // already torn down the daemon will surface a typed
+            // error at its end and fall back to a full push.
+            if let Ok(mut line) = serde_json::to_vec(&reply) {
+                line.push(b'\n');
+                let _ = writer.write_all(&line).await;
+                let _ = writer.flush().await;
+            }
+            Ok(DispatchOutcome::ValidPathsQueried {
+                build_id: header.build_id,
+                queried,
+                invalid,
             })
         }
     }
@@ -724,6 +775,168 @@ exit 99
              --import` rejects outputs whose runtime deps came from \
              a binary cache during the build (see the \
              `OVMF-202602-fd is not valid` regression).",
+        );
+    }
+
+    /// Install a fake `nix-store` that handles
+    /// `--check-validity --print-invalid <paths>` by treating each
+    /// line of `valid_file` as a path the builder *already has* —
+    /// any input arg not in that file is "invalid" and printed.
+    /// Empty `valid_file` (or absent) means everything is invalid.
+    fn fake_nix_store_validity(path: &Path, valid_file: &Path) {
+        let body = format!(
+            r#"#!/bin/sh
+if [ "$1" = "--check-validity" ] && [ "$2" = "--print-invalid" ]; then
+  shift 2
+  for a in "$@"; do
+    if [ -f "{valid}" ] && grep -Fxq -- "$a" "{valid}"; then
+      :
+    else
+      printf '%s\n' "$a"
+    fi
+  done
+  exit 0
+fi
+exit 99
+"#,
+            valid = valid_file.display(),
+        );
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perm).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_valid_paths_round_trips_through_dispatch_inbound() {
+        // Builder claims to already have `aaa` and `ccc`. Daemon
+        // probes the full closure {aaa, bbb, ccc, ddd}; agent must
+        // reply with {bbb, ddd}.
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("nix-store");
+        let valid = dir.path().join("valid.txt");
+        std::fs::write(&valid, "/nix/store/aaa\n/nix/store/ccc\n").unwrap();
+        fake_nix_store_validity(&bin, &valid);
+
+        let header = SideChannelHeader {
+            kind: SideChannelKind::QueryValidPaths,
+            build_id: 5,
+            paths: vec![
+                "/nix/store/aaa".into(),
+                "/nix/store/bbb".into(),
+                "/nix/store/ccc".into(),
+                "/nix/store/ddd".into(),
+            ],
+        };
+
+        let (rx_d_to_a, mut tx_d_to_a) = tokio::io::duplex(8 * 1024);
+        let (mut rx_a_to_d, tx_a_to_d) = tokio::io::duplex(8 * 1024);
+        let mut agent_reader = BufReader::new(rx_d_to_a);
+        let mut agent_writer = tx_a_to_d;
+
+        let header_clone = header.clone();
+        let daemon_task = tokio::spawn(async move {
+            write_header(&mut tx_d_to_a, &header_clone).await.unwrap();
+            tx_d_to_a.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            rx_a_to_d.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        let outcome = dispatch_inbound(&bin, &mut agent_reader, &mut agent_writer)
+            .await
+            .expect("dispatch should succeed for query_valid_paths");
+        drop(agent_writer);
+        let trailer = daemon_task.await.unwrap();
+
+        match outcome {
+            DispatchOutcome::ValidPathsQueried {
+                build_id,
+                queried,
+                invalid,
+            } => {
+                assert_eq!(build_id, 5);
+                assert_eq!(queried, 4);
+                assert_eq!(invalid, 2);
+            }
+            other => panic!("expected ValidPathsQueried, got {other:?}"),
+        }
+
+        let line = std::str::from_utf8(&trailer)
+            .unwrap()
+            .lines()
+            .next()
+            .expect("agent must emit a reply trailer");
+        let reply: ValidPathsReply = serde_json::from_str(line).unwrap();
+        assert_eq!(reply.invalid, vec!["/nix/store/bbb", "/nix/store/ddd"]);
+    }
+
+    #[tokio::test]
+    async fn query_valid_paths_replies_empty_when_builder_has_everything() {
+        // Builder already has the full closure → reply.invalid must
+        // be the empty list. Caller (daemon) treats this as "skip
+        // the push entirely", which the integration logic enforces.
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("nix-store");
+        let valid = dir.path().join("valid.txt");
+        std::fs::write(&valid, "/nix/store/aaa\n/nix/store/bbb\n").unwrap();
+        fake_nix_store_validity(&bin, &valid);
+
+        let header = SideChannelHeader {
+            kind: SideChannelKind::QueryValidPaths,
+            build_id: 6,
+            paths: vec!["/nix/store/aaa".into(), "/nix/store/bbb".into()],
+        };
+
+        let (rx_d_to_a, mut tx_d_to_a) = tokio::io::duplex(4 * 1024);
+        let (mut rx_a_to_d, tx_a_to_d) = tokio::io::duplex(4 * 1024);
+        let mut agent_reader = BufReader::new(rx_d_to_a);
+        let mut agent_writer = tx_a_to_d;
+
+        let daemon_task = tokio::spawn(async move {
+            write_header(&mut tx_d_to_a, &header).await.unwrap();
+            tx_d_to_a.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            rx_a_to_d.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        let outcome = dispatch_inbound(&bin, &mut agent_reader, &mut agent_writer)
+            .await
+            .expect("dispatch should succeed");
+        drop(agent_writer);
+        let trailer = daemon_task.await.unwrap();
+
+        match outcome {
+            DispatchOutcome::ValidPathsQueried { invalid, .. } => assert_eq!(invalid, 0),
+            other => panic!("expected ValidPathsQueried, got {other:?}"),
+        }
+        let line = std::str::from_utf8(&trailer)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
+        let reply: ValidPathsReply = serde_json::from_str(line).unwrap();
+        assert!(reply.invalid.is_empty());
+    }
+
+    #[test]
+    fn query_valid_paths_kind_is_snake_case_on_wire() {
+        let h = SideChannelHeader {
+            kind: SideChannelKind::QueryValidPaths,
+            build_id: 1,
+            paths: vec![],
+        };
+        let s = String::from_utf8(h.encode_line()).unwrap();
+        assert!(
+            s.contains("\"kind\":\"query_valid_paths\""),
+            "unexpected kind on wire: {s}",
         );
     }
 
