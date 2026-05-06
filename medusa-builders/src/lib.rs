@@ -33,8 +33,8 @@ pub use registry::{
 };
 pub use server::{BuilderServer, ServerConfig, ServerError};
 pub use side_channel::{
-    DispatchError as SideChannelDispatchError, DispatchOutcome as SideChannelDispatchOutcome,
-    MAX_HEADER_BYTES, SideChannelError, SideChannelHeader, SideChannelKind, dispatch_inbound,
-    read_header, write_header,
+    ClosurePushReply, DispatchError as SideChannelDispatchError,
+    DispatchOutcome as SideChannelDispatchOutcome, MAX_HEADER_BYTES, SideChannelError,
+    SideChannelHeader, SideChannelKind, dispatch_inbound, read_header, write_header,
 };
 pub use systems::SystemsResolver;

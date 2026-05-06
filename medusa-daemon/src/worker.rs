@@ -1171,9 +1171,34 @@ pub async fn dispatch_pool_build(
         }
     };
     let push_chan = push_chan.expect("dispatcher returned channel");
+    let closure_path_count = closure.len();
     if let Err(e) = push_closure_over_channel(push_chan, build_id, closure, nix_store_bin).await {
-        tracing::warn!(error = %e, "push_closure_over_channel failed");
-        log_buf.extend_from_slice(format!("medusa: pushing drv closure failed: {e}\n").as_bytes());
+        tracing::warn!(
+            error = %e,
+            builder = %builder_name,
+            build_id,
+            drv = drv_path,
+            closure_paths = closure_path_count,
+            "push_closure_over_channel failed",
+        );
+        // Surface the failure in the build log. `e`'s Display already
+        // includes the agent's stderr when the failure was an import
+        // rejection (see `ClosureXferError::AgentImportFailed`); for
+        // pure transport errors (BrokenPipe, channel teardown) we
+        // additionally hint where to look on the agent side.
+        log_buf.extend_from_slice(
+            format!(
+                "medusa: pushing drv closure to `{builder}` failed:\n\
+                 {e}\n\
+                 medusa: drv={drv_path}, closure_paths={closure_path_count}\n\
+                 medusa: if no agent stderr is shown above, the channel was\n\
+                 medusa: torn down before the agent could reply — check the\n\
+                 medusa: builder's `journalctl -u medusa-builder.service` for\n\
+                 medusa: a `side channel ended with error` line near build_id={build_id}.\n",
+                builder = builder_name,
+            )
+            .as_bytes(),
+        );
         return early_failure(log_buf, log_path.to_path_buf()).await;
     }
 

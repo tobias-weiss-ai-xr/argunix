@@ -25,6 +25,7 @@
 //! `tokio::io::duplex`.
 
 use crate::closure_xfer::{ClosureXferError, ClosureXferOutcome, export_closure, import_closure};
+use crate::protocol::BuildOutcomeStatus;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -61,6 +62,32 @@ pub enum SideChannelKind {
     ClosurePull,
 }
 
+/// Trailer the agent writes back on a `ClosurePush` channel after its
+/// `nix-store --import` finishes. Without this, a daemon-side IO
+/// error mid-write (e.g. `BrokenPipe` because the agent's import
+/// exited early) would have no diagnostic context — the operator
+/// would need to grep the agent's journal by timestamp to find the
+/// real cause. With this, the daemon reads the trailer after writing
+/// and folds the agent's stderr into the build log.
+///
+/// Single newline-terminated JSON line, written immediately after
+/// `nix-store --import` returns and before the agent's user closure
+/// drops the channel writer. Best-effort on both sides — if the
+/// channel is already torn down by the time the agent tries to write,
+/// the daemon will simply not read it; the daemon's read is bounded
+/// by a timeout so a non-cooperating agent can't hang the dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosurePushReply {
+    pub ok: bool,
+    pub bytes_received: u64,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// Captured stderr from the agent's `nix-store --import`. UTF-8
+    /// lossy on the wire; binary noise is rare in nix output.
+    #[serde(default)]
+    pub stderr: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SideChannelError {
     #[error("reading side-channel header: {0}")]
@@ -75,11 +102,19 @@ pub enum SideChannelError {
     UnexpectedEof,
 }
 
-/// Generously above any realistic header size — `paths` may have a
-/// few hundred entries for a fat closure but each is ~80 chars; 64K
-/// is enough headroom while still tripping fast on garbage / a
-/// misbehaving peer.
-pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+/// Cap on the side-channel header size. The JSON header carries the
+/// full `paths` list of the closure being transferred — for fat
+/// closures (thousands of input drvs, e.g. a moderately complex Rust
+/// build) that easily exceeds 100 KiB. The original 64 KiB cap was
+/// way too tight in production: a single Rust crate with ~1000
+/// transitive deps already serialises to ~80 KiB and trips it.
+///
+/// 16 MiB is *defense against a hostile / runaway peer* (preventing
+/// unbounded memory growth on a peer that opens a channel and never
+/// terminates the line). It is comfortably above any realistic drv
+/// closure: at ~85 bytes per path, that's ~190K paths — well past
+/// the size of the entire nixpkgs closure.
+pub const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
 
 impl SideChannelHeader {
     /// Encode as a single JSON line with trailing `\n`. Always
@@ -192,6 +227,23 @@ where
     match header.kind {
         SideChannelKind::ClosurePush => {
             let import = import_closure(nix_store_bin, reader).await?;
+            // Reply with a JSON line so the daemon side has diagnostic
+            // context for any IO error during its own write phase
+            // (BrokenPipe etc. — without this, the daemon log just says
+            // "broken pipe" and the operator has to grep agent logs by
+            // timestamp). Best-effort: if the channel is already torn
+            // down, the write silently no-ops.
+            let reply = ClosurePushReply {
+                ok: import.status == BuildOutcomeStatus::Success,
+                bytes_received: import.bytes_transferred,
+                exit_code: import.exit_code,
+                stderr: String::from_utf8_lossy(&import.stderr).into_owned(),
+            };
+            if let Ok(mut line) = serde_json::to_vec(&reply) {
+                line.push(b'\n');
+                let _ = writer.write_all(&line).await;
+                let _ = writer.flush().await;
+            }
             Ok(DispatchOutcome::ClosurePushed {
                 build_id: header.build_id,
                 paths: header.paths,
@@ -412,7 +464,9 @@ exit 99
             let (rx, tx) = tokio::io::duplex(8 * 1024);
             (tx, rx)
         };
-        let (mut _unused_agent_writer, mut _daemon_reader) = tokio::io::duplex(64);
+        // Agent → daemon direction: must be sized for the agent's
+        // reply trailer JSON line. 4 KiB is more than enough.
+        let (mut agent_writer, mut daemon_reader) = tokio::io::duplex(4 * 1024);
 
         // Daemon-side: write header + payload, then drop the
         // writer so the agent sees EOF and `import` finishes.
@@ -423,12 +477,18 @@ exit 99
                 .unwrap();
             daemon_tx_to_agent.write_all(&nar_clone).await.unwrap();
             daemon_tx_to_agent.shutdown().await.unwrap();
+            // Read the agent's trailer so we can assert on it.
+            let mut buf = Vec::new();
+            daemon_reader.read_to_end(&mut buf).await.unwrap();
+            buf
         });
 
-        let outcome = dispatch_inbound(&bin, &mut agent_rx, &mut _unused_agent_writer)
+        let outcome = dispatch_inbound(&bin, &mut agent_rx, &mut agent_writer)
             .await
             .expect("dispatch should succeed for closure_push");
-        daemon_task.await.unwrap();
+        // Drop the agent writer so daemon's read_to_end completes.
+        drop(agent_writer);
+        let trailer_bytes = daemon_task.await.unwrap();
 
         match outcome {
             DispatchOutcome::ClosurePushed {
@@ -447,6 +507,100 @@ exit 99
             std::fs::read(&sink).unwrap(),
             nar_payload,
             "every byte of the payload must reach `nix-store --import` stdin",
+        );
+        // The agent must send a single newline-terminated JSON
+        // ClosurePushReply with ok=true.
+        let trailer = std::str::from_utf8(&trailer_bytes).unwrap();
+        let line = trailer
+            .lines()
+            .next()
+            .expect("agent must emit a reply trailer");
+        let reply: ClosurePushReply = serde_json::from_str(line).unwrap();
+        assert!(reply.ok, "successful import must surface as ok=true");
+        assert_eq!(reply.bytes_received, nar_payload.len() as u64);
+        assert_eq!(reply.exit_code, Some(0));
+    }
+
+    /// Failure path: agent's `nix-store --import` exits non-zero.
+    /// The reply trailer must carry `ok=false` and the captured
+    /// stderr so the daemon side can surface it instead of just
+    /// "broken pipe".
+    #[tokio::test]
+    async fn dispatch_inbound_closure_push_failure_emits_stderr_in_reply() {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("nix-store");
+        // Fake nix-store that fails on --import with a recognisable
+        // stderr line — mirrors the kind of message a real
+        // nix-store would emit on a hash mismatch.
+        let body = "#!/bin/sh\n\
+            if [ \"$1\" = \"--import\" ]; then\n  \
+              cat >/dev/null\n  \
+              echo \"error: hash mismatch importing path \
+'/nix/store/x'\" >&2\n  \
+              exit 1\n\
+            fi\n\
+            exit 99\n";
+        let tmp = bin.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perm).unwrap();
+        std::fs::rename(&tmp, &bin).unwrap();
+
+        let header = SideChannelHeader {
+            kind: SideChannelKind::ClosurePush,
+            build_id: 99,
+            paths: vec!["/nix/store/x".into()],
+        };
+        let payload: Vec<u8> = vec![1, 2, 3, 4];
+        let (mut daemon_tx_to_agent, mut agent_rx) = {
+            let (rx, tx) = tokio::io::duplex(4096);
+            (tx, rx)
+        };
+        let (mut agent_writer, mut daemon_reader) = tokio::io::duplex(4096);
+
+        let payload_clone = payload.clone();
+        let daemon_task = tokio::spawn(async move {
+            write_header(&mut daemon_tx_to_agent, &header)
+                .await
+                .unwrap();
+            daemon_tx_to_agent.write_all(&payload_clone).await.unwrap();
+            daemon_tx_to_agent.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            daemon_reader.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        let outcome = dispatch_inbound(&bin, &mut agent_rx, &mut agent_writer)
+            .await
+            .expect("dispatch_inbound itself returns Ok even on import failure");
+        drop(agent_writer);
+        let trailer = daemon_task.await.unwrap();
+
+        match outcome {
+            DispatchOutcome::ClosurePushed { import, .. } => {
+                assert_eq!(import.status, BuildOutcomeStatus::Failure);
+                assert_eq!(import.exit_code, Some(1));
+            }
+            other => panic!("expected ClosurePushed, got {other:?}"),
+        }
+
+        let line = std::str::from_utf8(&trailer)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
+        let reply: ClosurePushReply = serde_json::from_str(line).unwrap();
+        assert!(!reply.ok, "import failure must surface as ok=false");
+        assert_eq!(reply.exit_code, Some(1));
+        assert!(
+            reply.stderr.contains("hash mismatch"),
+            "agent's stderr must round-trip in the reply: {:?}",
+            reply.stderr,
         );
     }
 

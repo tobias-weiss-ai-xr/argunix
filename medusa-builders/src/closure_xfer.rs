@@ -15,11 +15,14 @@
 
 use crate::channel_io::with_channel_io;
 use crate::protocol::BuildOutcomeStatus;
-use crate::side_channel::{SideChannelError, SideChannelHeader, SideChannelKind, write_header};
+use crate::side_channel::{
+    ClosurePushReply, SideChannelError, SideChannelHeader, SideChannelKind, write_header,
+};
 use russh::Channel;
 use russh::server::Msg as ServerMsg;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 
@@ -88,6 +91,22 @@ pub enum ClosureXferError {
     QueryRequisites(#[source] std::io::Error),
     #[error("`nix-store --query --requisites` exited {code:?}: {stderr}")]
     QueryRequisitesFailed { code: Option<i32>, stderr: String },
+    /// Agent's `nix-store --import` returned a non-success outcome.
+    /// Daemon-side surfaces this when the side-channel reply trailer
+    /// from the agent says `ok: false`, OR when a daemon-side IO
+    /// error coincides with such a reply (the agent's stderr is the
+    /// more diagnostic part). Carries the agent's stderr so an
+    /// operator can see the actual nix error in the daemon log /
+    /// build log without grepping the agent's journal.
+    #[error(
+        "agent `nix-store --import` failed: exit_code={exit_code:?}, \
+         bytes_received={bytes_received}; agent stderr:\n{stderr}"
+    )]
+    AgentImportFailed {
+        exit_code: Option<i32>,
+        bytes_received: u64,
+        stderr: String,
+    },
 }
 
 /// Run `<nix_store_bin> --import` and pipe `reader` into its stdin
@@ -305,16 +324,59 @@ pub async fn push_closure_over_channel(
     };
     let nix_store_bin = nix_store_bin.to_path_buf();
     let outcome = with_channel_io(channel, None, |io| async move {
-        let (_reader, mut writer) = tokio::io::split(io);
+        let (mut reader, mut writer) = tokio::io::split(io);
         write_header(&mut writer, &header).await?;
-        let outcome = export_closure(&nix_store_bin, &paths, &mut writer).await?;
+        // Capture the export result without propagating yet — we
+        // want to read the agent's reply trailer even if our own
+        // write half broke (BrokenPipe on the duplex usually means
+        // the agent's import exited and closed the channel; the
+        // agent's reply tells us *why*).
+        let export_result = export_closure(&nix_store_bin, &paths, &mut writer).await;
         // Drop our writer so the channel pump signals EOF on the
         // remote side (agent's `nix-store --import` exits on EOF).
         drop(writer);
-        Ok::<ClosureXferOutcome, ClosureXferError>(outcome)
+
+        // Read the agent's reply trailer. Best-effort with a
+        // generous timeout — a healthy agent replies promptly; a
+        // dead one is bounded by the timeout.
+        let mut reply_buf = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(60), reader.read_to_end(&mut reply_buf)).await;
+        let reply = first_json_line::<ClosurePushReply>(&reply_buf);
+
+        match (export_result, reply) {
+            (Ok(_o), Some(r)) if !r.ok => Err(ClosureXferError::AgentImportFailed {
+                exit_code: r.exit_code,
+                bytes_received: r.bytes_received,
+                stderr: r.stderr,
+            }),
+            (Ok(o), _) => Ok(o),
+            (Err(daemon_err), Some(r)) if !r.ok => {
+                // Both sides errored. The agent's stderr is more
+                // diagnostic than the daemon's IO error; surface it
+                // and append the daemon-side detail.
+                Err(ClosureXferError::AgentImportFailed {
+                    exit_code: r.exit_code,
+                    bytes_received: r.bytes_received,
+                    stderr: format!("{}\n[daemon-side IO error: {}]", r.stderr, daemon_err),
+                })
+            }
+            (Err(e), _) => Err(e),
+        }
     })
     .await;
     outcome
+}
+
+/// Parse the first newline-terminated JSON object out of `buf`,
+/// silently returning None on any error. Used to be tolerant of
+/// agent versions that emit no trailer or mangled trailers.
+fn first_json_line<T: serde::de::DeserializeOwned>(buf: &[u8]) -> Option<T> {
+    let line = buf.split(|&b| b == b'\n').next()?;
+    if line.is_empty() {
+        return None;
+    }
+    serde_json::from_slice(line).ok()
 }
 
 /// Daemon-side: open the supplied russh channel, write a `ClosurePull`
