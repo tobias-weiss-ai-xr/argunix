@@ -296,7 +296,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     // the single source of truth for "is anything still pending?".
     let mut persisted: Vec<(medusa_eval::JobSpec, JobId)> = Vec::with_capacity(jobs.len());
     for spec in jobs {
-        let job_id = persist_job(&ctx.store, eval_id, &spec).await?;
+        let job_id = persist_job(&ctx.store, &ctx.log_dir, repo.id, eval_id, &spec).await?;
         persisted.push((spec, job_id));
     }
 
@@ -479,6 +479,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
                 eval_id,
                 &spec.attr_path.as_str().to_string(),
                 final_status,
+                spec.error.is_some(),
             );
         }
     }
@@ -683,6 +684,7 @@ fn post_per_job_check(
     eval_id: EvalId,
     attr_path: &str,
     status: JobStatus,
+    had_eval_error: bool,
 ) {
     let state = match status {
         JobStatus::Success | JobStatus::Cached => CheckState::Success,
@@ -703,10 +705,14 @@ fn post_per_job_check(
         sha: sha.clone(),
         context: format!("medusa: {attr_path}"),
         state,
-        description: Some(match status {
-            JobStatus::Cached => "cache hit".to_string(),
-            JobStatus::Success => "build ok".to_string(),
-            JobStatus::Failure => "build failed".to_string(),
+        description: Some(match (status, had_eval_error) {
+            (JobStatus::Cached, _) => "cache hit".to_string(),
+            (JobStatus::Success, _) => "build ok".to_string(),
+            // Distinguish eval-time failures from build-time failures
+            // — the same JobStatus::Failure covers both, and operators
+            // looking at the forge UI need to know which.
+            (JobStatus::Failure, true) => "evaluation failed".to_string(),
+            (JobStatus::Failure, false) => "build failed".to_string(),
             _ => "build error".to_string(),
         }),
         target_url: Some(target),
@@ -784,24 +790,86 @@ fn spawn_post_check(
 
 async fn persist_job(
     store: &SqlxStore,
+    log_dir: &Path,
+    repo_id: RepoId,
     eval_id: EvalId,
     spec: &medusa_eval::JobSpec,
 ) -> anyhow::Result<JobId> {
+    // For an eval-time error, nix-eval-jobs typically doesn't include
+    // the `system` field — it errored before reaching that point. We
+    // fall back to parsing it out of the attr path (`packages.<system>
+    // .<rest>`) so the UI doesn't show "unknown".
+    let system = spec
+        .system
+        .clone()
+        .or_else(|| system_from_attr_path(spec.attr_path.as_str()))
+        .unwrap_or_else(|| "unknown".to_string());
     let job_id = <SqlxStore as JobStore>::create(
         store,
         medusa_store::NewJob {
             eval_id,
             attr_path: spec.attr_path.clone(),
             drv_path: spec.drv_path.clone(),
-            system: spec.system.clone().unwrap_or_else(|| "unknown".to_string()),
+            system,
         },
     )
     .await?;
-    if spec.error.is_some() {
-        <SqlxStore as JobStore>::finish(store, job_id, JobStatus::Failure, Utc::now(), None, None)
-            .await?;
+    if let Some(error) = spec.error.as_deref() {
+        // Write the eval error to the standard log path so the UI's
+        // log viewer surfaces it. Without this, the job appears as
+        // "failure" with no clickable detail and the operator has to
+        // grep daemon logs for the underlying nix error.
+        let log_path = log_dir
+            .join(repo_id.get().to_string())
+            .join(eval_id.get().to_string())
+            .join(format!("{}.log.zst", job_id.get()));
+        let body = format_eval_error_log(spec.attr_path.as_str(), error);
+        if let Err(e) = medusa_build::write_zstd_log(&log_path, body.into_bytes()).await {
+            tracing::warn!(
+                error = %e,
+                attr = %spec.attr_path,
+                "failed to write eval-error log",
+            );
+        }
+        let log_path_str = log_path.to_string_lossy().into_owned();
+        <SqlxStore as JobStore>::finish(
+            store,
+            job_id,
+            JobStatus::Failure,
+            Utc::now(),
+            Some(&log_path_str),
+            None,
+        )
+        .await?;
     }
     Ok(job_id)
+}
+
+/// Parse `<output>.<system>.<rest>` (e.g. `packages.x86_64-linux.image-v1`)
+/// and return the `system` segment. Returns `None` when the path
+/// doesn't have the canonical 3+-segment shape.
+fn system_from_attr_path(attr_path: &str) -> Option<String> {
+    let mut parts = attr_path.splitn(3, '.');
+    let _output = parts.next()?;
+    let system = parts.next()?;
+    // Sanity: require there's a third segment (the actual leaf attr)
+    // so we don't misinterpret a 2-segment path like `formatter.x86_64-linux`.
+    parts.next()?;
+    Some(system.to_string())
+}
+
+/// Format the eval error for the build-log file. Mirrors the local
+/// fail-fast log shape from `synthesize_no_eligible_builder_log`: a
+/// short prologue plus the underlying nix message verbatim, so the
+/// UI's log viewer renders something operator-actionable.
+fn format_eval_error_log(attr_path: &str, error: &str) -> String {
+    format!(
+        "medusa: this attribute failed at evaluation time, before any build started.\n\
+         attribute: {attr_path}\n\
+         \n\
+         nix-eval-jobs error:\n\
+         {error}\n",
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1544,8 +1612,8 @@ impl Drop for CancelGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuilderSlot, JobTally, collapsed_progress, pick_builder_for_spec, summarise_for_check,
-        synthesize_no_eligible_builder_log,
+        BuilderSlot, JobTally, collapsed_progress, format_eval_error_log, pick_builder_for_spec,
+        summarise_for_check, synthesize_no_eligible_builder_log, system_from_attr_path,
     };
     use medusa_builders::{BuilderRegistry, ConnState, ConnectedBuilder};
     use medusa_domain::{AttrPath, BuilderCapabilities, BuilderId, BuilderName, JobStatus};
@@ -1746,5 +1814,47 @@ mod tests {
     fn summary_handles_empty_input() {
         assert_eq!(summarise_for_check("", 20), "");
         assert_eq!(summarise_for_check("\n\n\n", 20), "");
+    }
+
+    #[test]
+    fn system_from_attr_path_extracts_canonical_three_segment() {
+        assert_eq!(
+            system_from_attr_path("packages.x86_64-linux.image-v1"),
+            Some("x86_64-linux".to_string()),
+        );
+        assert_eq!(
+            system_from_attr_path("checks.aarch64-darwin.foo"),
+            Some("aarch64-darwin".to_string()),
+        );
+        // Nested attrs (e.g. nixosConfigurations.<name>.config.system.build.toplevel)
+        // — second segment is the system regardless of further nesting.
+        assert_eq!(
+            system_from_attr_path("packages.x86_64-linux.foo.bar.baz"),
+            Some("x86_64-linux".to_string()),
+        );
+    }
+
+    #[test]
+    fn system_from_attr_path_returns_none_for_two_segment_paths() {
+        // `formatter.x86_64-linux` is a flake output without a leaf
+        // attr beneath the system; treat as unknown rather than
+        // misclaiming x86_64-linux as the system.
+        assert_eq!(system_from_attr_path("formatter.x86_64-linux"), None);
+        assert_eq!(system_from_attr_path("packages"), None);
+        assert_eq!(system_from_attr_path(""), None);
+    }
+
+    #[test]
+    fn eval_error_log_includes_attr_and_underlying_message() {
+        let body = format_eval_error_log(
+            "packages.x86_64-linux.image-v1",
+            "error: duplicate derivation output 'scripts'",
+        );
+        assert!(body.contains("packages.x86_64-linux.image-v1"));
+        assert!(body.contains("duplicate derivation output"));
+        assert!(
+            body.contains("evaluation time"),
+            "log must distinguish eval-time from build-time failure: {body}",
+        );
     }
 }
