@@ -26,7 +26,7 @@
 
 use crate::closure_xfer::{
     ClosureXferError, ClosureXferOutcome, check_invalid_paths, export_closure, import_closure,
-    query_requisites,
+    query_requisites, query_topo_closure,
 };
 use crate::protocol::BuildOutcomeStatus;
 use serde::{Deserialize, Serialize};
@@ -378,10 +378,13 @@ where
         SideChannelKind::ListRuntimeClosure => {
             // No binary payload. Agent expands the requested output
             // paths to their full runtime closure and replies with
-            // the list. Daemon will use this to chunk the actual
-            // pull into bounded batches.
+            // the list — in **topological order, leaves first** —
+            // so the daemon can chunk safely. Lex-ordered chunking
+            // (what `query_requisites` alone gives) breaks the very
+            // first chunk's `nix-store --import` with BrokenPipe
+            // when a path's references land in a later chunk.
             let outputs = header.paths.len();
-            let closure = query_requisites(nix_store_bin, &header.paths).await?;
+            let closure = query_topo_closure(nix_store_bin, &header.paths).await?;
             let closure_len = closure.len();
             let reply = RuntimeClosureReply { paths: closure };
             if let Ok(mut line) = serde_json::to_vec(&reply) {
@@ -566,6 +569,10 @@ mod tests {
         //    callers that pre-expand the closure (the agent's
         //    ClosurePull arm) can be observed adding the synthetic
         //    deps to the subsequent `--export` argv.
+        //  - `--query --graph <paths>` : emit a graphviz DAG where
+        //    each requested path references its synthetic
+        //    `<path>-runtime-dep`. Used by the agent's
+        //    `ListRuntimeClosure` arm via `query_topo_closure`.
         let tmp = path.with_extension("tmp");
         {
             let mut f = std::fs::File::create(&tmp).unwrap();
@@ -578,6 +585,21 @@ if [ "$1" = "--query" ] && [ "$2" = "--requisites" ]; then
     printf '%s\n' "$a"
     printf '%s-runtime-dep\n' "$a"
   done
+  exit 0
+fi
+if [ "$1" = "--query" ] && [ "$2" = "--graph" ]; then
+  shift 2
+  # Real `nix-store --query --graph` quotes BASENAMES, not full
+  # paths. Strip "/nix/store/" so the fake matches reality and
+  # `query_topo_closure`'s store-dir prepending is exercised.
+  printf 'digraph G {{\n'
+  for a in "$@"; do
+    bn=${{a##*/}}
+    printf '"%s" [label = ""]\n' "$bn"
+    printf '"%s-runtime-dep" [label = ""]\n' "$bn"
+    printf '"%s" -> "%s-runtime-dep"\n' "$bn" "$bn"
+  done
+  printf '}}\n'
   exit 0
 fi
 case "$1" in
@@ -1009,11 +1031,14 @@ exit 99
 
     #[tokio::test]
     async fn list_runtime_closure_round_trips_through_dispatch_inbound() {
-        // Agent must expand requested output paths via
-        // `--query --requisites` and reply with the JSON list. The
-        // existing fake_nix_store synthesises `<path>-runtime-dep`
-        // for every input — so for outputs [aaa, bbb], the reply
-        // must be [aaa, aaa-runtime-dep, bbb, bbb-runtime-dep].
+        // Agent must expand requested output paths and reply with
+        // the runtime closure in **topological order, leaves
+        // first**. The fake's `--query --graph` synthesises an edge
+        // `<path>` → `<path>-runtime-dep` per input, so for outputs
+        // [aaa, bbb], a valid topo order is [aaa-runtime-dep,
+        // bbb-runtime-dep, aaa, bbb] — but any permutation that
+        // places each *-runtime-dep before its parent satisfies the
+        // chunked-pull invariant.
         let dir = tempdir().unwrap();
         let bin = dir.path().join("nix-store");
         let sink = dir.path().join("imp-sink.bin");
@@ -1066,14 +1091,34 @@ exit 99
             .next()
             .expect("agent must emit a reply trailer");
         let reply: RuntimeClosureReply = serde_json::from_str(line).unwrap();
-        assert_eq!(
+        // Set membership: every path is present.
+        let set: std::collections::HashSet<&str> = reply.paths.iter().map(|s| s.as_str()).collect();
+        for expected in [
+            "/nix/store/aaa",
+            "/nix/store/aaa-runtime-dep",
+            "/nix/store/bbb",
+            "/nix/store/bbb-runtime-dep",
+        ] {
+            assert!(
+                set.contains(expected),
+                "missing {expected}: {:?}",
+                reply.paths
+            );
+        }
+        assert_eq!(reply.paths.len(), 4);
+        // Topological invariant: each `-runtime-dep` must come
+        // before its parent. Without this, chunked
+        // `nix-store --import` daemon-side gets BrokenPipe.
+        let pos = |s: &str| reply.paths.iter().position(|x| x == s).unwrap();
+        assert!(
+            pos("/nix/store/aaa-runtime-dep") < pos("/nix/store/aaa"),
+            "aaa's dep must come first: {:?}",
             reply.paths,
-            vec![
-                "/nix/store/aaa",
-                "/nix/store/aaa-runtime-dep",
-                "/nix/store/bbb",
-                "/nix/store/bbb-runtime-dep",
-            ],
+        );
+        assert!(
+            pos("/nix/store/bbb-runtime-dep") < pos("/nix/store/bbb"),
+            "bbb's dep must come first: {:?}",
+            reply.paths,
         );
     }
 

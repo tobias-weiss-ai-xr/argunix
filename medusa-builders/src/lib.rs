@@ -23,7 +23,7 @@ pub use channel_io::{ChannelSide, with_channel_io};
 pub use closure_xfer::{
     ClosureXferError, ClosureXferOutcome, check_invalid_paths, export_closure, import_closure,
     list_runtime_closure_over_channel, pull_closure_over_channel, pull_exact_over_channel,
-    push_closure_over_channel, query_invalid_over_channel, query_requisites,
+    push_closure_over_channel, query_invalid_over_channel, query_requisites, query_topo_closure,
 };
 pub use dispatcher::{BuilderDispatcher, DispatchError, DispatchedBuild};
 pub use host_key::{HostKey, HostKeyError, load_or_generate};

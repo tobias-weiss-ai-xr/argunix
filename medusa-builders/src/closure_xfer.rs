@@ -331,6 +331,182 @@ pub async fn query_requisites(
         .collect())
 }
 
+/// Compute the runtime closure of `paths` and return it in
+/// **topological order, leaves first** — i.e. for every path `P` in
+/// the result, any path that `P` references appears earlier in the
+/// list. Used agent-side before a chunked pull: chunking in this
+/// order guarantees that when the daemon imports chunk N, every
+/// reference of chunk N's paths is already valid in the local store
+/// (in chunks 0..N-1). Importing in lex order — what `--requisites`
+/// alone returns — gives `BrokenPipe` in `nix-store --import` the
+/// moment the first path with a forward reference is processed.
+///
+/// Implementation: one `nix-store --query --graph <paths>` call
+/// dumps the closure's dependency DAG in graphviz dot format. We
+/// parse `"A" -> "B"` edges (meaning A references B) and singleton
+/// node lines, then run Kahn's algorithm on the *reverse* of the
+/// natural topological order so that nodes with no outgoing edges
+/// (leaves) come out first.
+///
+/// Important quirk: `nix-store --query --graph` emits **basenames**
+/// (`i27rhb…-bash-5.3p9`), not full `/nix/store/...` paths. We
+/// reconstruct the full path by prepending the store directory we
+/// extract from the input — every input path is a full store path,
+/// so the directory component is consistent and authoritative.
+pub async fn query_topo_closure(
+    nix_store_bin: &Path,
+    paths: &[String],
+) -> Result<Vec<String>, ClosureXferError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cmd = Command::new(nix_store_bin);
+    cmd.arg("--query").arg("--graph");
+    for p in paths {
+        cmd.arg(p);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = spawn_retrying_etxtbsy(&mut cmd).map_err(ClosureXferError::QueryRequisites)?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(ClosureXferError::QueryRequisites)?;
+    if !output.status.success() {
+        return Err(ClosureXferError::QueryRequisitesFailed {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    let dot = String::from_utf8_lossy(&output.stdout);
+    let sorted = topo_sort_from_graphviz(&dot);
+
+    // Reconstruct full paths from basenames. The store dir comes
+    // from the caller's input — every input is a full store path,
+    // so the dir component is consistent. If a parsed token already
+    // starts with `/` (older nix versions, fixtures), pass through.
+    let store_dir = paths
+        .first()
+        .and_then(|p| p.rsplit_once('/'))
+        .map(|(d, _)| d.to_string())
+        .unwrap_or_else(|| "/nix/store".to_string());
+    Ok(sorted
+        .into_iter()
+        .map(|s| {
+            if s.starts_with('/') {
+                s
+            } else {
+                format!("{store_dir}/{s}")
+            }
+        })
+        .collect())
+}
+
+/// Parse the subset of graphviz dot format that
+/// `nix-store --query --graph` emits and return the nodes in
+/// topological order, leaves first.
+///
+/// Recognised lines:
+/// - `"<path>" -> "<other>" [...]` — A references B
+/// - `"<path>" [...]` — declares a node (catches isolated paths
+///   that have no edges in either direction)
+///
+/// Anything else (the `digraph G {`, `}`, blank lines, comments) is
+/// ignored. The parser is intentionally lenient about trailing
+/// graphviz attributes — what matters is the two quoted store paths.
+fn topo_sort_from_graphviz(dot: &str) -> Vec<String> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // Adjacency: refs[A] = paths that A references (outgoing edges).
+    // We also collect every node that appears anywhere, so isolated
+    // paths (no in or out edges) end up in the result too.
+    let mut refs: HashMap<String, Vec<String>> = HashMap::new();
+    let mut nodes: HashSet<String> = HashSet::new();
+
+    for line in dot.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        // Edge: "<from>" -> "<to>" [...]
+        if let Some(arrow) = line.find("->") {
+            let lhs = &line[..arrow];
+            let rhs = &line[arrow + 2..];
+            if let (Some(from), Some(to)) = (extract_quoted(lhs), extract_quoted(rhs)) {
+                nodes.insert(from.clone());
+                nodes.insert(to.clone());
+                refs.entry(from).or_default().push(to);
+                continue;
+            }
+        }
+        // Node-only line: "<path>" [...]
+        if let Some(node) = extract_quoted(line) {
+            nodes.insert(node);
+        }
+    }
+
+    // Kahn's algorithm. We want leaves (no outgoing edges) first, so
+    // run Kahn's against the *reverse* graph: a node's "in-degree in
+    // the reverse graph" is its outgoing-edge count in the original,
+    // and starting nodes are those with zero outgoing edges = leaves.
+    let mut out_degree: HashMap<String, usize> = HashMap::new();
+    for n in &nodes {
+        out_degree.insert(n.clone(), refs.get(n).map(|v| v.len()).unwrap_or(0));
+    }
+    // Reverse adjacency: rev[B] = paths that reference B.
+    let mut rev: HashMap<String, Vec<String>> = HashMap::new();
+    for (from, to_list) in &refs {
+        for to in to_list {
+            rev.entry(to.clone()).or_default().push(from.clone());
+        }
+    }
+
+    let mut queue: VecDeque<String> = nodes
+        .iter()
+        .filter(|n| out_degree.get(*n).copied().unwrap_or(0) == 0)
+        .cloned()
+        .collect();
+    let mut result: Vec<String> = Vec::with_capacity(nodes.len());
+    while let Some(n) = queue.pop_front() {
+        result.push(n.clone());
+        if let Some(predecessors) = rev.get(&n) {
+            for p in predecessors {
+                if let Some(d) = out_degree.get_mut(p) {
+                    *d = d.saturating_sub(1);
+                    if *d == 0 {
+                        queue.push_back(p.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Cycle safety: if the DAG turns out not to be a DAG (shouldn't
+    // happen with nix store paths but guard anyway), append any
+    // unsorted leftovers so we don't lose paths. Import order will
+    // be wrong for those, but the alternative is silently dropping
+    // them.
+    if result.len() < nodes.len() {
+        for n in nodes {
+            if !result.iter().any(|r| r == &n) {
+                result.push(n);
+            }
+        }
+    }
+    result
+}
+
+/// Pull the first quoted (`"…"`) substring out of `s` and return
+/// its contents. Used by [`topo_sort_from_graphviz`] to extract
+/// store paths from `"path" -> "path" [attr=val]` style edges and
+/// `"path" [attr=val]` style node declarations.
+fn extract_quoted(s: &str) -> Option<String> {
+    let start = s.find('"')?;
+    let rest = &s[start + 1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 /// Agent-side: ask the local nix store which of `paths` are NOT
 /// already valid here. Returns the subset that's missing — that's
 /// exactly what the daemon then needs to ship over a `ClosurePush`.
@@ -621,6 +797,105 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
     use tokio::io::BufReader;
+
+    /// Diamond DAG to pin the topo-sort contract:
+    ///   root → mid_a → leaf
+    ///   root → mid_b → leaf
+    /// Result must be leaves-first: leaf, then mid_a + mid_b in some
+    /// order, then root. The exact mid order isn't pinned (parallel
+    /// branches are interchangeable), but `leaf` MUST come before
+    /// any node that references it, and `root` MUST come last.
+    /// Without this guarantee, the chunked daemon-side `--import`
+    /// gets `BrokenPipe` the moment a forward reference is seen.
+    #[test]
+    fn topo_sort_from_graphviz_emits_leaves_first() {
+        let dot = r#"digraph G {
+"/nix/store/root" [label = "root"]
+"/nix/store/mid_a" [label = "mid_a"]
+"/nix/store/mid_b" [label = "mid_b"]
+"/nix/store/leaf" [label = "leaf"]
+"/nix/store/root" -> "/nix/store/mid_a" [color = green]
+"/nix/store/root" -> "/nix/store/mid_b" [color = green]
+"/nix/store/mid_a" -> "/nix/store/leaf" [color = green]
+"/nix/store/mid_b" -> "/nix/store/leaf" [color = green]
+}"#;
+        let sorted = topo_sort_from_graphviz(dot);
+        assert_eq!(sorted.len(), 4);
+        let pos = |s: &str| sorted.iter().position(|x| x == s).unwrap();
+        assert!(
+            pos("/nix/store/leaf") < pos("/nix/store/mid_a"),
+            "leaf must come before mid_a (its referer); got {sorted:?}",
+        );
+        assert!(
+            pos("/nix/store/leaf") < pos("/nix/store/mid_b"),
+            "leaf must come before mid_b (its referer); got {sorted:?}",
+        );
+        assert!(
+            pos("/nix/store/mid_a") < pos("/nix/store/root"),
+            "mid_a must come before root (its referer); got {sorted:?}",
+        );
+        assert!(
+            pos("/nix/store/mid_b") < pos("/nix/store/root"),
+            "mid_b must come before root (its referer); got {sorted:?}",
+        );
+    }
+
+    /// Regression: real `nix-store --query --graph` emits
+    /// **basenames** (e.g. `i27rh…-bash`), not full store paths.
+    /// `query_topo_closure` must reconstruct the full path by
+    /// prepending the input's store dir, otherwise the daemon
+    /// asks the agent to `--export` non-existent paths and the
+    /// chunked pull fails. Pinned via the realistic shape this
+    /// test uses (no leading slash on the in-quotes tokens).
+    #[tokio::test]
+    async fn query_topo_closure_reconstructs_full_paths_from_basenames() {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("nix-store");
+        // Fake `nix-store --query --graph <full-paths>` that
+        // mirrors real Nix: the quoted tokens are basenames, not
+        // full paths.
+        let body = r#"#!/bin/sh
+if [ "$1" = "--query" ] && [ "$2" = "--graph" ]; then
+  cat <<'EOF'
+digraph G {
+"hash1-foo" [label = "foo", shape = box];
+"hash2-bar" [label = "bar", shape = box];
+"hash1-foo" -> "hash2-bar" [color = green];
+}
+EOF
+  exit 0
+fi
+exit 99
+"#;
+        install_script_atomic(&bin, body);
+
+        let inputs = vec!["/nix/store/hash1-foo".to_string()];
+        let sorted = query_topo_closure(&bin, &inputs).await.unwrap();
+
+        // Both paths must come back as FULL store paths, with the
+        // store dir prepended onto the basenames. And topologically
+        // ordered: bar (leaf) before foo.
+        assert_eq!(
+            sorted,
+            vec![
+                "/nix/store/hash2-bar".to_string(),
+                "/nix/store/hash1-foo".to_string(),
+            ],
+            "basenames must be promoted to full store paths and \
+             leaves come first; got {sorted:?}",
+        );
+    }
+
+    #[test]
+    fn topo_sort_includes_isolated_nodes() {
+        // A path that has no references and is not referenced
+        // (e.g. an output passed in standalone) must still appear.
+        let dot = r#"digraph G {
+"/nix/store/lonely" [label = "lonely"]
+}"#;
+        let sorted = topo_sort_from_graphviz(dot);
+        assert_eq!(sorted, vec!["/nix/store/lonely"]);
+    }
 
     /// Lay down a fake `nix-store` that handles `--import` (cat
     /// stdin to sink) and `--export <paths...>` (record argv +
