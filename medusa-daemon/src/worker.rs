@@ -24,9 +24,9 @@ use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use medusa_builders::{
-    BuildLifecycle, BuildOutcomeStatus, BuilderDispatcher, ClosureXferError,
-    pull_closure_over_channel, push_closure_over_channel, query_invalid_over_channel,
-    query_requisites,
+    BuildLifecycle, BuildOutcomeStatus, BuilderDispatcher, list_runtime_closure_over_channel,
+    pull_closure_over_channel, pull_exact_over_channel, push_closure_over_channel,
+    query_invalid_over_channel, query_requisites,
 };
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
 use medusa_forge::{CheckPost, CheckState, ForgeError, Provider};
@@ -1496,52 +1496,46 @@ pub async fn dispatch_pool_build(
     }
 
     // 5. On success, pull the output closure into the local store.
+    //    Done in chunks so peak `nix-store --import` memory is
+    //    bounded by the chunk size, not the full closure size — a
+    //    NixOS image runtime closure that would OOM `--import` in
+    //    one shot can be safely streamed as N small imports.
     if final_status == BuildOutcomeStatus::Success && !output_paths.is_empty() {
-        let pull_chan = match dispatcher.open_channel(builder_name).await {
-            Ok(mut d) => d.take_channel(),
-            Err(e) => {
-                tracing::warn!(error = %e, "open ClosurePull channel failed");
-                log_buf.extend_from_slice(
-                    format!("\nmedusa: could not open pull channel: {e}\n").as_bytes(),
-                );
-                final_status = BuildOutcomeStatus::Failure;
-                None
-            }
-        };
-        if let Some(chan) = pull_chan {
-            match pull_closure_over_channel(chan, build_id, output_paths.clone(), nix_store_bin)
-                .await
-            {
-                Ok(o) if o.status == BuildOutcomeStatus::Success => {
-                    // 6. Register gcroot on the first output (matches
-                    //    the local path's atomic --add-root semantics
-                    //    as closely as we can post-hoc).
-                    if let Some(first) = output_paths.first() {
-                        if let Err(e) = add_indirect_gcroot(nix_store_bin, gc_root, first).await {
-                            tracing::warn!(
-                                error = %e,
-                                gc_root = %gc_root.display(),
-                                output = %first,
-                                "registering gcroot failed; output may be GC'd",
-                            );
-                        }
+        match chunked_pull_outputs(
+            &dispatcher,
+            builder_name,
+            build_id,
+            &output_paths,
+            nix_store_bin,
+        )
+        .await
+        {
+            Ok(()) => {
+                // 6. Register gcroot on the first output (matches
+                //    the local path's atomic --add-root semantics
+                //    as closely as we can post-hoc).
+                if let Some(first) = output_paths.first() {
+                    if let Err(e) = add_indirect_gcroot(nix_store_bin, gc_root, first).await {
+                        tracing::warn!(
+                            error = %e,
+                            gc_root = %gc_root.display(),
+                            output = %first,
+                            "registering gcroot failed; output may be GC'd",
+                        );
                     }
                 }
-                Ok(o) => {
-                    tracing::warn!(
-                        status = ?o.status,
-                        stderr = %String::from_utf8_lossy(&o.stderr),
-                        "pulling output closure failed",
-                    );
-                    log_buf.extend_from_slice(b"\nmedusa: pulling output closure failed:\n");
-                    log_buf.extend_from_slice(&o.stderr);
-                    log_buf.push(b'\n');
-                    final_status = BuildOutcomeStatus::Failure;
-                }
-                Err(ClosureXferError::Spawn { .. }) | Err(_) => {
-                    log_buf.extend_from_slice(b"\nmedusa: pulling output closure errored.\n");
-                    final_status = BuildOutcomeStatus::Failure;
-                }
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    error = %reason,
+                    build_id,
+                    builder = %builder_name,
+                    "pulling output closure failed",
+                );
+                log_buf.extend_from_slice(b"\nmedusa: pulling output closure failed:\n");
+                log_buf.extend_from_slice(reason.as_bytes());
+                log_buf.push(b'\n');
+                final_status = BuildOutcomeStatus::Failure;
             }
         }
     }
@@ -1561,6 +1555,121 @@ pub async fn dispatch_pool_build(
         log_path: log_path.to_path_buf(),
         log_truncated,
     }))
+}
+
+/// Chunk size for `chunked_pull_outputs` — number of paths the
+/// daemon asks the agent to ship per `ClosurePullExact` channel,
+/// and equivalently the number of paths each daemon-side
+/// `nix-store --import` subprocess processes per call. Bounds peak
+/// memory per import; smaller is safer but means more channels.
+/// 100 keeps a typical NixOS-image runtime closure (~5K paths) in
+/// ~50 short imports of a few hundred MB peak each, well under the
+/// observed 2.85 GB single-import OOM victim.
+const PULL_CHUNK_SIZE: usize = 100;
+
+/// Pull a build's output runtime closure into the daemon's local
+/// store via the chunked-pull protocol.
+///
+/// Steps:
+/// 1. Ask the agent (`ListRuntimeClosure`) for the full runtime
+///    closure of `output_paths`. No NAR bytes ship in this step.
+/// 2. Chunk the resulting list into `PULL_CHUNK_SIZE` batches.
+/// 3. For each batch, open a fresh side channel and run a
+///    `ClosurePullExact`. Each call spawns a separate
+///    `nix-store --import`, so peak memory per call is bounded by
+///    chunk size rather than total closure size.
+///
+/// On a `ListRuntimeClosure` failure (e.g. a pre-chunking agent
+/// that doesn't recognise the kind), falls back to the legacy
+/// single-shot `pull_closure_over_channel` so old agents stay
+/// functional. The fallback path is the OOM-prone one — the whole
+/// reason this helper exists is to avoid it on agents that support
+/// chunking — but it preserves correctness.
+///
+/// On per-chunk failure, returns immediately without trying further
+/// chunks: a partial closure is no use to the daemon (subsequent
+/// `--import`s would reject paths whose references aren't valid).
+async fn chunked_pull_outputs(
+    dispatcher: &BuilderDispatcher,
+    builder_name: &medusa_domain::BuilderName,
+    build_id: i64,
+    output_paths: &[String],
+    nix_store_bin: &Path,
+) -> Result<(), String> {
+    // 5a. List the runtime closure on the agent.
+    let list_chan = match dispatcher.open_channel(builder_name).await {
+        Ok(mut d) => d.take_channel().expect("dispatcher returned channel"),
+        Err(e) => return Err(format!("could not open list channel: {e}")),
+    };
+    let runtime_closure =
+        match list_runtime_closure_over_channel(list_chan, build_id, output_paths.to_vec()).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    build_id,
+                    builder = %builder_name,
+                    "list_runtime_closure failed; falling back to single-shot pull (OOM-prone)",
+                );
+                // Legacy fallback. Memory-unbounded but correct.
+                let pull_chan = match dispatcher.open_channel(builder_name).await {
+                    Ok(mut d) => d.take_channel().expect("dispatcher returned channel"),
+                    Err(e) => return Err(format!("could not open fallback pull channel: {e}")),
+                };
+                return match pull_closure_over_channel(
+                    pull_chan,
+                    build_id,
+                    output_paths.to_vec(),
+                    nix_store_bin,
+                )
+                .await
+                {
+                    Ok(o) if o.status == BuildOutcomeStatus::Success => Ok(()),
+                    Ok(o) => Err(format!(
+                        "fallback pull failed: {}",
+                        String::from_utf8_lossy(&o.stderr)
+                    )),
+                    Err(e) => Err(format!("fallback pull errored: {e}")),
+                };
+            }
+        };
+
+    let n_chunks = runtime_closure.len().div_ceil(PULL_CHUNK_SIZE);
+    tracing::info!(
+        build_id,
+        builder = %builder_name,
+        outputs = output_paths.len(),
+        closure = runtime_closure.len(),
+        chunk_size = PULL_CHUNK_SIZE,
+        n_chunks,
+        "pulling output runtime closure in chunks",
+    );
+
+    // 5b. Chunked pull. Sequential — parallelism here would just
+    //     re-introduce the OOM by running multiple imports at once.
+    for (idx, chunk) in runtime_closure.chunks(PULL_CHUNK_SIZE).enumerate() {
+        let chan = match dispatcher.open_channel(builder_name).await {
+            Ok(mut d) => d.take_channel().expect("dispatcher returned channel"),
+            Err(e) => return Err(format!("could not open chunk-{idx} channel: {e}")),
+        };
+        match pull_exact_over_channel(chan, build_id, chunk.to_vec(), nix_store_bin).await {
+            Ok(o) if o.status == BuildOutcomeStatus::Success => {}
+            Ok(o) => {
+                return Err(format!(
+                    "pull chunk {idx} (paths {start}..{end} of {total}) failed: {stderr}",
+                    start = idx * PULL_CHUNK_SIZE,
+                    end = idx * PULL_CHUNK_SIZE + chunk.len(),
+                    total = runtime_closure.len(),
+                    stderr = String::from_utf8_lossy(&o.stderr),
+                ));
+            }
+            Err(e) => {
+                return Err(format!("pull chunk {idx} errored: {e}"));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Wait on an optional cancel token. Returns immediately when fired;

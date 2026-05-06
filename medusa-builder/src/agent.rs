@@ -730,6 +730,36 @@ async fn serve_side_channel(
                 "side channel finished",
             );
         }
+        Ok(SideChannelDispatchOutcome::RuntimeClosureListed {
+            build_id,
+            outputs,
+            closure,
+        }) => {
+            tracing::info!(
+                channel = channel_id,
+                elapsed_ms,
+                kind = "list_runtime_closure",
+                build_id,
+                outputs,
+                closure,
+                "side channel finished",
+            );
+        }
+        Ok(SideChannelDispatchOutcome::ClosurePulledExact {
+            build_id,
+            paths,
+            export,
+        }) => {
+            tracing::info!(
+                channel = channel_id,
+                elapsed_ms,
+                kind = "closure_pull_exact",
+                build_id,
+                n_paths = paths.len(),
+                bytes = export.bytes_transferred,
+                "side channel finished",
+            );
+        }
         Err(e) => {
             tracing::warn!(
                 channel = channel_id,

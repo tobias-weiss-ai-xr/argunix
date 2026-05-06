@@ -61,7 +61,12 @@ pub enum SideChannelKind {
     ClosurePush,
     /// Agent → daemon. Payload is a `nix-store --export` byte
     /// stream of the build output paths; daemon pipes it into
-    /// `nix-store --import`.
+    /// `nix-store --import`. The agent first expands the requested
+    /// paths to their full runtime closure (`query_requisites`)
+    /// before exporting — this is the legacy single-shot pull.
+    /// Use `ListRuntimeClosure` + `ClosurePullExact` instead when
+    /// the closure is large enough that a single
+    /// `nix-store --import` would exhaust daemon memory.
     ClosurePull,
     /// Daemon → agent (probe). No binary payload; the header's
     /// `paths` field is the candidate set. Agent runs
@@ -70,6 +75,23 @@ pub enum SideChannelKind {
     /// subset. Daemon then pushes only that subset over a
     /// subsequent `ClosurePush` channel.
     QueryValidPaths,
+    /// Daemon → agent (probe, no payload). Agent expands
+    /// `header.paths` to their full runtime closure via
+    /// `nix-store --query --requisites` and replies with a
+    /// [`RuntimeClosureReply`] trailer. Daemon uses the result to
+    /// chunk the actual pull into bounded batches via
+    /// `ClosurePullExact`, keeping each `nix-store --import`
+    /// subprocess's memory footprint bounded regardless of total
+    /// closure size.
+    ListRuntimeClosure,
+    /// Agent → daemon. Payload is a `nix-store --export` stream of
+    /// **exactly** the paths in `header.paths` — no `--requisites`
+    /// expansion. Designed to be called in batches: the daemon
+    /// first lists the full runtime closure with
+    /// `ListRuntimeClosure`, then issues one `ClosurePullExact` per
+    /// chunk. Each chunk runs in its own `nix-store --import` so
+    /// per-import memory stays bounded.
+    ClosurePullExact,
 }
 
 /// Trailer the agent writes back on a `ClosurePush` channel after its
@@ -106,6 +128,16 @@ pub struct ClosurePushReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidPathsReply {
     pub invalid: Vec<String>,
+}
+
+/// Trailer the agent writes back on a `ListRuntimeClosure` channel.
+/// `paths` is the expanded runtime closure of the originally
+/// requested output paths (i.e. `nix-store --query --requisites`
+/// applied to `header.paths`). The daemon then chunks this list and
+/// pulls each chunk via `ClosurePullExact`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeClosureReply {
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -223,6 +255,22 @@ pub enum DispatchOutcome {
         queried: usize,
         invalid: usize,
     },
+    /// Agent answered a `ListRuntimeClosure` probe — expanded the
+    /// header's output paths to the full runtime closure and
+    /// returned the list. Carries counts only.
+    RuntimeClosureListed {
+        build_id: i64,
+        outputs: usize,
+        closure: usize,
+    },
+    /// Agent → daemon direction completed via `ClosurePullExact`
+    /// (one chunk of a chunked pull). No requisites expansion;
+    /// shipped exactly the paths the daemon listed.
+    ClosurePulledExact {
+        build_id: i64,
+        paths: Vec<String>,
+        export: ClosureXferOutcome,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -325,6 +373,39 @@ where
                 build_id: header.build_id,
                 queried,
                 invalid,
+            })
+        }
+        SideChannelKind::ListRuntimeClosure => {
+            // No binary payload. Agent expands the requested output
+            // paths to their full runtime closure and replies with
+            // the list. Daemon will use this to chunk the actual
+            // pull into bounded batches.
+            let outputs = header.paths.len();
+            let closure = query_requisites(nix_store_bin, &header.paths).await?;
+            let closure_len = closure.len();
+            let reply = RuntimeClosureReply { paths: closure };
+            if let Ok(mut line) = serde_json::to_vec(&reply) {
+                line.push(b'\n');
+                let _ = writer.write_all(&line).await;
+                let _ = writer.flush().await;
+            }
+            Ok(DispatchOutcome::RuntimeClosureListed {
+                build_id: header.build_id,
+                outputs,
+                closure: closure_len,
+            })
+        }
+        SideChannelKind::ClosurePullExact => {
+            // No requisites expansion: ship exactly what the daemon
+            // asked for. The daemon is responsible for having
+            // listed the full runtime closure first (via
+            // `ListRuntimeClosure`) and is feeding us one bounded
+            // chunk per call.
+            let export = export_closure(nix_store_bin, &header.paths, writer).await?;
+            Ok(DispatchOutcome::ClosurePulledExact {
+                build_id: header.build_id,
+                paths: header.paths,
+                export,
             })
         }
     }
@@ -924,6 +1005,176 @@ exit 99
             .unwrap();
         let reply: ValidPathsReply = serde_json::from_str(line).unwrap();
         assert!(reply.invalid.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_runtime_closure_round_trips_through_dispatch_inbound() {
+        // Agent must expand requested output paths via
+        // `--query --requisites` and reply with the JSON list. The
+        // existing fake_nix_store synthesises `<path>-runtime-dep`
+        // for every input — so for outputs [aaa, bbb], the reply
+        // must be [aaa, aaa-runtime-dep, bbb, bbb-runtime-dep].
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("nix-store");
+        let sink = dir.path().join("imp-sink.bin");
+        let argv = dir.path().join("exp-argv.txt");
+        let payload = dir.path().join("exp-payload.bin");
+        std::fs::write(&payload, b"unused").unwrap();
+        fake_nix_store(&bin, &sink, &argv, &payload);
+
+        let header = SideChannelHeader {
+            kind: SideChannelKind::ListRuntimeClosure,
+            build_id: 11,
+            paths: vec!["/nix/store/aaa".into(), "/nix/store/bbb".into()],
+        };
+
+        let (rx_d_to_a, mut tx_d_to_a) = tokio::io::duplex(8 * 1024);
+        let (mut rx_a_to_d, tx_a_to_d) = tokio::io::duplex(8 * 1024);
+        let mut agent_reader = BufReader::new(rx_d_to_a);
+        let mut agent_writer = tx_a_to_d;
+
+        let daemon_task = tokio::spawn(async move {
+            write_header(&mut tx_d_to_a, &header).await.unwrap();
+            tx_d_to_a.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            rx_a_to_d.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        let outcome = dispatch_inbound(&bin, &mut agent_reader, &mut agent_writer)
+            .await
+            .expect("dispatch should succeed for list_runtime_closure");
+        drop(agent_writer);
+        let trailer = daemon_task.await.unwrap();
+
+        match outcome {
+            DispatchOutcome::RuntimeClosureListed {
+                build_id,
+                outputs,
+                closure,
+            } => {
+                assert_eq!(build_id, 11);
+                assert_eq!(outputs, 2);
+                assert_eq!(closure, 4);
+            }
+            other => panic!("expected RuntimeClosureListed, got {other:?}"),
+        }
+
+        let line = std::str::from_utf8(&trailer)
+            .unwrap()
+            .lines()
+            .next()
+            .expect("agent must emit a reply trailer");
+        let reply: RuntimeClosureReply = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            reply.paths,
+            vec![
+                "/nix/store/aaa",
+                "/nix/store/aaa-runtime-dep",
+                "/nix/store/bbb",
+                "/nix/store/bbb-runtime-dep",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn closure_pull_exact_does_not_expand_requisites() {
+        // Critical contract: `ClosurePullExact` must hand `--export`
+        // exactly the paths from `header.paths` — no synthesised
+        // runtime-dep entries. The legacy `ClosurePull` arm DOES
+        // expand (see `dispatch_inbound_handles_closure_pull_end_to_end`);
+        // this test pins the difference so a future refactor can't
+        // silently re-introduce the OOM-prone single-shot behaviour
+        // for chunked callers.
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("nix-store");
+        let sink = dir.path().join("imp-sink.bin");
+        let argv = dir.path().join("exp-argv.txt");
+        let payload = dir.path().join("exp-payload.bin");
+        let canned: Vec<u8> = (0u8..100).cycle().take(1024).collect();
+        std::fs::write(&payload, &canned).unwrap();
+        fake_nix_store(&bin, &sink, &argv, &payload);
+
+        let header = SideChannelHeader {
+            kind: SideChannelKind::ClosurePullExact,
+            build_id: 12,
+            paths: vec!["/nix/store/aaa".into(), "/nix/store/bbb".into()],
+        };
+
+        let (rx_d_to_a, mut tx_d_to_a) = tokio::io::duplex(64 * 1024);
+        let (mut rx_a_to_d, tx_a_to_d) = tokio::io::duplex(64 * 1024);
+        let mut agent_reader = BufReader::new(rx_d_to_a);
+        let mut agent_writer = tx_a_to_d;
+
+        let header_clone = header.clone();
+        let daemon_task = tokio::spawn(async move {
+            write_header(&mut tx_d_to_a, &header_clone).await.unwrap();
+            tx_d_to_a.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            rx_a_to_d.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        let outcome = dispatch_inbound(&bin, &mut agent_reader, &mut agent_writer)
+            .await
+            .expect("dispatch should succeed for closure_pull_exact");
+        drop(agent_writer);
+        let received = daemon_task.await.unwrap();
+
+        match outcome {
+            DispatchOutcome::ClosurePulledExact {
+                build_id,
+                paths,
+                export,
+            } => {
+                assert_eq!(build_id, 12);
+                assert_eq!(paths, header.paths);
+                assert_eq!(export.status, BuildOutcomeStatus::Success);
+                assert_eq!(export.bytes_transferred, canned.len() as u64);
+            }
+            other => panic!("expected ClosurePulledExact, got {other:?}"),
+        }
+        assert_eq!(received, canned);
+
+        // Argv pin: NO `<path>-runtime-dep` synthesised entries.
+        let argv_lines = std::fs::read_to_string(&argv).unwrap();
+        let lines: Vec<&str> = argv_lines.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["--export", "/nix/store/aaa", "/nix/store/bbb"],
+            "ClosurePullExact must NOT expand requisites; the daemon \
+             does that pre-pull via ListRuntimeClosure and is \
+             responsible for chunking. Re-adding expansion here \
+             would re-introduce the single-shot import OOM.",
+        );
+    }
+
+    #[test]
+    fn list_runtime_closure_kind_is_snake_case_on_wire() {
+        let h = SideChannelHeader {
+            kind: SideChannelKind::ListRuntimeClosure,
+            build_id: 1,
+            paths: vec![],
+        };
+        let s = String::from_utf8(h.encode_line()).unwrap();
+        assert!(
+            s.contains("\"kind\":\"list_runtime_closure\""),
+            "unexpected kind on wire: {s}",
+        );
+    }
+
+    #[test]
+    fn closure_pull_exact_kind_is_snake_case_on_wire() {
+        let h = SideChannelHeader {
+            kind: SideChannelKind::ClosurePullExact,
+            build_id: 1,
+            paths: vec![],
+        };
+        let s = String::from_utf8(h.encode_line()).unwrap();
+        assert!(
+            s.contains("\"kind\":\"closure_pull_exact\""),
+            "unexpected kind on wire: {s}",
+        );
     }
 
     #[test]

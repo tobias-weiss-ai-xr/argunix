@@ -16,8 +16,8 @@
 use crate::channel_io::with_channel_io;
 use crate::protocol::BuildOutcomeStatus;
 use crate::side_channel::{
-    ClosurePushReply, SideChannelError, SideChannelHeader, SideChannelKind, ValidPathsReply,
-    write_header,
+    ClosurePushReply, RuntimeClosureReply, SideChannelError, SideChannelHeader, SideChannelKind,
+    ValidPathsReply, write_header,
 };
 use russh::Channel;
 use russh::server::Msg as ServerMsg;
@@ -102,6 +102,10 @@ pub enum ClosureXferError {
     ValidPathsReplyJson(#[source] serde_json::Error),
     #[error("valid-paths reply trailer was empty (agent did not respond)")]
     ValidPathsReplyEmpty,
+    #[error("decoding runtime-closure reply trailer JSON: {0}")]
+    RuntimeClosureReplyJson(#[source] serde_json::Error),
+    #[error("runtime-closure reply trailer was empty (agent did not respond)")]
+    RuntimeClosureReplyEmpty,
     /// Agent's `nix-store --import` returned a non-success outcome.
     /// Daemon-side surfaces this when the side-channel reply trailer
     /// from the agent says `ok: false`, OR when a daemon-side IO
@@ -498,6 +502,12 @@ fn first_json_line<T: serde::de::DeserializeOwned>(buf: &[u8]) -> Option<T> {
 /// stdout (the NAR archive) into a local `<nix_store_bin> --import`
 /// subprocess. Used to materialise a builder's output paths into the
 /// daemon's local store after a successful build.
+///
+/// Legacy single-shot variant — the agent expands the runtime
+/// closure and ships everything in one stream, so the local
+/// `nix-store --import` peak memory grows with closure size.
+/// Prefer the chunked path: [`list_runtime_closure_over_channel`] +
+/// [`pull_exact_over_channel`] in batches.
 pub async fn pull_closure_over_channel(
     channel: Channel<ServerMsg>,
     build_id: i64,
@@ -521,6 +531,82 @@ pub async fn pull_closure_over_channel(
         drop(writer);
         // Stream the agent's `--export` stdout straight into our
         // local `nix-store --import`.
+        let outcome = import_closure(&nix_store_bin, &mut reader).await?;
+        Ok::<ClosureXferOutcome, ClosureXferError>(outcome)
+    })
+    .await;
+    outcome
+}
+
+/// Daemon-side: ask the agent for the full runtime closure of the
+/// supplied output paths *without* shipping any NAR bytes. Returns
+/// the expanded path list, which the caller chunks into batches and
+/// pulls via [`pull_exact_over_channel`].
+///
+/// Recoverable: on any error the caller should fall back to
+/// [`pull_closure_over_channel`] (the legacy single-shot path) so
+/// pre-chunking agents stay functional.
+pub async fn list_runtime_closure_over_channel(
+    channel: Channel<ServerMsg>,
+    build_id: i64,
+    paths: Vec<String>,
+) -> Result<Vec<String>, ClosureXferError> {
+    let header = SideChannelHeader {
+        kind: SideChannelKind::ListRuntimeClosure,
+        build_id,
+        paths,
+    };
+    let outcome = with_channel_io(channel, None, |io| async move {
+        let (mut reader, mut writer) = tokio::io::split(io);
+        write_header(&mut writer, &header).await?;
+        let _ = writer.flush().await;
+        drop(writer);
+
+        let mut reply_buf = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(60), reader.read_to_end(&mut reply_buf)).await;
+        if reply_buf.is_empty() {
+            return Err(ClosureXferError::RuntimeClosureReplyEmpty);
+        }
+        let line = reply_buf.split(|&b| b == b'\n').next().unwrap_or(&[]);
+        if line.is_empty() {
+            return Err(ClosureXferError::RuntimeClosureReplyEmpty);
+        }
+        let reply: RuntimeClosureReply =
+            serde_json::from_slice(line).map_err(ClosureXferError::RuntimeClosureReplyJson)?;
+        Ok::<Vec<String>, ClosureXferError>(reply.paths)
+    })
+    .await;
+    outcome
+}
+
+/// Daemon-side: pull **exactly** `paths` (no `--requisites`
+/// expansion on the agent) into the local store. Designed to be
+/// called once per chunk after listing the full runtime closure
+/// with [`list_runtime_closure_over_channel`].
+///
+/// Each call spawns a separate `nix-store --import` subprocess for
+/// only this chunk, so peak memory per call is bounded by the chunk
+/// size rather than the total closure size — which is the whole
+/// point: a NixOS image runtime closure that would OOM `--import`
+/// in one shot can be safely streamed as N small imports.
+pub async fn pull_exact_over_channel(
+    channel: Channel<ServerMsg>,
+    build_id: i64,
+    paths: Vec<String>,
+    nix_store_bin: &Path,
+) -> Result<ClosureXferOutcome, ClosureXferError> {
+    let header = SideChannelHeader {
+        kind: SideChannelKind::ClosurePullExact,
+        build_id,
+        paths,
+    };
+    let nix_store_bin = nix_store_bin.to_path_buf();
+    let outcome = with_channel_io(channel, None, |io| async move {
+        let (mut reader, mut writer) = tokio::io::split(io);
+        write_header(&mut writer, &header).await?;
+        let _ = writer.flush().await;
+        drop(writer);
         let outcome = import_closure(&nix_store_bin, &mut reader).await?;
         Ok::<ClosureXferOutcome, ClosureXferError>(outcome)
     })
