@@ -400,19 +400,32 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         }
 
         // Wait for either a build to finish or a cancel signal. On
-        // cancel, abort everything in flight; build_one's
-        // `kill_on_drop(true)` reaps the nix-store children.
+        // cancel, do NOT `abort_all` the in-flight builds: each
+        // spawned task holds a clone of the same `cancel` token,
+        // and `dispatch_pool_build` has its own cancel arm that
+        // sends `Abort` to the builder and drains the resulting
+        // `BuildFinished{Killed}`. `JoinSet::abort_all` would
+        // forcibly drop those futures before they ever delivered
+        // `Abort`, leaving the agent's `nix-store --realise`
+        // running to completion on the builder host (observed
+        // symptom: jobset shows Cancelled in the UI but builders
+        // keep building). The local fallback path's
+        // `Command::kill_on_drop(true)` is also reachable through
+        // the same cancel token (its own select! arm at line
+        // ~1045), so a graceful drain is correct for both branches.
         let next = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 tracing::info!(
                     in_flight = set.len(),
                     remaining_done = tally.success + tally.cached + tally.failure,
-                    "evaluation cancelled mid-build-loop (Q39); aborting in-flight builds",
+                    "evaluation cancelled mid-build-loop (Q39); awaiting graceful shutdown of in-flight builds",
                 );
-                set.abort_all();
-                // Drain the JoinSet so spawned tasks observe the abort
-                // and run their drop logic (BuilderSlot release).
+                // Drain naturally — each in-flight build observes
+                // the cancel token through its own future and
+                // returns `JobStatus::Cancelled` after Abort + drain.
+                // The per-build wall-clock timeout bounds how long
+                // a wedged agent can keep us here.
                 while set.join_next().await.is_some() {}
                 <SqlxStore as EvalStore>::finish(
                     &ctx.store,
