@@ -192,19 +192,42 @@ where
             .map_err(ClosureXferError::StderrRead)?;
         Ok::<Vec<u8>, ClosureXferError>(buf)
     };
-    let (bytes_transferred, stderr_buf) = tokio::try_join!(pipe_in, collect_stderr)?;
-
+    // `tokio::join!` (not `try_join!`) so the stderr drain runs to
+    // completion even when pipe_in errors with `BrokenPipe`. That
+    // happens whenever `nix-store --import` exits before consuming
+    // all of stdin — typically because *it* errored, and the actual
+    // diagnostic is on its stderr. Using `try_join!` here cancelled
+    // the stderr drain on the first error and we'd surface a bare
+    // "Broken pipe" with no clue why.
+    let (pipe_in_result, stderr_result) = tokio::join!(pipe_in, collect_stderr);
     let status = child.wait().await.map_err(ClosureXferError::Wait)?;
-    Ok(ClosureXferOutcome {
-        status: if status.success() {
-            BuildOutcomeStatus::Success
-        } else {
-            BuildOutcomeStatus::Failure
-        },
-        exit_code: status.code(),
-        stderr: stderr_buf,
-        bytes_transferred,
-    })
+    let stderr_buf = stderr_result.unwrap_or_default();
+    let bytes_transferred = pipe_in_result.as_ref().copied().unwrap_or(0);
+
+    // Subprocess failure (exit ≠ 0) is the more diagnostic outcome
+    // — surface as `Failure` with the captured stderr. The pipe-in
+    // BrokenPipe (if any) was a downstream effect of the subprocess
+    // dying mid-import; the caller's "pull chunk N failed: <stderr>"
+    // path will now show the actual nix error instead of "Broken
+    // pipe". Only when the subprocess exited cleanly AND pipe_in
+    // errored is there a real IO failure to report as `Err`.
+    if !status.success() {
+        return Ok(ClosureXferOutcome {
+            status: BuildOutcomeStatus::Failure,
+            exit_code: status.code(),
+            stderr: stderr_buf,
+            bytes_transferred,
+        });
+    }
+    match pipe_in_result {
+        Ok(_) => Ok(ClosureXferOutcome {
+            status: BuildOutcomeStatus::Success,
+            exit_code: status.code(),
+            stderr: stderr_buf,
+            bytes_transferred,
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 /// Run `<nix_store_bin> --export <paths...>` and pipe its stdout
@@ -270,19 +293,34 @@ where
             .map_err(ClosureXferError::StderrRead)?;
         Ok::<Vec<u8>, ClosureXferError>(buf)
     };
-    let (bytes_transferred, stderr_buf) = tokio::try_join!(pipe_out, collect_stderr)?;
-
+    // `tokio::join!` (not `try_join!`) so the stderr drain runs to
+    // completion even on a `BrokenPipe` from the writer side. See
+    // the matching commentary in `import_closure` — same reasoning:
+    // when nix-store errors mid-export the diagnostic is on its
+    // stderr, and `try_join!` would cancel the drain before we
+    // captured it.
+    let (pipe_out_result, stderr_result) = tokio::join!(pipe_out, collect_stderr);
     let status = child.wait().await.map_err(ClosureXferError::Wait)?;
-    Ok(ClosureXferOutcome {
-        status: if status.success() {
-            BuildOutcomeStatus::Success
-        } else {
-            BuildOutcomeStatus::Failure
-        },
-        exit_code: status.code(),
-        stderr: stderr_buf,
-        bytes_transferred,
-    })
+    let stderr_buf = stderr_result.unwrap_or_default();
+    let bytes_transferred = pipe_out_result.as_ref().copied().unwrap_or(0);
+
+    if !status.success() {
+        return Ok(ClosureXferOutcome {
+            status: BuildOutcomeStatus::Failure,
+            exit_code: status.code(),
+            stderr: stderr_buf,
+            bytes_transferred,
+        });
+    }
+    match pipe_out_result {
+        Ok(_) => Ok(ClosureXferOutcome {
+            status: BuildOutcomeStatus::Success,
+            exit_code: status.code(),
+            stderr: stderr_buf,
+            bytes_transferred,
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 /// Compute the closure (transitive `--requisites`) of `paths` by
