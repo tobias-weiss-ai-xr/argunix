@@ -98,9 +98,22 @@ pub struct WorkerContext {
     pub nix_store_bin: PathBuf,
     /// Maximum number of derivations to build in parallel across the
     /// whole evaluation (M14). Per-builder concurrency is additionally
-    /// gated by each builder's advertised `max_jobs`. Defaults to 16
+    /// gated by each builder's advertised `max_jobs`. Defaults are set
     /// in `main.rs`; clamped to ≥1 at use.
     pub build_concurrency: usize,
+    /// Process-wide cap on concurrent **closure-pull imports**. Each
+    /// permit gates the entire `chunked_pull_outputs` call (one per
+    /// finished build). Bounds the number of parallel
+    /// `nix-store --import` subprocesses fighting over RAM and the
+    /// page cache — peak memory per import was observed at ~1.9 GB for
+    /// a NixOS image runtime closure, and 145 GB of disk reads in 14
+    /// minutes during the OOM event traced to multiple imports
+    /// thrashing the page cache simultaneously. Much smaller than
+    /// `build_concurrency`: a build can be running *on a remote
+    /// builder* in parallel with many others, but only `pull_concurrency`
+    /// of them are allowed to be importing into the daemon's local
+    /// store at once. Set in `main.rs`; clamped to ≥1 at construction.
+    pub pull_sem: Arc<tokio::sync::Semaphore>,
 }
 
 /// Spawn the worker on the current tokio runtime. Returns a `JoinHandle`
@@ -1126,6 +1139,13 @@ pub struct PoolDispatchSpec<'a> {
     pub log_limit: medusa_build::LogCaptureLimit,
     pub build_timeout: Duration,
     pub nix_store_bin: &'a Path,
+    /// Optional process-wide gate on concurrent
+    /// `nix-store --import` invocations during the pull step. The
+    /// worker's path passes `Some(ctx.pull_sem.clone())`; the
+    /// `medusactl test-dispatch-drv` path passes `None` (single
+    /// invocation, no contention to manage). See
+    /// `WorkerContext::pull_sem`.
+    pub pull_sem: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Distinguishes "build cancelled by caller" from "build finished
@@ -1160,6 +1180,7 @@ async fn dispatch_build_via_pool(
         log_limit,
         build_timeout: ctx.build_timeout,
         nix_store_bin: &ctx.nix_store_bin,
+        pull_sem: Some(ctx.pull_sem.clone()),
     };
     match dispatch_pool_build(spec, Some(cancel)).await? {
         PoolDispatchResult::Outcome(o) => Ok(o),
@@ -1207,6 +1228,7 @@ pub async fn dispatch_pool_build(
         log_limit,
         build_timeout,
         nix_store_bin,
+        pull_sem,
     } = spec;
     let dispatcher = BuilderDispatcher::new(registry.clone());
     let cap = log_limit.max_raw_bytes;
@@ -1500,42 +1522,97 @@ pub async fn dispatch_pool_build(
     //    bounded by the chunk size, not the full closure size — a
     //    NixOS image runtime closure that would OOM `--import` in
     //    one shot can be safely streamed as N small imports.
+    //
+    //    Gated on `pull_sem` (when supplied) to cap the *number of
+    //    parallel imports across the whole daemon* — chunking bounds
+    //    one import's peak, but it's the count of concurrent imports
+    //    that drove the host OOM (multi-GB RSS each, page-cache
+    //    thrash from 145 GB of disk reads in 14 minutes).
     if final_status == BuildOutcomeStatus::Success && !output_paths.is_empty() {
-        match chunked_pull_outputs(
-            &dispatcher,
-            builder_name,
-            build_id,
-            &output_paths,
-            nix_store_bin,
-        )
-        .await
-        {
-            Ok(()) => {
-                // 6. Register gcroot on the first output (matches
-                //    the local path's atomic --add-root semantics
-                //    as closely as we can post-hoc).
-                if let Some(first) = output_paths.first() {
-                    if let Err(e) = add_indirect_gcroot(nix_store_bin, gc_root, first).await {
-                        tracing::warn!(
-                            error = %e,
-                            gc_root = %gc_root.display(),
-                            output = %first,
-                            "registering gcroot failed; output may be GC'd",
-                        );
+        let _pull_permit = if let Some(sem) = pull_sem.as_ref() {
+            // Try to acquire without waiting first so we can log
+            // "throttled, waiting" only when the cap is actually hit.
+            // Otherwise the operator has no visibility into whether
+            // the throttle is biting or not.
+            match sem.clone().try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    let waiting_since = std::time::Instant::now();
+                    tracing::info!(
+                        build_id,
+                        builder = %builder_name,
+                        available = sem.available_permits(),
+                        "pull throttle saturated; waiting for permit",
+                    );
+                    match sem.clone().acquire_owned().await {
+                        Ok(p) => {
+                            tracing::info!(
+                                build_id,
+                                builder = %builder_name,
+                                waited_ms = waiting_since.elapsed().as_millis() as u64,
+                                "pull permit acquired",
+                            );
+                            Some(p)
+                        }
+                        Err(_) => {
+                            log_buf.extend_from_slice(
+                                b"\nmedusa: pull semaphore closed (shutdown?); skipping pull.\n",
+                            );
+                            final_status = BuildOutcomeStatus::Failure;
+                            None
+                        }
                     }
                 }
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    log_buf.extend_from_slice(
+                        b"\nmedusa: pull semaphore closed (shutdown?); skipping pull.\n",
+                    );
+                    final_status = BuildOutcomeStatus::Failure;
+                    None
+                }
             }
-            Err(reason) => {
-                tracing::warn!(
-                    error = %reason,
-                    build_id,
-                    builder = %builder_name,
-                    "pulling output closure failed",
-                );
-                log_buf.extend_from_slice(b"\nmedusa: pulling output closure failed:\n");
-                log_buf.extend_from_slice(reason.as_bytes());
-                log_buf.push(b'\n');
-                final_status = BuildOutcomeStatus::Failure;
+        } else {
+            None
+        };
+        // Fall-through guarded by status so the closed-semaphore
+        // branch above doesn't try to pull anyway.
+        if final_status == BuildOutcomeStatus::Success {
+            match chunked_pull_outputs(
+                &dispatcher,
+                builder_name,
+                build_id,
+                &output_paths,
+                nix_store_bin,
+            )
+            .await
+            {
+                Ok(()) => {
+                    // 6. Register gcroot on the first output (matches
+                    //    the local path's atomic --add-root semantics
+                    //    as closely as we can post-hoc).
+                    if let Some(first) = output_paths.first() {
+                        if let Err(e) = add_indirect_gcroot(nix_store_bin, gc_root, first).await {
+                            tracing::warn!(
+                                error = %e,
+                                gc_root = %gc_root.display(),
+                                output = %first,
+                                "registering gcroot failed; output may be GC'd",
+                            );
+                        }
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        error = %reason,
+                        build_id,
+                        builder = %builder_name,
+                        "pulling output closure failed",
+                    );
+                    log_buf.extend_from_slice(b"\nmedusa: pulling output closure failed:\n");
+                    log_buf.extend_from_slice(reason.as_bytes());
+                    log_buf.push(b'\n');
+                    final_status = BuildOutcomeStatus::Failure;
+                }
             }
         }
     }

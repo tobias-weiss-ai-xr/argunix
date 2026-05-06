@@ -230,6 +230,23 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let builder_registry = medusa_builders::BuilderRegistry::new();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // M14 throttles. Two distinct semaphores because the phases have
+    // wildly different resource profiles:
+    //   - `build_concurrency` gates the per-eval JoinSet of "this drv
+    //     is being driven through push/build/pull". Most of that wall
+    //     time is the build *on a remote builder* — cheap on the
+    //     daemon. Default 4 (was 16; lowered after repeated OOMs from
+    //     too many parallel pulls colliding).
+    //   - `pull_concurrency` separately gates *only* the in-process
+    //     `nix-store --import` step at the end of a build. Each
+    //     import is multi-GB peak (observed 1.86–2.85 GB anon-RSS
+    //     per import on NixOS image runtime closures); 145 GB of
+    //     disk reads in a 14-minute window during the OOM event
+    //     traced to multiple imports thrashing the page cache.
+    //     Default 2: enough to overlap one import's wind-down with
+    //     the next's wind-up, low enough to bound RAM and IO.
+    let build_concurrency: usize = 4;
+    let pull_concurrency: usize = 2;
     let worker_ctx = worker::WorkerContext {
         current: current.clone(),
         store: store.clone(),
@@ -244,11 +261,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         cancellations: cancellations.clone(),
         builder_registry: builder_registry.clone(),
         nix_store_bin: args.nix_store_bin.clone(),
-        // M14: parallelise per-eval builds. Default 16 — comfortably
-        // above the typical sum of `max_jobs` across a small builder
-        // pool, so the global cap doesn't bottleneck before per-builder
-        // caps do. Operator-tunable knob in YAML is a follow-up.
-        build_concurrency: 16,
+        build_concurrency,
+        pull_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(pull_concurrency.max(1))),
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
 

@@ -171,6 +171,8 @@ async fn handle_test_dispatch_drv(
         log_limit: medusa_build::LogCaptureLimit::default(),
         build_timeout: ctx.build_timeout,
         nix_store_bin: &ctx.nix_store_bin,
+        // Single-shot test invocation; no contention to manage.
+        pull_sem: None,
     };
     match crate::worker::dispatch_pool_build(spec, None).await? {
         crate::worker::PoolDispatchResult::Outcome(o) => Ok(serde_json::json!({
