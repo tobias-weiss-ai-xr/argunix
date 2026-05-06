@@ -1216,7 +1216,7 @@ pub async fn dispatch_pool_build(
     //    every input drv it transitively depends on, plus any source
     //    paths referenced by builtins. That's exactly what the agent
     //    needs to be able to run `--realise` on the drv.
-    let closure = match query_requisites(nix_store_bin, drv_path).await {
+    let closure = match query_requisites(nix_store_bin, &[drv_path.to_string()]).await {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(job_id = %build_id, error = %e, "could not compute drv closure");

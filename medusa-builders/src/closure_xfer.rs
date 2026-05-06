@@ -270,20 +270,31 @@ where
     })
 }
 
-/// Compute the closure (transitive `--requisites`) of `drv_path` by
-/// shelling out to `<nix_store_bin> --query --requisites <drv_path>`.
-/// Used by the daemon before pushing a drv to a builder: the agent
-/// runs `--realise` on the drv but needs every drv + source it
-/// depends on to be present in its local store first.
+/// Compute the closure (transitive `--requisites`) of `paths` by
+/// shelling out to `<nix_store_bin> --query --requisites <paths...>`.
+///
+/// Two callers, one helper:
+///
+/// - **Daemon, pre-push:** expands the *drv* path to every input drv
+///   and source the agent needs to be able to run `--realise`.
+/// - **Agent, pre-pull:** expands the build *output* paths to their
+///   full runtime closure. Critical: `nix-store --export` ships only
+///   the listed paths, not their references. Without expanding here,
+///   any output that picks up a runtime dep via substitution during
+///   the build (e.g. an OVMF / glibc / busybox path the build pulled
+///   from cache.nixos.org) would arrive on the daemon side as an
+///   unimportable orphan. See the regression that surfaced as
+///   `error: path '/nix/store/...-OVMF-202602-fd' is not valid`.
 pub async fn query_requisites(
     nix_store_bin: &Path,
-    drv_path: &str,
+    paths: &[String],
 ) -> Result<Vec<String>, ClosureXferError> {
     let mut cmd = Command::new(nix_store_bin);
-    cmd.arg("--query")
-        .arg("--requisites")
-        .arg(drv_path)
-        .stdin(Stdio::null())
+    cmd.arg("--query").arg("--requisites");
+    for p in paths {
+        cmd.arg(p);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = spawn_retrying_etxtbsy(&mut cmd).map_err(ClosureXferError::QueryRequisites)?;

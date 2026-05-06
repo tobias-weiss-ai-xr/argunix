@@ -24,7 +24,9 @@
 //! separate adapter so this module stays unit-testable through
 //! `tokio::io::duplex`.
 
-use crate::closure_xfer::{ClosureXferError, ClosureXferOutcome, export_closure, import_closure};
+use crate::closure_xfer::{
+    ClosureXferError, ClosureXferOutcome, export_closure, import_closure, query_requisites,
+};
 use crate::protocol::BuildOutcomeStatus;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -251,9 +253,25 @@ where
             })
         }
         SideChannelKind::ClosurePull => {
-            let export = export_closure(nix_store_bin, &header.paths, writer).await?;
+            // Expand the requested output paths to their full
+            // runtime closure before exporting. `nix-store --export
+            // <paths>` ships only the listed paths — it does NOT
+            // include their references. Without this expansion, any
+            // build that picks up a runtime dependency via
+            // substitution during the build (e.g. an OVMF / glibc /
+            // busybox path the build pulled from cache.nixos.org)
+            // would arrive on the daemon side as an unimportable
+            // orphan: `nix-store --import` rejects it with
+            // `error: path '/nix/store/...' is not valid` because
+            // the runtime dep isn't in the daemon's local store.
+            let closure = query_requisites(nix_store_bin, &header.paths).await?;
+            let export = export_closure(nix_store_bin, &closure, writer).await?;
             Ok(DispatchOutcome::ClosurePulled {
                 build_id: header.build_id,
+                // Surface the original output paths in the outcome,
+                // not the expanded closure — the daemon-side log
+                // wants "we built these outputs", not "and here are
+                // 200 transitive deps we shipped".
                 paths: header.paths,
                 export,
             })
@@ -407,12 +425,29 @@ mod tests {
         // it; the next exec attempt then sees ETXTBSY. Writing to
         // `.tmp` + chmod + rename means the final path never had a
         // writable fd opened on it.
+        //
+        // Modes the fake handles:
+        //  - `--import`            : cat stdin into `sink`, exit 0
+        //  - `--export <paths>`    : record argv into `argv`, emit `payload`
+        //  - `--query --requisites <paths>` : emit each requested path
+        //    plus a synthetic `<path>-runtime-dep` line per path, so
+        //    callers that pre-expand the closure (the agent's
+        //    ClosurePull arm) can be observed adding the synthetic
+        //    deps to the subsequent `--export` argv.
         let tmp = path.with_extension("tmp");
         {
             let mut f = std::fs::File::create(&tmp).unwrap();
             writeln!(
                 f,
                 r#"#!/bin/sh
+if [ "$1" = "--query" ] && [ "$2" = "--requisites" ]; then
+  shift 2
+  for a in "$@"; do
+    printf '%s\n' "$a"
+    printf '%s-runtime-dep\n' "$a"
+  done
+  exit 0
+fi
 case "$1" in
   --import)
     cat > "{sink}"
@@ -666,14 +701,29 @@ exit 99
             "agent's `nix-store --export` stdout must reach the daemon-side reader byte-for-byte",
         );
 
-        // Argv shape: the dispatcher must hand `--export` exactly
-        // the path list from the header, in order.
+        // Argv shape: the dispatcher must hand `--export` the FULL
+        // closure of the requested output paths, not just the paths
+        // themselves. Our fake `nix-store --query --requisites`
+        // synthesises a `<path>-runtime-dep` entry per path, so the
+        // expanded argv interleaves each header path with its
+        // pseudo-dep — proving the dispatcher pre-expanded before
+        // exporting.
         let argv_lines = std::fs::read_to_string(&argv).unwrap();
         let lines: Vec<&str> = argv_lines.lines().collect();
         assert_eq!(
             lines,
-            vec!["--export", "/nix/store/zzz-out", "/nix/store/yyy-out-dev"],
-            "subprocess argv must mirror header.paths",
+            vec![
+                "--export",
+                "/nix/store/zzz-out",
+                "/nix/store/zzz-out-runtime-dep",
+                "/nix/store/yyy-out-dev",
+                "/nix/store/yyy-out-dev-runtime-dep",
+            ],
+            "ClosurePull must expand to the full runtime closure \
+             before exporting; otherwise the daemon's `nix-store \
+             --import` rejects outputs whose runtime deps came from \
+             a binary cache during the build (see the \
+             `OVMF-202602-fd is not valid` regression).",
         );
     }
 
