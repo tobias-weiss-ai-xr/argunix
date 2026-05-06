@@ -8,7 +8,10 @@
 
 use crate::identity::PersistedKey;
 use base64::Engine as _;
-use medusa_builders::{BuildOutcomeStatus, ControlMessage, dispatch_inbound, with_channel_io};
+use medusa_builders::{
+    BuildOutcomeStatus, ControlMessage, SideChannelDispatchOutcome, dispatch_inbound,
+    with_channel_io,
+};
 use medusa_domain::{BuilderCapabilities, BuilderName};
 use russh::ChannelMsg;
 use russh::client::{self, Handle, Handler, Msg as ClientMsg, Session as ClientSession};
@@ -677,19 +680,45 @@ async fn serve_side_channel(
         dispatch_inbound(&nix_store_bin, &mut reader, &mut writer).await
     })
     .await;
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
     match outcome {
-        Ok(o) => {
+        // Log a summary, not the full DispatchOutcome — for fat
+        // closures (hundreds of paths) Debug-printing the enum
+        // dumps every store path and drowns the journal.
+        Ok(SideChannelDispatchOutcome::ClosurePushed {
+            build_id,
+            paths,
+            import,
+        }) => {
             tracing::info!(
                 channel = channel_id,
-                elapsed_ms = started_at.elapsed().as_millis() as u64,
-                outcome = ?o,
+                elapsed_ms,
+                kind = "closure_push",
+                build_id,
+                n_paths = paths.len(),
+                bytes = import.bytes_transferred,
+                "side channel finished",
+            );
+        }
+        Ok(SideChannelDispatchOutcome::ClosurePulled {
+            build_id,
+            paths,
+            export,
+        }) => {
+            tracing::info!(
+                channel = channel_id,
+                elapsed_ms,
+                kind = "closure_pull",
+                build_id,
+                n_paths = paths.len(),
+                bytes = export.bytes_transferred,
                 "side channel finished",
             );
         }
         Err(e) => {
             tracing::warn!(
                 channel = channel_id,
-                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                elapsed_ms,
                 error = %e,
                 "side channel ended with error",
             );
