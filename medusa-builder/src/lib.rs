@@ -18,8 +18,4 @@ mod identity;
 pub use agent::{AgentConfig, AgentError, run};
 pub use capabilities::{Capabilities, CapabilitiesError, discover_capabilities};
 pub use identity::{IdentityError, PersistedKey, load_or_generate};
-// M14b: closure-transfer subprocess helpers live in `medusa-builders`
-// next to the side-channel codec; both daemon and agent use both
-// directions (push closure / pull outputs vs import closure / export
-// outputs), so a single home avoids drift.
-pub use medusa_builders::{ClosureXferError, ClosureXferOutcome, export_closure, import_closure};
+pub use medusa_builders::ClosureXferError;

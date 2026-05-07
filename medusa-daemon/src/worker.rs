@@ -24,9 +24,7 @@ use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use medusa_builders::{
-    BuildLifecycle, BuildOutcomeStatus, BuilderDispatcher, list_runtime_closure_over_channel,
-    pull_closure_over_channel, pull_exact_over_channel, push_closure_over_channel,
-    query_invalid_over_channel, query_requisites,
+    BuildLifecycle, BuildOutcomeStatus, BuilderDispatcher, NixCopyDirection, nix_copy_over_pool,
 };
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
 use medusa_forge::{CheckPost, CheckState, ForgeError, Provider};
@@ -89,31 +87,21 @@ pub struct WorkerContext {
     /// On no match, the worker falls back to a local `nix-store
     /// --realise` (which itself may use the host's `nix.buildMachines`).
     pub builder_registry: Arc<medusa_builders::BuilderRegistry>,
-    /// Path to the local `nix-store` binary. Used by the M14b
-    /// side-channel transport to compute drv closures
-    /// (`nix-store --query --requisites`), export drv closures to
-    /// the agent, and import the agent's output closure back into
-    /// the daemon's local store. Tests inject a fake binary; in
-    /// production, `PathBuf::from("nix-store")` resolves on PATH.
+    /// Path to the local `nix-store` binary. Used post-pull to
+    /// register gc-roots (`nix-store --add-root --indirect`); the
+    /// closure transfer itself uses `nix copy` instead.
     pub nix_store_bin: PathBuf,
+    /// Path to the local `nix` binary. Used to drive the closure
+    /// transfer (`nix copy --from/--to unix:///proxy.sock`). The
+    /// proxy is a per-build Unix-domain socket that forwards to the
+    /// builder's `nix-daemon --stdio` over our russh side channel.
+    /// Tests inject a fake; in production `"nix"` on PATH.
+    pub nix_bin: PathBuf,
     /// Maximum number of derivations to build in parallel across the
     /// whole evaluation (M14). Per-builder concurrency is additionally
-    /// gated by each builder's advertised `max_jobs`. Defaults are set
-    /// in `main.rs`; clamped to ≥1 at use.
+    /// gated by each builder's advertised `max_jobs`. Set in
+    /// `main.rs`; clamped to ≥1 at use.
     pub build_concurrency: usize,
-    /// Process-wide cap on concurrent **closure-pull imports**. Each
-    /// permit gates the entire `chunked_pull_outputs` call (one per
-    /// finished build). Bounds the number of parallel
-    /// `nix-store --import` subprocesses fighting over RAM and the
-    /// page cache — peak memory per import was observed at ~1.9 GB for
-    /// a NixOS image runtime closure, and 145 GB of disk reads in 14
-    /// minutes during the OOM event traced to multiple imports
-    /// thrashing the page cache simultaneously. Much smaller than
-    /// `build_concurrency`: a build can be running *on a remote
-    /// builder* in parallel with many others, but only `pull_concurrency`
-    /// of them are allowed to be importing into the daemon's local
-    /// store at once. Set in `main.rs`; clamped to ≥1 at construction.
-    pub pull_sem: Arc<tokio::sync::Semaphore>,
 }
 
 /// Spawn the worker on the current tokio runtime. Returns a `JoinHandle`
@@ -1139,13 +1127,7 @@ pub struct PoolDispatchSpec<'a> {
     pub log_limit: medusa_build::LogCaptureLimit,
     pub build_timeout: Duration,
     pub nix_store_bin: &'a Path,
-    /// Optional process-wide gate on concurrent
-    /// `nix-store --import` invocations during the pull step. The
-    /// worker's path passes `Some(ctx.pull_sem.clone())`; the
-    /// `medusactl test-dispatch-drv` path passes `None` (single
-    /// invocation, no contention to manage). See
-    /// `WorkerContext::pull_sem`.
-    pub pull_sem: Option<Arc<tokio::sync::Semaphore>>,
+    pub nix_bin: &'a Path,
 }
 
 /// Distinguishes "build cancelled by caller" from "build finished
@@ -1180,7 +1162,7 @@ async fn dispatch_build_via_pool(
         log_limit,
         build_timeout: ctx.build_timeout,
         nix_store_bin: &ctx.nix_store_bin,
-        pull_sem: Some(ctx.pull_sem.clone()),
+        nix_bin: &ctx.nix_bin,
     };
     match dispatch_pool_build(spec, Some(cancel)).await? {
         PoolDispatchResult::Outcome(o) => Ok(o),
@@ -1228,7 +1210,7 @@ pub async fn dispatch_pool_build(
         log_limit,
         build_timeout,
         nix_store_bin,
-        pull_sem,
+        nix_bin,
     } = spec;
     let dispatcher = BuilderDispatcher::new(registry.clone());
     let cap = log_limit.max_raw_bytes;
@@ -1247,120 +1229,39 @@ pub async fn dispatch_pool_build(
         }))
     };
 
-    // 1. Compute the drv's input closure on the daemon side.
-    //    `nix-store --query --requisites <drv>` returns the drv plus
-    //    every input drv it transitively depends on, plus any source
-    //    paths referenced by builtins. That's exactly what the agent
-    //    needs to be able to run `--realise` on the drv.
-    let closure = match query_requisites(nix_store_bin, &[drv_path.to_string()]).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(job_id = %build_id, error = %e, "could not compute drv closure");
-            log_buf.extend_from_slice(
-                format!("medusa: could not compute drv closure: {e}\n").as_bytes(),
-            );
-            return early_failure(log_buf, log_path.to_path_buf()).await;
-        }
-    };
-
-    // 2a. Probe the builder for which closure paths it already has,
-    //     so we can ship only the missing subset. Opens a side
-    //     channel, sends `QueryValidPaths`, reads the reply, and
-    //     filters. On *any* probe error we fall back to pushing the
-    //     full closure — the optimization must never break a build,
-    //     and it lets us interoperate with older agents that don't
-    //     know the new header kind.
-    let full_closure_count = closure.len();
-    let to_push: Vec<String> = match dispatcher.open_channel(builder_name).await {
-        Ok(mut d) => {
-            let probe_chan = d.take_channel().expect("dispatcher returned channel");
-            match query_invalid_over_channel(probe_chan, build_id, closure.clone()).await {
-                Ok(invalid) => {
-                    tracing::debug!(
-                        builder = %builder_name,
-                        build_id,
-                        queried = full_closure_count,
-                        invalid = invalid.len(),
-                        "valid-paths probe succeeded",
-                    );
-                    invalid
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        builder = %builder_name,
-                        build_id,
-                        error = %e,
-                        "valid-paths probe failed; falling back to full push",
-                    );
-                    closure
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                builder = %builder_name,
-                build_id,
-                error = %e,
-                "could not open probe channel; falling back to full push",
-            );
-            closure
-        }
-    };
-
-    // 2b. If the builder already has every path, skip the push
-    //     entirely — `nix-store --export` with no paths errors out,
-    //     and there's nothing to ship anyway.
-    if to_push.is_empty() {
-        tracing::info!(
+    // 1+2. Push the drv (and its closure) to the builder via
+    //      `nix copy --to`. The closure is expanded automatically by
+    //      `nix copy`, valid-paths are probed natively by the daemon
+    //      protocol, and bytes stream per-file with bounded memory.
+    //      Replaces the previous query-requisites + valid-paths
+    //      probe + chunked-export dance.
+    if let Err(e) = nix_copy_over_pool(
+        &dispatcher,
+        builder_name,
+        NixCopyDirection::To,
+        &[drv_path.to_string()],
+        nix_bin,
+        build_id,
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %e,
             builder = %builder_name,
             build_id,
-            queried = full_closure_count,
-            "builder has full closure; skipping ClosurePush",
+            drv = drv_path,
+            "nix copy --to (push drv closure) failed",
         );
-    } else {
-        // 2c. Push the (filtered) closure to the builder.
-        let push_chan = match dispatcher.open_channel(builder_name).await {
-            Ok(mut d) => d.take_channel(),
-            Err(e) => {
-                tracing::warn!(builder = %builder_name, error = %e, "open ClosurePush channel failed");
-                log_buf.extend_from_slice(
-                    format!("medusa: could not open builder channel: {e}\n").as_bytes(),
-                );
-                return early_failure(log_buf, log_path.to_path_buf()).await;
-            }
-        };
-        let push_chan = push_chan.expect("dispatcher returned channel");
-        let closure_path_count = to_push.len();
-        if let Err(e) = push_closure_over_channel(push_chan, build_id, to_push, nix_store_bin).await
-        {
-            tracing::warn!(
-                error = %e,
-                builder = %builder_name,
-                build_id,
-                drv = drv_path,
-                closure_paths = closure_path_count,
-                "push_closure_over_channel failed",
-            );
-            // Surface the failure in the build log. `e`'s Display already
-            // includes the agent's stderr when the failure was an import
-            // rejection (see `ClosureXferError::AgentImportFailed`); for
-            // pure transport errors (BrokenPipe, channel teardown) we
-            // additionally hint where to look on the agent side.
-            log_buf.extend_from_slice(
-                format!(
-                    "medusa: pushing drv closure to `{builder}` failed:\n\
-                     {e}\n\
-                     medusa: drv={drv_path}, closure_paths={closure_path_count}\n\
-                     medusa: if no agent stderr is shown above, the channel was\n\
-                     medusa: torn down before the agent could reply — check the\n\
-                     medusa: builder's `journalctl -u medusa-builder.service` for\n\
-                     medusa: a `side channel ended with error` line near build_id={build_id}.\n",
-                    builder = builder_name,
-                )
-                .as_bytes(),
-            );
-            return early_failure(log_buf, log_path.to_path_buf()).await;
-        }
+        log_buf.extend_from_slice(
+            format!(
+                "medusa: pushing drv closure to `{builder}` failed:\n\
+                 {e}\n\
+                 medusa: drv={drv_path}\n",
+                builder = builder_name,
+            )
+            .as_bytes(),
+        );
+        return early_failure(log_buf, log_path.to_path_buf()).await;
     }
 
     // 3. Send Build over the control channel; subscribe to lifecycle.
@@ -1517,102 +1418,47 @@ pub async fn dispatch_pool_build(
         }));
     }
 
-    // 5. On success, pull the output closure into the local store.
-    //    Done in chunks so peak `nix-store --import` memory is
-    //    bounded by the chunk size, not the full closure size — a
-    //    NixOS image runtime closure that would OOM `--import` in
-    //    one shot can be safely streamed as N small imports.
-    //
-    //    Gated on `pull_sem` (when supplied) to cap the *number of
-    //    parallel imports across the whole daemon* — chunking bounds
-    //    one import's peak, but it's the count of concurrent imports
-    //    that drove the host OOM (multi-GB RSS each, page-cache
-    //    thrash from 145 GB of disk reads in 14 minutes).
+    // 5. On success, pull the output closure into the local store
+    //    via `nix copy --from`. Closure expansion, valid-path
+    //    deduplication, and per-file streaming are all handled by
+    //    the daemon protocol — no chunking, no topo sort, no
+    //    explicit memory throttle needed.
     if final_status == BuildOutcomeStatus::Success && !output_paths.is_empty() {
-        let _pull_permit = if let Some(sem) = pull_sem.as_ref() {
-            // Try to acquire without waiting first so we can log
-            // "throttled, waiting" only when the cap is actually hit.
-            // Otherwise the operator has no visibility into whether
-            // the throttle is biting or not.
-            match sem.clone().try_acquire_owned() {
-                Ok(p) => Some(p),
-                Err(tokio::sync::TryAcquireError::NoPermits) => {
-                    let waiting_since = std::time::Instant::now();
-                    tracing::info!(
-                        build_id,
-                        builder = %builder_name,
-                        available = sem.available_permits(),
-                        "pull throttle saturated; waiting for permit",
-                    );
-                    match sem.clone().acquire_owned().await {
-                        Ok(p) => {
-                            tracing::info!(
-                                build_id,
-                                builder = %builder_name,
-                                waited_ms = waiting_since.elapsed().as_millis() as u64,
-                                "pull permit acquired",
-                            );
-                            Some(p)
-                        }
-                        Err(_) => {
-                            log_buf.extend_from_slice(
-                                b"\nmedusa: pull semaphore closed (shutdown?); skipping pull.\n",
-                            );
-                            final_status = BuildOutcomeStatus::Failure;
-                            None
-                        }
+        match nix_copy_over_pool(
+            &dispatcher,
+            builder_name,
+            NixCopyDirection::From,
+            &output_paths,
+            nix_bin,
+            build_id,
+        )
+        .await
+        {
+            Ok(()) => {
+                // 6. Register gcroot on the first output (matches
+                //    the local path's atomic --add-root semantics
+                //    as closely as we can post-hoc).
+                if let Some(first) = output_paths.first() {
+                    if let Err(e) = add_indirect_gcroot(nix_store_bin, gc_root, first).await {
+                        tracing::warn!(
+                            error = %e,
+                            gc_root = %gc_root.display(),
+                            output = %first,
+                            "registering gcroot failed; output may be GC'd",
+                        );
                     }
-                }
-                Err(tokio::sync::TryAcquireError::Closed) => {
-                    log_buf.extend_from_slice(
-                        b"\nmedusa: pull semaphore closed (shutdown?); skipping pull.\n",
-                    );
-                    final_status = BuildOutcomeStatus::Failure;
-                    None
                 }
             }
-        } else {
-            None
-        };
-        // Fall-through guarded by status so the closed-semaphore
-        // branch above doesn't try to pull anyway.
-        if final_status == BuildOutcomeStatus::Success {
-            match chunked_pull_outputs(
-                &dispatcher,
-                builder_name,
-                build_id,
-                &output_paths,
-                nix_store_bin,
-            )
-            .await
-            {
-                Ok(()) => {
-                    // 6. Register gcroot on the first output (matches
-                    //    the local path's atomic --add-root semantics
-                    //    as closely as we can post-hoc).
-                    if let Some(first) = output_paths.first() {
-                        if let Err(e) = add_indirect_gcroot(nix_store_bin, gc_root, first).await {
-                            tracing::warn!(
-                                error = %e,
-                                gc_root = %gc_root.display(),
-                                output = %first,
-                                "registering gcroot failed; output may be GC'd",
-                            );
-                        }
-                    }
-                }
-                Err(reason) => {
-                    tracing::warn!(
-                        error = %reason,
-                        build_id,
-                        builder = %builder_name,
-                        "pulling output closure failed",
-                    );
-                    log_buf.extend_from_slice(b"\nmedusa: pulling output closure failed:\n");
-                    log_buf.extend_from_slice(reason.as_bytes());
-                    log_buf.push(b'\n');
-                    final_status = BuildOutcomeStatus::Failure;
-                }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    build_id,
+                    builder = %builder_name,
+                    "nix copy --from (pull output closure) failed",
+                );
+                log_buf.extend_from_slice(b"\nmedusa: pulling output closure failed:\n");
+                log_buf.extend_from_slice(format!("{e}\n").as_bytes());
+                final_status = BuildOutcomeStatus::Failure;
             }
         }
     }
@@ -1632,121 +1478,6 @@ pub async fn dispatch_pool_build(
         log_path: log_path.to_path_buf(),
         log_truncated,
     }))
-}
-
-/// Chunk size for `chunked_pull_outputs` — number of paths the
-/// daemon asks the agent to ship per `ClosurePullExact` channel,
-/// and equivalently the number of paths each daemon-side
-/// `nix-store --import` subprocess processes per call. Bounds peak
-/// memory per import; smaller is safer but means more channels.
-/// 100 keeps a typical NixOS-image runtime closure (~5K paths) in
-/// ~50 short imports of a few hundred MB peak each, well under the
-/// observed 2.85 GB single-import OOM victim.
-const PULL_CHUNK_SIZE: usize = 100;
-
-/// Pull a build's output runtime closure into the daemon's local
-/// store via the chunked-pull protocol.
-///
-/// Steps:
-/// 1. Ask the agent (`ListRuntimeClosure`) for the full runtime
-///    closure of `output_paths`. No NAR bytes ship in this step.
-/// 2. Chunk the resulting list into `PULL_CHUNK_SIZE` batches.
-/// 3. For each batch, open a fresh side channel and run a
-///    `ClosurePullExact`. Each call spawns a separate
-///    `nix-store --import`, so peak memory per call is bounded by
-///    chunk size rather than total closure size.
-///
-/// On a `ListRuntimeClosure` failure (e.g. a pre-chunking agent
-/// that doesn't recognise the kind), falls back to the legacy
-/// single-shot `pull_closure_over_channel` so old agents stay
-/// functional. The fallback path is the OOM-prone one — the whole
-/// reason this helper exists is to avoid it on agents that support
-/// chunking — but it preserves correctness.
-///
-/// On per-chunk failure, returns immediately without trying further
-/// chunks: a partial closure is no use to the daemon (subsequent
-/// `--import`s would reject paths whose references aren't valid).
-async fn chunked_pull_outputs(
-    dispatcher: &BuilderDispatcher,
-    builder_name: &medusa_domain::BuilderName,
-    build_id: i64,
-    output_paths: &[String],
-    nix_store_bin: &Path,
-) -> Result<(), String> {
-    // 5a. List the runtime closure on the agent.
-    let list_chan = match dispatcher.open_channel(builder_name).await {
-        Ok(mut d) => d.take_channel().expect("dispatcher returned channel"),
-        Err(e) => return Err(format!("could not open list channel: {e}")),
-    };
-    let runtime_closure =
-        match list_runtime_closure_over_channel(list_chan, build_id, output_paths.to_vec()).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    build_id,
-                    builder = %builder_name,
-                    "list_runtime_closure failed; falling back to single-shot pull (OOM-prone)",
-                );
-                // Legacy fallback. Memory-unbounded but correct.
-                let pull_chan = match dispatcher.open_channel(builder_name).await {
-                    Ok(mut d) => d.take_channel().expect("dispatcher returned channel"),
-                    Err(e) => return Err(format!("could not open fallback pull channel: {e}")),
-                };
-                return match pull_closure_over_channel(
-                    pull_chan,
-                    build_id,
-                    output_paths.to_vec(),
-                    nix_store_bin,
-                )
-                .await
-                {
-                    Ok(o) if o.status == BuildOutcomeStatus::Success => Ok(()),
-                    Ok(o) => Err(format!(
-                        "fallback pull failed: {}",
-                        String::from_utf8_lossy(&o.stderr)
-                    )),
-                    Err(e) => Err(format!("fallback pull errored: {e}")),
-                };
-            }
-        };
-
-    let n_chunks = runtime_closure.len().div_ceil(PULL_CHUNK_SIZE);
-    tracing::info!(
-        build_id,
-        builder = %builder_name,
-        outputs = output_paths.len(),
-        closure = runtime_closure.len(),
-        chunk_size = PULL_CHUNK_SIZE,
-        n_chunks,
-        "pulling output runtime closure in chunks",
-    );
-
-    // 5b. Chunked pull. Sequential — parallelism here would just
-    //     re-introduce the OOM by running multiple imports at once.
-    for (idx, chunk) in runtime_closure.chunks(PULL_CHUNK_SIZE).enumerate() {
-        let chan = match dispatcher.open_channel(builder_name).await {
-            Ok(mut d) => d.take_channel().expect("dispatcher returned channel"),
-            Err(e) => return Err(format!("could not open chunk-{idx} channel: {e}")),
-        };
-        match pull_exact_over_channel(chan, build_id, chunk.to_vec(), nix_store_bin).await {
-            Ok(o) if o.status == BuildOutcomeStatus::Success => {}
-            Ok(o) => {
-                return Err(format!(
-                    "pull chunk {idx} (paths {start}..{end} of {total}) failed: {stderr}",
-                    start = idx * PULL_CHUNK_SIZE,
-                    end = idx * PULL_CHUNK_SIZE + chunk.len(),
-                    total = runtime_closure.len(),
-                    stderr = String::from_utf8_lossy(&o.stderr),
-                ));
-            }
-            Err(e) => {
-                return Err(format!("pull chunk {idx} errored: {e}"));
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// Wait on an optional cancel token. Returns immediately when fired;

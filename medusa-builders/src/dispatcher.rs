@@ -38,6 +38,7 @@ pub enum DispatchError {
     },
 }
 
+#[derive(Clone)]
 pub struct BuilderDispatcher {
     registry: Arc<BuilderRegistry>,
 }

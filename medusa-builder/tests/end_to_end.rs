@@ -110,6 +110,7 @@ async fn token_first_then_pubkey_subsequent() {
         capabilities: caps(),
         reconnect_initial_backoff: Duration::from_millis(100),
         nix_store_bin: AgentConfig::default_nix_store_bin(),
+        nix_daemon_socket: AgentConfig::default_nix_daemon_socket(),
         medusa_host_key_path: None,
     };
     let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
@@ -136,56 +137,35 @@ async fn token_first_then_pubkey_subsequent() {
     let _ = tokio::time::timeout(Duration::from_secs(3), agent_handle).await;
 }
 
-/// Lay down a fake `nix-store` shell script at `path` that, on
-/// `--import`, pipes stdin into a sink file and exits 0. Used to
-/// verify the agent's side-channel handler runs the right
-/// subprocess and forwards bytes byte-for-byte from the daemon.
-fn fake_nix_store_import(path: &Path, sink: &Path) {
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-    // Atomic-rename install: dodge ETXTBSY under parallel cargo-test
-    // fork pressure by ensuring the final path never had a writable
-    // fd opened on it.
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp).unwrap();
-        writeln!(
-            f,
-            r#"#!/bin/sh
-if [ "$1" = "--import" ]; then
-  cat > "{sink}"
-  exit 0
-fi
-exit 99
-"#,
-            sink = sink.display(),
-        )
-        .unwrap();
-        f.sync_all().unwrap();
-    }
-    let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
-    perm.set_mode(0o755);
-    std::fs::set_permissions(&tmp, perm).unwrap();
-    std::fs::rename(&tmp, path).unwrap();
-}
-
-/// M14b end-to-end: spawn a real medusa server + a real agent over
-/// SSH, open a session channel from the daemon side, write a
-/// `ClosurePush` side-channel header + binary payload, and assert
-/// the agent's fake `nix-store --import` received every byte. This
-/// is the legacy `cat` round-trip test (M13) replaced for the new
-/// transport.
+/// M16 end-to-end: spawn a real medusa server + a real agent over
+/// SSH, open a side channel from the daemon side, write a
+/// `NixDaemonStdio` header + payload, and assert every byte
+/// round-trips back through the agent's socket tunnel. The fake
+/// "nix-daemon socket" is a Unix socket bound to a temp path with
+/// an echo server attached, so the agent's forwarding loop does a
+/// byte-for-byte round-trip.
 #[tokio::test]
-async fn closure_push_side_channel_end_to_end() {
+async fn nix_daemon_stdio_side_channel_end_to_end() {
     let (addr, _store, registry) = spawn_server().await;
     let identity = fresh_identity();
 
-    // Fake `nix-store` so we don't need a real nix install just to
-    // exercise the channel plumbing. `--import` cats stdin → sink.
     let bin_dir = tempfile::tempdir().unwrap();
-    let fake_bin = bin_dir.path().join("nix-store");
-    let import_sink = bin_dir.path().join("imp-sink.bin");
-    fake_nix_store_import(&fake_bin, &import_sink);
+    let fake_socket = bin_dir.path().join("fake-daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&fake_socket).unwrap();
+    // Echo every accepted connection. The agent connects once per
+    // side channel; we accept and copy stdin → stdout in a loop so
+    // the test stays alive across reconnects.
+    let echo_handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (mut r, mut w) = stream.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
 
     let cfg = AgentConfig {
         medusa: addr,
@@ -194,7 +174,8 @@ async fn closure_push_side_channel_end_to_end() {
         name: BuilderName::new("xfer-builder").unwrap(),
         capabilities: caps(),
         reconnect_initial_backoff: Duration::from_millis(100),
-        nix_store_bin: PathBuf::from(&fake_bin),
+        nix_store_bin: AgentConfig::default_nix_store_bin(),
+        nix_daemon_socket: PathBuf::from(&fake_socket),
         medusa_host_key_path: None,
     };
     let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
@@ -208,65 +189,50 @@ async fn closure_push_side_channel_end_to_end() {
 
     wait_for_active(&registry, "xfer-builder").await;
 
-    // Open a side channel from the daemon side. `BuilderDispatcher`
-    // owns the russh server-side `Channel<ServerMsg>`.
     let dispatcher = BuilderDispatcher::new(registry.clone());
     let mut dispatched = dispatcher
         .open_channel(&BuilderName::new("xfer-builder").unwrap())
         .await
         .expect("open_channel must succeed");
-    let channel = dispatched.take_channel().expect("channel present");
+    let mut channel = dispatched.take_channel().expect("channel present");
 
-    // Daemon-side write: header + binary payload.
     let header = SideChannelHeader {
-        kind: SideChannelKind::ClosurePush,
+        kind: SideChannelKind::NixDaemonStdio,
         build_id: 1234,
-        paths: vec!["/nix/store/aaa-foo.drv".into()],
+        paths: vec![],
     };
     let payload: Vec<u8> = (0u8..=255).chain(std::iter::once(b'X')).collect();
 
-    // Hack: the daemon side has `Channel::data` which writes bytes
-    // out, but no AsyncWrite adapter yet (that's the next slice on
-    // the daemon side). For the test we use the russh `data()` API
-    // directly — same byte stream the AsyncWrite adapter would
-    // produce.
-    let mut header_bytes = header.encode_line();
+    let header_bytes = header.encode_line();
     channel.data(&header_bytes[..]).await.unwrap();
-    header_bytes.clear(); // drop reference
     channel.data(&payload[..]).await.unwrap();
-    // Half-close the channel so the agent's import subprocess sees
-    // EOF on stdin and exits.
     channel.eof().await.unwrap();
 
-    // Wait until the fake nix-store has written everything to the
-    // sink. The agent runs the subprocess + waits for it; we poll
-    // the sink file size.
+    // Read echoed bytes back from the channel until we see the full
+    // payload. The echo server emits bytes as it reads them, so the
+    // round-trip arrives streamingly.
+    let mut received: Vec<u8> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut last_len = 0usize;
-    while tokio::time::Instant::now() < deadline {
-        if let Ok(meta) = std::fs::metadata(&import_sink) {
-            let len = meta.len() as usize;
-            if len == payload.len() {
-                last_len = len;
+    while tokio::time::Instant::now() < deadline && received.len() < payload.len() {
+        match tokio::time::timeout(Duration::from_millis(500), channel.wait()).await {
+            Ok(Some(russh::ChannelMsg::Data { data })) => {
+                received.extend_from_slice(&data);
+            }
+            Ok(Some(russh::ChannelMsg::Eof)) | Ok(Some(russh::ChannelMsg::Close)) | Ok(None) => {
                 break;
             }
-            last_len = len;
+            Ok(Some(_)) => continue,
+            Err(_) => continue, // poll timeout; loop and re-check deadline
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(
-        last_len,
-        payload.len(),
-        "fake `nix-store --import` should have received the full payload",
-    );
-    let written = std::fs::read(&import_sink).expect("sink readable");
-    assert_eq!(
-        written, payload,
-        "every byte of the daemon's payload must reach the agent's `nix-store --import`",
+        received, payload,
+        "every byte of the daemon's payload must round-trip through the agent's socket tunnel",
     );
 
     drop(channel);
     drop(dispatched);
     let _ = sd_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(3), agent_handle).await;
+    echo_handle.abort();
 }

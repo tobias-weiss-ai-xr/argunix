@@ -115,6 +115,7 @@ async fn main() -> Result<()> {
         capabilities: caps.inner,
         reconnect_initial_backoff: AgentConfig::default_backoff(),
         nix_store_bin: AgentConfig::default_nix_store_bin(),
+        nix_daemon_socket: AgentConfig::default_nix_daemon_socket(),
         // Pin medusa's SSH host key under the agent's state dir so a
         // future server-key swap is caught at TOFU rather than
         // silently accepted.

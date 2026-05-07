@@ -211,6 +211,11 @@ in
         pkgs.git
         pkgs.nix
         pkgs.nix-eval-jobs
+        # `nix copy --from ssh-ng://localhost?remote-program=…` invokes
+        # a tiny shell wrapper that execs `socat` to bridge stdio to
+        # our russh-tunneled proxy socket. Required for the M16
+        # closure-pull path; see `closure_xfer::nix_copy_over_pool`.
+        pkgs.socat
       ];
 
       serviceConfig = {

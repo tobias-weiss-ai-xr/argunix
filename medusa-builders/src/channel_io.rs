@@ -44,35 +44,42 @@ where
 {
     let mut buf = vec![0u8; 16 * 1024];
     let mut close_rx = close_rx;
-    // Once the user side stops writing (its writer dropped — we see
-    // Ok(0) on `pump_side.read`), we send `channel.eof()` to signal
-    // the peer and disable the read arm. We must NOT break the whole
-    // loop here: if the peer is still working (e.g. an agent draining
-    // `nix-store --import` after we've sent EOF), it may still emit
-    // Data events that the user side wants to see, and we need to
-    // wait for the peer's own Eof/Close before tearing down — which
-    // is what makes "user closure returned" mean "remote handling
-    // is also done" daemon-side.
+    // Track each direction independently. We tear down the pump
+    // only when BOTH halves are done: the user has stopped writing
+    // outbound (its writer was dropped — `pump_side.read()` returned
+    // `Ok(0)`) AND the peer has signalled inbound EOF (either via
+    // `channel.wait()` returning Eof/Close, or via the out-of-band
+    // `close_rx` callback path on agent-side server-pushed
+    // channels).
+    //
+    // Critical for bidirectional protocols like the
+    // `NixDaemonStdio` tunnel: when the daemon EOFs after writing
+    // its request, the agent's `nix-daemon --stdio` is still
+    // producing response bytes. Tearing down on inbound EOF would
+    // drop those bytes before they reach the channel.
     let mut user_writer_done = false;
+    let mut inbound_done = false;
     loop {
+        if user_writer_done && inbound_done {
+            break;
+        }
         tokio::select! {
             // Channel → pump_side (user reads via `read()` end).
-            ev = channel.wait() => match ev {
+            ev = channel.wait(), if !inbound_done => match ev {
                 Some(ChannelMsg::Data { data }) => {
                     if pump_side.write_all(&data).await.is_err() {
-                        break;
+                        // User-side reader gone — keep pumping
+                        // outbound but stop trying to write inbound.
+                        inbound_done = true;
                     }
                 }
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
                     let _ = pump_side.shutdown().await;
-                    break;
+                    inbound_done = true;
                 }
                 Some(_) => continue,
             },
             // pump_side → channel (user writes via `write()` end).
-            // After the user's writer is dropped (Ok(0) once), we
-            // disable this arm via `user_writer_done`; the loop
-            // continues so peer→user events are still pumped.
             r = pump_side.read(&mut buf), if !user_writer_done => match r {
                 Ok(0) => {
                     let _ = channel.eof().await;
@@ -80,14 +87,15 @@ where
                 }
                 Ok(n) => {
                     if channel.data(&buf[..n]).await.is_err() {
-                        break;
+                        // Channel write failed — stop trying.
+                        user_writer_done = true;
                     }
                 }
                 Err(_) => {
                     user_writer_done = true;
                 }
             },
-            // Agent-side: out-of-band EOF/Close from Handler.
+            // Agent-side out-of-band EOF/Close from Handler.
             // `wait_close` sets the slot to None after firing so
             // the branch can never re-fire.
             //
@@ -97,9 +105,9 @@ where
             // pumped yet. Drain them with a short polling timeout
             // before signalling EOF to the user — otherwise the
             // closing peer's last bytes get dropped and the
-            // user-side subprocess (e.g. `nix-store --import`) sees
-            // a truncated stream.
-            _ = wait_close(&mut close_rx) => {
+            // user-side subprocess (e.g. `nix-daemon --stdio`)
+            // sees a truncated stream.
+            _ = wait_close(&mut close_rx), if !inbound_done => {
                 loop {
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(50),
@@ -114,7 +122,11 @@ where
                     }
                 }
                 let _ = pump_side.shutdown().await;
-                break;
+                inbound_done = true;
+                // Do NOT break: outbound pump must keep running
+                // until the user closure drops its writer (which
+                // for the nix-daemon tunnel means the subprocess
+                // has finished emitting response bytes and exited).
             }
         }
     }

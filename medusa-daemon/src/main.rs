@@ -56,12 +56,18 @@ struct ServeArgs {
     /// here). Default: `/run/medusa/control.sock`.
     #[arg(long, value_name = "PATH")]
     control_socket: Option<PathBuf>,
-    /// Path to the local `nix-store` binary used for computing drv
-    /// closures (`--query --requisites`), exporting closures to
-    /// builders, and importing output closures from builders. Default
-    /// resolves on PATH; the NixOS module pins it to an absolute path.
+    /// Path to the local `nix-store` binary. Used post-pull to
+    /// register gc-roots (`nix-store --add-root --indirect`).
+    /// Default resolves on PATH; the NixOS module pins it.
     #[arg(long, value_name = "PATH", default_value = "nix-store")]
     nix_store_bin: PathBuf,
+    /// Path to the local `nix` binary. Used to drive closure
+    /// transfer via `nix copy --from/--to unix:///proxy.sock`,
+    /// where the proxy tunnels the daemon protocol through our
+    /// russh side channel to the builder's `nix-daemon --stdio`.
+    /// Default resolves on PATH; the NixOS module pins it.
+    #[arg(long, value_name = "PATH", default_value = "nix")]
+    nix_bin: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -230,23 +236,14 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let builder_registry = medusa_builders::BuilderRegistry::new();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    // M14 throttles. Two distinct semaphores because the phases have
-    // wildly different resource profiles:
-    //   - `build_concurrency` gates the per-eval JoinSet of "this drv
-    //     is being driven through push/build/pull". Most of that wall
-    //     time is the build *on a remote builder* — cheap on the
-    //     daemon. Default 4 (was 16; lowered after repeated OOMs from
-    //     too many parallel pulls colliding).
-    //   - `pull_concurrency` separately gates *only* the in-process
-    //     `nix-store --import` step at the end of a build. Each
-    //     import is multi-GB peak (observed 1.86–2.85 GB anon-RSS
-    //     per import on NixOS image runtime closures); 145 GB of
-    //     disk reads in a 14-minute window during the OOM event
-    //     traced to multiple imports thrashing the page cache.
-    //     Default 2: enough to overlap one import's wind-down with
-    //     the next's wind-up, low enough to bound RAM and IO.
+    // M16 simplification: closure transfer is now `nix copy` over a
+    // tunneled `nix-daemon --stdio`. The daemon-protocol streams
+    // per-file with bounded memory, so the previous `pull_sem`
+    // throttle (which existed to bound concurrent multi-GB
+    // `nix-store --import` subprocesses) is no longer needed.
+    // `build_concurrency` remains as the global cap on parallel
+    // in-flight builds.
     let build_concurrency: usize = 4;
-    let pull_concurrency: usize = 2;
     let worker_ctx = worker::WorkerContext {
         current: current.clone(),
         store: store.clone(),
@@ -261,8 +258,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         cancellations: cancellations.clone(),
         builder_registry: builder_registry.clone(),
         nix_store_bin: args.nix_store_bin.clone(),
+        nix_bin: args.nix_bin.clone(),
         build_concurrency,
-        pull_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(pull_concurrency.max(1))),
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
 
@@ -342,6 +339,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         skip_secret_check: args.skip_secret_check,
         builder_registry,
         nix_store_bin: args.nix_store_bin.clone(),
+        nix_bin: args.nix_bin.clone(),
         build_timeout: Duration::from_secs(7200),
     });
 

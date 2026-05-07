@@ -77,6 +77,12 @@ in
     # gone through the dynamic pool.
     environment.systemPackages = [ pkgs.medusa ];
     virtualisation.memorySize = 1536;
+    # Each VM needs its own writable nix store overlay; without
+    # this, builds and store imports go into a tmpfs that the VM's
+    # nix-daemon doesn't actually own, so `nix copy` and `nix-store
+    # --import` see "path does not exist" even when the file is on
+    # disk. Default in newer nixpkgs but safer to pin explicitly.
+    virtualisation.writableStore = true;
   };
 
   nodes.builder = {
@@ -100,6 +106,7 @@ in
     ];
 
     virtualisation.memorySize = 1536;
+    virtualisation.writableStore = true;
   };
 
   testScript = ''
@@ -146,9 +153,25 @@ in
         f" --builder smoke-builder {drv}"
     )
     payload = json.loads(raw)
-    assert payload.get("status") == "success", (
-        f"test-dispatch-drv reported non-success: {payload!r}"
-    )
+    if payload.get("status") != "success":
+        # On failure, dump the per-build zstd log and tails of both
+        # daemon journals so the test driver shows what went wrong.
+        log_path = payload.get("log_path")
+        log_dump = ""
+        if log_path:
+            rc, log_dump = medusa.execute(f"zstdcat {log_path} || cat {log_path}")
+        journal_tail = medusa.succeed(
+            "journalctl -u medusa.service --no-pager -n 80"
+        )
+        builder_journal = builder.succeed(
+            "journalctl -u medusa-builder.service --no-pager -n 80"
+        )
+        raise AssertionError(
+            f"test-dispatch-drv reported non-success: {payload!r}\n"
+            f"--- build log ({log_path}) ---\n{log_dump}\n"
+            f"--- medusa journal tail ---\n{journal_tail}\n"
+            f"--- builder journal tail ---\n{builder_journal}\n"
+        )
     output_paths = payload.get("output_paths") or []
     assert output_paths, f"no output paths reported: {payload!r}"
     out_path = output_paths[0]

@@ -60,13 +60,19 @@ pub struct AgentConfig {
     /// Initial reconnect backoff. Doubles up to 30s on repeated failures;
     /// resets to this value on every successful hello.
     pub reconnect_initial_backoff: Duration,
-    /// Path to the local `nix-store` binary (M14b). Each inbound
-    /// side channel either runs `<nix_store_bin> --import` (closure
-    /// push from daemon) or `<nix_store_bin> --export <paths>`
-    /// (closure pull for outputs). Tests substitute a fake
+    /// Path to the local `nix-store` binary. Used by `nix-store
+    /// --realise` during build execution. Tests substitute a fake
     /// shell-script binary; production deployments leave it at the
     /// default `"nix-store"` resolved on the agent's `PATH`.
     pub nix_store_bin: PathBuf,
+    /// Path to the system `nix-daemon` socket. Each inbound
+    /// `NixDaemonStdio` side channel forwards its bytes
+    /// bidirectionally to a connection on this socket — the daemon
+    /// side then drives the resulting daemon-protocol stream with
+    /// `nix copy --from/--to unix:///proxy.sock`. Defaults to the
+    /// NixOS standard `/nix/var/nix/daemon-socket/socket`; tests
+    /// point at a temp-path echo socket.
+    pub nix_daemon_socket: PathBuf,
     /// Path under which the agent pins medusa's SSH host key (TOFU).
     /// First successful connect writes the presented pubkey here in
     /// OpenSSH single-line format; subsequent connects refuse if the
@@ -84,6 +90,9 @@ impl AgentConfig {
     }
     pub fn default_nix_store_bin() -> PathBuf {
         PathBuf::from("nix-store")
+    }
+    pub fn default_nix_daemon_socket() -> PathBuf {
+        PathBuf::from("/nix/var/nix/daemon-socket/socket")
     }
 }
 
@@ -150,7 +159,7 @@ async fn serve_one_connection(
 
     let client_cfg = Arc::new(client::Config::default());
     let handler = AgentClient {
-        nix_store_bin: Arc::new(cfg.nix_store_bin.clone()),
+        nix_daemon_socket: Arc::new(cfg.nix_daemon_socket.clone()),
         medusa_host_key_path: cfg.medusa_host_key_path.clone(),
         close_signals: Arc::new(StdMutex::new(HashMap::new())),
     };
@@ -573,7 +582,7 @@ where
 /// dispatcher sees clean EOF on `nix-store --import`'s stdin.
 #[derive(Clone)]
 struct AgentClient {
-    nix_store_bin: Arc<PathBuf>,
+    nix_daemon_socket: Arc<PathBuf>,
     medusa_host_key_path: Option<PathBuf>,
     close_signals: Arc<StdMutex<HashMap<russh::ChannelId, oneshot::Sender<()>>>>,
 }
@@ -614,9 +623,9 @@ impl Handler for AgentClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(channel.id(), close_tx);
-        let nix_store_bin = self.nix_store_bin.clone();
+        let nix_daemon_socket = self.nix_daemon_socket.clone();
         tokio::spawn(async move {
-            serve_side_channel(channel, &nix_store_bin, close_rx).await;
+            serve_side_channel(channel, &nix_daemon_socket, close_rx).await;
         });
         Ok(())
     }
@@ -657,106 +666,38 @@ fn signal_close(
     }
 }
 
-/// M14b agent-side channel handler. Wraps the russh channel via
-/// [`with_channel_io`] (which ferries bytes through a duplex pipe
-/// to give us `AsyncRead`+`AsyncWrite`) and hands the duplex stream
-/// to [`dispatch_inbound`]. The dispatcher reads the side-channel
-/// header, then either runs `nix-store --import` (closure push from
-/// daemon) or `nix-store --export` (closure pull for outputs)
-/// against the channel.
+/// M16 agent-side channel handler. Wraps the russh channel via
+/// [`with_channel_io`] and hands the duplex stream to
+/// [`dispatch_inbound`], which reads the header and forwards bytes
+/// to/from the system `nix-daemon` socket for the lifetime of the
+/// channel.
 async fn serve_side_channel(
     channel: russh::Channel<ClientMsg>,
-    nix_store_bin: &Path,
+    nix_daemon_socket: &Path,
     close_rx: oneshot::Receiver<()>,
 ) {
     let started_at = std::time::Instant::now();
     let channel_id: u32 = channel.id().into();
-    let nix_store_bin = nix_store_bin.to_path_buf();
+    let nix_daemon_socket = nix_daemon_socket.to_path_buf();
     let outcome = with_channel_io(channel, Some(close_rx), |io| async move {
-        // Split into independent read/write halves so
-        // `dispatch_inbound` can read the header + payload and
-        // optionally write export bytes back simultaneously.
         let (mut reader, mut writer) = tokio::io::split(io);
-        dispatch_inbound(&nix_store_bin, &mut reader, &mut writer).await
+        dispatch_inbound(&nix_daemon_socket, &mut reader, &mut writer).await
     })
     .await;
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
     match outcome {
-        // Log a summary, not the full DispatchOutcome — for fat
-        // closures (hundreds of paths) Debug-printing the enum
-        // dumps every store path and drowns the journal.
-        Ok(SideChannelDispatchOutcome::ClosurePushed {
+        Ok(SideChannelDispatchOutcome::NixDaemonTunneled {
             build_id,
-            paths,
-            import,
+            bytes_to_daemon,
+            bytes_from_daemon,
         }) => {
             tracing::info!(
                 channel = channel_id,
                 elapsed_ms,
-                kind = "closure_push",
+                kind = "nix_daemon_stdio",
                 build_id,
-                n_paths = paths.len(),
-                bytes = import.bytes_transferred,
-                "side channel finished",
-            );
-        }
-        Ok(SideChannelDispatchOutcome::ClosurePulled {
-            build_id,
-            paths,
-            export,
-        }) => {
-            tracing::info!(
-                channel = channel_id,
-                elapsed_ms,
-                kind = "closure_pull",
-                build_id,
-                n_paths = paths.len(),
-                bytes = export.bytes_transferred,
-                "side channel finished",
-            );
-        }
-        Ok(SideChannelDispatchOutcome::ValidPathsQueried {
-            build_id,
-            queried,
-            invalid,
-        }) => {
-            tracing::info!(
-                channel = channel_id,
-                elapsed_ms,
-                kind = "query_valid_paths",
-                build_id,
-                queried,
-                invalid,
-                "side channel finished",
-            );
-        }
-        Ok(SideChannelDispatchOutcome::RuntimeClosureListed {
-            build_id,
-            outputs,
-            closure,
-        }) => {
-            tracing::info!(
-                channel = channel_id,
-                elapsed_ms,
-                kind = "list_runtime_closure",
-                build_id,
-                outputs,
-                closure,
-                "side channel finished",
-            );
-        }
-        Ok(SideChannelDispatchOutcome::ClosurePulledExact {
-            build_id,
-            paths,
-            export,
-        }) => {
-            tracing::info!(
-                channel = channel_id,
-                elapsed_ms,
-                kind = "closure_pull_exact",
-                build_id,
-                n_paths = paths.len(),
-                bytes = export.bytes_transferred,
+                bytes_to_daemon,
+                bytes_from_daemon,
                 "side channel finished",
             );
         }

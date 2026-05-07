@@ -34,8 +34,11 @@ pub struct ControlContext {
     /// `builder_enrollment` isn't configured. Held as Arc so it can
     /// also be shared with the BuilderServer once PR #8b wires it up.
     pub builder_registry: Arc<BuilderRegistry>,
-    /// Path to local `nix-store` (used by the M14b test-dispatch path).
+    /// Path to local `nix-store` (gc-root registration post-pull).
     pub nix_store_bin: PathBuf,
+    /// Path to local `nix` binary (drives `nix copy --from/--to`
+    /// for closure transfer).
+    pub nix_bin: PathBuf,
     /// Wall-clock cap for a single test-dispatched build.
     pub build_timeout: std::time::Duration,
 }
@@ -171,8 +174,7 @@ async fn handle_test_dispatch_drv(
         log_limit: medusa_build::LogCaptureLimit::default(),
         build_timeout: ctx.build_timeout,
         nix_store_bin: &ctx.nix_store_bin,
-        // Single-shot test invocation; no contention to manage.
-        pull_sem: None,
+        nix_bin: &ctx.nix_bin,
     };
     match crate::worker::dispatch_pool_build(spec, None).await? {
         crate::worker::PoolDispatchResult::Outcome(o) => Ok(serde_json::json!({

@@ -1,143 +1,58 @@
-//! Side-channel framing (M14b).
+//! Side-channel framing (M14b → M16).
 //!
 //! A side channel is a fresh russh session channel opened per
 //! closure transfer (one in each direction per build). The channel
 //! starts with a single newline-terminated JSON header describing
 //! what the payload is, followed by raw bytes until channel-close.
-//! See `design/plan.md` M14b for the broader picture.
 //!
-//! Why a header instead of inferring from byte content: nix-serve's
-//! own protocol starts with magic bytes, and `nix-store --export`
-//! output starts with magic bytes too. A JSON header makes the
-//! channel kind explicit before any binary payload starts, so the
-//! agent's dispatcher can branch unambiguously on the first line
-//! without parsing nix's wire format.
+//! M16 collapsed the protocol to a single binary kind — the agent
+//! spawns `nix-daemon --stdio` and tunnels its stdin/stdout
+//! through the channel; the daemon side wires this into a local
+//! Unix socket so `nix copy --from/--to unix:///path` can drive it
+//! as a normal nix-daemon endpoint. This replaces the legacy
+//! `--export | --import` path that OOM'd on multi-GB single-NAR
+//! image outputs because `nix-store --import` buffered each NAR for
+//! hash verification before extracting.
 //!
-//! This module owns the **codec** (encoding, decoding, the IO
-//! helpers to read/write a header from/to an `AsyncRead` /
-//! `AsyncWrite`) and the agent-side **dispatcher**
-//! ([`dispatch_inbound`]), which composes the codec with
-//! [`crate::closure_xfer::import_closure`] /
-//! [`crate::closure_xfer::export_closure`] to handle a complete
-//! side-channel transfer. The russh wiring — adapting a
-//! `russh::Channel` into `AsyncRead`+`AsyncWrite` — lives in a
-//! separate adapter so this module stays unit-testable through
-//! `tokio::io::duplex`.
+//! The header still exists so a future protocol change can be
+//! introduced behind a new kind without breaking older agents on
+//! the wire.
 
-use crate::closure_xfer::{
-    ClosureXferError, ClosureXferOutcome, check_invalid_paths, export_closure, import_closure,
-    query_requisites, query_topo_closure,
-};
-use crate::protocol::BuildOutcomeStatus;
+use crate::closure_xfer::ClosureXferError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Header that prefaces every M14b side channel. Always exactly one
-/// `\n`-terminated JSON line, written before any binary payload. The
-/// `paths` field carries the store paths the payload represents,
-/// which the receiver uses for logging and post-import validation.
+/// Header that prefaces every side channel. Always exactly one
+/// `\n`-terminated JSON line, written before any binary payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SideChannelHeader {
     pub kind: SideChannelKind,
     /// Correlates with the `Build` control message that triggered
-    /// this transfer. Receivers log it for trace correlation.
+    /// this transfer. Receivers log it for trace correlation. May
+    /// be 0 for transfers not tied to a specific build (e.g. a
+    /// pre-build push initiated outside the eval pipeline).
     pub build_id: i64,
-    /// Store paths the payload represents.
-    ///
-    /// - `ClosurePush`: the drv plus its transitive input closure.
-    ///   The agent runs `nix-store --import` and the resulting paths
-    ///   should match this list (validation is best-effort).
-    /// - `ClosurePull`: the output paths of a finished build.
+    /// Reserved for future protocol kinds; the current
+    /// `NixDaemonStdio` kind ignores this. Kept on the wire so
+    /// future variants can carry a path list without a header
+    /// schema bump.
+    #[serde(default)]
     pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SideChannelKind {
-    /// Daemon → agent. Payload is a `nix-store --export` byte
-    /// stream of the drv closure; agent pipes it into
-    /// `nix-store --import`.
-    ClosurePush,
-    /// Agent → daemon. Payload is a `nix-store --export` byte
-    /// stream of the build output paths; daemon pipes it into
-    /// `nix-store --import`. The agent first expands the requested
-    /// paths to their full runtime closure (`query_requisites`)
-    /// before exporting — this is the legacy single-shot pull.
-    /// Use `ListRuntimeClosure` + `ClosurePullExact` instead when
-    /// the closure is large enough that a single
-    /// `nix-store --import` would exhaust daemon memory.
-    ClosurePull,
-    /// Daemon → agent (probe). No binary payload; the header's
-    /// `paths` field is the candidate set. Agent runs
-    /// `nix-store --check-validity --print-invalid` and replies
-    /// with a [`ValidPathsReply`] trailer naming the missing
-    /// subset. Daemon then pushes only that subset over a
-    /// subsequent `ClosurePush` channel.
-    QueryValidPaths,
-    /// Daemon → agent (probe, no payload). Agent expands
-    /// `header.paths` to their full runtime closure via
-    /// `nix-store --query --requisites` and replies with a
-    /// [`RuntimeClosureReply`] trailer. Daemon uses the result to
-    /// chunk the actual pull into bounded batches via
-    /// `ClosurePullExact`, keeping each `nix-store --import`
-    /// subprocess's memory footprint bounded regardless of total
-    /// closure size.
-    ListRuntimeClosure,
-    /// Agent → daemon. Payload is a `nix-store --export` stream of
-    /// **exactly** the paths in `header.paths` — no `--requisites`
-    /// expansion. Designed to be called in batches: the daemon
-    /// first lists the full runtime closure with
-    /// `ListRuntimeClosure`, then issues one `ClosurePullExact` per
-    /// chunk. Each chunk runs in its own `nix-store --import` so
-    /// per-import memory stays bounded.
-    ClosurePullExact,
-}
-
-/// Trailer the agent writes back on a `ClosurePush` channel after its
-/// `nix-store --import` finishes. Without this, a daemon-side IO
-/// error mid-write (e.g. `BrokenPipe` because the agent's import
-/// exited early) would have no diagnostic context — the operator
-/// would need to grep the agent's journal by timestamp to find the
-/// real cause. With this, the daemon reads the trailer after writing
-/// and folds the agent's stderr into the build log.
-///
-/// Single newline-terminated JSON line, written immediately after
-/// `nix-store --import` returns and before the agent's user closure
-/// drops the channel writer. Best-effort on both sides — if the
-/// channel is already torn down by the time the agent tries to write,
-/// the daemon will simply not read it; the daemon's read is bounded
-/// by a timeout so a non-cooperating agent can't hang the dispatch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClosurePushReply {
-    pub ok: bool,
-    pub bytes_received: u64,
-    #[serde(default)]
-    pub exit_code: Option<i32>,
-    /// Captured stderr from the agent's `nix-store --import`. UTF-8
-    /// lossy on the wire; binary noise is rare in nix output.
-    #[serde(default)]
-    pub stderr: String,
-}
-
-/// Trailer the agent writes back on a `QueryValidPaths` channel.
-/// `invalid` is the subset of the header's `paths` that the builder
-/// does NOT already have — i.e. exactly what the daemon needs to
-/// ship in the follow-up `ClosurePush`. An empty list means the
-/// builder already has the full closure and the push can be skipped.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ValidPathsReply {
-    pub invalid: Vec<String>,
-}
-
-/// Trailer the agent writes back on a `ListRuntimeClosure` channel.
-/// `paths` is the expanded runtime closure of the originally
-/// requested output paths (i.e. `nix-store --query --requisites`
-/// applied to `header.paths`). The daemon then chunks this list and
-/// pulls each chunk via `ClosurePullExact`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeClosureReply {
-    pub paths: Vec<String>,
+    /// Bidirectional. Agent spawns `nix-daemon --stdio` and tunnels
+    /// its stdin/stdout through this channel; the daemon side
+    /// connects this to a local Unix-domain socket so
+    /// `nix copy --from/--to unix:///path` can use it as a normal
+    /// nix-daemon endpoint. The daemon protocol streams per-file
+    /// with bounded memory, fixing the multi-GB per-NAR OOMs that
+    /// broke our previous `--export | --import` path on image-
+    /// style outputs.
+    NixDaemonStdio,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -154,23 +69,14 @@ pub enum SideChannelError {
     UnexpectedEof,
 }
 
-/// Cap on the side-channel header size. The JSON header carries the
-/// full `paths` list of the closure being transferred — for fat
-/// closures (thousands of input drvs, e.g. a moderately complex Rust
-/// build) that easily exceeds 100 KiB. The original 64 KiB cap was
-/// way too tight in production: a single Rust crate with ~1000
-/// transitive deps already serialises to ~80 KiB and trips it.
-///
-/// 16 MiB is *defense against a hostile / runaway peer* (preventing
-/// unbounded memory growth on a peer that opens a channel and never
-/// terminates the line). It is comfortably above any realistic drv
-/// closure: at ~85 bytes per path, that's ~190K paths — well past
-/// the size of the entire nixpkgs closure.
+/// Cap on the side-channel header size. The header is a tiny JSON
+/// line under the new (M16) protocol — no path list — so the cap is
+/// purely a defense against a hostile / runaway peer that opens a
+/// channel and never sends a newline.
 pub const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
 
 impl SideChannelHeader {
-    /// Encode as a single JSON line with trailing `\n`. Always
-    /// succeeds — no `f64` fields.
+    /// Encode as a single JSON line with trailing `\n`.
     pub fn encode_line(&self) -> Vec<u8> {
         let mut buf = serde_json::to_vec(self).expect("SideChannelHeader always serialises");
         buf.push(b'\n');
@@ -180,9 +86,7 @@ impl SideChannelHeader {
 
 /// Read the header line from `reader`, byte-by-byte until a `\n`
 /// arrives. Caps at [`MAX_HEADER_BYTES`] to defend against a peer
-/// that opens a channel and never sends a newline. After this
-/// returns, `reader` is positioned at the first byte of the binary
-/// payload.
+/// that opens a channel and never sends a newline.
 pub async fn read_header<R>(reader: &mut R) -> Result<SideChannelHeader, SideChannelError>
 where
     R: AsyncRead + Unpin,
@@ -225,51 +129,17 @@ where
     Ok(())
 }
 
-/// Outcome of a side-channel dispatch — either a closure was
-/// imported (push direction) or exported (pull direction). Both
-/// arms carry the underlying [`ClosureXferOutcome`] so callers can
-/// log byte counts and forward stderr to the daemon.
+/// Outcome of a side-channel dispatch.
 #[derive(Debug)]
 pub enum DispatchOutcome {
-    /// Daemon → agent direction completed. The agent imported the
-    /// drv closure into its local nix store.
-    ClosurePushed {
+    /// The agent forwarded daemon-protocol bytes between the
+    /// channel and the system `nix-daemon` socket and the channel
+    /// was driven to completion (one or both directions closed).
+    /// Counts are useful for throughput diagnostics.
+    NixDaemonTunneled {
         build_id: i64,
-        paths: Vec<String>,
-        import: ClosureXferOutcome,
-    },
-    /// Agent → daemon direction completed. The agent exported the
-    /// requested paths onto the channel; the daemon will read them
-    /// on the other end.
-    ClosurePulled {
-        build_id: i64,
-        paths: Vec<String>,
-        export: ClosureXferOutcome,
-    },
-    /// Agent answered a `QueryValidPaths` probe. `queried` is the
-    /// number of candidate paths the daemon asked about; `invalid`
-    /// is the count it had to report missing. Carrying counts (not
-    /// the full lists) keeps this enum cheap to Debug-format.
-    ValidPathsQueried {
-        build_id: i64,
-        queried: usize,
-        invalid: usize,
-    },
-    /// Agent answered a `ListRuntimeClosure` probe — expanded the
-    /// header's output paths to the full runtime closure and
-    /// returned the list. Carries counts only.
-    RuntimeClosureListed {
-        build_id: i64,
-        outputs: usize,
-        closure: usize,
-    },
-    /// Agent → daemon direction completed via `ClosurePullExact`
-    /// (one chunk of a chunked pull). No requisites expansion;
-    /// shipped exactly the paths the daemon listed.
-    ClosurePulledExact {
-        build_id: i64,
-        paths: Vec<String>,
-        export: ClosureXferOutcome,
+        bytes_to_daemon: u64,
+        bytes_from_daemon: u64,
     },
 }
 
@@ -277,22 +147,38 @@ pub enum DispatchOutcome {
 pub enum DispatchError {
     #[error("reading side-channel header: {0}")]
     Header(#[from] SideChannelError),
-    #[error("running nix-store subprocess for transfer: {0}")]
+    #[error("forwarding daemon-protocol bytes: {0}")]
     Xfer(#[from] ClosureXferError),
+    #[error("connecting to nix-daemon socket at `{path}`: {source}")]
+    DaemonSocket {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
-/// Agent-side responder: read a side-channel header from `reader`,
-/// branch on `kind`, and either pipe `reader`'s remaining bytes
-/// into `nix-store --import` (`ClosurePush`) or run
-/// `nix-store --export <paths>` and stream its stdout onto `writer`
-/// (`ClosurePull`). The header is parsed first, so a malformed
-/// header surfaces as a typed error before any subprocess spawns.
+/// Agent-side responder: read the side-channel header, branch on
+/// `kind`. Currently only `NixDaemonStdio`: open a connection to
+/// the system `nix-daemon` socket and bidirectionally pipe bytes
+/// between the channel and the socket.
 ///
-/// `nix_store_bin` is taken explicitly so unit tests can inject a
-/// fake binary without mutating `PATH` (same convention as
-/// `closure_xfer`).
+/// **Why connect to the socket instead of spawning
+/// `nix-daemon --stdio`:** `nix-daemon --stdio` invoked by an
+/// unprivileged user runs an in-process daemon that doesn't have
+/// access to the system store DB at `/nix/var/nix/db/db.sqlite`,
+/// so every `queryValidPaths` returns false and `nix copy --from`
+/// fails with `path '...' does not exist` even though the path is
+/// right there. The system daemon socket is world-connectable, the
+/// kernel authenticates via `SO_PEERCRED`, and the agent's user is
+/// in `trusted-users` (per the NixOS module) — so connecting
+/// directly gives full daemon-protocol access without the
+/// permission landmine.
+///
+/// `nix_daemon_socket` is taken explicitly so unit tests can point
+/// at a custom Unix socket (e.g. an echo server bound to a temp
+/// path) rather than the system socket.
 pub async fn dispatch_inbound<R, W>(
-    nix_store_bin: &Path,
+    nix_daemon_socket: &Path,
     reader: &mut R,
     writer: &mut W,
 ) -> Result<DispatchOutcome, DispatchError>
@@ -302,113 +188,31 @@ where
 {
     let header = read_header(reader).await?;
     match header.kind {
-        SideChannelKind::ClosurePush => {
-            let import = import_closure(nix_store_bin, reader).await?;
-            // Reply with a JSON line so the daemon side has diagnostic
-            // context for any IO error during its own write phase
-            // (BrokenPipe etc. — without this, the daemon log just says
-            // "broken pipe" and the operator has to grep agent logs by
-            // timestamp). Best-effort: if the channel is already torn
-            // down, the write silently no-ops.
-            let reply = ClosurePushReply {
-                ok: import.status == BuildOutcomeStatus::Success,
-                bytes_received: import.bytes_transferred,
-                exit_code: import.exit_code,
-                stderr: String::from_utf8_lossy(&import.stderr).into_owned(),
+        SideChannelKind::NixDaemonStdio => {
+            let socket = tokio::net::UnixStream::connect(nix_daemon_socket)
+                .await
+                .map_err(|source| DispatchError::DaemonSocket {
+                    path: nix_daemon_socket.to_path_buf(),
+                    source,
+                })?;
+            let (sock_reader, sock_writer) = socket.into_split();
+
+            let to_daemon = async move {
+                let mut sock_writer = sock_writer;
+                let r = tokio::io::copy(reader, &mut sock_writer).await;
+                let _ = sock_writer.shutdown().await;
+                r
             };
-            if let Ok(mut line) = serde_json::to_vec(&reply) {
-                line.push(b'\n');
-                let _ = writer.write_all(&line).await;
-                let _ = writer.flush().await;
-            }
-            Ok(DispatchOutcome::ClosurePushed {
-                build_id: header.build_id,
-                paths: header.paths,
-                import,
-            })
-        }
-        SideChannelKind::ClosurePull => {
-            // Expand the requested output paths to their full
-            // runtime closure before exporting. `nix-store --export
-            // <paths>` ships only the listed paths — it does NOT
-            // include their references. Without this expansion, any
-            // build that picks up a runtime dependency via
-            // substitution during the build (e.g. an OVMF / glibc /
-            // busybox path the build pulled from cache.nixos.org)
-            // would arrive on the daemon side as an unimportable
-            // orphan: `nix-store --import` rejects it with
-            // `error: path '/nix/store/...' is not valid` because
-            // the runtime dep isn't in the daemon's local store.
-            let closure = query_requisites(nix_store_bin, &header.paths).await?;
-            let export = export_closure(nix_store_bin, &closure, writer).await?;
-            Ok(DispatchOutcome::ClosurePulled {
-                build_id: header.build_id,
-                // Surface the original output paths in the outcome,
-                // not the expanded closure — the daemon-side log
-                // wants "we built these outputs", not "and here are
-                // 200 transitive deps we shipped".
-                paths: header.paths,
-                export,
-            })
-        }
-        SideChannelKind::QueryValidPaths => {
-            // No binary payload — the header carries the candidate
-            // set in `paths`, and the agent's whole job is to answer
-            // which of those it does NOT already have.
-            let queried = header.paths.len();
-            let invalid_paths = check_invalid_paths(nix_store_bin, &header.paths).await?;
-            let invalid = invalid_paths.len();
-            let reply = ValidPathsReply {
-                invalid: invalid_paths,
+            let from_daemon = async move {
+                let mut sock_reader = sock_reader;
+                tokio::io::copy(&mut sock_reader, writer).await
             };
-            // Best-effort write of the trailer; if the channel is
-            // already torn down the daemon will surface a typed
-            // error at its end and fall back to a full push.
-            if let Ok(mut line) = serde_json::to_vec(&reply) {
-                line.push(b'\n');
-                let _ = writer.write_all(&line).await;
-                let _ = writer.flush().await;
-            }
-            Ok(DispatchOutcome::ValidPathsQueried {
+            let (to_result, from_result) = tokio::join!(to_daemon, from_daemon);
+
+            Ok(DispatchOutcome::NixDaemonTunneled {
                 build_id: header.build_id,
-                queried,
-                invalid,
-            })
-        }
-        SideChannelKind::ListRuntimeClosure => {
-            // No binary payload. Agent expands the requested output
-            // paths to their full runtime closure and replies with
-            // the list — in **topological order, leaves first** —
-            // so the daemon can chunk safely. Lex-ordered chunking
-            // (what `query_requisites` alone gives) breaks the very
-            // first chunk's `nix-store --import` with BrokenPipe
-            // when a path's references land in a later chunk.
-            let outputs = header.paths.len();
-            let closure = query_topo_closure(nix_store_bin, &header.paths).await?;
-            let closure_len = closure.len();
-            let reply = RuntimeClosureReply { paths: closure };
-            if let Ok(mut line) = serde_json::to_vec(&reply) {
-                line.push(b'\n');
-                let _ = writer.write_all(&line).await;
-                let _ = writer.flush().await;
-            }
-            Ok(DispatchOutcome::RuntimeClosureListed {
-                build_id: header.build_id,
-                outputs,
-                closure: closure_len,
-            })
-        }
-        SideChannelKind::ClosurePullExact => {
-            // No requisites expansion: ship exactly what the daemon
-            // asked for. The daemon is responsible for having
-            // listed the full runtime closure first (via
-            // `ListRuntimeClosure`) and is feeding us one bounded
-            // chunk per call.
-            let export = export_closure(nix_store_bin, &header.paths, writer).await?;
-            Ok(DispatchOutcome::ClosurePulledExact {
-                build_id: header.build_id,
-                paths: header.paths,
-                export,
+                bytes_to_daemon: to_result.unwrap_or(0),
+                bytes_from_daemon: from_result.unwrap_or(0),
             })
         }
     }
@@ -417,14 +221,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
     use tokio::io::BufReader;
 
     #[test]
     fn header_round_trip_via_json() {
         let h = SideChannelHeader {
-            kind: SideChannelKind::ClosurePush,
+            kind: SideChannelKind::NixDaemonStdio,
             build_id: 42,
-            paths: vec!["/nix/store/aaa-foo.drv".into(), "/nix/store/bbb-dep".into()],
+            paths: vec![],
         };
         let line = h.encode_line();
         assert!(line.ends_with(b"\n"), "header line must terminate with \\n");
@@ -435,17 +242,14 @@ mod tests {
 
     #[test]
     fn header_kind_is_snake_case_on_wire() {
-        // Forward-compat: pin the on-wire spelling so a future agent
-        // and daemon can interop across versions.
         let h = SideChannelHeader {
-            kind: SideChannelKind::ClosurePush,
+            kind: SideChannelKind::NixDaemonStdio,
             build_id: 1,
             paths: vec![],
         };
-        let line = h.encode_line();
-        let s = std::str::from_utf8(&line).unwrap();
+        let s = String::from_utf8(h.encode_line()).unwrap();
         assert!(
-            s.contains("\"kind\":\"closure_push\""),
+            s.contains("\"kind\":\"nix_daemon_stdio\""),
             "unexpected kind on wire: {s}",
         );
     }
@@ -453,9 +257,9 @@ mod tests {
     #[tokio::test]
     async fn read_header_parses_line_then_leaves_payload_intact() {
         let h = SideChannelHeader {
-            kind: SideChannelKind::ClosurePull,
+            kind: SideChannelKind::NixDaemonStdio,
             build_id: 7,
-            paths: vec!["/nix/store/zzz-out".into()],
+            paths: vec![],
         };
         let mut wire: Vec<u8> = h.encode_line();
         wire.extend_from_slice(b"BINARY-PAYLOAD-FOLLOWS");
@@ -464,39 +268,13 @@ mod tests {
         let parsed = read_header(&mut reader).await.expect("header parses");
         assert_eq!(parsed, h);
 
-        // Reader must be positioned at the first byte AFTER the
-        // header newline — i.e. the start of the binary payload.
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).await.unwrap();
         assert_eq!(rest, b"BINARY-PAYLOAD-FOLLOWS");
     }
 
     #[tokio::test]
-    async fn read_header_handles_chunk_boundary_inside_header() {
-        // Simulate a transport that delivers bytes in arbitrary
-        // chunks — the byte-by-byte read loop must work regardless.
-        let h = SideChannelHeader {
-            kind: SideChannelKind::ClosurePush,
-            build_id: 99,
-            paths: vec!["/nix/store/aaa".into()],
-        };
-        let mut wire: Vec<u8> = h.encode_line();
-        wire.extend_from_slice(b"PAYLOAD");
-
-        // tokio::io::BufReader with a tiny capacity simulates the
-        // worst-case tiny-chunks behaviour.
-        let mut reader = BufReader::with_capacity(1, &wire[..]);
-        let parsed = read_header(&mut reader).await.expect("header parses");
-        assert_eq!(parsed, h);
-        let mut rest = Vec::new();
-        reader.read_to_end(&mut rest).await.unwrap();
-        assert_eq!(rest, b"PAYLOAD");
-    }
-
-    #[tokio::test]
     async fn read_header_caps_at_max_bytes() {
-        // A peer that opens a side channel and sends ridiculous
-        // amounts of data with no newline must not OOM the agent.
         let mut wire = vec![b'x'; MAX_HEADER_BYTES + 1];
         wire.push(b'\n');
         let mut reader = BufReader::new(&wire[..]);
@@ -509,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_header_unexpected_eof_before_newline() {
-        let wire = b"{\"kind\":\"closure_push\",\"build_id\":1,\"paths\":[]"; // no newline
+        let wire = b"{\"kind\":\"nix_daemon_stdio\",\"build_id\":1"; // no newline
         let mut reader = BufReader::new(&wire[..]);
         let err = read_header(&mut reader).await.unwrap_err();
         assert!(
@@ -518,730 +296,70 @@ mod tests {
         );
     }
 
+    /// End-to-end: dispatch_inbound connects to the configured
+    /// Unix socket and bidirectionally pipes bytes. Stand up an
+    /// echo server bound to a temp socket — every byte written
+    /// must come back through the channel.
     #[tokio::test]
-    async fn write_then_read_round_trips_through_pipe() {
-        let h = SideChannelHeader {
-            kind: SideChannelKind::ClosurePush,
-            build_id: 13,
-            paths: vec!["/nix/store/foo".into()],
-        };
-        let (rx, mut tx) = tokio::io::duplex(64 * 1024);
-        write_header(&mut tx, &h).await.unwrap();
-        // After write, drop the writer so the reader sees EOF on
-        // remaining bytes — but only after we've read the header.
-        let mut reader = BufReader::new(rx);
-        let parsed = read_header(&mut reader).await.unwrap();
-        assert_eq!(parsed, h);
-    }
-
-    // ---------- dispatch_inbound tests ----------
-    //
-    // These drive the full agent-side responder through
-    // `tokio::io::duplex`: the test spawns the dispatcher on one
-    // end and a fake "daemon" on the other that writes a header
-    // and binary payload (push) or reads them (pull). Same shape
-    // the russh wiring will take, just without russh.
-    //
-    // The fake nix-store binary follows the same convention as
-    // `closure_xfer::tests`: a tiny shell script handling
-    // `--import` (cat stdin → sink) and `--export <paths>` (record
-    // argv + emit canned bytes from a fixture file).
-
-    use crate::protocol::BuildOutcomeStatus;
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
-    use tempfile::tempdir;
-
-    fn fake_nix_store(path: &Path, sink: &Path, argv: &Path, payload: &Path) {
-        // Atomic-rename install. Under parallel cargo-test fork
-        // pressure, sibling threads' forks can briefly inherit a
-        // writable fd to this script before the parent thread closes
-        // it; the next exec attempt then sees ETXTBSY. Writing to
-        // `.tmp` + chmod + rename means the final path never had a
-        // writable fd opened on it.
-        //
-        // Modes the fake handles:
-        //  - `--import`            : cat stdin into `sink`, exit 0
-        //  - `--export <paths>`    : record argv into `argv`, emit `payload`
-        //  - `--query --requisites <paths>` : emit each requested path
-        //    plus a synthetic `<path>-runtime-dep` line per path, so
-        //    callers that pre-expand the closure (the agent's
-        //    ClosurePull arm) can be observed adding the synthetic
-        //    deps to the subsequent `--export` argv.
-        //  - `--query --graph <paths>` : emit a graphviz DAG where
-        //    each requested path references its synthetic
-        //    `<path>-runtime-dep`. Used by the agent's
-        //    `ListRuntimeClosure` arm via `query_topo_closure`.
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp).unwrap();
-            writeln!(
-                f,
-                r#"#!/bin/sh
-if [ "$1" = "--query" ] && [ "$2" = "--requisites" ]; then
-  shift 2
-  for a in "$@"; do
-    printf '%s\n' "$a"
-    printf '%s-runtime-dep\n' "$a"
-  done
-  exit 0
-fi
-if [ "$1" = "--query" ] && [ "$2" = "--graph" ]; then
-  shift 2
-  # Real `nix-store --query --graph` quotes BASENAMES, not full
-  # paths. Strip "/nix/store/" so the fake matches reality and
-  # `query_topo_closure`'s store-dir prepending is exercised.
-  printf 'digraph G {{\n'
-  for a in "$@"; do
-    bn=${{a##*/}}
-    printf '"%s" [label = ""]\n' "$bn"
-    printf '"%s-runtime-dep" [label = ""]\n' "$bn"
-    printf '"%s" -> "%s-runtime-dep"\n' "$bn" "$bn"
-  done
-  printf '}}\n'
-  exit 0
-fi
-case "$1" in
-  --import)
-    cat > "{sink}"
-    exit 0
-    ;;
-  --export)
-    : > "{argv}"
-    for a in "$@"; do printf '%s\n' "$a" >> "{argv}"; done
-    cat "{payload}"
-    exit 0
-    ;;
-esac
-exit 99
-"#,
-                sink = sink.display(),
-                argv = argv.display(),
-                payload = payload.display(),
-            )
-            .unwrap();
-            f.sync_all().unwrap();
-        }
-        let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&tmp, perm).unwrap();
-        std::fs::rename(&tmp, path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn dispatch_inbound_handles_closure_push_end_to_end() {
+    async fn dispatch_inbound_tunnels_bytes_through_socket() {
         let dir = tempdir().unwrap();
-        let bin = dir.path().join("nix-store");
-        let sink = dir.path().join("imp-sink.bin");
-        let argv = dir.path().join("imp-argv.txt");
-        let payload = dir.path().join("imp-payload.bin");
-        std::fs::write(&payload, b"unused").unwrap();
-        fake_nix_store(&bin, &sink, &argv, &payload);
-
-        // Daemon-side fixture: a header + binary payload that the
-        // agent's dispatcher must consume, parse, and feed into
-        // `nix-store --import`.
-        let header = SideChannelHeader {
-            kind: SideChannelKind::ClosurePush,
-            build_id: 17,
-            paths: vec!["/nix/store/aaa.drv".into(), "/nix/store/bbb-dep".into()],
-        };
-        let nar_payload: Vec<u8> = (0u8..=255).chain(std::iter::once(b'X')).collect();
-
-        let (mut daemon_tx_to_agent, mut agent_rx) = {
-            let (rx, tx) = tokio::io::duplex(8 * 1024);
-            (tx, rx)
-        };
-        // Agent → daemon direction: must be sized for the agent's
-        // reply trailer JSON line. 4 KiB is more than enough.
-        let (mut agent_writer, mut daemon_reader) = tokio::io::duplex(4 * 1024);
-
-        // Daemon-side: write header + payload, then drop the
-        // writer so the agent sees EOF and `import` finishes.
-        let nar_clone = nar_payload.clone();
-        let daemon_task = tokio::spawn(async move {
-            write_header(&mut daemon_tx_to_agent, &header)
-                .await
-                .unwrap();
-            daemon_tx_to_agent.write_all(&nar_clone).await.unwrap();
-            daemon_tx_to_agent.shutdown().await.unwrap();
-            // Read the agent's trailer so we can assert on it.
-            let mut buf = Vec::new();
-            daemon_reader.read_to_end(&mut buf).await.unwrap();
-            buf
+        let socket_path = dir.path().join("fake-daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        // Echo server: accept one connection, copy stdin → stdout.
+        let echo_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = stream.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
         });
 
-        let outcome = dispatch_inbound(&bin, &mut agent_rx, &mut agent_writer)
-            .await
-            .expect("dispatch should succeed for closure_push");
-        // Drop the agent writer so daemon's read_to_end completes.
-        drop(agent_writer);
-        let trailer_bytes = daemon_task.await.unwrap();
-
-        match outcome {
-            DispatchOutcome::ClosurePushed {
-                build_id,
-                paths,
-                import,
-            } => {
-                assert_eq!(build_id, 17);
-                assert_eq!(paths, vec!["/nix/store/aaa.drv", "/nix/store/bbb-dep"]);
-                assert_eq!(import.status, BuildOutcomeStatus::Success);
-                assert_eq!(import.bytes_transferred, nar_payload.len() as u64);
-            }
-            other => panic!("expected ClosurePushed, got {other:?}"),
-        }
-        assert_eq!(
-            std::fs::read(&sink).unwrap(),
-            nar_payload,
-            "every byte of the payload must reach `nix-store --import` stdin",
-        );
-        // The agent must send a single newline-terminated JSON
-        // ClosurePushReply with ok=true.
-        let trailer = std::str::from_utf8(&trailer_bytes).unwrap();
-        let line = trailer
-            .lines()
-            .next()
-            .expect("agent must emit a reply trailer");
-        let reply: ClosurePushReply = serde_json::from_str(line).unwrap();
-        assert!(reply.ok, "successful import must surface as ok=true");
-        assert_eq!(reply.bytes_received, nar_payload.len() as u64);
-        assert_eq!(reply.exit_code, Some(0));
-    }
-
-    /// Failure path: agent's `nix-store --import` exits non-zero.
-    /// The reply trailer must carry `ok=false` and the captured
-    /// stderr so the daemon side can surface it instead of just
-    /// "broken pipe".
-    #[tokio::test]
-    async fn dispatch_inbound_closure_push_failure_emits_stderr_in_reply() {
-        let dir = tempdir().unwrap();
-        let bin = dir.path().join("nix-store");
-        // Fake nix-store that fails on --import with a recognisable
-        // stderr line — mirrors the kind of message a real
-        // nix-store would emit on a hash mismatch.
-        let body = "#!/bin/sh\n\
-            if [ \"$1\" = \"--import\" ]; then\n  \
-              cat >/dev/null\n  \
-              echo \"error: hash mismatch importing path \
-'/nix/store/x'\" >&2\n  \
-              exit 1\n\
-            fi\n\
-            exit 99\n";
-        let tmp = bin.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp).unwrap();
-            f.write_all(body.as_bytes()).unwrap();
-            f.sync_all().unwrap();
-        }
-        let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&tmp, perm).unwrap();
-        std::fs::rename(&tmp, &bin).unwrap();
-
         let header = SideChannelHeader {
-            kind: SideChannelKind::ClosurePush,
-            build_id: 99,
-            paths: vec!["/nix/store/x".into()],
-        };
-        let payload: Vec<u8> = vec![1, 2, 3, 4];
-        let (mut daemon_tx_to_agent, mut agent_rx) = {
-            let (rx, tx) = tokio::io::duplex(4096);
-            (tx, rx)
-        };
-        let (mut agent_writer, mut daemon_reader) = tokio::io::duplex(4096);
-
-        let payload_clone = payload.clone();
-        let daemon_task = tokio::spawn(async move {
-            write_header(&mut daemon_tx_to_agent, &header)
-                .await
-                .unwrap();
-            daemon_tx_to_agent.write_all(&payload_clone).await.unwrap();
-            daemon_tx_to_agent.shutdown().await.unwrap();
-            let mut buf = Vec::new();
-            daemon_reader.read_to_end(&mut buf).await.unwrap();
-            buf
-        });
-
-        let outcome = dispatch_inbound(&bin, &mut agent_rx, &mut agent_writer)
-            .await
-            .expect("dispatch_inbound itself returns Ok even on import failure");
-        drop(agent_writer);
-        let trailer = daemon_task.await.unwrap();
-
-        match outcome {
-            DispatchOutcome::ClosurePushed { import, .. } => {
-                assert_eq!(import.status, BuildOutcomeStatus::Failure);
-                assert_eq!(import.exit_code, Some(1));
-            }
-            other => panic!("expected ClosurePushed, got {other:?}"),
-        }
-
-        let line = std::str::from_utf8(&trailer)
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap();
-        let reply: ClosurePushReply = serde_json::from_str(line).unwrap();
-        assert!(!reply.ok, "import failure must surface as ok=false");
-        assert_eq!(reply.exit_code, Some(1));
-        assert!(
-            reply.stderr.contains("hash mismatch"),
-            "agent's stderr must round-trip in the reply: {:?}",
-            reply.stderr,
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_inbound_handles_closure_pull_end_to_end() {
-        let dir = tempdir().unwrap();
-        let bin = dir.path().join("nix-store");
-        let sink = dir.path().join("imp-sink.bin");
-        let argv = dir.path().join("exp-argv.txt");
-        let payload = dir.path().join("exp-payload.bin");
-        let canned: Vec<u8> = (0u8..200).cycle().take(50_000).collect();
-        std::fs::write(&payload, &canned).unwrap();
-        fake_nix_store(&bin, &sink, &argv, &payload);
-
-        // Daemon-side fixture: write a Pull header asking for two
-        // output paths, then read back what the agent sends.
-        let header = SideChannelHeader {
-            kind: SideChannelKind::ClosurePull,
-            build_id: 23,
-            paths: vec!["/nix/store/zzz-out".into(), "/nix/store/yyy-out-dev".into()],
-        };
-
-        let (rx_daemon_to_agent, mut tx_daemon_to_agent) = tokio::io::duplex(64 * 1024);
-        let (mut rx_agent_to_daemon, tx_agent_to_daemon) = tokio::io::duplex(64 * 1024);
-        let mut agent_reader = BufReader::new(rx_daemon_to_agent);
-        let mut agent_writer = tx_agent_to_daemon;
-
-        let header_clone = header.clone();
-        let daemon_task = tokio::spawn(async move {
-            write_header(&mut tx_daemon_to_agent, &header_clone)
-                .await
-                .unwrap();
-            tx_daemon_to_agent.shutdown().await.unwrap();
-
-            // Read everything the agent emits.
-            let mut buf = Vec::new();
-            rx_agent_to_daemon.read_to_end(&mut buf).await.unwrap();
-            buf
-        });
-
-        let outcome = dispatch_inbound(&bin, &mut agent_reader, &mut agent_writer)
-            .await
-            .expect("dispatch should succeed for closure_pull");
-        // Drop the agent writer so the daemon's read_to_end can finish.
-        drop(agent_writer);
-        let received = daemon_task.await.unwrap();
-
-        match outcome {
-            DispatchOutcome::ClosurePulled {
-                build_id,
-                paths,
-                export,
-            } => {
-                assert_eq!(build_id, 23);
-                assert_eq!(paths, header.paths);
-                assert_eq!(export.status, BuildOutcomeStatus::Success);
-                assert_eq!(export.bytes_transferred, canned.len() as u64);
-            }
-            other => panic!("expected ClosurePulled, got {other:?}"),
-        }
-        assert_eq!(
-            received, canned,
-            "agent's `nix-store --export` stdout must reach the daemon-side reader byte-for-byte",
-        );
-
-        // Argv shape: the dispatcher must hand `--export` the FULL
-        // closure of the requested output paths, not just the paths
-        // themselves. Our fake `nix-store --query --requisites`
-        // synthesises a `<path>-runtime-dep` entry per path, so the
-        // expanded argv interleaves each header path with its
-        // pseudo-dep — proving the dispatcher pre-expanded before
-        // exporting.
-        let argv_lines = std::fs::read_to_string(&argv).unwrap();
-        let lines: Vec<&str> = argv_lines.lines().collect();
-        assert_eq!(
-            lines,
-            vec![
-                "--export",
-                "/nix/store/zzz-out",
-                "/nix/store/zzz-out-runtime-dep",
-                "/nix/store/yyy-out-dev",
-                "/nix/store/yyy-out-dev-runtime-dep",
-            ],
-            "ClosurePull must expand to the full runtime closure \
-             before exporting; otherwise the daemon's `nix-store \
-             --import` rejects outputs whose runtime deps came from \
-             a binary cache during the build (see the \
-             `OVMF-202602-fd is not valid` regression).",
-        );
-    }
-
-    /// Install a fake `nix-store` that handles
-    /// `--check-validity --print-invalid <paths>` by treating each
-    /// line of `valid_file` as a path the builder *already has* —
-    /// any input arg not in that file is "invalid" and printed.
-    /// Empty `valid_file` (or absent) means everything is invalid.
-    fn fake_nix_store_validity(path: &Path, valid_file: &Path) {
-        let body = format!(
-            r#"#!/bin/sh
-if [ "$1" = "--check-validity" ] && [ "$2" = "--print-invalid" ]; then
-  shift 2
-  for a in "$@"; do
-    if [ -f "{valid}" ] && grep -Fxq -- "$a" "{valid}"; then
-      :
-    else
-      printf '%s\n' "$a"
-    fi
-  done
-  exit 0
-fi
-exit 99
-"#,
-            valid = valid_file.display(),
-        );
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp).unwrap();
-            f.write_all(body.as_bytes()).unwrap();
-            f.sync_all().unwrap();
-        }
-        let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&tmp, perm).unwrap();
-        std::fs::rename(&tmp, path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn query_valid_paths_round_trips_through_dispatch_inbound() {
-        // Builder claims to already have `aaa` and `ccc`. Daemon
-        // probes the full closure {aaa, bbb, ccc, ddd}; agent must
-        // reply with {bbb, ddd}.
-        let dir = tempdir().unwrap();
-        let bin = dir.path().join("nix-store");
-        let valid = dir.path().join("valid.txt");
-        std::fs::write(&valid, "/nix/store/aaa\n/nix/store/ccc\n").unwrap();
-        fake_nix_store_validity(&bin, &valid);
-
-        let header = SideChannelHeader {
-            kind: SideChannelKind::QueryValidPaths,
-            build_id: 5,
-            paths: vec![
-                "/nix/store/aaa".into(),
-                "/nix/store/bbb".into(),
-                "/nix/store/ccc".into(),
-                "/nix/store/ddd".into(),
-            ],
-        };
-
-        let (rx_d_to_a, mut tx_d_to_a) = tokio::io::duplex(8 * 1024);
-        let (mut rx_a_to_d, tx_a_to_d) = tokio::io::duplex(8 * 1024);
-        let mut agent_reader = BufReader::new(rx_d_to_a);
-        let mut agent_writer = tx_a_to_d;
-
-        let header_clone = header.clone();
-        let daemon_task = tokio::spawn(async move {
-            write_header(&mut tx_d_to_a, &header_clone).await.unwrap();
-            tx_d_to_a.shutdown().await.unwrap();
-            let mut buf = Vec::new();
-            rx_a_to_d.read_to_end(&mut buf).await.unwrap();
-            buf
-        });
-
-        let outcome = dispatch_inbound(&bin, &mut agent_reader, &mut agent_writer)
-            .await
-            .expect("dispatch should succeed for query_valid_paths");
-        drop(agent_writer);
-        let trailer = daemon_task.await.unwrap();
-
-        match outcome {
-            DispatchOutcome::ValidPathsQueried {
-                build_id,
-                queried,
-                invalid,
-            } => {
-                assert_eq!(build_id, 5);
-                assert_eq!(queried, 4);
-                assert_eq!(invalid, 2);
-            }
-            other => panic!("expected ValidPathsQueried, got {other:?}"),
-        }
-
-        let line = std::str::from_utf8(&trailer)
-            .unwrap()
-            .lines()
-            .next()
-            .expect("agent must emit a reply trailer");
-        let reply: ValidPathsReply = serde_json::from_str(line).unwrap();
-        assert_eq!(reply.invalid, vec!["/nix/store/bbb", "/nix/store/ddd"]);
-    }
-
-    #[tokio::test]
-    async fn query_valid_paths_replies_empty_when_builder_has_everything() {
-        // Builder already has the full closure → reply.invalid must
-        // be the empty list. Caller (daemon) treats this as "skip
-        // the push entirely", which the integration logic enforces.
-        let dir = tempdir().unwrap();
-        let bin = dir.path().join("nix-store");
-        let valid = dir.path().join("valid.txt");
-        std::fs::write(&valid, "/nix/store/aaa\n/nix/store/bbb\n").unwrap();
-        fake_nix_store_validity(&bin, &valid);
-
-        let header = SideChannelHeader {
-            kind: SideChannelKind::QueryValidPaths,
-            build_id: 6,
-            paths: vec!["/nix/store/aaa".into(), "/nix/store/bbb".into()],
-        };
-
-        let (rx_d_to_a, mut tx_d_to_a) = tokio::io::duplex(4 * 1024);
-        let (mut rx_a_to_d, tx_a_to_d) = tokio::io::duplex(4 * 1024);
-        let mut agent_reader = BufReader::new(rx_d_to_a);
-        let mut agent_writer = tx_a_to_d;
-
-        let daemon_task = tokio::spawn(async move {
-            write_header(&mut tx_d_to_a, &header).await.unwrap();
-            tx_d_to_a.shutdown().await.unwrap();
-            let mut buf = Vec::new();
-            rx_a_to_d.read_to_end(&mut buf).await.unwrap();
-            buf
-        });
-
-        let outcome = dispatch_inbound(&bin, &mut agent_reader, &mut agent_writer)
-            .await
-            .expect("dispatch should succeed");
-        drop(agent_writer);
-        let trailer = daemon_task.await.unwrap();
-
-        match outcome {
-            DispatchOutcome::ValidPathsQueried { invalid, .. } => assert_eq!(invalid, 0),
-            other => panic!("expected ValidPathsQueried, got {other:?}"),
-        }
-        let line = std::str::from_utf8(&trailer)
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap();
-        let reply: ValidPathsReply = serde_json::from_str(line).unwrap();
-        assert!(reply.invalid.is_empty());
-    }
-
-    #[tokio::test]
-    async fn list_runtime_closure_round_trips_through_dispatch_inbound() {
-        // Agent must expand requested output paths and reply with
-        // the runtime closure in **topological order, leaves
-        // first**. The fake's `--query --graph` synthesises an edge
-        // `<path>` → `<path>-runtime-dep` per input, so for outputs
-        // [aaa, bbb], a valid topo order is [aaa-runtime-dep,
-        // bbb-runtime-dep, aaa, bbb] — but any permutation that
-        // places each *-runtime-dep before its parent satisfies the
-        // chunked-pull invariant.
-        let dir = tempdir().unwrap();
-        let bin = dir.path().join("nix-store");
-        let sink = dir.path().join("imp-sink.bin");
-        let argv = dir.path().join("exp-argv.txt");
-        let payload = dir.path().join("exp-payload.bin");
-        std::fs::write(&payload, b"unused").unwrap();
-        fake_nix_store(&bin, &sink, &argv, &payload);
-
-        let header = SideChannelHeader {
-            kind: SideChannelKind::ListRuntimeClosure,
+            kind: SideChannelKind::NixDaemonStdio,
             build_id: 11,
-            paths: vec!["/nix/store/aaa".into(), "/nix/store/bbb".into()],
+            paths: vec![],
         };
-
-        let (rx_d_to_a, mut tx_d_to_a) = tokio::io::duplex(8 * 1024);
-        let (mut rx_a_to_d, tx_a_to_d) = tokio::io::duplex(8 * 1024);
-        let mut agent_reader = BufReader::new(rx_d_to_a);
-        let mut agent_writer = tx_a_to_d;
-
-        let daemon_task = tokio::spawn(async move {
-            write_header(&mut tx_d_to_a, &header).await.unwrap();
-            tx_d_to_a.shutdown().await.unwrap();
-            let mut buf = Vec::new();
-            rx_a_to_d.read_to_end(&mut buf).await.unwrap();
-            buf
-        });
-
-        let outcome = dispatch_inbound(&bin, &mut agent_reader, &mut agent_writer)
-            .await
-            .expect("dispatch should succeed for list_runtime_closure");
-        drop(agent_writer);
-        let trailer = daemon_task.await.unwrap();
-
-        match outcome {
-            DispatchOutcome::RuntimeClosureListed {
-                build_id,
-                outputs,
-                closure,
-            } => {
-                assert_eq!(build_id, 11);
-                assert_eq!(outputs, 2);
-                assert_eq!(closure, 4);
-            }
-            other => panic!("expected RuntimeClosureListed, got {other:?}"),
-        }
-
-        let line = std::str::from_utf8(&trailer)
-            .unwrap()
-            .lines()
-            .next()
-            .expect("agent must emit a reply trailer");
-        let reply: RuntimeClosureReply = serde_json::from_str(line).unwrap();
-        // Set membership: every path is present.
-        let set: std::collections::HashSet<&str> = reply.paths.iter().map(|s| s.as_str()).collect();
-        for expected in [
-            "/nix/store/aaa",
-            "/nix/store/aaa-runtime-dep",
-            "/nix/store/bbb",
-            "/nix/store/bbb-runtime-dep",
-        ] {
-            assert!(
-                set.contains(expected),
-                "missing {expected}: {:?}",
-                reply.paths
-            );
-        }
-        assert_eq!(reply.paths.len(), 4);
-        // Topological invariant: each `-runtime-dep` must come
-        // before its parent. Without this, chunked
-        // `nix-store --import` daemon-side gets BrokenPipe.
-        let pos = |s: &str| reply.paths.iter().position(|x| x == s).unwrap();
-        assert!(
-            pos("/nix/store/aaa-runtime-dep") < pos("/nix/store/aaa"),
-            "aaa's dep must come first: {:?}",
-            reply.paths,
-        );
-        assert!(
-            pos("/nix/store/bbb-runtime-dep") < pos("/nix/store/bbb"),
-            "bbb's dep must come first: {:?}",
-            reply.paths,
-        );
-    }
-
-    #[tokio::test]
-    async fn closure_pull_exact_does_not_expand_requisites() {
-        // Critical contract: `ClosurePullExact` must hand `--export`
-        // exactly the paths from `header.paths` — no synthesised
-        // runtime-dep entries. The legacy `ClosurePull` arm DOES
-        // expand (see `dispatch_inbound_handles_closure_pull_end_to_end`);
-        // this test pins the difference so a future refactor can't
-        // silently re-introduce the OOM-prone single-shot behaviour
-        // for chunked callers.
-        let dir = tempdir().unwrap();
-        let bin = dir.path().join("nix-store");
-        let sink = dir.path().join("imp-sink.bin");
-        let argv = dir.path().join("exp-argv.txt");
-        let payload = dir.path().join("exp-payload.bin");
-        let canned: Vec<u8> = (0u8..100).cycle().take(1024).collect();
-        std::fs::write(&payload, &canned).unwrap();
-        fake_nix_store(&bin, &sink, &argv, &payload);
-
-        let header = SideChannelHeader {
-            kind: SideChannelKind::ClosurePullExact,
-            build_id: 12,
-            paths: vec!["/nix/store/aaa".into(), "/nix/store/bbb".into()],
-        };
+        let payload: Vec<u8> = (0u8..=255).chain(0..200).collect();
 
         let (rx_d_to_a, mut tx_d_to_a) = tokio::io::duplex(64 * 1024);
         let (mut rx_a_to_d, tx_a_to_d) = tokio::io::duplex(64 * 1024);
         let mut agent_reader = BufReader::new(rx_d_to_a);
         let mut agent_writer = tx_a_to_d;
 
-        let header_clone = header.clone();
+        let payload_clone = payload.clone();
         let daemon_task = tokio::spawn(async move {
-            write_header(&mut tx_d_to_a, &header_clone).await.unwrap();
+            write_header(&mut tx_d_to_a, &header).await.unwrap();
+            tx_d_to_a.write_all(&payload_clone).await.unwrap();
             tx_d_to_a.shutdown().await.unwrap();
             let mut buf = Vec::new();
             rx_a_to_d.read_to_end(&mut buf).await.unwrap();
             buf
         });
 
-        let outcome = dispatch_inbound(&bin, &mut agent_reader, &mut agent_writer)
+        let outcome = dispatch_inbound(&socket_path, &mut agent_reader, &mut agent_writer)
             .await
-            .expect("dispatch should succeed for closure_pull_exact");
+            .expect("dispatch should succeed");
         drop(agent_writer);
         let received = daemon_task.await.unwrap();
+        let _ = echo_task.await;
 
         match outcome {
-            DispatchOutcome::ClosurePulledExact {
+            DispatchOutcome::NixDaemonTunneled {
                 build_id,
-                paths,
-                export,
+                bytes_to_daemon,
+                bytes_from_daemon,
             } => {
-                assert_eq!(build_id, 12);
-                assert_eq!(paths, header.paths);
-                assert_eq!(export.status, BuildOutcomeStatus::Success);
-                assert_eq!(export.bytes_transferred, canned.len() as u64);
+                assert_eq!(build_id, 11);
+                assert_eq!(bytes_to_daemon, payload.len() as u64);
+                assert_eq!(bytes_from_daemon, payload.len() as u64);
             }
-            other => panic!("expected ClosurePulledExact, got {other:?}"),
         }
-        assert_eq!(received, canned);
-
-        // Argv pin: NO `<path>-runtime-dep` synthesised entries.
-        let argv_lines = std::fs::read_to_string(&argv).unwrap();
-        let lines: Vec<&str> = argv_lines.lines().collect();
         assert_eq!(
-            lines,
-            vec!["--export", "/nix/store/aaa", "/nix/store/bbb"],
-            "ClosurePullExact must NOT expand requisites; the daemon \
-             does that pre-pull via ListRuntimeClosure and is \
-             responsible for chunking. Re-adding expansion here \
-             would re-introduce the single-shot import OOM.",
-        );
-    }
-
-    #[test]
-    fn list_runtime_closure_kind_is_snake_case_on_wire() {
-        let h = SideChannelHeader {
-            kind: SideChannelKind::ListRuntimeClosure,
-            build_id: 1,
-            paths: vec![],
-        };
-        let s = String::from_utf8(h.encode_line()).unwrap();
-        assert!(
-            s.contains("\"kind\":\"list_runtime_closure\""),
-            "unexpected kind on wire: {s}",
-        );
-    }
-
-    #[test]
-    fn closure_pull_exact_kind_is_snake_case_on_wire() {
-        let h = SideChannelHeader {
-            kind: SideChannelKind::ClosurePullExact,
-            build_id: 1,
-            paths: vec![],
-        };
-        let s = String::from_utf8(h.encode_line()).unwrap();
-        assert!(
-            s.contains("\"kind\":\"closure_pull_exact\""),
-            "unexpected kind on wire: {s}",
-        );
-    }
-
-    #[test]
-    fn query_valid_paths_kind_is_snake_case_on_wire() {
-        let h = SideChannelHeader {
-            kind: SideChannelKind::QueryValidPaths,
-            build_id: 1,
-            paths: vec![],
-        };
-        let s = String::from_utf8(h.encode_line()).unwrap();
-        assert!(
-            s.contains("\"kind\":\"query_valid_paths\""),
-            "unexpected kind on wire: {s}",
+            received, payload,
+            "every byte must round-trip through the tunneled socket",
         );
     }
 
     #[tokio::test]
     async fn dispatch_inbound_surfaces_header_parse_error_before_spawning() {
-        // A garbage header must fail fast — no subprocess spawn,
-        // no nix-store invocation. We point the dispatcher at a
-        // path that doesn't exist; if it tried to spawn we'd get a
-        // Spawn error, but we expect a Header error instead.
         let dir = tempdir().unwrap();
         let bin = dir.path().join("does-not-exist");
 
