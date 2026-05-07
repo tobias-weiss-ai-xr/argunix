@@ -22,7 +22,7 @@ pub use dispatcher::{BuilderDispatcher, DispatchError, DispatchedBuild};
 pub use host_key::{HostKey, HostKeyError, load_or_generate};
 pub use protocol::{BuildOutcomeStatus, ControlMessage, LineFramer, ProtocolError};
 pub use registry::{
-    BuildLifecycle, BuilderRegistry, BuilderSnapshot, ConnState, ConnectedBuilder,
+    BuildLifecycle, BuildPhase, BuilderRegistry, BuilderSnapshot, ConnState, ConnectedBuilder,
     DisplacedConnection, RusshSession,
 };
 pub use server::{BuilderServer, ServerConfig, ServerError};

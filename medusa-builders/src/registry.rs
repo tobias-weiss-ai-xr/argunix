@@ -70,6 +70,29 @@ pub struct BuilderSnapshot {
     pub in_flight: u32,
 }
 
+/// M16: which transport/build phase a `(builder, build_id)` pair is
+/// in right now. Set by the worker as it walks through
+/// `dispatch_pool_build`; cleared on every exit (success, failure,
+/// cancel, timeout) via [`PhaseGuard`] in the daemon. Surfaced to the
+/// status page so operators see whether a builder is staging inputs
+/// (`Push`), running the build (`Build`), or fetching outputs (`Pull`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildPhase {
+    Push,
+    Build,
+    Pull,
+}
+
+impl BuildPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BuildPhase::Push => "push",
+            BuildPhase::Build => "build",
+            BuildPhase::Pull => "pull",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct BuilderRegistry {
     inner: Mutex<HashMap<BuilderName, ConnectedBuilder>>,
@@ -88,6 +111,11 @@ pub struct BuilderRegistry {
     /// reused build_id across builders (unlikely with sqlite-allocated
     /// JobIds, but cheap to defend) doesn't cross-fire.
     in_flight_builds: Mutex<HashMap<(BuilderName, i64), mpsc::Sender<BuildLifecycle>>>,
+    /// M16: per-(builder, build_id) live phase. Worker writes via
+    /// [`Self::set_phase`] and clears via [`Self::clear_phase`] (or a
+    /// `PhaseGuard` so exit paths can't forget). Read by the status
+    /// page to annotate running-job rows.
+    phases: Mutex<HashMap<(BuilderName, i64), BuildPhase>>,
 }
 
 /// M14b: a single event in a build's lifecycle. The daemon's worker
@@ -321,6 +349,37 @@ impl BuilderRegistry {
         };
         let _ = tx.try_send(event);
         true
+    }
+
+    /// Set the current build phase for `(name, build_id)`. Called by
+    /// the daemon's worker as it advances through push → build → pull;
+    /// idempotent (re-setting the same phase is a no-op).
+    pub fn set_phase(&self, name: &BuilderName, build_id: i64, phase: BuildPhase) {
+        self.phases
+            .lock()
+            .unwrap()
+            .insert((name.clone(), build_id), phase);
+    }
+
+    /// Drop the live phase entry. Safe to call from any exit path.
+    pub fn clear_phase(&self, name: &BuilderName, build_id: i64) {
+        self.phases
+            .lock()
+            .unwrap()
+            .remove(&(name.clone(), build_id));
+    }
+
+    /// Snapshot of all live phase entries, keyed by builder *name* (as
+    /// String) so the UI doesn't need to round-trip through
+    /// `BuilderName::new` on the parsed `String` it already holds.
+    /// Read once per status-page render and looked up per running row.
+    pub fn phase_snapshot(&self) -> HashMap<(String, i64), BuildPhase> {
+        self.phases
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((n, id), p)| ((n.as_str().to_string(), *id), *p))
+            .collect()
     }
 }
 

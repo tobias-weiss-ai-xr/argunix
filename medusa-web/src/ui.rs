@@ -71,6 +71,12 @@ struct RunningRow {
     short_sha: String,
     builder: String,
     started: String,
+    /// Live transport/build phase for jobs currently dispatched to a
+    /// pool builder (M16). `"push"`, `"build"`, `"pull"`, or empty for
+    /// jobs that are running locally / haven't reached a pool builder
+    /// yet. Sourced from `BuilderRegistry::phase_snapshot()`.
+    phase: &'static str,
+    phase_class: &'static str,
 }
 
 struct QueuedRow {
@@ -209,23 +215,41 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
         .map(|r| (r.id.get(), r.name.as_str().to_string()))
         .collect();
 
+    // Snapshot of live transport/build phases per (builder name,
+    // job id). Read once so the running-row loop doesn't take the
+    // registry's phase mutex per iteration.
+    let phases = state.builder_registry.phase_snapshot();
     let running_jobs = <medusa_store::SqlxStore as JobStore>::list_running(&state.store).await?;
     let running: Vec<RunningRow> = running_jobs
         .into_iter()
-        .map(|j| RunningRow {
-            forge: j.forge,
-            slug: j.slug.as_str().to_string(),
-            eval_id: j.job.eval_id.get(),
-            attr_path: j.job.attr_path.to_string(),
-            system: j.job.system,
-            git_ref: j.git_ref,
-            short_sha: j.short_sha,
-            builder: j
+        .map(|j| {
+            let builder = j
                 .job
                 .builder_id
                 .and_then(|id| builder_id_to_name.get(&id.get()).cloned())
-                .unwrap_or_else(|| "—".to_string()),
-            started: fmt_opt_time(j.job.started_at),
+                .unwrap_or_else(|| "—".to_string());
+            let live_phase = phases.get(&(builder.clone(), j.job.id.get())).copied();
+            let (phase, phase_class) = match live_phase {
+                Some(medusa_builders::BuildPhase::Push) => ("push", "bg-amber-100 text-amber-700"),
+                Some(medusa_builders::BuildPhase::Build) => ("build", "bg-blue-100 text-blue-700"),
+                Some(medusa_builders::BuildPhase::Pull) => {
+                    ("pull", "bg-emerald-100 text-emerald-700")
+                }
+                None => ("", ""),
+            };
+            RunningRow {
+                forge: j.forge,
+                slug: j.slug.as_str().to_string(),
+                eval_id: j.job.eval_id.get(),
+                attr_path: j.job.attr_path.to_string(),
+                system: j.job.system,
+                git_ref: j.git_ref,
+                short_sha: j.short_sha,
+                builder,
+                started: fmt_opt_time(j.job.started_at),
+                phase,
+                phase_class,
+            }
         })
         .collect();
 

@@ -82,6 +82,7 @@
         <th class="py-2 pr-4">attr</th>
         <th class="py-2 pr-4">system</th>
         <th class="py-2 pr-4">builder</th>
+        <th class="py-2 pr-4">phase</th>
         <th class="py-2">started</th>
       </tr>
     </thead>
@@ -110,6 +111,15 @@
         </td>
         <td class="py-2 pr-4 font-mono text-xs">{{ r.system }}</td>
         <td class="py-2 pr-4 font-mono text-xs">{{ r.builder }}</td>
+        <td class="py-2 pr-4">
+          {% if r.phase.is_empty() %}
+          <span class="text-slate-400 text-xs">—</span>
+          {% else %}
+          <span class="inline-block px-2 py-0.5 rounded text-xs {{ r.phase_class }}"
+            >{{ r.phase }}</span
+          >
+          {% endif %}
+        </td>
         <td class="py-2 text-slate-500 text-xs">{{ r.started }}</td>
       </tr>
       {% endfor %}

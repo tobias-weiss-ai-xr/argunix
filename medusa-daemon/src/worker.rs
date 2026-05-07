@@ -24,7 +24,8 @@ use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use medusa_builders::{
-    BuildLifecycle, BuildOutcomeStatus, BuilderDispatcher, NixCopyDirection, nix_copy_over_pool,
+    BuildLifecycle, BuildOutcomeStatus, BuildPhase, BuilderDispatcher, NixCopyDirection,
+    nix_copy_over_pool,
 };
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
 use medusa_forge::{CheckPost, CheckState, ForgeError, Provider};
@@ -60,6 +61,41 @@ impl BuilderSlot {
 impl Drop for BuilderSlot {
     fn drop(&mut self) {
         self.registry.dec_in_flight(&self.name);
+    }
+}
+
+/// RAII guard that owns the live-phase entry for one
+/// `(builder, build_id)` pair. Each `set` overwrites the registry's
+/// phase map; `drop` clears it, so every exit path of
+/// `dispatch_pool_build` (including `?` early returns and panics)
+/// removes the entry. Backs the status page's "this builder is
+/// pushing / building / pulling right now" overlay.
+struct PhaseGuard {
+    registry: Arc<medusa_builders::BuilderRegistry>,
+    name: medusa_domain::BuilderName,
+    build_id: i64,
+}
+
+impl PhaseGuard {
+    fn new(
+        registry: Arc<medusa_builders::BuilderRegistry>,
+        name: medusa_domain::BuilderName,
+        build_id: i64,
+    ) -> Self {
+        Self {
+            registry,
+            name,
+            build_id,
+        }
+    }
+    fn set(&self, phase: BuildPhase) {
+        self.registry.set_phase(&self.name, self.build_id, phase);
+    }
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        self.registry.clear_phase(&self.name, self.build_id);
     }
 }
 
@@ -1253,6 +1289,8 @@ pub async fn dispatch_pool_build(
     //      protocol, and bytes stream per-file with bounded memory.
     //      Replaces the previous query-requisites + valid-paths
     //      probe + chunked-export dance.
+    let phase_guard = PhaseGuard::new(registry.clone(), builder_name.clone(), build_id);
+    phase_guard.set(BuildPhase::Push);
     let mut phase_metrics = JobPhaseMetrics::default();
     let push_started_at = std::time::Instant::now();
     let push_metrics = match nix_copy_over_pool(
@@ -1295,6 +1333,7 @@ pub async fn dispatch_pool_build(
         phase_metrics.push_bytes = Some(m.bytes_to_builder);
         phase_metrics.push_ms = Some(m.elapsed.as_millis() as u64);
     }
+    phase_guard.set(BuildPhase::Build);
 
     // 3. Send Build over the control channel; subscribe to lifecycle.
     let mut lifecycle = match dispatcher
@@ -1467,6 +1506,7 @@ pub async fn dispatch_pool_build(
     //    the daemon protocol — no chunking, no topo sort, no
     //    explicit memory throttle needed.
     if final_status == BuildOutcomeStatus::Success && !output_paths.is_empty() {
+        phase_guard.set(BuildPhase::Pull);
         let pull_started_at = std::time::Instant::now();
         match nix_copy_over_pool(
             &dispatcher,
