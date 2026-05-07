@@ -470,7 +470,7 @@ impl ConnectionHandler {
 
                 *self.state.lock().await = AuthState::Established(record);
             }
-            ControlMessage::Heartbeat { ts, load } => {
+            ControlMessage::Heartbeat { ts, stats } => {
                 let state = self.state.lock().await.clone();
                 let AuthState::Established(record) = state else {
                     tracing::warn!("control channel: heartbeat before hello; ignoring",);
@@ -480,10 +480,13 @@ impl ConnectionHandler {
                 if let Err(e) = self.store.mark_seen(record.id, now).await {
                     tracing::warn!(error = %e, "mark_seen failed");
                 }
+                if let Some(stats) = stats {
+                    self.registry.push_stats(&record.name, now, stats);
+                }
                 tracing::trace!(
                     builder = %record.name,
                     ts,
-                    load = ?load,
+                    has_stats = stats.is_some(),
                     "heartbeat",
                 );
             }

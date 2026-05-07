@@ -9,15 +9,29 @@
 //! `builders` sqlite table (see `argunix-store::BuilderStore`). The
 //! registry is the *runtime* view, not a cache of sqlite.
 
-use crate::protocol::BuildOutcomeStatus;
+use crate::protocol::{BuildOutcomeStatus, BuilderStats};
 use argunix_domain::{BuilderCapabilities, BuilderId, BuilderName};
 use chrono::{DateTime, Utc};
 use russh::ChannelId;
 use russh::server::Handle as SessionHandle;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+
+/// One stats sample with the wall-clock time at which the coordinator
+/// received it. Surfaced to the web UI as the JSON shape under
+/// `GET /api/builders/{name}/stats`.
+#[derive(Debug, Clone, Copy)]
+pub struct StatsSample {
+    pub ts: DateTime<Utc>,
+    pub stats: BuilderStats,
+}
+
+/// Per-builder ring of recent stats samples. ~5 minutes at 5s cadence.
+/// Stored in-memory only — restarts wipe the window, which is fine for
+/// the "is this thing alive" UX (we don't keep history past now).
+const STATS_RING_CAPACITY: usize = 60;
 
 /// Whether the dispatcher should consider a connection for new work.
 ///
@@ -116,6 +130,12 @@ pub struct BuilderRegistry {
     /// `PhaseGuard` so exit paths can't forget). Read by the status
     /// page to annotate running-job rows.
     phases: Mutex<HashMap<(BuilderName, i64), BuildPhase>>,
+    /// Per-builder ring of the last [`STATS_RING_CAPACITY`] heartbeat
+    /// stats samples. Written by the SSH server's heartbeat handler;
+    /// read by the web layer to render live sparklines. Entries for a
+    /// builder live until the builder reconnects (we wipe on register
+    /// so a stale window from a previous incarnation doesn't show up).
+    stats: Mutex<HashMap<BuilderName, VecDeque<StatsSample>>>,
 }
 
 /// M14b: a single event in a build's lifecycle. The daemon's worker
@@ -167,6 +187,9 @@ impl BuilderRegistry {
     ) -> Option<DisplacedConnection> {
         let mut map = self.inner.lock().unwrap();
         let prior = map.insert(name.clone(), conn);
+        // Drop any stats from a previous incarnation so the UI doesn't
+        // show a window that ends before this connection started.
+        self.stats.lock().unwrap().remove(&name);
         prior.map(|p| DisplacedConnection {
             name,
             session: p.session,
@@ -192,6 +215,7 @@ impl BuilderRegistry {
         if matches {
             map.remove(name);
             self.in_flight.lock().unwrap().remove(name);
+            self.stats.lock().unwrap().remove(name);
         }
     }
 
@@ -380,6 +404,43 @@ impl BuilderRegistry {
             .iter()
             .map(|((n, id), p)| ((n.as_str().to_string(), *id), *p))
             .collect()
+    }
+
+    /// Append a stats sample to the per-builder ring, evicting the
+    /// oldest if at capacity. Called from the SSH server's heartbeat
+    /// handler.
+    pub fn push_stats(&self, name: &BuilderName, ts: DateTime<Utc>, stats: BuilderStats) {
+        let mut map = self.stats.lock().unwrap();
+        let ring = map.entry(name.clone()).or_default();
+        if ring.len() == STATS_RING_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(StatsSample { ts, stats });
+    }
+
+    /// Snapshot the per-builder stats ring in chronological order
+    /// (oldest first). Returns an empty vec if the builder isn't
+    /// connected or has not sent a heartbeat with stats yet.
+    pub fn stats_snapshot(&self, name: &BuilderName) -> Vec<StatsSample> {
+        self.stats
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|ring| ring.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Looks up the builder name currently dispatching `build_id`, if
+    /// any. Used by the job page to know whose stats ring to attach
+    /// to a running job. O(phases-map size) — fine for human-scale
+    /// numbers of concurrent builds.
+    pub fn builder_for_build(&self, build_id: i64) -> Option<BuilderName> {
+        self.phases
+            .lock()
+            .unwrap()
+            .keys()
+            .find(|(_, id)| *id == build_id)
+            .map(|(name, _)| name.clone())
     }
 }
 

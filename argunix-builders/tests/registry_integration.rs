@@ -369,7 +369,7 @@ async fn duplicate_name_displaces_old_connection() {
 
     // Try to send another heartbeat on channel_a; it should fail
     // because the server disconnected the displaced session.
-    let hb = ControlMessage::Heartbeat { ts: 1, load: None };
+    let hb = ControlMessage::Heartbeat { ts: 1, stats: None };
     let send = channel_a.data(&hb.encode_line()[..]).await;
     let recv = tokio::time::timeout(Duration::from_secs(2), channel_a.wait()).await;
     assert!(

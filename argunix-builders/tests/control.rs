@@ -255,7 +255,7 @@ async fn heartbeat_advances_last_seen() {
     // own chrono::Utc::now(), which must be strictly after t0 (1h ago).
     let hb = ControlMessage::Heartbeat {
         ts: 12345,
-        load: Some(0.5),
+        stats: None,
     };
     channel.data(&hb.encode_line()[..]).await.unwrap();
 

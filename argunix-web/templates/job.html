@@ -23,8 +23,48 @@
   {% endif %} {% if let Some(o) = output_path %}
   <dt class="text-slate-500">output</dt>
   <dd class="font-mono break-all">{{ o }}</dd>
+  {% endif %} {% if let Some(b) = live_builder %}
+  <dt class="text-slate-500">builder</dt>
+  <dd class="font-mono">{{ b }}</dd>
   {% endif %}
 </dl>
+
+{% if let Some(builder_name) = live_builder %}
+<section class="mb-6" id="live-stats" data-builder="{{ builder_name }}">
+  <h2 class="text-lg font-semibold mb-2">live (5s)</h2>
+  <div class="grid grid-cols-3 gap-4 text-sm">
+    <figure class="border border-slate-200 rounded p-2">
+      <figcaption class="text-slate-500 mb-1">
+        cpu <span data-field="cpu" class="font-mono text-slate-800">—</span>
+      </figcaption>
+      <svg data-spark="cpu" viewBox="0 0 120 30" class="w-full h-8" preserveAspectRatio="none">
+        <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
+      </svg>
+    </figure>
+    <figure class="border border-slate-200 rounded p-2">
+      <figcaption class="text-slate-500 mb-1">
+        load1 <span data-field="load" class="font-mono text-slate-800">—</span>
+      </figcaption>
+      <svg data-spark="load" viewBox="0 0 120 30" class="w-full h-8" preserveAspectRatio="none">
+        <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
+      </svg>
+    </figure>
+    <figure class="border border-slate-200 rounded p-2">
+      <figcaption class="text-slate-500 mb-1">
+        mem <span data-field="mem" class="font-mono text-slate-800">—</span>
+      </figcaption>
+      <svg data-spark="mem" viewBox="0 0 120 30" class="w-full h-8" preserveAspectRatio="none">
+        <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
+      </svg>
+    </figure>
+  </div>
+</section>
+
+<section class="mb-6">
+  <h2 class="text-lg font-semibold mb-2">live log</h2>
+  <pre id="live-log" data-job-id="{{ job_id }}" class="bg-slate-900 text-slate-100 text-xs font-mono p-3 rounded h-96 overflow-auto whitespace-pre-wrap"></pre>
+</section>
+{% endif %}
 
 {% if phase_metrics.has_any %}
 <section class="mb-6">
@@ -71,4 +111,84 @@
     >view build log</a
   >
 </p>
+{% endif %}
+
+{% if let Some(_) = live_builder %}
+<script>
+  (() => {
+    const stats = document.getElementById("live-stats");
+    const log = document.getElementById("live-log");
+    if (!stats) return;
+    const builder = stats.dataset.builder;
+    const jobId = log && log.dataset.jobId;
+
+    const drawSpark = (svg, values, opts) => {
+      if (!values.length) return;
+      const lo = opts.lo ?? Math.min(...values);
+      const hi = opts.hi ?? Math.max(...values);
+      const span = Math.max(hi - lo, 1e-6);
+      const w = 120, h = 30;
+      const stepX = values.length > 1 ? w / (values.length - 1) : 0;
+      const pts = values
+        .map((v, i) => {
+          const y = h - ((v - lo) / span) * h;
+          return `${(i * stepX).toFixed(2)},${y.toFixed(2)}`;
+        })
+        .join(" ");
+      svg.querySelector("polyline").setAttribute("points", pts);
+    };
+
+    const fmtBytes = (b) => {
+      const u = ["B", "KB", "MB", "GB", "TB"];
+      let i = 0, v = b;
+      while (v >= 1024 && i + 1 < u.length) { v /= 1024; i++; }
+      return `${v.toFixed(1)} ${u[i]}`;
+    };
+
+    const refresh = async () => {
+      try {
+        const r = await fetch(`/api/builders/${encodeURIComponent(builder)}/stats`);
+        if (!r.ok) return;
+        const samples = await r.json();
+        if (!samples.length) return;
+        const cpu = samples.map((s) => s.cpu_percent);
+        const load = samples.map((s) => s.load1);
+        const memPct = samples.map((s) =>
+          s.mem_total_bytes ? (s.mem_used_bytes / s.mem_total_bytes) * 100 : 0,
+        );
+        const last = samples[samples.length - 1];
+        stats.querySelector('[data-field="cpu"]').textContent =
+          `${last.cpu_percent.toFixed(1)}%`;
+        stats.querySelector('[data-field="load"]').textContent =
+          last.load1.toFixed(2);
+        stats.querySelector('[data-field="mem"]').textContent =
+          `${fmtBytes(last.mem_used_bytes)} / ${fmtBytes(last.mem_total_bytes)}`;
+        drawSpark(stats.querySelector('[data-spark="cpu"]'), cpu, { lo: 0, hi: 100 });
+        drawSpark(stats.querySelector('[data-spark="load"]'), load, { lo: 0 });
+        drawSpark(stats.querySelector('[data-spark="mem"]'), memPct, { lo: 0, hi: 100 });
+      } catch (_) { /* network blip; next tick will catch up */ }
+    };
+    refresh();
+    setInterval(refresh, 5000);
+
+    if (log && jobId) {
+      const es = new EventSource(`/api/jobs/${jobId}/log/stream`);
+      const append = (s) => {
+        const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+        log.appendChild(document.createTextNode(s));
+        if (stick) log.scrollTop = log.scrollHeight;
+      };
+      es.onmessage = (e) => append(e.data);
+      es.addEventListener("end", () => es.close());
+      es.addEventListener("lag", (e) =>
+        append(`\n[argunix: ${e.data}]\n`),
+      );
+      es.onerror = () => {
+        // Browser will auto-reconnect on transient errors; close
+        // explicitly only when the build is finished and the server
+        // has dropped the registry entry (404).
+      };
+    }
+  })();
+</script>
 {% endif %} {% endblock %}

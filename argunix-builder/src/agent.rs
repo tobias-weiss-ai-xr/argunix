@@ -239,11 +239,14 @@ async fn serve_one_connection(
         return Ok(false);
     }
 
-    // Heartbeat + shutdown loop.
-    let mut hb_interval = tokio::time::interval(Duration::from_secs(30));
+    // Heartbeat + shutdown loop. 5s cadence so the web UI's stats
+    // sparkline feels live; payload is ~50 bytes so the bandwidth
+    // cost over a 30s baseline is negligible.
+    let mut hb_interval = tokio::time::interval(Duration::from_secs(5));
     hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Skip the immediate first tick.
     hb_interval.tick().await;
+    let mut stats_sampler = crate::stats::StatsSampler::new();
 
     // M14b: outbound control queue. Build tasks send `BuildStarted /
     // BuildLogChunk / BuildFinished` here; the main loop drains the
@@ -275,7 +278,7 @@ async fn serve_one_connection(
             _ = hb_interval.tick() => {
                 let hb = ControlMessage::Heartbeat {
                     ts: chrono::Utc::now().timestamp(),
-                    load: None,
+                    stats: stats_sampler.sample(),
                 };
                 if channel.data(&hb.encode_line()[..]).await.is_err() {
                     return Ok(false);

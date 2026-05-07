@@ -43,6 +43,10 @@ pub struct AppStateInner {
     /// the persistent `builders` table is the roster, this is the
     /// runtime layer over it.
     pub builder_registry: Arc<argunix_builders::BuilderRegistry>,
+    /// Per-build broadcast taps for SSE log tailing. Worker pushes
+    /// each `BuildLogChunk` here as it arrives from the agent; web
+    /// SSE handlers snapshot + subscribe. Drops on build completion.
+    pub live_logs: Arc<crate::live_log::LiveLogRegistry>,
     /// Daemon start time for `argunixctl status` uptime reporting.
     pub started_at: std::time::Instant,
 }

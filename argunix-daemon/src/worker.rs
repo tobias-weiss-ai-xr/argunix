@@ -123,6 +123,10 @@ pub struct WorkerContext {
     /// On no match, the worker falls back to a local `nix-store
     /// --realise` (which itself may use the host's `nix.buildMachines`).
     pub builder_registry: Arc<argunix_builders::BuilderRegistry>,
+    /// Per-running-build broadcast taps for the SSE log endpoint.
+    /// Pool dispatch opens an entry on `BuildStarted`, pushes each
+    /// chunk it gets from the agent, and closes on `BuildFinished`.
+    pub live_logs: Arc<argunix_web::LiveLogRegistry>,
     /// Path to the local `nix-store` binary. Used post-pull to
     /// register gc-roots (`nix-store --add-root --indirect`); the
     /// closure transfer itself uses `nix copy` instead.
@@ -1172,6 +1176,9 @@ pub struct PoolDispatchSpec<'a> {
     pub build_timeout: Duration,
     pub nix_store_bin: &'a Path,
     pub nix_bin: &'a Path,
+    /// Optional broadcast tap for the SSE log endpoint. Worker passes
+    /// the global registry; the test dispatch path can pass `None`.
+    pub live_logs: Option<Arc<argunix_web::LiveLogRegistry>>,
 }
 
 /// Distinguishes "build cancelled by caller" from "build finished
@@ -1210,6 +1217,7 @@ async fn dispatch_build_via_pool(
         build_timeout: ctx.build_timeout,
         nix_store_bin: &ctx.nix_store_bin,
         nix_bin: &ctx.nix_bin,
+        live_logs: Some(ctx.live_logs.clone()),
     };
     match dispatch_pool_build(spec, Some(cancel)).await? {
         PoolDispatchResult::Outcome {
@@ -1262,9 +1270,30 @@ pub async fn dispatch_pool_build(
         build_timeout,
         nix_store_bin,
         nix_bin,
+        live_logs,
     } = spec;
     let dispatcher = BuilderDispatcher::new(registry.clone());
     let cap = log_limit.max_raw_bytes;
+    // Open the broadcast tap up-front so a fast UI can subscribe before
+    // the first chunk arrives. The guard's `Drop` closes the registry
+    // entry on every exit path so push-failure and dispatch-failure
+    // returns don't leak entries.
+    let live_log = live_logs.as_ref().map(|r| r.open(build_id));
+    struct LiveLogGuard {
+        registry: Option<Arc<argunix_web::LiveLogRegistry>>,
+        build_id: i64,
+    }
+    impl Drop for LiveLogGuard {
+        fn drop(&mut self) {
+            if let Some(r) = &self.registry {
+                r.close(self.build_id);
+            }
+        }
+    }
+    let _live_log_guard = LiveLogGuard {
+        registry: live_logs.clone(),
+        build_id,
+    };
 
     let mut log_buf: Vec<u8> = Vec::new();
     let mut log_truncated = false;
@@ -1390,6 +1419,9 @@ pub async fn dispatch_pool_build(
                         tracing::info!(job_id = build_id, ?pid, builder = %builder_name, "agent started build");
                     }
                     Some(BuildLifecycle::LogChunk { bytes }) => {
+                        if let Some(ref tap) = live_log {
+                            tap.push(&bytes);
+                        }
                         if log_buf.len() < cap {
                             let remaining = cap - log_buf.len();
                             if bytes.len() <= remaining {
@@ -1469,6 +1501,7 @@ pub async fn dispatch_pool_build(
         }
     }
     registry.unregister_in_flight_build(builder_name, build_id);
+    drop(live_log);
 
     if aborted || (final_status == BuildOutcomeStatus::Killed && !timed_out) {
         // Operator-initiated cancel (or agent-emitted Killed before

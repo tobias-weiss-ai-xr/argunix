@@ -20,10 +20,10 @@ pub use channel_io::{ChannelSide, with_channel_io};
 pub use closure_xfer::{ClosureXferError, NixCopyDirection, NixCopyMetrics, nix_copy_over_pool};
 pub use dispatcher::{BuilderDispatcher, DispatchError, DispatchedBuild};
 pub use host_key::{HostKey, HostKeyError, load_or_generate};
-pub use protocol::{BuildOutcomeStatus, ControlMessage, LineFramer, ProtocolError};
+pub use protocol::{BuildOutcomeStatus, BuilderStats, ControlMessage, LineFramer, ProtocolError};
 pub use registry::{
     BuildLifecycle, BuildPhase, BuilderRegistry, BuilderSnapshot, ConnState, ConnectedBuilder,
-    DisplacedConnection, RusshSession,
+    DisplacedConnection, RusshSession, StatsSample,
 };
 pub use server::{BuilderServer, ServerConfig, ServerError};
 pub use side_channel::{

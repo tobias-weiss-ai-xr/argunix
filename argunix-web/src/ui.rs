@@ -169,6 +169,7 @@ struct JobTemplate {
     forge: String,
     slug: String,
     eval_id: i64,
+    job_id: i64,
     attr_path: String,
     system: String,
     status_label: &'static str,
@@ -177,6 +178,10 @@ struct JobTemplate {
     drv_path: Option<String>,
     output_path: Option<String>,
     has_log: bool,
+    /// `Some(builder_name)` while this job is dispatched on a pool
+    /// builder — drives the live stats sparkline + log SSE on the
+    /// page. `None` for finished jobs and locally-built ones.
+    live_builder: Option<String>,
     /// M16 per-phase transport accounting. Each pair is rendered as
     /// "<value> (<raw>)" already-formatted; absent fields surface as
     /// "—". The whole block is suppressed in the template when no
@@ -658,10 +663,20 @@ async fn job_page(
         pull_ms: humanize_ms(pm.pull_ms),
     };
 
+    let live_builder = if matches!(job.status, JobStatus::Running) {
+        state
+            .builder_registry
+            .builder_for_build(job.id.get())
+            .map(|n| n.as_str().to_string())
+    } else {
+        None
+    };
+
     let html = render(&JobTemplate {
         forge,
         slug: slug.as_str().to_string(),
         eval_id: eval_id.get(),
+        job_id: job.id.get(),
         attr_path: job.attr_path.to_string(),
         system: job.system,
         status_label: job_status_label(&job.status),
@@ -670,6 +685,7 @@ async fn job_page(
         drv_path: job.drv_path,
         output_path: job.output_path,
         has_log: job.log_path.is_some(),
+        live_builder,
         phase_metrics,
     })?;
     Ok(Html(html).into_response())
@@ -724,6 +740,100 @@ async fn job_json(
         )],
         serde_json::to_vec_pretty(&body).map_err(UiError::Json)?,
     )
+        .into_response())
+}
+
+/// `GET /api/builders/{name}/stats` — JSON ring of recent heartbeat
+/// stats samples for one connected builder. Polled every ~5s by the
+/// job page's sparkline JS. Returns an empty list (200) for a
+/// connected builder that hasn't sent a stats-bearing heartbeat yet,
+/// 404 only when the builder name is invalid.
+pub async fn builder_stats(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, UiError> {
+    let name = argunix_domain::BuilderName::new(&name).map_err(|_| UiError::NotFound)?;
+    let samples = state.builder_registry.stats_snapshot(&name);
+    let body: Vec<_> = samples
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "ts": s.ts.to_rfc3339(),
+                "load1": s.stats.load1,
+                "cpu_percent": s.stats.cpu_percent,
+                "mem_used_bytes": s.stats.mem_used_bytes,
+                "mem_total_bytes": s.stats.mem_total_bytes,
+            })
+        })
+        .collect();
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        serde_json::to_vec(&body).map_err(UiError::Json)?,
+    )
+        .into_response())
+}
+
+/// `GET /api/jobs/{job_id}/log/stream` — SSE tail of a running build's
+/// stderr. Replays the buffered prefix as a single `data:` event so a
+/// late-joining browser sees the full log so far, then forwards each
+/// new chunk from the broadcast tap until the build finishes (the
+/// registry entry is dropped → broadcast receiver closes → stream
+/// ends naturally). 404 if no entry — caller should fall back to the
+/// static `/log` endpoint.
+pub async fn job_log_stream(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<i64>,
+) -> Result<Response, UiError> {
+    let live = state.live_logs.get(job_id).ok_or(UiError::NotFound)?;
+    let (initial, mut rx) = live.subscribe();
+
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
+
+    if !initial.is_empty() {
+        let _ = tx
+            .send(Ok(Event::default().data(String::from_utf8_lossy(&initial))))
+            .await;
+    }
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(bytes) => {
+                    if tx
+                        .send(Ok(Event::default().data(String::from_utf8_lossy(&bytes))))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                // Lagged: tell the client we lost some bytes rather
+                // than silently skipping. The buffer is unbounded
+                // server-side; lag here is purely the broadcast
+                // channel's depth, hit only by very slow clients.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    let _ = tx
+                        .send(Ok(Event::default()
+                            .event("lag")
+                            .data(format!("dropped {n} chunks"))))
+                        .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = tx.send(Ok(Event::default().event("end").data(""))).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(Sse::new(ReceiverStream::new(out_rx))
+        .keep_alive(KeepAlive::default())
         .into_response())
 }
 

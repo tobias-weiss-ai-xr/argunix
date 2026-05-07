@@ -234,6 +234,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // BuilderServer (when `builder_enrollment` is configured) writes
     // into the same Arc; argunixctl reads it via the control socket.
     let builder_registry = argunix_builders::BuilderRegistry::new();
+    let live_logs = argunix_web::LiveLogRegistry::new();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     // M16 simplification: closure transfer is now `nix copy` over a
@@ -257,6 +258,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         pauses: pauses.clone(),
         cancellations: cancellations.clone(),
         builder_registry: builder_registry.clone(),
+        live_logs: live_logs.clone(),
         nix_store_bin: args.nix_store_bin.clone(),
         nix_bin: args.nix_bin.clone(),
         build_concurrency,
@@ -307,6 +309,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         pauses,
         cancellations,
         builder_registry: builder_registry.clone(),
+        live_logs,
         started_at: std::time::Instant::now(),
     };
     let app_state = std::sync::Arc::new(inner);

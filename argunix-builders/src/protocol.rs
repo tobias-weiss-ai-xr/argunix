@@ -14,10 +14,30 @@
 use argunix_domain::BuilderName;
 use serde::{Deserialize, Serialize};
 
+/// Builder-side system stats sample carried on every heartbeat. Used by
+/// the web UI to render live sparklines while a build is running on
+/// this builder. `None` from the agent means "couldn't sample" (e.g.
+/// non-Linux or a `/proc` read failed); the coordinator still records
+/// the heartbeat for liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BuilderStats {
+    /// 1-minute load average (`/proc/loadavg` field 0).
+    pub load1: f32,
+    /// Aggregate CPU busy fraction since the previous sample, as a
+    /// percentage in [0, 100]. Computed from `/proc/stat`'s `cpu` line:
+    /// `1 - idle_delta / total_delta`. The first sample after agent
+    /// start has no prior to diff against and is reported as 0.
+    pub cpu_percent: f32,
+    /// `MemTotal - MemAvailable` from `/proc/meminfo`, bytes.
+    pub mem_used_bytes: u64,
+    /// `MemTotal` from `/proc/meminfo`, bytes.
+    pub mem_total_bytes: u64,
+}
+
 /// Shared envelope for every control-channel message. `tag` selects the
 /// variant; serde flattens the variant fields onto the same object.
 ///
-/// `Eq` is intentionally not derived — `Heartbeat::load` is `Option<f64>`
+/// `Eq` is intentionally not derived — `Heartbeat::stats` carries f32
 /// which precludes it. Round-trip tests use `==` (PartialEq).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -38,13 +58,13 @@ pub enum ControlMessage {
     /// sqlite row id, surfaced for the agent's log line so operators
     /// can correlate `argunixctl builders` output with the agent's logs.
     Welcome { builder_id: String },
-    /// Builder → argunix. Periodic liveness signal. The optional `load`
-    /// is a free-form floating point (e.g. 1-min loadavg); argunix
-    /// records it on the row for `argunixctl builders`.
+    /// Builder → argunix. Periodic liveness signal carrying live system
+    /// stats. The web UI subscribes to the per-builder ring of these
+    /// samples and renders sparklines for cpu / load / memory.
     Heartbeat {
         ts: i64,
         #[serde(default)]
-        load: Option<f64>,
+        stats: Option<BuilderStats>,
     },
     /// Builder → argunix. Sent on graceful agent stop (SIGTERM).
     /// `drain` is reserved for future graceful-drain semantics; v1
@@ -272,12 +292,31 @@ mod tests {
         assert_eq!(got.len(), 1);
         let m = got.into_iter().next().unwrap().unwrap();
         match m {
-            ControlMessage::Heartbeat { ts, load } => {
+            ControlMessage::Heartbeat { ts, stats } => {
                 assert_eq!(ts, 42);
-                assert!(load.is_none());
+                assert!(stats.is_none());
             }
             other => panic!("expected Heartbeat, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn heartbeat_round_trips_with_stats() {
+        let m = ControlMessage::Heartbeat {
+            ts: 1700000000,
+            stats: Some(BuilderStats {
+                load1: 1.25,
+                cpu_percent: 42.5,
+                mem_used_bytes: 4 * 1024 * 1024 * 1024,
+                mem_total_bytes: 16 * 1024 * 1024 * 1024,
+            }),
+        };
+        let s = std::str::from_utf8(&m.encode_line())
+            .unwrap()
+            .trim_end()
+            .to_string();
+        let back: ControlMessage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, m);
     }
 
     #[test]
