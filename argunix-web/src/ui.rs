@@ -30,6 +30,9 @@ use std::collections::HashMap;
 #[derive(Template)]
 #[template(path = "status.html")]
 struct StatusTemplate {
+    /// Drives the header logo's `argunix-spin` class in `base.html`.
+    /// True iff anything is `Evaluating` or `Running` at render time.
+    cluster_active: bool,
     totals: ClusterTotals,
     builders: Vec<BuilderRow>,
     evaluating: Vec<EvalRow2>,
@@ -110,6 +113,7 @@ const QUEUED_DISPLAY_LIMIT: u32 = 50;
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate {
+    cluster_active: bool,
     repos: Vec<RepoRow>,
 }
 
@@ -121,6 +125,7 @@ struct RepoRow {
 #[derive(Template)]
 #[template(path = "repo.html")]
 struct RepoTemplate {
+    cluster_active: bool,
     forge: String,
     slug: String,
     evals: Vec<EvalRow>,
@@ -137,6 +142,7 @@ struct EvalRow {
 #[derive(Template)]
 #[template(path = "eval.html")]
 struct EvalTemplate {
+    cluster_active: bool,
     forge: String,
     slug: String,
     eval_id: i64,
@@ -163,6 +169,7 @@ struct JobRow {
 #[derive(Template)]
 #[template(path = "job.html")]
 struct JobTemplate {
+    cluster_active: bool,
     forge: String,
     slug: String,
     eval_id: i64,
@@ -197,6 +204,7 @@ struct PhaseMetricsRow {
 }
 
 pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiError> {
+    let cluster_active = cluster_is_active(&state).await?;
     let repos = state
         .store
         .list()
@@ -207,7 +215,10 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiErro
             slug: r.slug.as_str().to_string(),
         })
         .collect();
-    Ok(Html(render(&IndexTemplate { repos })?))
+    Ok(Html(render(&IndexTemplate {
+        cluster_active,
+        repos,
+    })?))
 }
 
 /// Cluster status overview — at-a-glance view of every known builder
@@ -339,7 +350,9 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
         queued_total,
     };
 
+    let cluster_active = !evaluating.is_empty() || !running.is_empty();
     Ok(Html(render(&StatusTemplate {
+        cluster_active,
         totals,
         builders,
         evaluating,
@@ -569,7 +582,9 @@ async fn repo_page(
         })
         .collect();
 
+    let cluster_active = cluster_is_active(&state).await?;
     let html = render(&RepoTemplate {
+        cluster_active,
         forge,
         slug: slug.as_str().to_string(),
         evals,
@@ -601,7 +616,9 @@ async fn eval_page(
         })
         .collect();
 
+    let cluster_active = cluster_is_active(&state).await?;
     let html = render(&EvalTemplate {
+        cluster_active,
         forge,
         slug: slug.as_str().to_string(),
         eval_id: eval_id.get(),
@@ -655,7 +672,9 @@ async fn job_page(
         None
     };
 
+    let cluster_active = cluster_is_active(&state).await?;
     let html = render(&JobTemplate {
+        cluster_active,
         forge,
         slug: slug.as_str().to_string(),
         eval_id: eval_id.get(),
@@ -724,6 +743,24 @@ async fn job_json(
         serde_json::to_vec_pretty(&body).map_err(UiError::Json)?,
     )
         .into_response())
+}
+
+/// True iff anything is currently evaluating or running. Computed
+/// once per page render and passed to every template's `cluster_active`
+/// field; the base layout reads it to decide whether the header logo
+/// gets the `argunix-spin` class. Two `LIMIT 1`-sized queries.
+async fn cluster_is_active(state: &AppState) -> Result<bool, UiError> {
+    let evaluating = <argunix_store::SqlxStore as EvalStore>::list_by_status(
+        &state.store,
+        EvalStatus::Evaluating,
+        1,
+    )
+    .await?;
+    if !evaluating.is_empty() {
+        return Ok(true);
+    }
+    let running = <argunix_store::SqlxStore as JobStore>::list_running(&state.store).await?;
+    Ok(!running.is_empty())
 }
 
 /// `GET /api/builders/{name}/stats` — JSON ring of recent heartbeat
@@ -1019,12 +1056,10 @@ mod tests {
         // Smoke: no builders, nothing running, nothing queued. Verifies
         // the template's empty-state branches all compile + render.
         let tmpl = StatusTemplate {
+            cluster_active: false,
             totals: ClusterTotals {
                 builders_online: 0,
                 builders_known: 0,
-                in_flight: 0,
-                total_slots: 0,
-                utilization_pct: 0,
                 running: 0,
                 queued_total: 0,
             },

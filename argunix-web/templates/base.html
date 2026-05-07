@@ -5,15 +5,19 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>{% block title %}argunix{% endblock %}</title>
     <link rel="stylesheet" href="/static/ui.css" />
+    <style>
+      @keyframes argunix-spin { to { transform: rotate(360deg); } }
+      .argunix-spin { animation: argunix-spin 4s linear infinite; }
+    </style>
     {% block head_extra %}{% endblock %}
   </head>
   <body class="bg-slate-50 text-slate-900 font-sans">
     <header class="max-w-5xl mx-auto px-4 pt-6 pb-2 flex items-center justify-between">
       <a class="flex items-center gap-3 no-underline text-slate-900" href="/">
         <img
-          src="/static/img/argunix.svg"
+          src="/static/img/argunix-logo-square.svg"
           alt="argunix"
-          class="h-10 w-10"
+          class="h-10 w-10{% if cluster_active %} argunix-spin{% endif %}"
         />
         <span class="text-xl font-semibold">argunix</span>
       </a>
