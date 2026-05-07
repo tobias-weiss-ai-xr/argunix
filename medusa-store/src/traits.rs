@@ -1,6 +1,6 @@
 use crate::records::{
-    BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, JobWithContext, NewBuilder,
-    NewEvaluation, NewJob, RepoRecord,
+    BuilderRecord, EvalRecord, ForgeStatusRecord, JobPhaseMetrics, JobRecord, JobWithContext,
+    NewBuilder, NewEvaluation, NewJob, RepoRecord,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -139,7 +139,10 @@ pub trait JobStore: Send + Sync {
     /// Mark a job as `Running` and stamp `started_at`.
     async fn start(&self, id: JobId, started_at: DateTime<Utc>) -> Result<(), StoreError>;
     /// Mark a job terminal: set `status`, `finished_at`, and (where present)
-    /// the on-disk paths produced by the build pipeline.
+    /// the on-disk paths produced by the build pipeline. `metrics` carries
+    /// per-phase byte counts and durations for pool-dispatched builds;
+    /// pass [`JobPhaseMetrics::default`] (all `None`) for local builds or
+    /// failures with no transport activity to record.
     async fn finish(
         &self,
         id: JobId,
@@ -147,6 +150,7 @@ pub trait JobStore: Send + Sync {
         finished_at: DateTime<Utc>,
         log_path: Option<&str>,
         output_path: Option<&str>,
+        metrics: &JobPhaseMetrics,
     ) -> Result<(), StoreError>;
     /// Used at boot (Q79): mark every still-`running` job as `interrupted`.
     /// Returns the number of rows updated. Does NOT touch `interrupt_count`

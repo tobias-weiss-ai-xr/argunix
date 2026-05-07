@@ -64,6 +64,34 @@ pub struct JobRecord {
     /// Set when a job fails for a non-build-process reason (currently only
     /// "exceeded interruption retry limit"). NULL for build-level failures.
     pub failure_reason: Option<String>,
+    /// Per-phase accounting for pool-dispatched builds (M16). All `None`
+    /// for jobs that were never dispatched, built locally, or finished
+    /// before this column-set existed.
+    pub phase_metrics: JobPhaseMetrics,
+}
+
+/// Bytes through our russh tunnel + wall-clock per pool-dispatch phase.
+/// Stored on `jobs` once the build reaches a terminal state; rendered
+/// on the job detail page so operators can answer "where did the wall
+/// clock / bandwidth go on this build."
+///
+/// `bytes` measure transport-level bytes through the proxy in each
+/// direction (daemon-protocol framing included), not the on-disk size
+/// of the closure. They'll be a few percent above what `du -b $output`
+/// reports — that's the right number for "what did our network
+/// actually carry."
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobPhaseMetrics {
+    /// Bytes daemon → builder during the drv-closure push.
+    pub push_bytes: Option<u64>,
+    /// Wall-clock of the entire `nix copy --to` invocation.
+    pub push_ms: Option<u64>,
+    /// Wall-clock between agent's `BuildStarted` and `BuildFinished`.
+    pub build_ms: Option<u64>,
+    /// Bytes builder → daemon during the output-closure pull.
+    pub pull_bytes: Option<u64>,
+    /// Wall-clock of the entire `nix copy --from` invocation.
+    pub pull_ms: Option<u64>,
 }
 
 /// A job row joined with its evaluation and repo. Used by the status

@@ -177,7 +177,10 @@ async fn handle_test_dispatch_drv(
         nix_bin: &ctx.nix_bin,
     };
     match crate::worker::dispatch_pool_build(spec, None).await? {
-        crate::worker::PoolDispatchResult::Outcome(o) => Ok(serde_json::json!({
+        crate::worker::PoolDispatchResult::Outcome {
+            outcome: o,
+            phase_metrics,
+        } => Ok(serde_json::json!({
             "status": match o.status {
                 medusa_build::BuildStatus::Success => "success",
                 medusa_build::BuildStatus::Failure => "failure",
@@ -185,6 +188,13 @@ async fn handle_test_dispatch_drv(
             "output_paths": o.output_paths,
             "log_path": o.log_path.to_string_lossy(),
             "log_truncated": o.log_truncated,
+            "phase_metrics": {
+                "push_bytes": phase_metrics.push_bytes,
+                "push_ms": phase_metrics.push_ms,
+                "build_ms": phase_metrics.build_ms,
+                "pull_bytes": phase_metrics.pull_bytes,
+                "pull_ms": phase_metrics.pull_ms,
+            },
         })),
         crate::worker::PoolDispatchResult::Cancelled => {
             anyhow::bail!("test dispatch cancelled (unexpected — no cancel token)");

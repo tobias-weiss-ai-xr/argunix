@@ -13,8 +13,8 @@ mod sqlite;
 mod traits;
 
 pub use records::{
-    BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, JobWithContext, NewBuilder,
-    NewEvaluation, NewJob, RepoRecord,
+    BuilderRecord, EvalRecord, ForgeStatusRecord, JobPhaseMetrics, JobRecord, JobWithContext,
+    NewBuilder, NewEvaluation, NewJob, RepoRecord,
 };
 pub use sqlite::SqlxStore;
 pub use traits::{

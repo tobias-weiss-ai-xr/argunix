@@ -151,6 +151,16 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
     let builder_id: Option<i64> = row.try_get("builder_id")?;
     let interrupt_count: i64 = row.try_get("interrupt_count")?;
     let failure_reason: Option<String> = row.try_get("failure_reason")?;
+    // Per-phase metrics (M16). All NULL for jobs that pre-date the
+    // 0005 migration or never went through pool dispatch. Read as
+    // i64 to dodge the rowid signedness; clamp to non-negative on
+    // surface (unsigned in the domain type).
+    let push_bytes: Option<i64> = row.try_get("push_bytes")?;
+    let push_ms: Option<i64> = row.try_get("push_ms")?;
+    let build_ms: Option<i64> = row.try_get("build_ms")?;
+    let pull_bytes: Option<i64> = row.try_get("pull_bytes")?;
+    let pull_ms: Option<i64> = row.try_get("pull_ms")?;
+    let to_u64 = |v: Option<i64>| v.map(|n| n.max(0) as u64);
     Ok(JobRecord {
         id: JobId::new(id),
         eval_id: EvalId::new(eval_id),
@@ -165,7 +175,30 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
         builder_id: builder_id.map(BuilderId::new),
         interrupt_count: interrupt_count.max(0) as u32,
         failure_reason,
+        phase_metrics: medusa_store_records_phase_metrics(
+            to_u64(push_bytes),
+            to_u64(push_ms),
+            to_u64(build_ms),
+            to_u64(pull_bytes),
+            to_u64(pull_ms),
+        ),
     })
+}
+
+fn medusa_store_records_phase_metrics(
+    push_bytes: Option<u64>,
+    push_ms: Option<u64>,
+    build_ms: Option<u64>,
+    pull_bytes: Option<u64>,
+    pull_ms: Option<u64>,
+) -> crate::records::JobPhaseMetrics {
+    crate::records::JobPhaseMetrics {
+        push_bytes,
+        push_ms,
+        build_ms,
+        pull_bytes,
+        pull_ms,
+    }
 }
 
 #[async_trait]
@@ -440,7 +473,8 @@ impl JobStore for SqlxStore {
     async fn get(&self, id: JobId) -> Result<Option<JobRecord>, StoreError> {
         let row = sqlx::query(
             "SELECT id, eval_id, attr_path, drv_path, system, started_at, finished_at,
-                    status, log_path, output_path, builder_id, interrupt_count, failure_reason
+                    status, log_path, output_path, builder_id, interrupt_count, failure_reason,
+                    push_bytes, push_ms, build_ms, pull_bytes, pull_ms
              FROM jobs WHERE id = ?1",
         )
         .bind(id.get())
@@ -452,7 +486,8 @@ impl JobStore for SqlxStore {
     async fn list_by_eval(&self, eval_id: EvalId) -> Result<Vec<JobRecord>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, eval_id, attr_path, drv_path, system, started_at, finished_at,
-                    status, log_path, output_path, builder_id, interrupt_count, failure_reason
+                    status, log_path, output_path, builder_id, interrupt_count, failure_reason,
+                    push_bytes, push_ms, build_ms, pull_bytes, pull_ms
              FROM jobs WHERE eval_id = ?1 ORDER BY id",
         )
         .bind(eval_id.get())
@@ -466,6 +501,7 @@ impl JobStore for SqlxStore {
             "SELECT j.id, j.eval_id, j.attr_path, j.drv_path, j.system,
                     j.started_at, j.finished_at, j.status, j.log_path, j.output_path,
                     j.builder_id, j.interrupt_count, j.failure_reason,
+                    j.push_bytes, j.push_ms, j.build_ms, j.pull_bytes, j.pull_ms,
                     r.forge AS r_forge, r.slug AS r_slug,
                     e.git_ref AS e_git_ref, e.sha AS e_sha
              FROM jobs j
@@ -484,6 +520,7 @@ impl JobStore for SqlxStore {
             "SELECT j.id, j.eval_id, j.attr_path, j.drv_path, j.system,
                     j.started_at, j.finished_at, j.status, j.log_path, j.output_path,
                     j.builder_id, j.interrupt_count, j.failure_reason,
+                    j.push_bytes, j.push_ms, j.build_ms, j.pull_bytes, j.pull_ms,
                     r.forge AS r_forge, r.slug AS r_slug,
                     e.git_ref AS e_git_ref, e.sha AS e_sha
              FROM jobs j
@@ -526,16 +563,28 @@ impl JobStore for SqlxStore {
         finished_at: DateTime<Utc>,
         log_path: Option<&str>,
         output_path: Option<&str>,
+        metrics: &crate::records::JobPhaseMetrics,
     ) -> Result<(), StoreError> {
+        // Cast Option<u64> → Option<i64> for sqlx binding. Clamp at
+        // i64::MAX defensively — closures over 9 EiB don't happen,
+        // but a buggy counter shouldn't blow up the UPDATE.
+        let to_i64 = |v: Option<u64>| v.map(|n| n.min(i64::MAX as u64) as i64);
         sqlx::query(
             "UPDATE jobs
-             SET status = ?1, finished_at = ?2, log_path = ?3, output_path = ?4
-             WHERE id = ?5",
+             SET status = ?1, finished_at = ?2, log_path = ?3, output_path = ?4,
+                 push_bytes = ?5, push_ms = ?6, build_ms = ?7,
+                 pull_bytes = ?8, pull_ms = ?9
+             WHERE id = ?10",
         )
         .bind(status.as_str())
         .bind(finished_at)
         .bind(log_path)
         .bind(output_path)
+        .bind(to_i64(metrics.push_bytes))
+        .bind(to_i64(metrics.push_ms))
+        .bind(to_i64(metrics.build_ms))
+        .bind(to_i64(metrics.pull_bytes))
+        .bind(to_i64(metrics.pull_ms))
         .bind(id.get())
         .execute(&self.pool)
         .await?;

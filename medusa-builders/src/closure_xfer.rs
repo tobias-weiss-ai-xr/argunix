@@ -26,8 +26,27 @@ use medusa_domain::BuilderName;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+
+/// Per-call byte-count + wall-clock for one `nix_copy_over_pool`
+/// invocation. Returned to the worker so it can persist per-job
+/// transport metrics (M16) without instrumenting the full nix-copy
+/// stderr.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NixCopyMetrics {
+    /// Bytes daemon-side `nix copy` sent into the proxy socket
+    /// (i.e. daemon → builder over our russh tunnel). Includes
+    /// daemon-protocol framing.
+    pub bytes_to_builder: u64,
+    /// Bytes proxy received from the builder (builder → daemon).
+    pub bytes_from_builder: u64,
+    /// Wall-clock from `nix copy` spawn to the subprocess exiting,
+    /// proxy teardown included.
+    pub elapsed: Duration,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClosureXferError {
@@ -120,10 +139,19 @@ pub async fn nix_copy_over_pool(
     paths: &[String],
     nix_bin: &Path,
     build_id: i64,
-) -> Result<(), ClosureXferError> {
+) -> Result<NixCopyMetrics, ClosureXferError> {
     if paths.is_empty() {
-        return Ok(());
+        return Ok(NixCopyMetrics::default());
     }
+    let started_at = Instant::now();
+    // Shared atomics: each accepted bridge increments these as bytes
+    // flow. Returning the sum lets the worker persist per-job
+    // transport metrics. "to_builder" / "from_builder" semantics are
+    // direction-independent here — they always describe the daemon
+    // → builder / builder → daemon directions through our tunnel,
+    // regardless of whether `nix copy` is pushing or pulling.
+    let bytes_to_builder = Arc::new(AtomicU64::new(0));
+    let bytes_from_builder = Arc::new(AtomicU64::new(0));
     let sock_dir = tempfile::tempdir().map_err(ClosureXferError::Tempdir)?;
     let sock_path = sock_dir.path().join("nix-daemon.sock");
     let wrapper_path = sock_dir.path().join("tunnel.sh");
@@ -157,6 +185,8 @@ pub async fn nix_copy_over_pool(
     // per invocation but we don't constrain that.
     let dispatcher = Arc::new(dispatcher.clone());
     let builder = builder_name.clone();
+    let bytes_to = bytes_to_builder.clone();
+    let bytes_from = bytes_from_builder.clone();
     let proxy = tokio::spawn(async move {
         loop {
             let (sock, _) = match listener.accept().await {
@@ -168,8 +198,18 @@ pub async fn nix_copy_over_pool(
             };
             let dispatcher = dispatcher.clone();
             let builder = builder.clone();
+            let bytes_to = bytes_to.clone();
+            let bytes_from = bytes_from.clone();
             tokio::spawn(async move {
-                if let Err(e) = bridge_unix_to_channel(sock, &dispatcher, &builder, build_id).await
+                if let Err(e) = bridge_unix_to_channel(
+                    sock,
+                    &dispatcher,
+                    &builder,
+                    build_id,
+                    bytes_to,
+                    bytes_from,
+                )
+                .await
                 {
                     tracing::warn!(
                         error = %e,
@@ -213,17 +253,51 @@ pub async fn nix_copy_over_pool(
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    Ok(())
+    Ok(NixCopyMetrics {
+        bytes_to_builder: bytes_to_builder.load(Ordering::Relaxed),
+        bytes_from_builder: bytes_from_builder.load(Ordering::Relaxed),
+        elapsed: started_at.elapsed(),
+    })
+}
+
+/// Counting variant of `tokio::io::copy`: forwards reader → writer
+/// like the standard helper but also adds each chunk's length to a
+/// shared atomic so the parent can report total bytes seen.
+async fn copy_counted<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    counter: &AtomicU64,
+) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 8 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            writer.flush().await?;
+            return Ok(total);
+        }
+        writer.write_all(&buf[..n]).await?;
+        total += n as u64;
+        counter.fetch_add(n as u64, Ordering::Relaxed);
+    }
 }
 
 /// Bridge a single accepted Unix-socket connection to a fresh
 /// `NixDaemonStdio` side channel. Writes the header, then bidir-
-/// ectionally pipes bytes between the socket and the channel.
+/// ectionally pipes bytes between the socket and the channel,
+/// summing the per-direction byte counts into the shared atomics
+/// the parent passes in for transport-metrics accounting.
 async fn bridge_unix_to_channel(
     sock: tokio::net::UnixStream,
     dispatcher: &BuilderDispatcher,
     builder_name: &BuilderName,
     build_id: i64,
+    bytes_to_builder: Arc<AtomicU64>,
+    bytes_from_builder: Arc<AtomicU64>,
 ) -> Result<(), ClosureXferError> {
     let chan = dispatcher
         .open_channel(builder_name)
@@ -262,7 +336,7 @@ async fn bridge_unix_to_channel(
         let to_chan = async move {
             let mut sock_reader = sock_reader;
             let mut chan_writer = chan_writer;
-            let r = tokio::io::copy(&mut sock_reader, &mut chan_writer).await;
+            let r = copy_counted(&mut sock_reader, &mut chan_writer, &bytes_to_builder).await;
             let _ = chan_writer.shutdown().await;
             drop(chan_writer);
             r
@@ -270,7 +344,7 @@ async fn bridge_unix_to_channel(
         let from_chan = async move {
             let mut chan_reader = chan_reader;
             let mut sock_writer = sock_writer;
-            let r = tokio::io::copy(&mut chan_reader, &mut sock_writer).await;
+            let r = copy_counted(&mut chan_reader, &mut sock_writer, &bytes_from_builder).await;
             let _ = sock_writer.shutdown().await;
             r
         };

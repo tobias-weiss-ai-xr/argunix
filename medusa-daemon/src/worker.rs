@@ -28,7 +28,7 @@ use medusa_builders::{
 };
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
 use medusa_forge::{CheckPost, CheckState, ForgeError, Provider};
-use medusa_store::{EvalStore, JobStore, RepoStore, SqlxStore};
+use medusa_store::{EvalStore, JobPhaseMetrics, JobStore, RepoStore, SqlxStore};
 use medusa_web::{CancelRegistry, ConfigSnapshot, PauseRegistry, eval_target_url, job_target_url};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -854,6 +854,7 @@ async fn persist_job(
             Utc::now(),
             Some(&log_path_str),
             None,
+            &JobPhaseMetrics::default(),
         )
         .await?;
     }
@@ -915,6 +916,7 @@ async fn build_one(
                     Utc::now(),
                     None,
                     Some(output),
+                    &JobPhaseMetrics::default(),
                 )
                 .await?;
                 return Ok(JobStatus::Cached);
@@ -961,6 +963,7 @@ async fn build_one(
                     Utc::now(),
                     Some(&log_path.to_string_lossy()),
                     None,
+                    &JobPhaseMetrics::default(),
                 )
                 .await?;
                 tracing::warn!(
@@ -1023,7 +1026,7 @@ async fn build_one(
     // the child; for the remote (pool) path, `dispatch_build_via_pool`
     // sends an `Abort` control message and drains the resulting
     // `BuildFinished{Killed}` itself.
-    let outcome = match &chosen {
+    let (outcome, phase_metrics) = match &chosen {
         Some(b) => {
             // M14b: dispatch via the dynamic builder pool through
             // side channels. The helper drives push-closure → Build
@@ -1045,7 +1048,8 @@ async fn build_one(
             // No matching connected builder: fall back to a local
             // `nix-store --realise` (no `--builders`). The host's
             // `nix.buildMachines`, if any, is honoured natively; if
-            // not, the build runs locally.
+            // not, the build runs locally. Local builds have no
+            // remote-transport phases, so we record empty metrics.
             let request = medusa_build::BuildRequest {
                 drv_path: drv_path.clone(),
                 log_path: log_path.clone(),
@@ -1053,7 +1057,7 @@ async fn build_one(
                 log_limit: medusa_build::LogCaptureLimit::default(),
                 gc_root: Some(gc_root.clone()),
             };
-            tokio::select! {
+            let local_outcome = tokio::select! {
                 biased;
                 res = medusa_build::run_build(&request) => res?,
                 _ = cancel.cancelled() => {
@@ -1063,11 +1067,13 @@ async fn build_one(
                         "build cancelled by new push (Q39); killing nix-store",
                     );
                     <SqlxStore as JobStore>::finish(
-                        &ctx.store, job_id, JobStatus::Cancelled, Utc::now(), None, None
+                        &ctx.store, job_id, JobStatus::Cancelled, Utc::now(), None, None,
+                        &JobPhaseMetrics::default(),
                     ).await?;
                     return Ok(JobStatus::Cancelled);
                 }
-            }
+            };
+            (local_outcome, JobPhaseMetrics::default())
         }
     };
     let log_path_str = log_path.to_string_lossy().into_owned();
@@ -1094,6 +1100,7 @@ async fn build_one(
                 Utc::now(),
                 Some(&log_path_str),
                 primary.as_deref(),
+                &phase_metrics,
             )
             .await?;
             Ok(JobStatus::Success)
@@ -1106,6 +1113,7 @@ async fn build_one(
                 Utc::now(),
                 Some(&log_path_str),
                 None,
+                &phase_metrics,
             )
             .await?;
             Ok(JobStatus::Failure)
@@ -1136,7 +1144,10 @@ pub struct PoolDispatchSpec<'a> {
 /// row update and a `JobStatus::Cancelled` return value; the test
 /// dispatch path never sees `Cancelled` (no cancel token is wired in).
 pub enum PoolDispatchResult {
-    Outcome(medusa_build::BuildOutcome),
+    Outcome {
+        outcome: medusa_build::BuildOutcome,
+        phase_metrics: JobPhaseMetrics,
+    },
     Cancelled,
 }
 
@@ -1151,7 +1162,7 @@ async fn dispatch_build_via_pool(
     log_path: &Path,
     log_limit: medusa_build::LogCaptureLimit,
     cancel: &medusa_web::CancelToken,
-) -> anyhow::Result<medusa_build::BuildOutcome> {
+) -> anyhow::Result<(medusa_build::BuildOutcome, JobPhaseMetrics)> {
     let spec = PoolDispatchSpec {
         registry: ctx.builder_registry.clone(),
         builder_name,
@@ -1165,7 +1176,10 @@ async fn dispatch_build_via_pool(
         nix_bin: &ctx.nix_bin,
     };
     match dispatch_pool_build(spec, Some(cancel)).await? {
-        PoolDispatchResult::Outcome(o) => Ok(o),
+        PoolDispatchResult::Outcome {
+            outcome,
+            phase_metrics,
+        } => Ok((outcome, phase_metrics)),
         PoolDispatchResult::Cancelled => {
             <SqlxStore as JobStore>::finish(
                 &ctx.store,
@@ -1174,6 +1188,7 @@ async fn dispatch_build_via_pool(
                 Utc::now(),
                 Some(&log_path.to_string_lossy()),
                 None,
+                &JobPhaseMetrics::default(),
             )
             .await?;
             Err(anyhow!("build cancelled"))
@@ -1218,15 +1233,18 @@ pub async fn dispatch_pool_build(
     let mut log_buf: Vec<u8> = Vec::new();
     let mut log_truncated = false;
 
-    let early_failure = |log_buf: Vec<u8>, log_path: PathBuf| async move {
+    let early_failure = |log_buf: Vec<u8>, log_path: PathBuf, phase_metrics: JobPhaseMetrics| async move {
         medusa_build::write_zstd_log(&log_path, log_buf).await?;
-        Ok::<_, anyhow::Error>(PoolDispatchResult::Outcome(medusa_build::BuildOutcome {
-            status: medusa_build::BuildStatus::Failure,
-            exit_code: None,
-            output_paths: Vec::new(),
-            log_path,
-            log_truncated: false,
-        }))
+        Ok::<_, anyhow::Error>(PoolDispatchResult::Outcome {
+            outcome: medusa_build::BuildOutcome {
+                status: medusa_build::BuildStatus::Failure,
+                exit_code: None,
+                output_paths: Vec::new(),
+                log_path,
+                log_truncated: false,
+            },
+            phase_metrics,
+        })
     };
 
     // 1+2. Push the drv (and its closure) to the builder via
@@ -1235,7 +1253,9 @@ pub async fn dispatch_pool_build(
     //      protocol, and bytes stream per-file with bounded memory.
     //      Replaces the previous query-requisites + valid-paths
     //      probe + chunked-export dance.
-    if let Err(e) = nix_copy_over_pool(
+    let mut phase_metrics = JobPhaseMetrics::default();
+    let push_started_at = std::time::Instant::now();
+    let push_metrics = match nix_copy_over_pool(
         &dispatcher,
         builder_name,
         NixCopyDirection::To,
@@ -1245,23 +1265,35 @@ pub async fn dispatch_pool_build(
     )
     .await
     {
-        tracing::warn!(
-            error = %e,
-            builder = %builder_name,
-            build_id,
-            drv = drv_path,
-            "nix copy --to (push drv closure) failed",
-        );
-        log_buf.extend_from_slice(
-            format!(
-                "medusa: pushing drv closure to `{builder}` failed:\n\
-                 {e}\n\
-                 medusa: drv={drv_path}\n",
-                builder = builder_name,
-            )
-            .as_bytes(),
-        );
-        return early_failure(log_buf, log_path.to_path_buf()).await;
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                builder = %builder_name,
+                build_id,
+                drv = drv_path,
+                "nix copy --to (push drv closure) failed",
+            );
+            log_buf.extend_from_slice(
+                format!(
+                    "medusa: pushing drv closure to `{builder}` failed:\n\
+                     {e}\n\
+                     medusa: drv={drv_path}\n",
+                    builder = builder_name,
+                )
+                .as_bytes(),
+            );
+            // Even on failure, record what we did push (= 0 or partial)
+            // and how long we tried for. Useful when looking at
+            // operations that flap between success and failure.
+            phase_metrics.push_ms = Some(push_started_at.elapsed().as_millis() as u64);
+            phase_metrics.push_bytes = Some(0);
+            return early_failure(log_buf, log_path.to_path_buf(), phase_metrics).await;
+        }
+    };
+    if let Some(m) = push_metrics {
+        phase_metrics.push_bytes = Some(m.bytes_to_builder);
+        phase_metrics.push_ms = Some(m.elapsed.as_millis() as u64);
     }
 
     // 3. Send Build over the control channel; subscribe to lifecycle.
@@ -1284,7 +1316,7 @@ pub async fn dispatch_pool_build(
         Err(e) => {
             tracing::warn!(error = %e, "dispatch_build failed");
             log_buf.extend_from_slice(format!("medusa: dispatch_build failed: {e}\n").as_bytes());
-            return early_failure(log_buf, log_path.to_path_buf()).await;
+            return early_failure(log_buf, log_path.to_path_buf(), phase_metrics).await;
         }
     };
 
@@ -1306,12 +1338,16 @@ pub async fn dispatch_pool_build(
     let mut exit_code: Option<i32> = None;
     let mut aborted = false;
     let mut timed_out = false;
+    // Wall-clock between agent's `BuildStarted` and `BuildFinished`.
+    // None until BuildStarted arrives.
+    let mut build_started_at: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             biased;
             ev = lifecycle.recv() => {
                 match ev {
                     Some(BuildLifecycle::Started { pid }) => {
+                        build_started_at = Some(std::time::Instant::now());
                         tracing::info!(job_id = build_id, ?pid, builder = %builder_name, "agent started build");
                     }
                     Some(BuildLifecycle::LogChunk { bytes }) => {
@@ -1337,6 +1373,10 @@ pub async fn dispatch_pool_build(
                         exit_code = code;
                         output_paths = outs;
                         log_truncated = log_truncated || t;
+                        if let Some(started) = build_started_at {
+                            phase_metrics.build_ms =
+                                Some(started.elapsed().as_millis() as u64);
+                        }
                         break;
                     }
                     None => {
@@ -1409,13 +1449,16 @@ pub async fn dispatch_pool_build(
             log_buf.extend_from_slice(b"\n--- log truncated by medusa ---\n");
         }
         medusa_build::write_zstd_log(log_path, log_buf).await?;
-        return Ok(PoolDispatchResult::Outcome(medusa_build::BuildOutcome {
-            status: medusa_build::BuildStatus::Failure,
-            exit_code,
-            output_paths: Vec::new(),
-            log_path: log_path.to_path_buf(),
-            log_truncated,
-        }));
+        return Ok(PoolDispatchResult::Outcome {
+            outcome: medusa_build::BuildOutcome {
+                status: medusa_build::BuildStatus::Failure,
+                exit_code,
+                output_paths: Vec::new(),
+                log_path: log_path.to_path_buf(),
+                log_truncated,
+            },
+            phase_metrics,
+        });
     }
 
     // 5. On success, pull the output closure into the local store
@@ -1424,6 +1467,7 @@ pub async fn dispatch_pool_build(
     //    the daemon protocol — no chunking, no topo sort, no
     //    explicit memory throttle needed.
     if final_status == BuildOutcomeStatus::Success && !output_paths.is_empty() {
+        let pull_started_at = std::time::Instant::now();
         match nix_copy_over_pool(
             &dispatcher,
             builder_name,
@@ -1434,7 +1478,9 @@ pub async fn dispatch_pool_build(
         )
         .await
         {
-            Ok(()) => {
+            Ok(m) => {
+                phase_metrics.pull_bytes = Some(m.bytes_from_builder);
+                phase_metrics.pull_ms = Some(m.elapsed.as_millis() as u64);
                 // 6. Register gcroot on the first output (matches
                 //    the local path's atomic --add-root semantics
                 //    as closely as we can post-hoc).
@@ -1458,6 +1504,8 @@ pub async fn dispatch_pool_build(
                 );
                 log_buf.extend_from_slice(b"\nmedusa: pulling output closure failed:\n");
                 log_buf.extend_from_slice(format!("{e}\n").as_bytes());
+                phase_metrics.pull_ms = Some(pull_started_at.elapsed().as_millis() as u64);
+                phase_metrics.pull_bytes = Some(0);
                 final_status = BuildOutcomeStatus::Failure;
             }
         }
@@ -1468,16 +1516,19 @@ pub async fn dispatch_pool_build(
     }
     medusa_build::write_zstd_log(log_path, log_buf).await?;
 
-    Ok(PoolDispatchResult::Outcome(medusa_build::BuildOutcome {
-        status: match final_status {
-            BuildOutcomeStatus::Success => medusa_build::BuildStatus::Success,
-            _ => medusa_build::BuildStatus::Failure,
+    Ok(PoolDispatchResult::Outcome {
+        outcome: medusa_build::BuildOutcome {
+            status: match final_status {
+                BuildOutcomeStatus::Success => medusa_build::BuildStatus::Success,
+                _ => medusa_build::BuildStatus::Failure,
+            },
+            exit_code,
+            output_paths,
+            log_path: log_path.to_path_buf(),
+            log_truncated,
         },
-        exit_code,
-        output_paths,
-        log_path: log_path.to_path_buf(),
-        log_truncated,
-    }))
+        phase_metrics,
+    })
 }
 
 /// Wait on an optional cancel token. Returns immediately when fired;

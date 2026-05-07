@@ -5,7 +5,7 @@ use anyhow::{Context, anyhow};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use medusa_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
-use medusa_store::{EvalStore, JobStore, RepoStore};
+use medusa_store::{EvalStore, JobPhaseMetrics, JobStore, RepoStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -669,6 +669,7 @@ async fn persist_job(
             Utc::now(),
             None,
             None,
+            &JobPhaseMetrics::default(),
         )
         .await?;
     }
@@ -713,6 +714,7 @@ async fn build_one_job(
                     Utc::now(),
                     None,
                     Some(output),
+                    &JobPhaseMetrics::default(),
                 )
                 .await?;
                 return Ok(JobStatus::Cached);
@@ -767,6 +769,7 @@ async fn build_one_job(
                 Utc::now(),
                 Some(&log_path_str),
                 primary_output.as_deref(),
+                &JobPhaseMetrics::default(),
             )
             .await?;
             Ok(JobStatus::Success)
@@ -779,6 +782,7 @@ async fn build_one_job(
                 Utc::now(),
                 Some(&log_path_str),
                 None,
+                &JobPhaseMetrics::default(),
             )
             .await?;
             Ok(JobStatus::Failure)

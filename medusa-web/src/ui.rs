@@ -363,9 +363,13 @@ fn humanize_last_seen(
 }
 
 /// Single catch-all for everything under `/r/<forge>/...`. Parses the
-/// trailing path and routes to the right page.
+/// trailing path and routes to the right page. Per Q97, the per-job
+/// detail endpoint is content-negotiated: `Accept: application/json`
+/// returns the raw record + phase metrics as JSON; anything else
+/// renders the HTML page.
 pub async fn dispatch_repo(
     AxumPath((forge, tail)): AxumPath<(String, String)>,
+    headers: axum::http::HeaderMap,
     state: State<AppState>,
 ) -> Result<Response, UiError> {
     let parsed = parse_repo_tail(&tail).ok_or(UiError::NotFound)?;
@@ -375,12 +379,28 @@ pub async fn dispatch_repo(
         TailKind::Repo => repo_page(state, forge, slug).await,
         TailKind::Eval(id) => eval_page(state, forge, slug, EvalId::new(id)).await,
         TailKind::Job { eval_id, attr } => {
-            job_page(state, forge, slug, EvalId::new(eval_id), attr.to_string()).await
+            if wants_json(&headers) {
+                job_json(state, forge, slug, EvalId::new(eval_id), attr.to_string()).await
+            } else {
+                job_page(state, forge, slug, EvalId::new(eval_id), attr.to_string()).await
+            }
         }
         TailKind::Log { eval_id, attr } => {
             log_handler(state, forge, slug, EvalId::new(eval_id), attr.to_string()).await
         }
     }
+}
+
+/// True if the client's `Accept` header prefers JSON. Cheap pattern
+/// match — we don't honour qvalues, just look for `application/json`
+/// in the header. Matches the read-only-by-design API: clients that
+/// want JSON say so, everyone else gets HTML.
+fn wants_json(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("application/json"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -550,6 +570,58 @@ async fn job_page(
     Ok(Html(html).into_response())
 }
 
+/// JSON shape for the per-job detail endpoint. Returned when the
+/// client sends `Accept: application/json` to the job route. The
+/// shape is the JobRecord's UI-relevant subset plus the per-phase
+/// transport accounting (M16) — bytes through our russh tunnel and
+/// wall-clock per phase, all `null` when the job wasn't dispatched
+/// to the pool. Pretty-printed for terminal-friendly `curl | jq`.
+async fn job_json(
+    State(state): State<AppState>,
+    forge: String,
+    slug: Slug,
+    eval_id: EvalId,
+    attr: String,
+) -> Result<Response, UiError> {
+    let jobs = <medusa_store::SqlxStore as JobStore>::list_by_eval(&state.store, eval_id).await?;
+    let job = jobs
+        .into_iter()
+        .find(|j| j.attr_path.as_str() == attr)
+        .ok_or(UiError::NotFound)?;
+
+    let body = serde_json::json!({
+        "forge": forge,
+        "slug": slug.as_str(),
+        "eval_id": eval_id.get(),
+        "attr_path": job.attr_path.to_string(),
+        "system": job.system,
+        "status": job_status_label(&job.status),
+        "started_at": job.started_at.map(|t| t.to_rfc3339()),
+        "finished_at": job.finished_at.map(|t| t.to_rfc3339()),
+        "drv_path": job.drv_path,
+        "output_path": job.output_path,
+        "log_path": job.log_path,
+        // M16 per-phase transport accounting. `null` for jobs that
+        // pre-date the column-set or were built locally.
+        "phase_metrics": {
+            "push_bytes": job.phase_metrics.push_bytes,
+            "push_ms": job.phase_metrics.push_ms,
+            "build_ms": job.phase_metrics.build_ms,
+            "pull_bytes": job.phase_metrics.pull_bytes,
+            "pull_ms": job.phase_metrics.pull_ms,
+        },
+    });
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        serde_json::to_vec_pretty(&body).map_err(UiError::Json)?,
+    )
+        .into_response())
+}
+
 /// Stream the zstd-compressed build log decompressed as `text/plain`.
 async fn log_handler(
     State(state): State<AppState>,
@@ -677,13 +749,15 @@ pub enum UiError {
     LogRead(#[source] std::io::Error),
     #[error("rendering template: {0}")]
     Render(#[source] askama::Error),
+    #[error("encoding JSON response: {0}")]
+    Json(#[source] serde_json::Error),
 }
 
 impl IntoResponse for UiError {
     fn into_response(self) -> Response {
         let status = match &self {
             UiError::NotFound => StatusCode::NOT_FOUND,
-            UiError::Store(_) | UiError::LogRead(_) | UiError::Render(_) => {
+            UiError::Store(_) | UiError::LogRead(_) | UiError::Render(_) | UiError::Json(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };

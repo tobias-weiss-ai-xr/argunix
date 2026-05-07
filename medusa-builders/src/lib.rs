@@ -17,7 +17,7 @@ mod systems;
 
 pub use auth::AuthState;
 pub use channel_io::{ChannelSide, with_channel_io};
-pub use closure_xfer::{ClosureXferError, NixCopyDirection, nix_copy_over_pool};
+pub use closure_xfer::{ClosureXferError, NixCopyDirection, NixCopyMetrics, nix_copy_over_pool};
 pub use dispatcher::{BuilderDispatcher, DispatchError, DispatchedBuild};
 pub use host_key::{HostKey, HostKeyError, load_or_generate};
 pub use protocol::{BuildOutcomeStatus, ControlMessage, LineFramer, ProtocolError};
