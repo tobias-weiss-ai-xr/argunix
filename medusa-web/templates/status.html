@@ -70,6 +70,51 @@
 </section>
 
 <section class="mb-8">
+  <h2 class="text-lg font-semibold mb-2">
+    evaluating right now ({{ evaluating.len() }}{% if eval_queue_depth > 0 %},
+    {{ eval_queue_depth }} waiting{% endif %})
+  </h2>
+  {% if evaluating.is_empty() %}
+  <p class="text-slate-500">
+    No evaluation in progress.{% if eval_queue_depth > 0 %} ({{ eval_queue_depth }} queued — the
+    worker processes evals serially.){% endif %}
+  </p>
+  {% else %}
+  <table class="w-full text-sm border-collapse">
+    <thead class="text-left text-slate-500">
+      <tr>
+        <th class="py-2 pr-4">eval</th>
+        <th class="py-2 pr-4">repo</th>
+        <th class="py-2 pr-4">trigger</th>
+        <th class="py-2">started</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in evaluating %}
+      <tr class="border-t border-slate-200">
+        <td class="py-2 pr-4">
+          <a
+            class="text-blue-600 hover:underline"
+            href="/r/{{ e.forge }}/{{ e.slug }}/eval/{{ e.eval_id }}"
+            >#{{ e.eval_id }}</a
+          >
+        </td>
+        <td class="py-2 pr-4">
+          <a class="text-blue-600 hover:underline" href="/r/{{ e.forge }}/{{ e.slug }}"
+            >{{ e.forge }}/{{ e.slug }}</a
+          >
+          <span class="text-slate-400 font-mono text-xs">{{ e.git_ref }} @ {{ e.short_sha }}</span>
+        </td>
+        <td class="py-2 pr-4 font-mono text-xs">{{ e.trigger }}</td>
+        <td class="py-2 text-slate-500 text-xs">{{ e.started }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<section class="mb-8">
   <h2 class="text-lg font-semibold mb-2">building right now ({{ running.len() }})</h2>
   {% if running.is_empty() %}
   <p class="text-slate-500">Nothing is building.</p>

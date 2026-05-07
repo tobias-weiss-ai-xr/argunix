@@ -106,6 +106,16 @@ pub struct JobWithContext {
     pub short_sha: String,
 }
 
+/// An evaluation row joined with its repo. Status page uses this to
+/// show currently-evaluating + eval-queued rows without the caller
+/// doing N+1 lookups against `repos`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalWithRepo {
+    pub eval: EvalRecord,
+    pub forge: String,
+    pub slug: Slug,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeStatusRecord {
     pub eval_id: EvalId,

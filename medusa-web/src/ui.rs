@@ -32,10 +32,27 @@ use std::collections::HashMap;
 struct StatusTemplate {
     totals: ClusterTotals,
     builders: Vec<BuilderRow>,
+    evaluating: Vec<EvalRow2>,
+    eval_queue_depth: usize,
     running: Vec<RunningRow>,
     queued: Vec<QueuedRow>,
     queued_shown: usize,
     queued_truncated: bool,
+}
+
+/// Status-page row for an evaluation in `Evaluating` (or, when
+/// `eval_queue_depth > 0`, the head-of-queue we surface alongside).
+/// Distinct from the `EvalRow` used by the repo page so the column
+/// layouts can diverge — the status-page version shows trigger and
+/// elapsed-since-started, repo page shows finished_at.
+struct EvalRow2 {
+    eval_id: i64,
+    forge: String,
+    slug: String,
+    git_ref: String,
+    short_sha: String,
+    trigger: String,
+    started: String,
 }
 
 struct ClusterTotals {
@@ -290,6 +307,38 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
         .collect();
     let queued_shown = queued.len();
 
+    // M16: surface the worker's eval pipeline. Evaluations are
+    // processed serially through a single mpsc → single tokio task,
+    // so `evaluating` is normally 0 or 1 rows. >1 only if a previous
+    // worker died mid-eval and left a stale row — that's worth
+    // showing too. `eval_queue_depth` is the count of `Queued` evals
+    // waiting their turn, so an operator can see "3 PRs landed at
+    // once, mine is 3rd."
+    let evaluating_rows = <medusa_store::SqlxStore as EvalStore>::list_by_status(
+        &state.store,
+        EvalStatus::Evaluating,
+        16,
+    )
+    .await?;
+    let evaluating: Vec<EvalRow2> = evaluating_rows
+        .into_iter()
+        .map(|r| EvalRow2 {
+            eval_id: r.eval.id.get(),
+            forge: r.forge,
+            slug: r.slug.as_str().to_string(),
+            git_ref: r.eval.git_ref,
+            short_sha: r.eval.sha.short().to_string(),
+            trigger: r.eval.trigger,
+            started: fmt_opt_time(r.eval.started_at),
+        })
+        .collect();
+    // For the queue depth, we don't need the rows themselves — just
+    // the count. Cap at LIMIT+1 isn't needed here either (sqlite
+    // reads are cheap and we want the actual depth for display).
+    let eval_queue_depth = <medusa_store::SqlxStore as EvalStore>::list_queued_ids(&state.store)
+        .await?
+        .len();
+
     let totals = ClusterTotals {
         builders_online,
         builders_known: roster.len(),
@@ -305,6 +354,8 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
     Ok(Html(render(&StatusTemplate {
         totals,
         builders,
+        evaluating,
+        eval_queue_depth,
         running,
         queued,
         queued_shown,
@@ -885,6 +936,8 @@ mod tests {
                 queued_total: 0,
             },
             builders: vec![],
+            evaluating: vec![],
+            eval_queue_depth: 0,
             running: vec![],
             queued: vec![],
             queued_shown: 0,

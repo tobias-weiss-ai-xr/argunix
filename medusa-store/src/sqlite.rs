@@ -1,6 +1,6 @@
 use crate::records::{
-    BuilderRecord, EvalRecord, ForgeStatusRecord, JobRecord, JobWithContext, NewBuilder,
-    NewEvaluation, NewJob, RepoRecord,
+    BuilderRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord, JobRecord, JobWithContext,
+    NewBuilder, NewEvaluation, NewJob, RepoRecord,
 };
 use crate::traits::{
     BuilderStore, EvalStore, ForgeStatusStore, InterruptOutcome, JobStore, MAX_INTERRUPTIONS,
@@ -448,6 +448,36 @@ impl EvalStore for SqlxStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(EvalId::new).collect())
+    }
+
+    async fn list_by_status(
+        &self,
+        status: EvalStatus,
+        limit: u32,
+    ) -> Result<Vec<EvalWithRepo>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT e.id, e.repo_id, e.trigger, e.git_ref, e.sha,
+                    e.started_at, e.finished_at, e.status,
+                    r.forge AS r_forge, r.slug AS r_slug
+             FROM evaluations e
+             JOIN repos r ON e.repo_id = r.id
+             WHERE e.status = ?1
+             ORDER BY e.id ASC
+             LIMIT ?2",
+        )
+        .bind(status.as_str())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let eval = map_eval(row)?;
+                let forge: String = row.try_get("r_forge")?;
+                let slug_s: String = row.try_get("r_slug")?;
+                let slug = to_slug(eval.id.get(), slug_s)?;
+                Ok(EvalWithRepo { eval, forge, slug })
+            })
+            .collect()
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::records::{
-    BuilderRecord, EvalRecord, ForgeStatusRecord, JobPhaseMetrics, JobRecord, JobWithContext,
-    NewBuilder, NewEvaluation, NewJob, RepoRecord,
+    BuilderRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord, JobPhaseMetrics, JobRecord,
+    JobWithContext, NewBuilder, NewEvaluation, NewJob, RepoRecord,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -117,6 +117,18 @@ pub trait EvalStore: Send + Sync {
     /// attr_path (no upsert today). Per-job redrive for
     /// in-flight evals is a separate, larger change.
     async fn list_queued_ids(&self) -> Result<Vec<EvalId>, StoreError>;
+    /// Up to `limit` evaluations whose row sits in `status`, joined
+    /// with their repo for UI display. Ordering: oldest started first
+    /// (so a stale `Evaluating` row from a crashed worker floats to
+    /// the top of the status page) — we ORDER BY id ASC since
+    /// `started_at` is `NULL` for `Queued` rows. Used by the status
+    /// page to render "evaluating right now" + "eval queue depth"
+    /// without N+1'ing through `repos`.
+    async fn list_by_status(
+        &self,
+        status: EvalStatus,
+        limit: u32,
+    ) -> Result<Vec<EvalWithRepo>, StoreError>;
 }
 
 #[async_trait]
