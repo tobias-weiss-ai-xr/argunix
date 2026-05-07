@@ -26,6 +26,43 @@
   {% endif %}
 </dl>
 
+{% if phase_metrics.has_any %}
+<section class="mb-6">
+  <h2 class="text-lg font-semibold mb-2">transport &amp; build</h2>
+  <p class="text-xs text-slate-500 mb-2">
+    bytes counted at the daemon-side end of the russh tunnel; net build
+    is the agent's <span class="font-mono">nix-store --realise</span>
+    wall-clock, transfer not included.
+  </p>
+  <table class="text-sm border-collapse">
+    <thead class="text-left text-slate-500">
+      <tr>
+        <th class="py-1 pr-6">phase</th>
+        <th class="py-1 pr-6">duration</th>
+        <th class="py-1">bytes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="border-t border-slate-200">
+        <td class="py-1 pr-6">push (drv closure → builder)</td>
+        <td class="py-1 pr-6 font-mono">{{ phase_metrics.push_ms }}</td>
+        <td class="py-1 font-mono">{{ phase_metrics.push_bytes }}</td>
+      </tr>
+      <tr class="border-t border-slate-200">
+        <td class="py-1 pr-6">build (net, on builder)</td>
+        <td class="py-1 pr-6 font-mono">{{ phase_metrics.build_ms }}</td>
+        <td class="py-1 text-slate-400">—</td>
+      </tr>
+      <tr class="border-t border-slate-200">
+        <td class="py-1 pr-6">pull (output closure ← builder)</td>
+        <td class="py-1 pr-6 font-mono">{{ phase_metrics.pull_ms }}</td>
+        <td class="py-1 font-mono">{{ phase_metrics.pull_bytes }}</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
 {% if has_log %}
 <p>
   <a

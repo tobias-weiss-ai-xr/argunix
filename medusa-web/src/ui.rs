@@ -160,6 +160,21 @@ struct JobTemplate {
     drv_path: Option<String>,
     output_path: Option<String>,
     has_log: bool,
+    /// M16 per-phase transport accounting. Each pair is rendered as
+    /// "<value> (<raw>)" already-formatted; absent fields surface as
+    /// "—". The whole block is suppressed in the template when no
+    /// phase has data, so jobs built locally / pre-M16 stay clean.
+    phase_metrics: PhaseMetricsRow,
+}
+
+#[derive(Default)]
+struct PhaseMetricsRow {
+    has_any: bool,
+    push_bytes: String,
+    push_ms: String,
+    build_ms: String,
+    pull_bytes: String,
+    pull_ms: String,
 }
 
 pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiError> {
@@ -578,6 +593,20 @@ async fn job_page(
         .find(|j| j.attr_path.as_str() == attr)
         .ok_or(UiError::NotFound)?;
 
+    let pm = job.phase_metrics;
+    let phase_metrics = PhaseMetricsRow {
+        has_any: pm.push_bytes.is_some()
+            || pm.push_ms.is_some()
+            || pm.build_ms.is_some()
+            || pm.pull_bytes.is_some()
+            || pm.pull_ms.is_some(),
+        push_bytes: humanize_bytes(pm.push_bytes),
+        push_ms: humanize_ms(pm.push_ms),
+        build_ms: humanize_ms(pm.build_ms),
+        pull_bytes: humanize_bytes(pm.pull_bytes),
+        pull_ms: humanize_ms(pm.pull_ms),
+    };
+
     let html = render(&JobTemplate {
         forge,
         slug: slug.as_str().to_string(),
@@ -590,6 +619,7 @@ async fn job_page(
         drv_path: job.drv_path,
         output_path: job.output_path,
         has_log: job.log_path.is_some(),
+        phase_metrics,
     })?;
     Ok(Html(html).into_response())
 }
@@ -698,6 +728,49 @@ fn fmt_opt_time(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
     match t {
         Some(t) => t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
         None => "—".to_string(),
+    }
+}
+
+/// Render a byte count with an SI-ish unit (KB/MB/GB at 1024-base) and
+/// the raw byte total in parens. `None` → `"—"`. Used for the per-job
+/// page's M16 transport rows. Three sigfigs is plenty — "523 MB" is
+/// more useful than "523.418 MB", and the raw value is right next to it
+/// for anyone who needs the exact figure.
+fn humanize_bytes(b: Option<u64>) -> String {
+    let Some(b) = b else { return "—".to_string() };
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.2} {} ({b} B)", UNITS[i])
+    }
+}
+
+/// Render a millisecond duration as `Hh Mm Ss` / `Mm Ss` / `Ss` /
+/// `123 ms`, picking the largest non-zero grain. `None` → `"—"`.
+fn humanize_ms(ms: Option<u64>) -> String {
+    let Some(ms) = ms else {
+        return "—".to_string();
+    };
+    if ms < 1000 {
+        return format!("{ms} ms");
+    }
+    let total_s = ms / 1000;
+    let h = total_s / 3600;
+    let m = (total_s % 3600) / 60;
+    let s = total_s % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
     }
 }
 
