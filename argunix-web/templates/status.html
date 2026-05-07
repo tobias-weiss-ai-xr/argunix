@@ -3,29 +3,20 @@
 {% endblock %} {% block content %}
 <h1 class="text-2xl font-semibold mb-4">cluster status</h1>
 
-<section class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
+<section class="grid grid-cols-3 gap-4 mb-8">
+  <div class="rounded border border-slate-200 bg-white p-4">
+    <div class="text-xs uppercase tracking-wide text-slate-500">building</div>
+    <div class="text-2xl font-semibold">{{ totals.running }}</div>
+  </div>
+  <div class="rounded border border-slate-200 bg-white p-4">
+    <div class="text-xs uppercase tracking-wide text-slate-500">queued</div>
+    <div class="text-2xl font-semibold">{{ totals.queued_total }}</div>
+  </div>
   <div class="rounded border border-slate-200 bg-white p-4">
     <div class="text-xs uppercase tracking-wide text-slate-500">builders online</div>
     <div class="text-2xl font-semibold">
       {{ totals.builders_online }}<span class="text-slate-400 text-base"> / {{ totals.builders_known }}</span>
     </div>
-  </div>
-  <div class="rounded border border-slate-200 bg-white p-4">
-    <div class="text-xs uppercase tracking-wide text-slate-500">slots in use</div>
-    <div class="text-2xl font-semibold">
-      {{ totals.in_flight }}<span class="text-slate-400 text-base"> / {{ totals.total_slots }}</span>
-    </div>
-    <div class="text-xs text-slate-500">{{ totals.utilization_pct }}% utilization</div>
-  </div>
-  <div class="rounded border border-slate-200 bg-white p-4">
-    <div class="text-xs uppercase tracking-wide text-slate-500">running</div>
-    <div class="text-2xl font-semibold">{{ totals.running }}</div>
-    <div class="text-xs text-slate-500">derivations being built right now</div>
-  </div>
-  <div class="rounded border border-slate-200 bg-white p-4">
-    <div class="text-xs uppercase tracking-wide text-slate-500">queued</div>
-    <div class="text-2xl font-semibold">{{ totals.queued_total }}</div>
-    <div class="text-xs text-slate-500">waiting for a builder</div>
   </div>
 </section>
 

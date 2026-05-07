@@ -58,9 +58,6 @@ struct EvalRow2 {
 struct ClusterTotals {
     builders_online: usize,
     builders_known: usize,
-    in_flight: u32,
-    total_slots: u32,
-    utilization_pct: u32,
     running: usize,
     queued_total: usize,
 }
@@ -233,17 +230,6 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
         .collect();
 
     let builders_online = live.iter().filter(|b| b.state == ConnState::Active).count();
-    let in_flight: u32 = live.iter().map(|b| b.in_flight).sum();
-    let total_slots: u32 = live
-        .iter()
-        .filter(|b| b.state == ConnState::Active)
-        .map(|b| b.capabilities.max_jobs)
-        .sum();
-    let utilization_pct = if total_slots == 0 {
-        0
-    } else {
-        ((in_flight as u64 * 100) / total_slots as u64) as u32
-    };
 
     // BuilderId → display name map so running rows can show the operator
     // name rather than the opaque numeric id stored on the job row.
@@ -347,9 +333,6 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
     let totals = ClusterTotals {
         builders_online,
         builders_known: roster.len(),
-        in_flight,
-        total_slots,
-        utilization_pct,
         running: running.len(),
         // queued_jobs was capped at LIMIT+1, so we report ≥ truthfully.
         // For >LIMIT queues we show "LIMIT+" using the truncated flag.
