@@ -1,5 +1,11 @@
 {% extends "base.html" %} {% block title %}{{ forge }}/{{ slug }} — argunix{% endblock %} {% block content %}
-<h1 class="text-2xl font-semibold mb-2">{{ forge }} / {{ slug }}</h1>
+<h1 class="text-2xl font-semibold mb-1">
+  {% if let Some(n) = name %}{{ n }}{% else %}{{ forge }} / {{ slug }}{% endif %}
+</h1>
+<p class="text-sm text-slate-500 font-mono mb-1">{{ forge }} / {{ slug }}</p>
+{% if let Some(d) = description %}
+<p class="text-slate-700 mb-3">{{ d }}</p>
+{% endif %}
 <p class="mb-4">
   <a class="text-blue-600 hover:underline" href="/repos">← all repos</a>
 </p>
@@ -13,7 +19,8 @@
       <th class="py-2 pr-4">ref</th>
       <th class="py-2 pr-4">sha</th>
       <th class="py-2 pr-4">status</th>
-      <th class="py-2">finished</th>
+      <th class="py-2 pr-4">finished</th>
+      <th class="py-2">total</th>
     </tr>
   </thead>
   <tbody>
@@ -29,7 +36,8 @@
       <td class="py-2 pr-4 font-mono">{{ e.git_ref }}</td>
       <td class="py-2 pr-4 font-mono">{{ e.short_sha }}</td>
       <td class="py-2 pr-4">{{ e.status }}</td>
-      <td class="py-2 text-slate-500">{{ e.finished }}</td>
+      <td class="py-2 pr-4 text-slate-500">{{ e.finished }}</td>
+      <td class="py-2 font-mono">{{ e.total }}</td>
     </tr>
     {% endfor %}
   </tbody>

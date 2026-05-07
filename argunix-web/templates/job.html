@@ -17,6 +17,8 @@
   <dd class="text-slate-500">{{ started }}</dd>
   <dt class="text-slate-500">finished</dt>
   <dd class="text-slate-500">{{ finished }}</dd>
+  <dt class="text-slate-500">total</dt>
+  <dd class="font-mono">{{ total }}</dd>
   {% if let Some(d) = drv_path %}
   <dt class="text-slate-500">derivation</dt>
   <dd class="font-mono break-all">{{ d }}</dd>
@@ -70,9 +72,10 @@
 <section class="mb-6">
   <h2 class="text-lg font-semibold mb-2">transport &amp; build</h2>
   <p class="text-xs text-slate-500 mb-2">
-    bytes counted at the daemon-side end of the russh tunnel; net build
-    is the agent's <span class="font-mono">nix-store --realise</span>
-    wall-clock, transfer not included.
+    Time and data spent uploading the build inputs to the builder,
+    running the build, and downloading the outputs back. Bytes are
+    measured between argunix and the builder; the build duration is
+    the build itself, not including transfer.
   </p>
   <table class="text-sm border-collapse">
     <thead class="text-left text-slate-500">

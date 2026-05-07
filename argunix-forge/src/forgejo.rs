@@ -418,6 +418,8 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
     #[derive(Deserialize)]
     struct Repository {
         full_name: String,
+        name: Option<String>,
+        description: Option<String>,
     }
     #[derive(Deserialize)]
     struct Pusher {
@@ -436,6 +438,8 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
         git_ref: view.git_ref,
         sha,
         pusher: view.pusher.and_then(|p| p.username.or(p.login)),
+        repo_name: view.repository.name,
+        repo_description: view.repository.description.filter(|s| !s.is_empty()),
     })
 }
 
@@ -450,6 +454,8 @@ fn parse_pull_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
     #[derive(Deserialize)]
     struct Repository {
         full_name: String,
+        name: Option<String>,
+        description: Option<String>,
     }
     #[derive(Deserialize)]
     struct PullRequest {
@@ -508,6 +514,8 @@ fn parse_pull_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
             .unwrap_or_default(),
         action: PullRequestAction::from_str(&view.action),
         is_fork,
+        repo_name: view.repository.name,
+        repo_description: view.repository.description.filter(|s| !s.is_empty()),
     })
 }
 

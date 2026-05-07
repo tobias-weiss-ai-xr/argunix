@@ -70,6 +70,18 @@ pub trait RepoStore: Send + Sync {
         secret: &[u8],
         hook_id: &str,
     ) -> Result<(), StoreError>;
+    /// Update the forge-supplied display fields for `repo_id`. Both
+    /// `name` and `description` are optional — pass `None` to clear,
+    /// `Some(_)` to overwrite. Called from each webhook handler so the
+    /// UI's `/repos` and per-repo pages stay current with whatever the
+    /// forge surfaces; on push events both forges include these on the
+    /// `repository` / `project` payload object.
+    async fn set_metadata(
+        &self,
+        repo_id: RepoId,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<(), StoreError>;
     /// Delete every repo (and its cascaded evaluations / jobs / queue
     /// rows / forge_status rows) whose `(forge, slug)` does not appear
     /// in `keep`. Returns the deleted repo records so the caller can
@@ -86,6 +98,16 @@ pub trait EvalStore: Send + Sync {
     async fn create(&self, new: NewEvaluation) -> Result<EvalId, StoreError>;
     async fn get(&self, id: EvalId) -> Result<Option<EvalRecord>, StoreError>;
     async fn set_status(&self, id: EvalId, status: EvalStatus) -> Result<(), StoreError>;
+    /// Mark this evaluation as started: writes `started_at` and flips
+    /// status. Idempotent in the sense that calling it twice will
+    /// overwrite `started_at` — callers (worker on first pickup) should
+    /// only call it once per eval.
+    async fn start(
+        &self,
+        id: EvalId,
+        started_at: DateTime<Utc>,
+        status: EvalStatus,
+    ) -> Result<(), StoreError>;
     async fn finish(
         &self,
         id: EvalId,

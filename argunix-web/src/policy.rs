@@ -179,6 +179,8 @@ mod tests {
             git_ref: git_ref.into(),
             sha: Sha::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
             pusher: Some("alice".into()),
+            repo_name: None,
+            repo_description: None,
         })
     }
 
@@ -192,6 +194,8 @@ mod tests {
             author: author.into(),
             action,
             is_fork: true,
+            repo_name: None,
+            repo_description: None,
         })
     }
 

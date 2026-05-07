@@ -482,6 +482,8 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
     #[derive(Deserialize)]
     struct Project {
         path_with_namespace: String,
+        name: Option<String>,
+        description: Option<String>,
     }
 
     let view: PushView = serde_json::from_slice(body).map_err(ForgeError::BadPayload)?;
@@ -494,6 +496,8 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
         git_ref: view.git_ref,
         sha,
         pusher: view.user_username,
+        repo_name: view.project.name,
+        repo_description: view.project.description.filter(|s| !s.is_empty()),
     })
 }
 
@@ -516,6 +520,8 @@ fn parse_merge_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
     #[derive(Deserialize)]
     struct Project {
         path_with_namespace: String,
+        name: Option<String>,
+        description: Option<String>,
     }
     #[derive(Deserialize)]
     struct User {
@@ -577,6 +583,8 @@ fn parse_merge_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
                 .unwrap_or("other"),
         ),
         is_fork,
+        repo_name: view.project.name,
+        repo_description: view.project.description.filter(|s| !s.is_empty()),
     })
 }
 

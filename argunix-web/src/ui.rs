@@ -72,9 +72,14 @@ struct BuilderRow {
     is_online: bool,
     in_flight: u32,
     max_jobs: u32,
-    systems: String,
-    features: String,
+    /// Rendered as small pill badges in `status.html`. Stored as
+    /// `Vec<String>` rather than a comma-joined string so the template
+    /// can iterate.
+    systems: Vec<String>,
+    features: Vec<String>,
     nix_version: String,
+    /// Suppressed in the template when `is_online` is true (we already
+    /// know it's live; "last seen" reads as past tense).
     last_seen: String,
 }
 
@@ -120,6 +125,13 @@ struct IndexTemplate {
 struct RepoRow {
     forge: String,
     slug: String,
+    /// Forge-supplied display name. Falls back to `slug` in the
+    /// template when `None`.
+    name: Option<String>,
+    description: Option<String>,
+    /// `Some(id)` if the repo has at least one evaluation; the template
+    /// renders a "latest eval" link to it.
+    latest_eval_id: Option<i64>,
 }
 
 #[derive(Template)]
@@ -128,6 +140,8 @@ struct RepoTemplate {
     cluster_active: bool,
     forge: String,
     slug: String,
+    name: Option<String>,
+    description: Option<String>,
     evals: Vec<EvalRow>,
 }
 
@@ -137,6 +151,9 @@ struct EvalRow {
     short_sha: String,
     status: &'static str,
     finished: String,
+    /// Wall-clock between `started_at` and `finished_at`, humanized.
+    /// `"—"` when either is missing.
+    total: String,
 }
 
 #[derive(Template)]
@@ -153,6 +170,8 @@ struct EvalTemplate {
     sha: String,
     started: String,
     finished: String,
+    /// Wall-clock between `started_at` and `finished_at`, humanized.
+    total: String,
     job_heading: String,
     empty_jobs_msg: &'static str,
     jobs: Vec<JobRow>,
@@ -164,6 +183,8 @@ struct JobRow {
     status: &'static str,
     finished: String,
     has_log: bool,
+    /// Per-job wall-clock; `"—"` when missing.
+    duration: String,
 }
 
 #[derive(Template)]
@@ -179,6 +200,8 @@ struct JobTemplate {
     status_label: &'static str,
     started: String,
     finished: String,
+    /// Wall-clock between `started_at` and `finished_at`, humanized.
+    total: String,
     drv_path: Option<String>,
     output_path: Option<String>,
     has_log: bool,
@@ -205,16 +228,25 @@ struct PhaseMetricsRow {
 
 pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiError> {
     let cluster_active = cluster_is_active(&state).await?;
-    let repos = state
-        .store
-        .list()
-        .await?
-        .into_iter()
-        .map(|r| RepoRow {
+    let raw = state.store.list().await?;
+    let mut repos: Vec<RepoRow> = Vec::with_capacity(raw.len());
+    for r in raw {
+        // One latest-eval lookup per repo. Cheap (LIMIT 1, indexed); we
+        // skip a join here so the query stays trivially correct.
+        let latest_eval_id =
+            <argunix_store::SqlxStore as EvalStore>::list_by_repo(&state.store, r.id, 1)
+                .await?
+                .into_iter()
+                .next()
+                .map(|e| e.id.get());
+        repos.push(RepoRow {
             forge: r.forge,
             slug: r.slug.as_str().to_string(),
-        })
-        .collect();
+            name: r.name,
+            description: r.description,
+            latest_eval_id,
+        });
+    }
     Ok(Html(render(&IndexTemplate {
         cluster_active,
         repos,
@@ -417,12 +449,8 @@ fn build_builder_row(
         is_online,
         in_flight,
         max_jobs: caps.max_jobs,
-        systems: caps.systems.join(", "),
-        features: if caps.features.is_empty() {
-            "—".to_string()
-        } else {
-            caps.features.join(", ")
-        },
+        systems: caps.systems.clone(),
+        features: caps.features.clone(),
         nix_version: caps.nix_version.clone(),
         last_seen: humanize_last_seen(row.last_seen, now),
     }
@@ -579,6 +607,7 @@ async fn repo_page(
             short_sha: short_sha(e.sha.as_str()).to_string(),
             status: eval_status_label(&e.status),
             finished: fmt_opt_time(e.finished_at),
+            total: humanize_duration(e.started_at, e.finished_at),
         })
         .collect();
 
@@ -587,6 +616,8 @@ async fn repo_page(
         cluster_active,
         forge,
         slug: slug.as_str().to_string(),
+        name: repo.name,
+        description: repo.description,
         evals,
     })?;
     Ok(Html(html).into_response())
@@ -613,6 +644,7 @@ async fn eval_page(
             status: job_status_label(&j.status),
             finished: fmt_opt_time(j.finished_at),
             has_log: j.log_path.is_some(),
+            duration: humanize_duration(j.started_at, j.finished_at),
         })
         .collect();
 
@@ -629,6 +661,7 @@ async fn eval_page(
         sha: eval.sha.to_string(),
         started: fmt_opt_time(eval.started_at),
         finished: fmt_opt_time(eval.finished_at),
+        total: humanize_duration(eval.started_at, eval.finished_at),
         job_heading,
         empty_jobs_msg,
         jobs: job_rows,
@@ -684,6 +717,7 @@ async fn job_page(
         status_label: job_status_label(&job.status),
         started: fmt_opt_time(job.started_at),
         finished: fmt_opt_time(job.finished_at),
+        total: humanize_duration(job.started_at, job.finished_at),
         drv_path: job.drv_path,
         output_path: job.output_path,
         has_log: job.log_path.is_some(),
@@ -935,6 +969,23 @@ fn humanize_bytes(b: Option<u64>) -> String {
 
 /// Render a millisecond duration as `Hh Mm Ss` / `Mm Ss` / `Ss` /
 /// `123 ms`, picking the largest non-zero grain. `None` → `"—"`.
+/// Wall-clock between two timestamps, humanized via [`humanize_ms`].
+/// `"—"` when either side is missing or the diff would be negative
+/// (clock skew on a freshly-cancelled row).
+fn humanize_duration(
+    started: Option<chrono::DateTime<chrono::Utc>>,
+    finished: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    let (Some(s), Some(f)) = (started, finished) else {
+        return "—".to_string();
+    };
+    let ms = (f - s).num_milliseconds();
+    if ms < 0 {
+        return "—".to_string();
+    }
+    humanize_ms(Some(ms as u64))
+}
+
 fn humanize_ms(ms: Option<u64>) -> String {
     let Some(ms) = ms else {
         return "—".to_string();

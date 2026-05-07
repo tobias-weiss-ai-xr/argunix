@@ -9,6 +9,11 @@ pub struct RepoRecord {
     pub id: RepoId,
     pub forge: String,
     pub slug: Slug,
+    /// Forge-supplied display name. Populated from each webhook payload.
+    /// `None` until the first matching webhook lands.
+    pub name: Option<String>,
+    /// Forge-supplied description. Same population rules as `name`.
+    pub description: Option<String>,
 }
 
 /// Fields supplied when creating a new evaluation row.
@@ -18,6 +23,10 @@ pub struct NewEvaluation {
     pub trigger: String,
     pub git_ref: String,
     pub sha: Sha,
+    /// PR number when `trigger == "pull_request"`. `None` for branch
+    /// pushes. Populated from the webhook payload so the UI can link
+    /// directly to the PR on the forge.
+    pub pr_number: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +39,8 @@ pub struct EvalRecord {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub status: EvalStatus,
+    /// PR number for pull-request evals. See [`NewEvaluation::pr_number`].
+    pub pr_number: Option<u32>,
 }
 
 /// Fields supplied when creating a new job row.

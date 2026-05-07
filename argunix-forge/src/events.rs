@@ -17,6 +17,12 @@ pub struct PushEvent {
     /// events carry the author rather than pusher; we pick whichever the
     /// forge gives us via `pusher.name` / `head_commit.author.login`.
     pub pusher: Option<String>,
+    /// Forge-supplied display name (`repository.name` on GitHub/Forgejo,
+    /// `project.name` on GitLab). `None` if the field is absent.
+    pub repo_name: Option<String>,
+    /// Forge-supplied description (`repository.description` /
+    /// `project.description`). `None` if absent or empty.
+    pub repo_description: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +38,10 @@ pub struct PullRequestEvent {
     pub action: PullRequestAction,
     /// True iff the PR's head repo differs from the base repo (a fork PR).
     pub is_fork: bool,
+    /// Forge-supplied repo display name. See [`PushEvent::repo_name`].
+    pub repo_name: Option<String>,
+    /// Forge-supplied repo description. See [`PushEvent::repo_description`].
+    pub repo_description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -244,30 +244,56 @@ async fn persist(
     provider: &Arc<dyn Provider>,
     event: NormalizedEvent,
 ) -> Result<(), WebhookError> {
-    let (slug, git_ref, sha, trigger) = match &event {
+    let (slug, git_ref, sha, trigger, pr_number, repo_name, repo_description) = match &event {
         NormalizedEvent::Push(PushEvent {
-            slug, git_ref, sha, ..
+            slug,
+            git_ref,
+            sha,
+            repo_name,
+            repo_description,
+            ..
         }) => (
             slug.clone(),
             git_ref.clone(),
             sha.clone(),
             "push".to_string(),
+            None,
+            repo_name.clone(),
+            repo_description.clone(),
         ),
         NormalizedEvent::PullRequest(PullRequestEvent {
             slug,
             pr_number,
             head_sha,
             head_ref,
+            repo_name,
+            repo_description,
             ..
         }) => (
             slug.clone(),
             format!("refs/pull/{pr_number}/head:{head_ref}"),
             head_sha.clone(),
             "pull_request".to_string(),
+            u32::try_from(*pr_number).ok(),
+            repo_name.clone(),
+            repo_description.clone(),
         ),
     };
 
     let repo_id = state.store.upsert(forge_name, &slug).await?;
+    if let Err(e) = state
+        .store
+        .set_metadata(repo_id, repo_name.as_deref(), repo_description.as_deref())
+        .await
+    {
+        // Cosmetic data — log and continue rather than failing the
+        // webhook ack.
+        tracing::warn!(
+            error = %e,
+            repo_id = repo_id.get(),
+            "set_metadata failed; continuing without updating display fields",
+        );
+    }
 
     // Q99: drop duplicate `(repo_id, sha)` events within the configured
     // window. GitHub sends both a `push` and a `pull_request.synchronize`
@@ -320,6 +346,7 @@ async fn persist(
             trigger,
             git_ref: git_ref.clone(),
             sha: sha.clone(),
+            pr_number,
         },
     )
     .await?;

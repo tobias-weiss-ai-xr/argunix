@@ -211,7 +211,8 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         .get(&repo.forge)
         .ok_or_else(|| anyhow!("no provider for forge `{}`", repo.forge))?;
 
-    <SqlxStore as EvalStore>::set_status(&ctx.store, eval_id, EvalStatus::Evaluating).await?;
+    <SqlxStore as EvalStore>::start(&ctx.store, eval_id, Utc::now(), EvalStatus::Evaluating)
+        .await?;
 
     let work_dir = ctx.work_dir.join(eval_id.get().to_string());
     if work_dir.exists() {

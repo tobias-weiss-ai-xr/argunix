@@ -543,6 +543,7 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
             trigger: args.trigger.clone(),
             git_ref: args.git_ref.clone(),
             sha,
+            pr_number: None,
         },
     )
     .await

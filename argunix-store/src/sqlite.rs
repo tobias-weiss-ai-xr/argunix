@@ -52,10 +52,14 @@ fn map_repo(row: &SqliteRow) -> Result<RepoRecord, StoreError> {
     let id: i64 = row.try_get("id")?;
     let forge: String = row.try_get("forge")?;
     let slug: String = row.try_get("slug")?;
+    let name: Option<String> = row.try_get("name")?;
+    let description: Option<String> = row.try_get("description")?;
     Ok(RepoRecord {
         id: RepoId::new(id),
         forge,
         slug: to_slug(id, slug)?,
+        name,
+        description,
     })
 }
 
@@ -68,6 +72,7 @@ fn map_eval(row: &SqliteRow) -> Result<EvalRecord, StoreError> {
     let started_at: Option<DateTime<Utc>> = row.try_get("started_at")?;
     let finished_at: Option<DateTime<Utc>> = row.try_get("finished_at")?;
     let status: String = row.try_get("status")?;
+    let pr_number: Option<i64> = row.try_get("pr_number")?;
     Ok(EvalRecord {
         id: EvalId::new(id),
         repo_id: RepoId::new(repo_id),
@@ -77,6 +82,7 @@ fn map_eval(row: &SqliteRow) -> Result<EvalRecord, StoreError> {
         started_at,
         finished_at,
         status: to_eval_status(&status)?,
+        pr_number: pr_number.and_then(|n| u32::try_from(n).ok()),
     })
 }
 
@@ -219,7 +225,7 @@ impl RepoStore for SqlxStore {
     }
 
     async fn get(&self, id: RepoId) -> Result<Option<RepoRecord>, StoreError> {
-        let row = sqlx::query("SELECT id, forge, slug FROM repos WHERE id = ?1")
+        let row = sqlx::query("SELECT id, forge, slug, name, description FROM repos WHERE id = ?1")
             .bind(id.get())
             .fetch_optional(&self.pool)
             .await?;
@@ -227,16 +233,18 @@ impl RepoStore for SqlxStore {
     }
 
     async fn find(&self, forge: &str, slug: &Slug) -> Result<Option<RepoRecord>, StoreError> {
-        let row = sqlx::query("SELECT id, forge, slug FROM repos WHERE forge = ?1 AND slug = ?2")
-            .bind(forge)
-            .bind(slug.as_str())
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT id, forge, slug, name, description FROM repos WHERE forge = ?1 AND slug = ?2",
+        )
+        .bind(forge)
+        .bind(slug.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
         row.as_ref().map(map_repo).transpose()
     }
 
     async fn list(&self) -> Result<Vec<RepoRecord>, StoreError> {
-        let rows = sqlx::query("SELECT id, forge, slug FROM repos ORDER BY id")
+        let rows = sqlx::query("SELECT id, forge, slug, name, description FROM repos ORDER BY id")
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(map_repo).collect()
@@ -276,13 +284,28 @@ impl RepoStore for SqlxStore {
         Ok(())
     }
 
+    async fn set_metadata(
+        &self,
+        repo_id: RepoId,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE repos SET name = ?1, description = ?2 WHERE id = ?3")
+            .bind(name)
+            .bind(description)
+            .bind(repo_id.get())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn prune_repos_not_in(
         &self,
         keep: &[(String, Slug)],
     ) -> Result<Vec<RepoRecord>, StoreError> {
         let mut tx = self.pool.begin().await?;
 
-        let all_rows = sqlx::query("SELECT id, forge, slug FROM repos")
+        let all_rows = sqlx::query("SELECT id, forge, slug, name, description FROM repos")
             .fetch_all(&mut *tx)
             .await?;
         let all: Vec<RepoRecord> = all_rows.iter().map(map_repo).collect::<Result<_, _>>()?;
@@ -344,8 +367,8 @@ impl RepoStore for SqlxStore {
 impl EvalStore for SqlxStore {
     async fn create(&self, new: NewEvaluation) -> Result<EvalId, StoreError> {
         let row = sqlx::query(
-            "INSERT INTO evaluations (repo_id, trigger, git_ref, sha, status)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO evaluations (repo_id, trigger, git_ref, sha, status, pr_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              RETURNING id",
         )
         .bind(new.repo_id.get())
@@ -353,6 +376,7 @@ impl EvalStore for SqlxStore {
         .bind(new.git_ref)
         .bind(new.sha.as_str())
         .bind(EvalStatus::Queued.as_str())
+        .bind(new.pr_number.map(|n| n as i64))
         .fetch_one(&self.pool)
         .await?;
         let id: i64 = row.try_get("id")?;
@@ -361,7 +385,7 @@ impl EvalStore for SqlxStore {
 
     async fn get(&self, id: EvalId) -> Result<Option<EvalRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number
              FROM evaluations WHERE id = ?1",
         )
         .bind(id.get())
@@ -373,6 +397,21 @@ impl EvalStore for SqlxStore {
     async fn set_status(&self, id: EvalId, status: EvalStatus) -> Result<(), StoreError> {
         sqlx::query("UPDATE evaluations SET status = ?1 WHERE id = ?2")
             .bind(status.as_str())
+            .bind(id.get())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn start(
+        &self,
+        id: EvalId,
+        started_at: DateTime<Utc>,
+        status: EvalStatus,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE evaluations SET status = ?1, started_at = ?2 WHERE id = ?3")
+            .bind(status.as_str())
+            .bind(started_at)
             .bind(id.get())
             .execute(&self.pool)
             .await?;
@@ -400,7 +439,7 @@ impl EvalStore for SqlxStore {
         limit: u32,
     ) -> Result<Vec<EvalRecord>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number
              FROM evaluations
              WHERE repo_id = ?1
              ORDER BY id DESC
@@ -424,7 +463,7 @@ impl EvalStore for SqlxStore {
         // we look for `<key>` exactly OR `<key>:%`.
         let like_pattern = format!("{}:%", branch_key_prefix.replace('\\', "\\\\"));
         let rows = sqlx::query(
-            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number
              FROM evaluations
              WHERE repo_id = ?1
                AND status IN ('queued', 'evaluating', 'building')
@@ -457,7 +496,7 @@ impl EvalStore for SqlxStore {
     ) -> Result<Vec<EvalWithRepo>, StoreError> {
         let rows = sqlx::query(
             "SELECT e.id, e.repo_id, e.trigger, e.git_ref, e.sha,
-                    e.started_at, e.finished_at, e.status,
+                    e.started_at, e.finished_at, e.status, e.pr_number,
                     r.forge AS r_forge, r.slug AS r_slug
              FROM evaluations e
              JOIN repos r ON e.repo_id = r.id
@@ -937,6 +976,7 @@ mod tests {
                 trigger: "push".to_string(),
                 git_ref: "refs/heads/main".to_string(),
                 sha: Sha::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                pr_number: None,
             },
         )
         .await
@@ -979,6 +1019,7 @@ mod tests {
             trigger: "push".to_string(),
             git_ref: gref.to_string(),
             sha: Sha::new(sha).unwrap(),
+            pr_number: None,
         };
         let queued = <SqlxStore as EvalStore>::create(
             &s,
@@ -1076,6 +1117,7 @@ mod tests {
                 trigger: "push".to_string(),
                 git_ref: "refs/heads/main".to_string(),
                 sha: Sha::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                pr_number: None,
             },
         )
         .await
@@ -1124,6 +1166,7 @@ mod tests {
                 trigger: "push".to_string(),
                 git_ref: "refs/heads/main".to_string(),
                 sha: Sha::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                pr_number: None,
             },
         )
         .await
@@ -1171,6 +1214,7 @@ mod tests {
                 trigger: "push".into(),
                 git_ref: "refs/heads/main".into(),
                 sha: argunix_domain::Sha::new("0".repeat(40)).unwrap(),
+                pr_number: None,
             },
         )
         .await
@@ -1182,6 +1226,7 @@ mod tests {
                 trigger: "push".into(),
                 git_ref: "refs/heads/main".into(),
                 sha: argunix_domain::Sha::new("1".repeat(40)).unwrap(),
+                pr_number: None,
             },
         )
         .await
@@ -1543,6 +1588,7 @@ mod tests {
                 trigger: "push".into(),
                 git_ref: "refs/heads/main".into(),
                 sha: Sha::new("0".repeat(40)).unwrap(),
+                pr_number: None,
             },
         )
         .await
@@ -1710,6 +1756,7 @@ mod tests {
                 trigger: "push".into(),
                 git_ref: "refs/heads/main".into(),
                 sha: Sha::new("abcdef0123456789abcdef0123456789abcdef01").unwrap(),
+                pr_number: None,
             },
         )
         .await
@@ -1772,6 +1819,7 @@ mod tests {
                 trigger: "push".into(),
                 git_ref: "refs/heads/main".into(),
                 sha: Sha::new("0".repeat(40)).unwrap(),
+                pr_number: None,
             },
         )
         .await

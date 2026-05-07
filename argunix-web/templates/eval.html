@@ -20,6 +20,7 @@
     <dt class="text-slate-500">sha</dt><dd class="font-mono">{{ sha }}</dd>
     <dt class="text-slate-500">started</dt><dd class="text-slate-500">{{ started }}</dd>
     <dt class="text-slate-500">finished</dt><dd class="text-slate-500">{{ finished }}</dd>
+    <dt class="text-slate-500">total</dt><dd class="font-mono">{{ total }}</dd>
   </dl>
 
   <h2 class="text-lg font-semibold mb-2">{{ job_heading }}</h2>
@@ -33,6 +34,7 @@
           <th class="py-2 pr-4">system</th>
           <th class="py-2 pr-4">status</th>
           <th class="py-2 pr-4">finished</th>
+          <th class="py-2 pr-4">duration</th>
           <th class="py-2">log</th>
         </tr>
       </thead>
@@ -46,6 +48,7 @@
             <td class="py-2 pr-4 font-mono">{{ j.system }}</td>
             <td class="py-2 pr-4">{{ j.status }}</td>
             <td class="py-2 pr-4 text-slate-500">{{ j.finished }}</td>
+            <td class="py-2 pr-4 font-mono">{{ j.duration }}</td>
             <td class="py-2">
               {% if j.has_log %}
                 <a class="text-blue-600 hover:underline"
