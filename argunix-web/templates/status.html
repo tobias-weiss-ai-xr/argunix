@@ -49,23 +49,17 @@
         <td class="py-2 pr-4">
           {% if b.is_online %}{{ b.in_flight }} / {{ b.max_jobs }}{% else %}—{% endif %}
         </td>
-        <td class="py-2 pr-4 text-xs">
-          <div class="flex flex-wrap gap-1">
-            {% for s in b.systems %}
-            <span class="inline-block px-1.5 rounded bg-slate-200 text-slate-700 font-mono">{{ s }}</span>
-            {% endfor %}
-          </div>
+        <td class="py-2 pr-4 text-xs leading-6">
+          {% for s in b.systems %}
+          <span class="inline-block whitespace-nowrap px-1.5 mr-1 rounded bg-slate-200 text-slate-700 font-mono text-xs">{{ s }}</span>
+          {% endfor %}
         </td>
-        <td class="py-2 pr-4 text-xs">
+        <td class="py-2 pr-4 text-xs leading-6">
           {% if b.features.is_empty() %}
           <span class="text-slate-400">—</span>
-          {% else %}
-          <div class="flex flex-wrap gap-1">
-            {% for f in b.features %}
-            <span class="inline-block px-1.5 rounded bg-slate-200 text-slate-700 font-mono">{{ f }}</span>
-            {% endfor %}
-          </div>
-          {% endif %}
+          {% else %} {% for f in b.features %}
+          <span class="inline-block whitespace-nowrap px-1.5 mr-1 rounded bg-slate-200 text-slate-700 font-mono text-xs">{{ f }}</span>
+          {% endfor %} {% endif %}
         </td>
         <td class="py-2 pr-4 font-mono text-xs">{{ b.nix_version }}</td>
         <td class="py-2 text-slate-500 text-xs">

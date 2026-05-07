@@ -963,7 +963,7 @@ fn humanize_bytes(b: Option<u64>) -> String {
     if i == 0 {
         format!("{b} B")
     } else {
-        format!("{v:.2} {} ({b} B)", UNITS[i])
+        format!("{v:.2} {}", UNITS[i])
     }
 }
 

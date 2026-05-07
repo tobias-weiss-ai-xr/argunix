@@ -22,7 +22,9 @@
           href="/r/{{ r.forge }}/{{ r.slug }}"
           >{% if let Some(n) = r.name %}{{ n }}{% else %}{{ r.slug }}{% endif %}</a
         >
+        {% if let Some(_) = r.name %}
         <div class="text-xs text-slate-500 font-mono">{{ r.slug }}</div>
+        {% endif %}
       </td>
       <td class="py-2 pr-4 text-slate-600">{% if let Some(d) = r.description %}{{ d }}{% else %}—{% endif %}</td>
       <td class="py-2">

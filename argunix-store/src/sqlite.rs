@@ -996,6 +996,20 @@ mod tests {
             .unwrap();
         assert_eq!(r.status, EvalStatus::Evaluating);
 
+        // start(): writes started_at and flips status. Worker calls
+        // this on first pickup so the per-eval and per-repo pages can
+        // render an accurate duration.
+        let started = Utc::now();
+        <SqlxStore as EvalStore>::start(&s, eval_id, started, EvalStatus::Evaluating)
+            .await
+            .unwrap();
+        let r = <SqlxStore as EvalStore>::get(&s, eval_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.status, EvalStatus::Evaluating);
+        assert!(r.started_at.is_some(), "start() must populate started_at");
+
         let now = Utc::now();
         <SqlxStore as EvalStore>::finish(&s, eval_id, EvalStatus::Done, now)
             .await
@@ -1006,6 +1020,10 @@ mod tests {
             .unwrap();
         assert_eq!(r.status, EvalStatus::Done);
         assert!(r.finished_at.is_some());
+        assert!(
+            r.started_at.is_some(),
+            "started_at must persist across finish()",
+        );
     }
 
     #[tokio::test]
