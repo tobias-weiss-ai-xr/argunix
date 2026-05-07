@@ -1,0 +1,9 @@
+[package]
+name = "argunix-sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+argunix-domain = { workspace = true }
+tracing = { workspace = true }

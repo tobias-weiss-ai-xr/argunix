@@ -1,3 +1,3 @@
 _final: prev: {
-  medusa = prev.callPackage ./package.nix { };
+  argunix = prev.callPackage ./package.nix { };
 }

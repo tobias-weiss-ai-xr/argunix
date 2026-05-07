@@ -1,41 +1,41 @@
-# M9-lite NixOS test: enable services.medusa, hit /healthz.
+# M9-lite NixOS test: enable services.argunix, hit /healthz.
 #
 # Pass directly to `pkgs.testers.runNixOSTest`. The `pkgs` argument is
-# the host's pkgs (with the medusa overlay already applied), so the VM
-# inherits `pkgs.medusa` and `pkgs.testers.runNixOSTest` doesn't need a
+# the host's pkgs (with the argunix overlay already applied), so the VM
+# inherits `pkgs.argunix` and `pkgs.testers.runNixOSTest` doesn't need a
 # `nixpkgs.overlays` override.
 #
 # Verifies:
 #   - The module evaluates and the systemd unit starts.
 #   - LoadCredential exposes the forge token under $CREDENTIALS_DIRECTORY
-#     and the daemon accepts it. (Webhook secrets are now medusa-managed,
+#     and the daemon accepts it. (Webhook secrets are now argunix-managed,
 #     stored in sqlite — no operator file involved.)
 #   - Port 8080 listens and /healthz returns "ok".
-#   - The medusa user is in nix.settings.trusted-users.
+#   - The argunix user is in nix.settings.trusted-users.
 #
 # This deliberately doesn't exercise the worker pipeline — that's
 # already covered by serve-pipeline-smoke.nix and forge-status-smoke.nix.
 { pkgs, ... }:
 
 let
-  githubToken = pkgs.writeText "medusa-test-github-token" "tok";
+  githubToken = pkgs.writeText "argunix-test-github-token" "tok";
 in
 {
-  name = "medusa-module-smoke";
+  name = "argunix-module-smoke";
 
   nodes.machine =
     { ... }:
     {
       imports = [ ../module.nix ];
 
-      services.medusa = {
+      services.argunix = {
         enable = true;
         listen = "127.0.0.1:8080";
         credentials = {
           gh-token = "${githubToken}";
         };
         settings = {
-          external_url = "https://medusa.example.com";
+          external_url = "https://argunix.example.com";
           forges.gh = {
             kind = "github";
             api_url = "https://api.github.com";
@@ -56,17 +56,17 @@ in
 
   testScript = ''
     machine.start()
-    machine.wait_for_unit("medusa.service")
+    machine.wait_for_unit("argunix.service")
     machine.wait_for_open_port(8080)
 
     out = machine.succeed("curl -fsS http://127.0.0.1:8080/healthz")
     assert out.strip() == "ok", f"unexpected /healthz body: {out!r}"
 
-    machine.succeed("getent passwd medusa")
-    machine.succeed("grep -q '^trusted-users.*medusa' /etc/nix/nix.conf")
+    machine.succeed("getent passwd argunix")
+    machine.succeed("grep -q '^trusted-users.*argunix' /etc/nix/nix.conf")
 
     # Static assets: the package ships a Tailwind-compiled `ui.css`
-    # and an `img/` directory under `$out/share/medusa/static`; the
+    # and an `img/` directory under `$out/share/argunix/static`; the
     # module wires `web.static_dir` to that path. Past versions left
     # `static_dir` defaulted to a non-existent relative path, so
     # every `/static/...` request 404'd and the UI rendered with no
@@ -94,9 +94,9 @@ in
     )
     import time
     t0 = time.monotonic()
-    machine.succeed("timeout 25 systemctl stop medusa.service")
+    machine.succeed("timeout 25 systemctl stop argunix.service")
     elapsed = time.monotonic() - t0
-    assert elapsed < 20, f"medusa.service took {elapsed:.1f}s to stop — drain likely hung"
-    machine.succeed("systemctl is-failed medusa.service || true")
+    assert elapsed < 20, f"argunix.service took {elapsed:.1f}s to stop — drain likely hung"
+    machine.succeed("systemctl is-failed argunix.service || true")
   '';
 }

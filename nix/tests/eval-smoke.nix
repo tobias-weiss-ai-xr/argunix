@@ -1,15 +1,15 @@
-# Sandboxed test that exercises the medusa-eval pipeline end-to-end.
+# Sandboxed test that exercises the argunix-eval pipeline end-to-end.
 #
 # Real `nix-eval-jobs` would need network and recursive nix to evaluate a
 # flake from inside a build; that lands in M11 with the NixOS test
 # framework. For now we ship a stand-in that pattern-matches on the
 # `--flake` argument and prints canned JSON-lines, which is enough to
-# validate medusa's wiring (subprocess spawn, JSON parsing, prefix
+# validate argunix's wiring (subprocess spawn, JSON parsing, prefix
 # rebuilding, output aggregation).
 {
   runCommand,
   writeShellScriptBin,
-  medusa,
+  argunix,
 }:
 let
   fakeNixEvalJobs = writeShellScriptBin "nix-eval-jobs" ''
@@ -41,34 +41,34 @@ let
         echo '{"attr":"hello","drvPath":"/nix/store/eeee-hello-aarch64.drv","system":"aarch64-linux"}'
         ;;
       *)
-        # No output for fragments medusa asked about that aren't in this
+        # No output for fragments argunix asked about that aren't in this
         # fixture. Mirror nix-eval-jobs' "no such output" behaviour by
-        # exiting non-zero with empty stderr; medusa treats that as zero
+        # exiting non-zero with empty stderr; argunix treats that as zero
         # jobs (see runner.rs).
         exit 1
         ;;
     esac
   '';
 
-  fixtureFlake = runCommand "medusa-eval-fixture-flake" { } ''
+  fixtureFlake = runCommand "argunix-eval-fixture-flake" { } ''
     mkdir -p $out
     cat > $out/flake.nix <<'EOF'
     # A placeholder flake. Our fake nix-eval-jobs ignores the contents and
     # just looks at the fragment, so this only needs to exist.
     {
-      description = "medusa eval-smoke fixture";
+      description = "argunix eval-smoke fixture";
       outputs = { self }: { };
     }
     EOF
   '';
 in
-runCommand "medusa-eval-smoke"
+runCommand "argunix-eval-smoke"
   {
     nativeBuildInputs = [
-      medusa
+      argunix
       fakeNixEvalJobs
     ];
-    meta.description = "M2: medusa eval spawns nix-eval-jobs, parses output, aggregates per-system jobs";
+    meta.description = "M2: argunix eval spawns nix-eval-jobs, parses output, aggregates per-system jobs";
   }
   ''
     set -euo pipefail
@@ -76,7 +76,7 @@ runCommand "medusa-eval-smoke"
     workdir=$(mktemp -d)
     cd "$workdir"
 
-    medusa eval \
+    argunix eval \
       --src ${fixtureFlake} \
       --systems x86_64-linux,aarch64-linux \
       --timeout-seconds 30 \

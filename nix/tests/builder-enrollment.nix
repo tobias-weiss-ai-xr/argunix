@@ -1,24 +1,24 @@
 # M13b NixOS test: end-to-end builder enrollment.
 #
 # Two nodes:
-#   - `medusa`  — the daemon with `builder_enrollment` configured.
-#   - `builder` — the agent dialing medusa.
+#   - `argunix`  — the daemon with `builder_enrollment` configured.
+#   - `builder` — the agent dialing argunix.
 #
-# Asserts the agent reaches `Active` in medusa's registry within a
-# reasonable timeout, surfaced via `medusactl builders --json`.
+# Asserts the agent reaches `Active` in argunix's registry within a
+# reasonable timeout, surfaced via `argunixctl builders --json`.
 { pkgs, ... }:
 
 let
-  enrollmentToken = pkgs.writeText "medusa-builder-enrollment-token" "tok";
-  githubToken = pkgs.writeText "medusa-test-github-token" "ghtok";
+  enrollmentToken = pkgs.writeText "argunix-builder-enrollment-token" "tok";
+  githubToken = pkgs.writeText "argunix-test-github-token" "ghtok";
 in
 {
-  name = "medusa-builder-enrollment";
+  name = "argunix-builder-enrollment";
 
-  nodes.medusa = {
+  nodes.argunix = {
     imports = [ ../module.nix ];
 
-    services.medusa = {
+    services.argunix = {
       enable = true;
       listen = "127.0.0.1:8080";
       credentials = {
@@ -26,7 +26,7 @@ in
         builder-enrollment-token = "${enrollmentToken}";
       };
       settings = {
-        external_url = "https://medusa.example.com";
+        external_url = "https://argunix.example.com";
         builder_enrollment = {
           # `[::]:2222` listens on both IPv4 and IPv6 — the test
           # network gives each node both, and the agent's
@@ -45,17 +45,17 @@ in
 
     # Module auto-opens settings.builder_enrollment.listen — no
     # operator-side firewall config needed.
-    environment.systemPackages = [ pkgs.medusa ];
+    environment.systemPackages = [ pkgs.argunix ];
     virtualisation.memorySize = 1024;
   };
 
   nodes.builder = {
     imports = [ ../builder-module.nix ];
 
-    services.medusa-builder = {
+    services.argunix-builder = {
       enable = true;
-      medusaHost = "medusa";
-      medusaPort = 2222;
+      argunixHost = "argunix";
+      argunixPort = 2222;
       enrollmentTokenFile = "${enrollmentToken}";
       name = "smoke-builder";
     };
@@ -65,22 +65,22 @@ in
 
   testScript = ''
     start_all()
-    medusa.wait_for_unit("medusa.service")
-    medusa.wait_for_open_port(2222)
-    builder.wait_for_unit("medusa-builder.service")
+    argunix.wait_for_unit("argunix.service")
+    argunix.wait_for_open_port(2222)
+    builder.wait_for_unit("argunix-builder.service")
 
-    # Builder dials medusa, enrols via TOFU password auth, and lands
+    # Builder dials argunix, enrols via TOFU password auth, and lands
     # in the registry as `active`. The agent's first dial races
-    # against medusa's startup; the reconnect-backoff loop covers it.
+    # against argunix's startup; the reconnect-backoff loop covers it.
     # JSON output is pretty-printed (spaces after `:`), so match on
     # the values rather than literal `"key":"value"` substrings.
-    medusa.wait_until_succeeds(
-        "medusactl --socket /run/medusa/control.sock builders list --json"
+    argunix.wait_until_succeeds(
+        "argunixctl --socket /run/argunix/control.sock builders list --json"
         " | grep -q smoke-builder",
         timeout=30,
     )
-    medusa.wait_until_succeeds(
-        "medusactl --socket /run/medusa/control.sock builders list --json"
+    argunix.wait_until_succeeds(
+        "argunixctl --socket /run/argunix/control.sock builders list --json"
         " | tr -d ' \\n' | grep -q '\"connected\":true'",
         timeout=30,
     )

@@ -1,7 +1,7 @@
-# medusa-builder NixOS module (M13b).
+# argunix-builder NixOS module (M13b).
 #
-# Runs the `medusa-builder` agent as a systemd unit. The agent dials
-# medusa over SSH on `medusaPort`, authenticates (TOFU on first
+# Runs the `argunix-builder` agent as a systemd unit. The agent dials
+# argunix over SSH on `argunixPort`, authenticates (TOFU on first
 # contact via the enrollment token, pubkey thereafter), and serves
 # inbound build channels by spawning `nix-store --serve --write` per
 # channel.
@@ -16,25 +16,25 @@
 }:
 
 let
-  cfg = config.services.medusa-builder;
+  cfg = config.services.argunix-builder;
 in
 {
-  options.services.medusa-builder = {
-    enable = lib.mkEnableOption "the medusa builder agent";
+  options.services.argunix-builder = {
+    enable = lib.mkEnableOption "the argunix builder agent";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.medusa;
-      defaultText = lib.literalExpression "pkgs.medusa";
+      default = pkgs.argunix;
+      defaultText = lib.literalExpression "pkgs.argunix";
       description = ''
-        The package providing the `medusa-builder` binary. Defaults
-        to `pkgs.medusa`, the same package the daemon ships with.
+        The package providing the `argunix-builder` binary. Defaults
+        to `pkgs.argunix`, the same package the daemon ships with.
       '';
     };
 
     user = lib.mkOption {
       type = lib.types.str;
-      default = "medusa-builder";
+      default = "argunix-builder";
       description = ''
         System user the agent runs as. Added to nix's `trusted-users`
         because `nix-store --serve --write` (the per-channel
@@ -45,13 +45,13 @@ in
 
     group = lib.mkOption {
       type = lib.types.str;
-      default = "medusa-builder";
-      description = "System group for the medusa-builder user.";
+      default = "argunix-builder";
+      description = "System group for the argunix-builder user.";
     };
 
     stateDir = lib.mkOption {
       type = lib.types.path;
-      default = "/var/lib/medusa-builder";
+      default = "/var/lib/argunix-builder";
       description = ''
         Working directory of the agent. The persistent ed25519
         identity lives at `<stateDir>/identity.ed25519` and is
@@ -60,20 +60,20 @@ in
       '';
     };
 
-    medusaHost = lib.mkOption {
+    argunixHost = lib.mkOption {
       type = lib.types.str;
-      example = "medusa.example.com";
+      example = "argunix.example.com";
       description = ''
-        Hostname or IP of the medusa daemon. Resolved once at
+        Hostname or IP of the argunix daemon. Resolved once at
         startup; if DNS changes, restart the unit.
       '';
     };
 
-    medusaPort = lib.mkOption {
+    argunixPort = lib.mkOption {
       type = lib.types.port;
       default = 2222;
       description = ''
-        SSH port on medusa where `builder_enrollment.listen` is
+        SSH port on argunix where `builder_enrollment.listen` is
         bound. Must match the daemon's YAML config.
       '';
     };
@@ -83,7 +83,7 @@ in
       default = null;
       description = ''
         Builder name reported in the `hello` message. Becomes the
-        primary key in medusa's `builders` sqlite table. Defaults to
+        primary key in argunix's `builders` sqlite table. Defaults to
         the machine's hostname when null.
       '';
     };
@@ -91,12 +91,12 @@ in
     enrollmentTokenFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
-      example = "/run/agenix/medusa-builder-token";
+      example = "/run/agenix/argunix-builder-token";
       description = ''
         Path on the host to a file containing the shared
         builder-enrollment token. Used only on first contact (or
-        after `medusactl builders revoke`); subsequent connects use
-        the persistent pubkey. Once medusa has the row, the operator
+        after `argunixctl builders revoke`); subsequent connects use
+        the persistent pubkey. Once argunix has the row, the operator
         can wipe the file and unset this option — the agent keeps
         running on pubkey auth.
 
@@ -134,7 +134,7 @@ in
     users.users.${cfg.user} = {
       isSystemUser = true;
       inherit (cfg) group;
-      description = "medusa builder agent";
+      description = "argunix builder agent";
       home = cfg.stateDir;
     };
     users.groups.${cfg.group} = { };
@@ -143,8 +143,8 @@ in
     # the nix daemon accepts pushed paths.
     nix.settings.trusted-users = [ cfg.user ];
 
-    systemd.services.medusa-builder = {
-      description = "medusa builder agent";
+    systemd.services.argunix-builder = {
+      description = "argunix builder agent";
       after = [
         "network-online.target"
         "nix-daemon.service"
@@ -162,11 +162,11 @@ in
         Type = "simple";
         ExecStart = lib.concatStringsSep " " (
           [
-            (lib.getExe' cfg.package "medusa-builder")
-            "--medusa-host"
-            cfg.medusaHost
-            "--medusa-port"
-            (toString cfg.medusaPort)
+            (lib.getExe' cfg.package "argunix-builder")
+            "--argunix-host"
+            cfg.argunixHost
+            "--argunix-port"
+            (toString cfg.argunixPort)
             "--state-dir"
             cfg.stateDir
             "--nix-bin"
@@ -187,20 +187,15 @@ in
         User = cfg.user;
         Group = cfg.group;
 
-        StateDirectory = "medusa-builder";
+        StateDirectory = "argunix-builder";
         StateDirectoryMode = "0700";
         WorkingDirectory = cfg.stateDir;
-        RuntimeDirectory = "medusa-builder";
+        RuntimeDirectory = "argunix-builder";
 
         LoadCredential = lib.optional (
           cfg.enrollmentTokenFile != null
         ) "enrollment-token:${toString cfg.enrollmentTokenFile}";
 
-        # Sandboxing — same conservative-but-realistic profile as the
-        # daemon module. The agent itself is a small Rust binary that
-        # only needs network + the nix daemon socket; we leave the
-        # store strictly read-only and let the nix daemon do the
-        # actual writes via its socket.
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;

@@ -1,0 +1,28 @@
+[package]
+name = "argunix-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+argunix-builders = { path = "../argunix-builders" }
+argunix-config = { workspace = true }
+argunix-domain = { workspace = true }
+argunix-forge = { path = "../argunix-forge" }
+argunix-store = { workspace = true }
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+askama = { workspace = true }
+tower-http = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zstd = "0.13"

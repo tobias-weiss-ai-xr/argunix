@@ -1,0 +1,15 @@
+[package]
+name = "argunixctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "argunixctl"
+path = "src/main.rs"
+
+[dependencies]
+argunix-control = { path = "../argunix-control" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

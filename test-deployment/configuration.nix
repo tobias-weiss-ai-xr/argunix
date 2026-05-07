@@ -5,7 +5,7 @@
 }:
 
 let
-  fqdn = "medusa.nix-consulting.net";
+  fqdn = "argunix.nix-consulting.net";
 in
 {
   imports = [
@@ -24,7 +24,7 @@ in
     efiInstallAsRemovable = true;
   };
 
-  networking.hostName = "medusa";
+  networking.hostName = "argunix";
   networking.domain = "nix-consulting.net";
 
   networking.useDHCP = false;
@@ -47,14 +47,14 @@ in
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6Z4dj1RU+44lXXW1Dw6TW4cLtV/4+qJRO7vFOmyC6C tfc@ai"
   ];
 
-  services.medusa = {
+  services.argunix = {
     enable = true;
     listen = "127.0.0.1:8080";
     credentials = {
-      gh-token = "/var/lib/medusa-credentials/gh-token";
-      gl-token = "/var/lib/medusa-credentials/gl-token";
-      fj-token = "/var/lib/medusa-credentials/fj-token";
-      builder-enrollment-token = "/var/lib/medusa-credentials/builder-enrollment-token";
+      gh-token = "/var/lib/argunix-credentials/gh-token";
+      gl-token = "/var/lib/argunix-credentials/gl-token";
+      fj-token = "/var/lib/argunix-credentials/fj-token";
+      builder-enrollment-token = "/var/lib/argunix-credentials/builder-enrollment-token";
     };
     settings = {
       external_url = "https://${fqdn}";

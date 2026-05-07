@@ -1,8 +1,8 @@
 # Sandboxed test of the M5b webhook ingestion path.
 #
-# Starts `medusa serve` in the background, posts a few webhooks via curl
+# Starts `argunix serve` in the background, posts a few webhooks via curl
 # (with HMAC computed by openssl), verifies HTTP responses and the rows
-# medusa created in sqlite, and shuts the daemon down cleanly.
+# argunix created in sqlite, and shuts the daemon down cleanly.
 {
   runCommand,
   writeText,
@@ -11,13 +11,13 @@
   openssl,
   python3,
   sqlite,
-  medusa,
+  argunix,
 }:
 let
-  token = writeText "medusa-test-github-token" "tok-value";
+  token = writeText "argunix-test-github-token" "tok-value";
 
   # Tiny in-process forge that auto-install can reach. Returns an empty hook
-  # list on GET (so medusa goes straight to POST) and a fake hook id on POST.
+  # list on GET (so argunix goes straight to POST) and a fake hook id on POST.
   # Without it, ensure_webhook fails and `repos.webhook_secret` never gets
   # persisted — the test could not sign the payload.
   fakeForge = writeText "fake-forge.py" ''
@@ -43,8 +43,8 @@ let
     srv.serve_forever()
   '';
 
-  configTemplate = writers.writeYAML "medusa.yaml.template" {
-    external_url = "https://medusa.example.com";
+  configTemplate = writers.writeYAML "argunix.yaml.template" {
+    external_url = "https://argunix.example.com";
     listen = "127.0.0.1:0"; # bind to an ephemeral port; we override at CLI
     forges.github-myorg = {
       kind = "github";
@@ -70,16 +70,16 @@ let
     repository.full_name = "stranger/elsewhere";
   };
 in
-runCommand "medusa-webhook-smoke"
+runCommand "argunix-webhook-smoke"
   {
     nativeBuildInputs = [
-      medusa
+      argunix
       curl
       openssl
       python3
       sqlite
     ];
-    meta.description = "M5b: medusa serve accepts validated webhooks and queues evaluations";
+    meta.description = "M5b: argunix serve accepts validated webhooks and queues evaluations";
   }
   ''
     set -euo pipefail
@@ -102,12 +102,12 @@ runCommand "medusa-webhook-smoke"
       sleep 0.05
     done
     test -n "$forge_addr"
-    sed "s|API_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > medusa.yaml
+    sed "s|API_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > argunix.yaml
 
-    medusa serve --config "$workdir/medusa.yaml" --listen "127.0.0.1:0" \
+    argunix serve --config "$workdir/argunix.yaml" --listen "127.0.0.1:0" \
       > daemon.stdout 2> daemon.stderr &
     daemon_pid=$!
-    # Use SIGKILL on cleanup. medusa's graceful shutdown can wait for
+    # Use SIGKILL on cleanup. argunix's graceful shutdown can wait for
     # an idle worker to drain (worker rx never closes by itself), which
     # would block the trap's `wait` indefinitely.
     trap 'kill -KILL $daemon_pid 2>/dev/null || true; kill -KILL $forge_pid 2>/dev/null || true; wait 2>/dev/null || true' EXIT
@@ -133,7 +133,7 @@ runCommand "medusa-webhook-smoke"
     done
     curl -fs "http://$listen/healthz" > /dev/null
 
-    # Medusa generates and stores the webhook secret per (forge, slug)
+    # Argunix generates and stores the webhook secret per (forge, slug)
     # at boot. Read it out of sqlite so we can sign payloads with it.
     webhookSecret=$(sqlite3 db.sqlite \
       "SELECT hex(webhook_secret) FROM repos WHERE forge='github-myorg' AND slug='myorg/myrepo';")

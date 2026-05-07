@@ -180,6 +180,218 @@ dependencies = [
 ]
 
 [[package]]
+name = "argunix-build"
+version = "0.0.1"
+dependencies = [
+ "argunix-domain",
+ "chrono",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "argunix-builder"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "argunix-builders",
+ "argunix-domain",
+ "argunix-store",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "ed25519-dalek 2.2.0",
+ "rand 0.10.1",
+ "rand 0.8.6",
+ "russh",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "argunix-builders"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "argunix-domain",
+ "argunix-store",
+ "async-trait",
+ "base64",
+ "bytes",
+ "chrono",
+ "ed25519-dalek 2.2.0",
+ "rand 0.10.1",
+ "rand 0.8.6",
+ "russh",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "argunix-config"
+version = "0.0.1"
+dependencies = [
+ "argunix-domain",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "argunix-control"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "argunix-daemon"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "argunix-build",
+ "argunix-builders",
+ "argunix-config",
+ "argunix-control",
+ "argunix-domain",
+ "argunix-eval",
+ "argunix-forge",
+ "argunix-store",
+ "argunix-web",
+ "axum",
+ "bytes",
+ "chrono",
+ "clap",
+ "russh",
+ "sd-notify",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "argunix-domain"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "argunix-eval"
+version = "0.0.1"
+dependencies = [
+ "argunix-domain",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "argunix-forge"
+version = "0.0.1"
+dependencies = [
+ "argunix-domain",
+ "async-trait",
+ "base64",
+ "hex",
+ "hmac 0.12.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "argunix-sched"
+version = "0.0.1"
+dependencies = [
+ "argunix-domain",
+ "tracing",
+]
+
+[[package]]
+name = "argunix-store"
+version = "0.0.1"
+dependencies = [
+ "argunix-domain",
+ "async-trait",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "argunix-web"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "argunix-builders",
+ "argunix-config",
+ "argunix-domain",
+ "argunix-forge",
+ "argunix-store",
+ "askama",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "hex",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "argunixctl"
+version = "0.0.1"
+dependencies = [
+ "argunix-control",
+ "clap",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "askama"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1966,218 +2178,6 @@ name = "md5"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
-
-[[package]]
-name = "medusa-build"
-version = "0.0.1"
-dependencies = [
- "chrono",
- "medusa-domain",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "medusa-builder"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "ed25519-dalek 2.2.0",
- "medusa-builders",
- "medusa-domain",
- "medusa-store",
- "rand 0.10.1",
- "rand 0.8.6",
- "russh",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "medusa-builders"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "bytes",
- "chrono",
- "ed25519-dalek 2.2.0",
- "medusa-domain",
- "medusa-store",
- "rand 0.10.1",
- "rand 0.8.6",
- "russh",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "medusa-config"
-version = "0.0.1"
-dependencies = [
- "medusa-domain",
- "serde",
- "serde_yaml",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "medusa-control"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "medusa-daemon"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "arc-swap",
- "axum",
- "bytes",
- "chrono",
- "clap",
- "medusa-build",
- "medusa-builders",
- "medusa-config",
- "medusa-control",
- "medusa-domain",
- "medusa-eval",
- "medusa-forge",
- "medusa-store",
- "medusa-web",
- "russh",
- "sd-notify",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "medusa-domain"
-version = "0.0.1"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "medusa-eval"
-version = "0.0.1"
-dependencies = [
- "medusa-domain",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "medusa-forge"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "base64",
- "hex",
- "hmac 0.12.1",
- "medusa-domain",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "medusa-sched"
-version = "0.0.1"
-dependencies = [
- "medusa-domain",
- "tracing",
-]
-
-[[package]]
-name = "medusa-store"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "chrono",
- "medusa-domain",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "medusa-web"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "arc-swap",
- "askama",
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "hex",
- "medusa-builders",
- "medusa-config",
- "medusa-domain",
- "medusa-forge",
- "medusa-store",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tower-http",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "medusactl"
-version = "0.0.1"
-dependencies = [
- "clap",
- "medusa-control",
- "serde_json",
- "tokio",
-]
 
 [[package]]
 name = "memchr"

@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-  "medusa-domain",
-  "medusa-config",
-  "medusa-store",
-  "medusa-forge",
-  "medusa-eval",
-  "medusa-build",
-  "medusa-sched",
-  "medusa-web",
-  "medusa-control",
-  "medusa-builders",
-  "medusa-builder",
-  "medusa-daemon",
-  "medusactl",
+  "argunix-domain",
+  "argunix-config",
+  "argunix-store",
+  "argunix-forge",
+  "argunix-eval",
+  "argunix-build",
+  "argunix-sched",
+  "argunix-web",
+  "argunix-control",
+  "argunix-builders",
+  "argunix-builder",
+  "argunix-daemon",
+  "argunixctl",
 ]
 
 [workspace.package]
@@ -22,9 +22,9 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-medusa-domain = { path = "medusa-domain" }
-medusa-config = { path = "medusa-config" }
-medusa-store = { path = "medusa-store" }
+argunix-domain = { path = "argunix-domain" }
+argunix-config = { path = "argunix-config" }
+argunix-store = { path = "argunix-store" }
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

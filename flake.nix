@@ -1,5 +1,5 @@
 {
-  description = "medusa: a declarative Nix-only CI";
+  description = "argunix: a declarative Nix-only CI";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -27,29 +27,29 @@
 
       flake.overlays =
         let
-          medusa = import ./nix/overlay.nix;
+          argunix = import ./nix/overlay.nix;
           naersk = final: _prev: {
             naersk = final.callPackage inputs.naersk { };
           };
         in
         {
-          inherit medusa naersk;
+          inherit argunix naersk;
           default = inputs.nixpkgs.lib.composeManyExtensions [
             naersk
-            medusa
+            argunix
           ];
         };
 
       flake.nixosModules = {
         default = ./nix/module.nix;
-        medusa = ./nix/module.nix;
-        medusa-builder = ./nix/builder-module.nix;
+        argunix = ./nix/module.nix;
+        argunix-builder = ./nix/builder-module.nix;
       };
 
-      # Test deployment to medusa.nix-consulting.net.
+      # Test deployment to argunix.nix-consulting.net.
       # Provision with `nixos-anywhere`; later updates via
       # `nixos-rebuild switch --target-host`.
-      flake.nixosConfigurations.medusa = inputs.nixpkgs.lib.nixosSystem {
+      flake.nixosConfigurations.argunix = inputs.nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
         modules = [
           inputs.disko.nixosModules.disko
@@ -80,7 +80,7 @@
             # prettier doesn't understand — it reflows them across lines
             # and breaks rendering. Exclude the template folder.
             settings.formatter.prettier.excludes = [
-              "medusa-web/templates/*"
+              "argunix-web/templates/*"
             ];
           };
         in
@@ -91,8 +91,8 @@
           };
 
           packages = {
-            default = pkgs.medusa;
-            inherit (pkgs) medusa;
+            default = pkgs.argunix;
+            inherit (pkgs) argunix;
           };
 
           formatter = treefmtEval.config.build.wrapper;
@@ -114,7 +114,7 @@
 
           checks = {
             formatting = treefmtEval.config.build.check inputs.self;
-            inherit (pkgs) medusa;
+            inherit (pkgs) argunix;
             config-smoke = pkgs.callPackage ./nix/tests/config-smoke.nix { };
             eval-smoke = pkgs.callPackage ./nix/tests/eval-smoke.nix { };
             build-smoke = pkgs.callPackage ./nix/tests/build-smoke.nix { };

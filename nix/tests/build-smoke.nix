@@ -3,7 +3,7 @@
 # Real `nix-store --realise` would need recursive nix and a writable store,
 # neither of which is available in a `runCommand` sandbox. We ship
 # stand-ins for `nix-eval-jobs`, `nix-store`, and `nix` (for `path-info`)
-# that fake the surface area medusa-build talks to. The test then verifies
+# that fake the surface area argunix-build talks to. The test then verifies
 # the daemon's wiring: cache-skip → no build, success → log + gc root,
 # failure → log + no gc root.
 {
@@ -13,7 +13,7 @@
   writers,
   sqlite,
   zstd,
-  medusa,
+  argunix,
 }:
 let
   fakeNixEvalJobs = writeShellScriptBin "nix-eval-jobs" ''
@@ -32,7 +32,7 @@ let
         echo '{"attr":"fail","drvPath":"/nix/store/eeee-fail.drv","system":"x86_64-linux","outputs":{"out":"/nix/store/eeee-fail"}}'
         ;;
       *)
-        # Empty-stderr non-zero is medusa's "no such output" signal.
+        # Empty-stderr non-zero is argunix's "no such output" signal.
         exit 1
         ;;
     esac
@@ -40,7 +40,7 @@ let
 
   fakeNixStore = writeShellScriptBin "nix-store" ''
     set -eu
-    # medusa-build invokes a combined form:
+    # argunix-build invokes a combined form:
     #   nix-store --realise [--add-root <root>] [-L] <drv>
     # We parse all args into (root, drv) and then dispatch on drv.
     case "$1" in
@@ -98,7 +98,7 @@ let
 
   fakeNix = writeShellScriptBin "nix" ''
     set -eu
-    # Only `nix path-info --store <url> <path>` is invoked by medusa in M3.
+    # Only `nix path-info --store <url> <path>` is invoked by argunix in M3.
     case "$1" in
       path-info)
         shift
@@ -122,11 +122,11 @@ let
     esac
   '';
 
-  token = writeText "medusa-test-github-token" "tok-value";
-  signingKey = writeText "medusa-test-cache-signing-key" "fake-key";
+  token = writeText "argunix-test-github-token" "tok-value";
+  signingKey = writeText "argunix-test-cache-signing-key" "fake-key";
 
-  config = writers.writeYAML "medusa.yaml" {
-    external_url = "https://medusa.example.com";
+  config = writers.writeYAML "argunix.yaml" {
+    external_url = "https://argunix.example.com";
     forges.github-myorg = {
       kind = "github";
       api_url = "https://api.github.com";
@@ -145,24 +145,24 @@ let
     ];
   };
 
-  fixtureFlake = runCommand "medusa-build-fixture-flake" { } ''
+  fixtureFlake = runCommand "argunix-build-fixture-flake" { } ''
     mkdir -p $out
     cat > $out/flake.nix <<'EOF'
     { description = "fixture"; outputs = { self }: { }; }
     EOF
   '';
 in
-runCommand "medusa-build-smoke"
+runCommand "argunix-build-smoke"
   {
     nativeBuildInputs = [
-      medusa
+      argunix
       fakeNixEvalJobs
       fakeNixStore
       fakeNix
       sqlite
       zstd
     ];
-    meta.description = "M3: medusa build runs eval, cache-skip, build, log capture, gc roots";
+    meta.description = "M3: argunix build runs eval, cache-skip, build, log capture, gc roots";
   }
   ''
     set -euo pipefail
@@ -170,7 +170,7 @@ runCommand "medusa-build-smoke"
     workdir=$(mktemp -d)
     cd "$workdir"
 
-    medusa build \
+    argunix build \
       --config ${config} \
       --src ${fixtureFlake} \
       --slug myorg/myrepo \

@@ -2,13 +2,13 @@
   runCommand,
   writeText,
   writers,
-  medusa,
+  argunix,
 }:
 let
-  token = writeText "medusa-test-github-token" "tok-value";
+  token = writeText "argunix-test-github-token" "tok-value";
 
-  config = writers.writeYAML "medusa.yaml" {
-    external_url = "https://medusa.example.com";
+  config = writers.writeYAML "argunix.yaml" {
+    external_url = "https://argunix.example.com";
     forges.github-myorg = {
       kind = "github";
       api_url = "https://api.github.com";
@@ -19,9 +19,9 @@ let
     };
   };
 in
-runCommand "medusa-config-smoke"
+runCommand "argunix-config-smoke"
   {
-    nativeBuildInputs = [ medusa ];
+    nativeBuildInputs = [ argunix ];
     meta.description = "M1: load YAML, open sqlite, run migrations, print 'ready'";
   }
   ''
@@ -30,7 +30,7 @@ runCommand "medusa-config-smoke"
     workdir=$(mktemp -d)
     cd "$workdir"
 
-    stdout=$(medusa run --config ${config} 2> stderr.log)
+    stdout=$(argunix run --config ${config} 2> stderr.log)
     echo "--- daemon stderr ---"
     cat stderr.log
     echo "--- daemon stdout ---"
@@ -41,7 +41,7 @@ runCommand "medusa-config-smoke"
 
     # Re-running on the same DB should still succeed (idempotent migration,
     # idempotent boot recovery).
-    medusa run --config ${config} > /dev/null
+    argunix run --config ${config} > /dev/null
 
     touch $out
   ''

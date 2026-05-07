@@ -1,0 +1,54 @@
+[package]
+name = "argunix-builder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "argunix_builder_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "argunix-builder"
+path = "src/main.rs"
+
+[dependencies]
+argunix-builders = { path = "../argunix-builders" }
+argunix-domain = { workspace = true }
+
+# Workspace tokio doesn't enable `net`/`process`/`io-std`; the agent
+# uses all three (TCP for russh, subprocess for `nix-store --serve`,
+# stdin/stdout when running attached). Add locally so the rest of the
+# workspace doesn't pay for them.
+tokio = { version = "1", features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "io-util",
+  "io-std",
+  "net",
+  "process",
+  "signal",
+  "sync",
+  "time",
+  "fs",
+] }
+russh = { workspace = true }
+ed25519-dalek = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+argunix-store = { workspace = true }
+chrono = { workspace = true }
+rand10 = { package = "rand", version = "0.10" }

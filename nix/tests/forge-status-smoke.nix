@@ -5,7 +5,7 @@
 # - A small Python http.server stands in for github's API. It accepts
 #   `POST /repos/.../statuses/<sha>`, logs every request body to a file,
 #   and replies with `201 {"id":N}`.
-# - `medusa serve` is configured with `api_url = http://<fake forge>`.
+# - `argunix serve` is configured with `api_url = http://<fake forge>`.
 # - We send a webhook, wait for the daemon to finish, and grep the forge
 #   log for the sequence of expected checks.
 {
@@ -17,10 +17,10 @@
   openssl,
   python3,
   sqlite,
-  medusa,
+  argunix,
 }:
 let
-  token = writeText "medusa-test-github-token" "tok-value";
+  token = writeText "argunix-test-github-token" "tok-value";
 
   fakeFlake = writeText "fake-flake.nix" ''
     {
@@ -163,8 +163,8 @@ let
     srv.serve_forever()
   '';
 
-  configTemplate = writers.writeYAML "medusa.yaml.template" {
-    external_url = "https://medusa.example.com";
+  configTemplate = writers.writeYAML "argunix.yaml.template" {
+    external_url = "https://argunix.example.com";
     listen = "127.0.0.1:0";
     forges.github-myorg = {
       kind = "github";
@@ -183,10 +183,10 @@ let
     pusher.name = "alice";
   };
 in
-runCommand "medusa-forge-status-smoke"
+runCommand "argunix-forge-status-smoke"
   {
     nativeBuildInputs = [
-      medusa
+      argunix
       fakeGit
       fakeNixEvalJobs
       fakeNixStore
@@ -208,7 +208,7 @@ runCommand "medusa-forge-status-smoke"
     FAKE_FORGE_LOG="$workdir/forge.log" \
       python3 ${fakeForge} > forge.stdout 2> forge.stderr &
     forge_pid=$!
-    # SIGKILL — medusa's graceful TERM can wait for the worker
+    # SIGKILL — argunix's graceful TERM can wait for the worker
     # JoinHandle which only completes when the worker rx closes.
     # On any failure, dump the daemon stderr so the runCommand log is
     # actionable instead of just showing the last echo.
@@ -242,12 +242,12 @@ runCommand "medusa-forge-status-smoke"
     test -n "$forge_addr"
     echo "fake forge listening on $forge_addr"
 
-    # 2. Materialise medusa.yaml with the right api_url.
-    sed "s|API_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > medusa.yaml
+    # 2. Materialise argunix.yaml with the right api_url.
+    sed "s|API_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > argunix.yaml
 
-    # 3. Start medusa serve.
-    medusa serve \
-      --config "$workdir/medusa.yaml" \
+    # 3. Start argunix serve.
+    argunix serve \
+      --config "$workdir/argunix.yaml" \
       --listen "127.0.0.1:0" \
       --work-dir "$workdir/work" \
       --log-dir "$workdir/logs" \
@@ -265,9 +265,9 @@ runCommand "medusa-forge-status-smoke"
       sleep 0.05
     done
     test -n "$listen"
-    echo "medusa listening on $listen"
+    echo "argunix listening on $listen"
 
-    # 4. Send the webhook. The secret is medusa-generated at boot;
+    # 4. Send the webhook. The secret is argunix-generated at boot;
     # read it from sqlite to sign with the right key.
     webhookSecretHex=$(sqlite3 db.sqlite \
       "SELECT hex(webhook_secret) FROM repos WHERE forge='github-myorg' AND slug='myorg/myrepo';")
@@ -309,14 +309,14 @@ runCommand "medusa-forge-status-smoke"
     grep -F "POST /repos/myorg/myrepo/statuses/$sha" forge.log
 
     # Initial pending check.
-    grep -F '"state":"pending"' forge.log | grep -F '"context":"medusa: evaluation"'
+    grep -F '"state":"pending"' forge.log | grep -F '"context":"argunix: evaluation"'
 
     # Per-job: one success and one failure.
-    grep -F '"context":"medusa: packages.x86_64-linux.hello"' forge.log | grep -F '"state":"success"'
-    grep -F '"context":"medusa: packages.x86_64-linux.goodbye"' forge.log | grep -F '"state":"failure"'
+    grep -F '"context":"argunix: packages.x86_64-linux.hello"' forge.log | grep -F '"state":"success"'
+    grep -F '"context":"argunix: packages.x86_64-linux.goodbye"' forge.log | grep -F '"state":"failure"'
 
     # Final overall: failure (because goodbye failed).
-    final=$(grep -F '"context":"medusa: evaluation"' forge.log | tail -n 1)
+    final=$(grep -F '"context":"argunix: evaluation"' forge.log | tail -n 1)
     echo "final overall check: $final"
     echo "$final" | grep -F '"state":"failure"'
     echo "$final" | grep -F '1 ok, 0 cached, 1 failed'

@@ -20,8 +20,8 @@
 { pkgs, ... }:
 
 let
-  enrollmentToken = pkgs.writeText "medusa-builder-enrollment-token" "tok";
-  githubToken = pkgs.writeText "medusa-test-github-token" "ghtok";
+  enrollmentToken = pkgs.writeText "argunix-builder-enrollment-token" "tok";
+  githubToken = pkgs.writeText "argunix-test-github-token" "ghtok";
 
   # File size produced by the test derivation. Set well above each
   # VM's RAM so a buffering implementation would OOM the cgroup
@@ -36,7 +36,7 @@ let
   # so its build inputs (stdenv → coreutils → bash → glibc → …) are
   # tracked and end up in the closure properly. We DON'T realise
   # `largeBlob` at flake-eval time (the host can't — it lacks the
-  # `medusa-test` system feature). Instead we ship its
+  # `argunix-test` system feature). Instead we ship its
   # `inputDerivation` to both VMs (which collects all build inputs
   # into a single drv with no special features required), so when
   # the agent runs `nix-store --realise` on the .drv inside the
@@ -44,16 +44,16 @@ let
   largeBlob =
     pkgs.runCommand "stream-large-blob"
       {
-        requiredSystemFeatures = [ "medusa-test" ];
+        requiredSystemFeatures = [ "argunix-test" ];
       }
       ''
         dd if=/dev/zero of=$out bs=1M count=${toString bigFileMib} status=none
       '';
 
-  # Nix expression file the medusa VM nix-instantiate's at runtime.
+  # Nix expression file the argunix VM nix-instantiate's at runtime.
   # Imports nixpkgs from a path we ship (`pkgs.path`), so
   # `runCommand` is available with full input-tracking. This is
-  # what makes the resulting .drv usable: when the medusa daemon
+  # what makes the resulting .drv usable: when the argunix daemon
   # then `nix copy --to`s it to the builder, all build-input drvs
   # are in the closure (already in both VMs' stores via
   # `additionalPaths`).
@@ -62,11 +62,11 @@ let
   # escape (so the inner `runCommand` body uses `''…''`), and
   # `''$` is the literal `$` escape (to keep `$out` as a shell
   # variable, not Nix interpolation).
-  derivExpr = pkgs.writeText "medusa-test-large-deriv.nix" ''
+  derivExpr = pkgs.writeText "argunix-test-large-deriv.nix" ''
     let
       pkgs = import ${pkgs.path} {};
       env = {
-        requiredSystemFeatures = [ "medusa-test" ];
+        requiredSystemFeatures = [ "argunix-test" ];
       };
     in
       pkgs.runCommand "stream-large-blob" env '''
@@ -74,7 +74,7 @@ let
       '''
   '';
 
-  # Memory cap enforced on each medusa* systemd unit. Below the
+  # Memory cap enforced on each argunix* systemd unit. Below the
   # file size by design — if streaming works, peak stays well
   # under this; if anything starts buffering NARs, the cgroup
   # OOM-killer fires and the test fails loudly.
@@ -86,20 +86,20 @@ let
   vmRamMib = 1024;
 
   # Disk image size — must comfortably hold the file twice (source
-  # store on builder + dest store on medusa) plus the system
+  # store on builder + dest store on argunix) plus the system
   # closure. 16 GiB is generous; smaller wedges the test under
   # tmpfs/qcow2 pressure.
   vmDiskMib = 16384;
 in
 {
-  name = "medusa-builder-stream-large";
+  name = "argunix-builder-stream-large";
 
-  nodes.medusa =
+  nodes.argunix =
     { pkgs, ... }:
     {
       imports = [ ../module.nix ];
 
-      services.medusa = {
+      services.argunix = {
         enable = true;
         listen = "127.0.0.1:8080";
         credentials = {
@@ -107,7 +107,7 @@ in
           builder-enrollment-token = "${enrollmentToken}";
         };
         settings = {
-          external_url = "https://medusa.example.com";
+          external_url = "https://argunix.example.com";
           builder_enrollment = {
             listen = "[::]:2222";
             token_path = "$CREDENTIALS_DIRECTORY/builder-enrollment-token";
@@ -122,7 +122,7 @@ in
       };
 
       environment.systemPackages = [
-        pkgs.medusa
+        pkgs.argunix
         pkgs.jq
       ];
 
@@ -130,7 +130,7 @@ in
       virtualisation.diskSize = vmDiskMib;
       virtualisation.writableStore = true;
       # Pre-stage everything `nix-instantiate` and `nix copy --to`
-      # need for the test deriv on the medusa side: the nixpkgs
+      # need for the test deriv on the argunix side: the nixpkgs
       # source so `import` works, and the build-input closure of
       # `largeBlob` (= stdenv + coreutils + bash + …) so the resulting
       # drv's closure can be assembled and pushed to the builder
@@ -155,7 +155,7 @@ in
       # Cgroup cap on the daemon. If `nix copy --from` ever reverts
       # to buffering NARs, the daemon's cgroup will exceed this and
       # systemd OOM-kills the unit.
-      systemd.services.medusa.serviceConfig = {
+      systemd.services.argunix.serviceConfig = {
         MemoryMax = memoryMax;
         MemoryAccounting = true;
       };
@@ -166,10 +166,10 @@ in
     {
       imports = [ ../builder-module.nix ];
 
-      services.medusa-builder = {
+      services.argunix-builder = {
         enable = true;
-        medusaHost = "medusa";
-        medusaPort = 2222;
+        argunixHost = "argunix";
+        argunixPort = 2222;
         enrollmentTokenFile = "${enrollmentToken}";
         name = "smoke-builder";
       };
@@ -179,14 +179,14 @@ in
         "nixos-test"
         "benchmark"
         "big-parallel"
-        "medusa-test"
+        "argunix-test"
       ];
 
       virtualisation.memorySize = vmRamMib;
       virtualisation.diskSize = vmDiskMib;
       virtualisation.writableStore = true;
       virtualisation.writableStoreUseTmpfs = false;
-      # Same as on the medusa node — nixpkgs source + build-input
+      # Same as on the argunix node — nixpkgs source + build-input
       # closure of the test deriv. The agent's `nix-store --realise`
       # finds every input under /nix/store on this VM, runs the
       # build inside the standard sandbox, and produces the 2 GiB
@@ -201,7 +201,7 @@ in
       # Cap the agent unit too. Same reasoning, mirrored side: if the
       # agent's `nix-daemon --stdio` (forwarded via socket) buffered
       # a NAR for the export, this catches it.
-      systemd.services.medusa-builder.serviceConfig = {
+      systemd.services.argunix-builder.serviceConfig = {
         MemoryMax = memoryMax;
         MemoryAccounting = true;
       };
@@ -214,26 +214,26 @@ in
     expected_bytes = ${toString bigFileMib} * 1024 * 1024
 
     start_all()
-    medusa.wait_for_unit("medusa.service")
-    medusa.wait_for_open_port(2222)
-    builder.wait_for_unit("medusa-builder.service")
+    argunix.wait_for_unit("argunix.service")
+    argunix.wait_for_open_port(2222)
+    builder.wait_for_unit("argunix-builder.service")
 
-    medusa.wait_until_succeeds(
-        "medusactl --socket /run/medusa/control.sock builders list --json"
+    argunix.wait_until_succeeds(
+        "argunixctl --socket /run/argunix/control.sock builders list --json"
         " | jq '.[].connected' | grep -q 'true'",
         timeout=30,
     )
 
-    # Mint the .drv into the medusa VM's own store at runtime via
+    # Mint the .drv into the argunix VM's own store at runtime via
     # nix-instantiate. The .nix expression has no
     # Nix-store-tracked inputs, so this works without an internet
     # substituter and produces a drv whose closure is just itself.
-    drv = medusa.succeed("nix-instantiate ${derivExpr}").strip()
+    drv = argunix.succeed("nix-instantiate ${derivExpr}").strip()
     assert drv.endswith(".drv"), f"unexpected nix-instantiate output: {drv!r}"
 
     t0 = time.monotonic()
-    raw = medusa.succeed(
-        f"medusactl --socket /run/medusa/control.sock test-dispatch-drv"
+    raw = argunix.succeed(
+        f"argunixctl --socket /run/argunix/control.sock test-dispatch-drv"
         f" --builder smoke-builder {drv}",
         timeout=600,  # 5 GiB transfer over QEMU virtio is slow
     )
@@ -244,16 +244,16 @@ in
         log_path = payload.get("log_path")
         log_dump = ""
         if log_path:
-            _rc, log_dump = medusa.execute(f"zstdcat {log_path} || cat {log_path}")
-        medusa_journal = medusa.succeed(
-            "journalctl -u medusa.service --no-pager -n 200"
+            _rc, log_dump = argunix.execute(f"zstdcat {log_path} || cat {log_path}")
+        argunix_journal = argunix.succeed(
+            "journalctl -u argunix.service --no-pager -n 200"
         )
         builder_journal = builder.succeed(
-            "journalctl -u medusa-builder.service --no-pager -n 200"
+            "journalctl -u argunix-builder.service --no-pager -n 200"
         )
         # Build itself ran on the builder via the system nix-daemon;
         # if the build failed, the actual stderr is in nix-daemon's
-        # journal, not in medusa-builder's.
+        # journal, not in argunix-builder's.
         nix_daemon_journal = builder.succeed(
             "journalctl -u nix-daemon.service --no-pager -n 200"
         )
@@ -264,8 +264,8 @@ in
         raise AssertionError(
             f"test-dispatch-drv reported non-success: {payload!r}\n"
             f"--- build log ---\n{log_dump}\n"
-            f"--- medusa journal ---\n{medusa_journal}\n"
-            f"--- builder medusa-builder journal ---\n{builder_journal}\n"
+            f"--- argunix journal ---\n{argunix_journal}\n"
+            f"--- builder argunix-builder journal ---\n{builder_journal}\n"
             f"--- builder nix-daemon journal ---\n{nix_daemon_journal}\n"
             f"--- builder disk/RAM ---\n{df_out}\n"
         )
@@ -275,10 +275,10 @@ in
     out_path = out_paths[0]
 
     # Integrity: file size must match exactly on both VMs.
-    medusa_size = int(medusa.succeed(f"stat -c %s {out_path}").strip())
+    argunix_size = int(argunix.succeed(f"stat -c %s {out_path}").strip())
     builder_size = int(builder.succeed(f"stat -c %s {out_path}").strip())
-    assert medusa_size == expected_bytes, (
-        f"medusa-side size {medusa_size} != expected {expected_bytes}"
+    assert argunix_size == expected_bytes, (
+        f"argunix-side size {argunix_size} != expected {expected_bytes}"
     )
     assert builder_size == expected_bytes, (
         f"builder-side size {builder_size} != expected {expected_bytes}"
@@ -294,8 +294,8 @@ in
         # it's always on, so we expect a real number.
         return int(line) if line.isdigit() else 0
 
-    medusa_peak = memory_peak(medusa, "medusa.service")
-    builder_peak = memory_peak(builder, "medusa-builder.service")
+    argunix_peak = memory_peak(argunix, "argunix.service")
+    builder_peak = memory_peak(builder, "argunix-builder.service")
 
     cap_bytes = ${
       toString (
@@ -317,8 +317,8 @@ in
 
     # The streaming claim: peak < cap. (Cap < file size by
     # construction, so peak < file size transitively.)
-    assert medusa_peak < cap_bytes, (
-        f"medusa daemon peaked at {medusa_peak} bytes, cap is {cap_bytes}; "
+    assert argunix_peak < cap_bytes, (
+        f"argunix daemon peaked at {argunix_peak} bytes, cap is {cap_bytes}; "
         f"a buffered NAR would have OOM-killed the cgroup before this assert ran, "
         f"but if it didn't, this catches a near-miss."
     )
@@ -343,7 +343,7 @@ in
 
     print("")
     print("=" * 72)
-    print("medusa stream-large test summary")
+    print("argunix stream-large test summary")
     print("=" * 72)
     print("Test goal: prove `nix copy --from` streams per-file (no NAR buffer)")
     print("")
@@ -355,14 +355,14 @@ in
     print("  writableStore:            true (overlay on DISK; useTmpfs=false)")
     print("")
     print("Cgroup memory caps (systemd MemoryMax):")
-    print(f"  medusa.service:           {cap_bytes:>14} B  ({memory_max_str})")
-    print(f"  medusa-builder.service:   {cap_bytes:>14} B  ({memory_max_str})")
+    print(f"  argunix.service:           {cap_bytes:>14} B  ({memory_max_str})")
+    print(f"  argunix-builder.service:   {cap_bytes:>14} B  ({memory_max_str})")
     print("")
     print("Observed peak RSS (systemd MemoryPeak):")
-    headroom_m = (cap_bytes - medusa_peak) * 100.0 / cap_bytes
+    headroom_m = (cap_bytes - argunix_peak) * 100.0 / cap_bytes
     headroom_b = (cap_bytes - builder_peak) * 100.0 / cap_bytes
-    print(f"  medusa.service:           {medusa_peak:>14} B  ({fmt(medusa_peak)}, {headroom_m:.1f}% headroom under cap)")
-    print(f"  medusa-builder.service:   {builder_peak:>14} B  ({fmt(builder_peak)}, {headroom_b:.1f}% headroom under cap)")
+    print(f"  argunix.service:           {argunix_peak:>14} B  ({fmt(argunix_peak)}, {headroom_m:.1f}% headroom under cap)")
+    print(f"  argunix-builder.service:   {builder_peak:>14} B  ({fmt(builder_peak)}, {headroom_b:.1f}% headroom under cap)")
     print("")
     print("Wall clock:")
     print(f"  test-dispatch-drv total:  {elapsed:>14.2f} s")
@@ -371,7 +371,7 @@ in
         print(f"  effective throughput:     {throughput:>14.1f} MiB/s")
     print("")
     print(f"Output path:                {out_path}")
-    print(f"  on medusa:                {medusa_size} bytes (matches expected)")
+    print(f"  on argunix:                {argunix_size} bytes (matches expected)")
     print(f"  on builder:               {builder_size} bytes (matches expected)")
     print("=" * 72)
   '';

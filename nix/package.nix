@@ -21,7 +21,7 @@ let
   };
 
   rust = naersk.buildPackage {
-    name = "medusa";
+    name = "argunix";
     inherit src;
     # Askama compiles templates into the binary; nothing on disk at
     # runtime depends on the template directory. Static assets are
@@ -29,13 +29,13 @@ let
   };
 
   static =
-    runCommand "medusa-static"
+    runCommand "argunix-static"
       {
         nativeBuildInputs = [ tailwindcss_4 ];
       }
       ''
         mkdir -p $out
-        cp -r ${src}/medusa-web/static/. $out/
+        cp -r ${src}/argunix-web/static/. $out/
         chmod -R u+w $out
         # Strip the placeholder ui.css that's checked in (read-only
         # straight from /nix/store after `cp`) and the input source —
@@ -44,20 +44,20 @@ let
         # Tailwind v4 picks up `@source` directives from input.css, so
         # no extra `--content` flag here.
         tailwindcss \
-          -i ${src}/medusa-web/static/input.css \
+          -i ${src}/argunix-web/static/input.css \
           -o $out/ui.css \
           --minify
       '';
 in
-runCommand "medusa"
+runCommand "argunix"
   {
     inherit (rust) version;
     passthru = { inherit rust static; };
-    meta.mainProgram = "medusa";
+    meta.mainProgram = "argunix";
   }
   ''
     mkdir -p $out
     cp -r ${rust}/. $out/
-    mkdir -p $out/share/medusa
-    cp -r ${static} $out/share/medusa/static
+    mkdir -p $out/share/argunix
+    cp -r ${static} $out/share/argunix/static
   ''

@@ -1,10 +1,10 @@
-# M13b NixOS test: enable services.medusa-builder, assert the unit
+# M13b NixOS test: enable services.argunix-builder, assert the unit
 # comes up and the agent runs through identity + capability discovery
 # before entering its reconnect-backoff loop.
 #
-# A full end-to-end test (medusa node + builder node, agent reaches
+# A full end-to-end test (argunix node + builder node, agent reaches
 # the `Active` state in the registry) lands once the daemon's
-# `BuilderServer` is wired up — see TODO at medusa-daemon/src/main.rs.
+# `BuilderServer` is wired up — see TODO at argunix-daemon/src/main.rs.
 # Until then, this single-node smoke test verifies the module shape:
 #   - The systemd unit evaluates and starts.
 #   - The user exists and is in `nix.settings.trusted-users`.
@@ -16,22 +16,22 @@
 { pkgs, ... }:
 
 let
-  enrollmentToken = pkgs.writeText "medusa-builder-test-token" "tok";
+  enrollmentToken = pkgs.writeText "argunix-builder-test-token" "tok";
 in
 {
-  name = "medusa-builder-module-smoke";
+  name = "argunix-builder-module-smoke";
 
   nodes.machine = {
     imports = [ ../builder-module.nix ];
 
-    services.medusa-builder = {
+    services.argunix-builder = {
       enable = true;
-      # No medusa is running here; the agent enters its
+      # No argunix is running here; the agent enters its
       # connection-refused / backoff loop. That's expected — what
       # we assert below is that the unit reached its run loop in
       # the first place.
-      medusaHost = "127.0.0.1";
-      medusaPort = 2222;
+      argunixHost = "127.0.0.1";
+      argunixPort = 2222;
       enrollmentTokenFile = "${enrollmentToken}";
       name = "smoke-builder";
     };
@@ -41,22 +41,22 @@ in
 
   testScript = ''
     machine.start()
-    machine.wait_for_unit("medusa-builder.service")
+    machine.wait_for_unit("argunix-builder.service")
 
     # User + nix trust.
-    machine.succeed("getent passwd medusa-builder")
-    machine.succeed("grep -q '^trusted-users.*medusa-builder' /etc/nix/nix.conf")
+    machine.succeed("getent passwd argunix-builder")
+    machine.succeed("grep -q '^trusted-users.*argunix-builder' /etc/nix/nix.conf")
 
     # Persistent identity file is created on first start.
     machine.wait_until_succeeds(
-        "test -s /var/lib/medusa-builder/identity.ed25519",
+        "test -s /var/lib/argunix-builder/identity.ed25519",
         timeout=20,
     )
 
     # Capability discovery ran (proves `nix show-config --json` works
     # under the unit's PATH and sandbox profile).
     machine.wait_until_succeeds(
-        "journalctl -u medusa-builder.service --no-pager | grep -q 'capabilities discovered'",
+        "journalctl -u argunix-builder.service --no-pager | grep -q 'capabilities discovered'",
         timeout=20,
     )
 
@@ -64,7 +64,7 @@ in
     # events — proves the enrollment-token credential was loaded and
     # the binary is past startup.
     machine.wait_until_succeeds(
-        "journalctl -u medusa-builder.service --no-pager | grep -q 'agent starting'",
+        "journalctl -u argunix-builder.service --no-pager | grep -q 'agent starting'",
         timeout=20,
     )
   '';

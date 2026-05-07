@@ -1,0 +1,32 @@
+[package]
+name = "argunix-builders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+argunix-domain = { workspace = true }
+argunix-store = { workspace = true }
+
+base64 = { workspace = true }
+russh = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+# russh 0.60 uses rand 0.10 internally; the workspace pin is 0.8.
+# Tests need a 0.10 RNG to call `PrivateKey::random`. Renamed to keep
+# both versions accessible without pulling 0.10 into the production dep
+# graph of any other crate.
+rand10 = { package = "rand", version = "0.10" }
