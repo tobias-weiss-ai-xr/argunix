@@ -125,6 +125,7 @@
             builder-module-smoke = pkgs.testers.runNixOSTest ./nix/tests/builder-module-smoke.nix;
             builder-enrollment = pkgs.testers.runNixOSTest ./nix/tests/builder-enrollment.nix;
             builder-build-dispatch = pkgs.testers.runNixOSTest ./nix/tests/builder-build-dispatch.nix;
+            builder-stream-large = pkgs.testers.runNixOSTest ./nix/tests/builder-stream-large.nix;
           };
         };
     };
