@@ -16,7 +16,8 @@
 {% if evals.is_empty() %}
 <p class="text-muted">No evaluations yet.</p>
 {% else %}
-<table class="w-full text-sm border-collapse">
+<div class="overflow-x-auto">
+<table class="w-full min-w-[36rem] text-sm border-collapse">
   <thead class="text-left text-muted">
     <tr>
       <th class="py-2 pr-4">id</th>
@@ -58,4 +59,5 @@
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% endif %} {% endblock %}

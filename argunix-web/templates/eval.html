@@ -31,7 +31,7 @@
       {% endif %}
     </dd>
     <dt class="text-muted">sha</dt>
-    <dd class="font-mono">
+    <dd class="font-mono break-all">
       {% if commit_link.is_empty() %}
         {{ sha }}
       {% else %}
@@ -56,7 +56,8 @@
   {% if jobs.is_empty() %}
     <p class="text-muted">{{ empty_jobs_msg }}</p>
   {% else %}
-    <table class="w-full text-sm border-collapse">
+    <div class="overflow-x-auto">
+    <table class="w-full min-w-[40rem] text-sm border-collapse">
       <thead class="text-left text-muted">
         <tr>
           <th class="py-2 pr-4">attr</th>
@@ -90,5 +91,6 @@
         {% endfor %}
       </tbody>
     </table>
+    </div>
   {% endif %}
 {% endblock %}
