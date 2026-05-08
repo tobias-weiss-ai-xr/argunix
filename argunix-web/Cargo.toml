@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "argunix-web-dev"
+path = "src/bin/dev.rs"
+
 [dependencies]
 argunix-builders = { path = "../argunix-builders" }
 argunix-config = { workspace = true }
@@ -22,8 +26,15 @@ tower-http = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 zstd = "0.13"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `PR_SET_PDEATHSIG` for the dev binary so the spawned tailwind --watch
+# child gets reaped even if the parent dies via SIGKILL or panic.
+libc = "0.2"

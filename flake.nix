@@ -100,14 +100,16 @@
           devShells.default = pkgs.mkShell {
             packages = [
               pkgs.cargo
-              pkgs.rustc
+              pkgs.cargo-watch
               pkgs.clippy
-              pkgs.rustfmt
-              pkgs.rust-analyzer
-              pkgs.pkg-config
-              pkgs.openssl
               pkgs.nix-eval-jobs
+              pkgs.openssl
+              pkgs.pkg-config
+              pkgs.rust-analyzer
+              pkgs.rustc
+              pkgs.rustfmt
               pkgs.sqlx-cli
+              pkgs.tailwindcss_4
               treefmtEval.config.build.wrapper
             ];
           };
