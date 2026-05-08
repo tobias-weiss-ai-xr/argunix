@@ -303,6 +303,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let coalesce = std::sync::Arc::new(argunix_web::CoalescePool::new(
         std::time::Duration::from_secs(coalesce_seconds),
     ));
+    let host_stats = argunix_web::HostStatsRing::new();
+    // Background sampler — ticks /proc every 5s and pushes into
+    // `host_stats`, the same ring `/api/host/stats` reads from. Aborted
+    // when its handle drops (at daemon shutdown).
+    let _host_stats_handle = argunix_web::spawn_host_sampler(host_stats.clone());
+
     let inner = argunix_web::AppStateInner {
         current: current.clone(),
         store: store.clone(),
@@ -312,6 +318,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         cancellations,
         builder_registry: builder_registry.clone(),
         live_logs,
+        host_stats,
         started_at: std::time::Instant::now(),
     };
     let app_state = std::sync::Arc::new(inner);

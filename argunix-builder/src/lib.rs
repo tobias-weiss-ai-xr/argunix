@@ -14,7 +14,6 @@
 mod agent;
 mod capabilities;
 mod identity;
-mod stats;
 
 pub use agent::{AgentConfig, AgentError, run};
 pub use argunix_builders::ClosureXferError;

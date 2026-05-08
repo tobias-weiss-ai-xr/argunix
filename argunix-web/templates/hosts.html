@@ -1,13 +1,61 @@
 {% extends "base.html" %}
-{% block title %}builders — argunix{% endblock %}
+{% block title %}hosts — argunix{% endblock %}
 {% block content %}
 <div class="flex items-baseline justify-between mb-4 flex-wrap gap-2">
-  <h1 class="text-2xl font-semibold">Builders</h1>
+  <h1 class="text-2xl font-semibold">Hosts</h1>
   <p class="text-sm text-muted">
-    {{ online }} online · {{ known }} known
+    coordinator + {{ online }} online · {{ known }} builder{% if known != 1 %}s{% endif %} known
   </p>
 </div>
 
+{# Coordinator card. Always rendered. Polls /api/host/stats for cpu /
+   load / mem; the badge marks it visually distinct from the builders. #}
+<article class="rounded border border-border bg-surface p-4 flex flex-col gap-3 mb-4"
+         data-stats-url="/api/host/stats">
+  <header class="flex items-baseline justify-between gap-2">
+    <h2 class="font-mono text-base font-semibold truncate" title="{{ coordinator.hostname }}">
+      {{ coordinator.hostname }}
+    </h2>
+    <span class="inline-block px-2 py-0.5 rounded text-xs whitespace-nowrap bg-info-soft text-info-strong">
+      coordinator
+    </span>
+  </header>
+
+  <div class="text-xs text-muted flex flex-wrap gap-x-4 gap-y-1">
+    <span><span class="text-fg font-mono" data-field="load">—</span> load</span>
+    <span><span class="text-fg font-mono" data-field="cpu">—</span> cpu</span>
+    <span><span class="text-fg font-mono" data-field="mem">—</span> mem</span>
+    <span class="ml-auto">up {{ coordinator.uptime }}</span>
+  </div>
+
+  <div class="grid grid-cols-3 gap-2 text-[11px]">
+    <figure class="border border-border rounded p-1.5">
+      <figcaption class="text-muted leading-none mb-1">cpu</figcaption>
+      <svg data-spark="cpu" viewBox="0 0 120 24" class="w-full h-6" preserveAspectRatio="none">
+        <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
+      </svg>
+    </figure>
+    <figure class="border border-border rounded p-1.5">
+      <figcaption class="text-muted leading-none mb-1">load1</figcaption>
+      <svg data-spark="load" viewBox="0 0 120 24" class="w-full h-6" preserveAspectRatio="none">
+        <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
+      </svg>
+    </figure>
+    <figure class="border border-border rounded p-1.5">
+      <figcaption class="text-muted leading-none mb-1">mem</figcaption>
+      <svg data-spark="mem" viewBox="0 0 120 24" class="w-full h-6" preserveAspectRatio="none">
+        <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
+      </svg>
+    </figure>
+  </div>
+
+  <footer class="border-t border-border pt-2 text-[11px] leading-5 text-muted">
+    Webhook ingest, scheduling, and forge integration run here.
+    Builders below execute the actual nix builds.
+  </footer>
+</article>
+
+<h2 class="text-lg font-semibold mb-2">Builders</h2>
 {% if rows.is_empty() %}
 <p class="text-muted">
   No builders enrolled yet. Set <code class="text-xs font-mono">services.argunix-builder.enable = true;</code>
@@ -19,7 +67,8 @@
   {% for b in rows %}
   <article class="rounded border border-border bg-surface p-4 flex flex-col gap-3"
            data-builder="{{ b.name }}"
-           data-online="{% if b.is_online %}1{% else %}0{% endif %}">
+           data-online="{% if b.is_online %}1{% else %}0{% endif %}"
+           {% if b.is_online %}data-stats-url="/api/builders/{{ b.name }}/stats"{% endif %}>
     <header class="flex items-baseline justify-between gap-2">
       <h2 class="font-mono text-base font-semibold truncate" title="{{ b.name }}">{{ b.name }}</h2>
       <span class="inline-block px-2 py-0.5 rounded text-xs whitespace-nowrap {{ b.status_class }}">{{ b.status }}</span>
@@ -101,10 +150,13 @@
   </article>
   {% endfor %}
 </div>
+{% endif %}
 
 <script>
   (() => {
-    const cards = document.querySelectorAll('article[data-builder][data-online="1"]');
+    {# Selector covers both the coordinator card and online builder
+       cards — anything carrying a stats endpoint URL gets polled. #}
+    const cards = document.querySelectorAll('article[data-stats-url]');
     if (!cards.length) return;
 
     const drawSpark = (svg, values, opts) => {
@@ -131,9 +183,8 @@
     };
 
     const refreshCard = async (card) => {
-      const name = card.dataset.builder;
       try {
-        const r = await fetch(`/api/builders/${encodeURIComponent(name)}/stats`);
+        const r = await fetch(card.dataset.statsUrl);
         if (!r.ok) return;
         const samples = await r.json();
         if (!samples.length) return;
@@ -164,5 +215,4 @@
     setInterval(tick, 5000);
   })();
 </script>
-{% endif %}
 {% endblock %}

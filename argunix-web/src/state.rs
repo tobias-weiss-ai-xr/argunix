@@ -47,6 +47,11 @@ pub struct AppStateInner {
     /// each `BuildLogChunk` here as it arrives from the agent; web
     /// SSE handlers snapshot + subscribe. Drops on build completion.
     pub live_logs: Arc<crate::live_log::LiveLogRegistry>,
+    /// Coordinator-host stats ring (cpu / load / mem) for the
+    /// `/hosts` page. Populated by a background sampler task spawned
+    /// from the daemon at startup; read by the `/api/host/stats`
+    /// handler and the `/hosts` page header.
+    pub host_stats: crate::host_stats::HostStatsRing,
     /// Daemon start time for `argunixctl status` uptime reporting.
     pub started_at: std::time::Instant,
 }

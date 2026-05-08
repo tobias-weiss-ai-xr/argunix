@@ -33,7 +33,8 @@ use argunix_store::{
     RepoStore, SqlxStore,
 };
 use argunix_web::{
-    AppStateInner, CancelRegistry, CoalescePool, ConfigSnapshot, LiveLogRegistry, PauseRegistry,
+    AppStateInner, CancelRegistry, CoalescePool, ConfigSnapshot, HostStatsRing, LiveLogRegistry,
+    PauseRegistry, spawn_host_sampler,
 };
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -99,6 +100,10 @@ async fn main() -> anyhow::Result<()> {
     let pauses = Arc::new(PauseRegistry::new());
     let cancellations = Arc::new(CancelRegistry::new());
     let coalesce = Arc::new(CoalescePool::new(Duration::from_secs(5)));
+    let host_stats = HostStatsRing::new();
+    // Sampler runs as long as the dev binary does — `_host_sampler` is
+    // its abort handle, kept alive so the task isn't dropped early.
+    let _host_sampler = spawn_host_sampler(host_stats.clone());
 
     // Worker dispatcher channel. Nothing in dev mode publishes to it,
     // but `AppStateInner` requires a live sender. Keep `_keep_rx` in
@@ -115,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         cancellations,
         builder_registry,
         live_logs,
+        host_stats,
         started_at: std::time::Instant::now(),
     };
     let app_state = Arc::new(inner);

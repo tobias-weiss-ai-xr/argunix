@@ -13,6 +13,7 @@ mod protocol;
 mod registry;
 mod server;
 mod side_channel;
+mod stats;
 mod systems;
 
 pub use auth::AuthState;
@@ -31,4 +32,5 @@ pub use side_channel::{
     MAX_HEADER_BYTES, SideChannelError, SideChannelHeader, SideChannelKind, dispatch_inbound,
     read_header, write_header,
 };
+pub use stats::StatsSampler;
 pub use systems::SystemsResolver;

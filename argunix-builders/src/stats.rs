@@ -1,10 +1,12 @@
-//! Cheap `/proc` sampler for the heartbeat payload.
+//! Cheap `/proc` sampler for [`BuilderStats`].
 //!
-//! Linux-only. Returns `None` on read/parse failure so the heartbeat
-//! itself remains a pure liveness signal — sampling problems must
-//! never knock the agent off the control channel.
+//! Originally written for the agent's heartbeat payload (Linux-only,
+//! returns `None` on read/parse failure so sampling problems can't
+//! knock the agent off the control channel). Lives in the shared lib
+//! so the daemon can reuse it for the coordinator host's row on the
+//! `/hosts` page.
 
-use argunix_builders::BuilderStats;
+use crate::BuilderStats;
 
 /// Stateful sampler. CPU% requires a delta against the prior sample,
 /// so we keep the last raw `/proc/stat` totals; the first sample

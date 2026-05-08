@@ -11,6 +11,7 @@
 mod auto_install;
 mod cancel;
 mod coalesce;
+mod host_stats;
 mod live_log;
 mod pause;
 mod policy;
@@ -21,6 +22,7 @@ mod webhook;
 pub use auto_install::ensure_all as ensure_webhooks;
 pub use cancel::{CancelRegistry, CancelToken, branch_key};
 pub use coalesce::CoalescePool;
+pub use host_stats::{HostStatsRing, spawn_sampler as spawn_host_sampler};
 pub use live_log::{LiveLog, LiveLogRegistry};
 pub use pause::PauseRegistry;
 
@@ -43,10 +45,11 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(ui::status))
         .route("/_/status", get(ui::status_fragment))
         .route("/repos", get(ui::index))
-        .route("/builders", get(ui::builders))
+        .route("/hosts", get(ui::hosts))
         .route("/healthz", get(healthz))
         .route("/r/{forge}/{*tail}", get(ui::dispatch_repo))
-        .route("/api/builders", get(ui::builders_json))
+        .route("/api/hosts", get(ui::hosts_json))
+        .route("/api/host/stats", get(ui::host_stats))
         .route("/api/builders/{name}/stats", get(ui::builder_stats))
         .route("/api/jobs/{job_id}/log/stream", get(ui::job_log_stream))
         .route("/webhook/{forge_kind}", post(webhook::handle))

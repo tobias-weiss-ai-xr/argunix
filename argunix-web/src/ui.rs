@@ -44,18 +44,34 @@ struct StatusTemplate {
     queued_truncated: bool,
 }
 
-/// Dedicated `/builders` page. Renders the same per-builder data as
-/// the homepage strip but with sparklines + capabilities + the full
-/// list of current jobs.
+/// Dedicated `/hosts` page. Renders one card for the argunix
+/// coordinator host (cpu / load / mem sparklines polled from
+/// `/api/host/stats`) followed by one card per builder. Builders
+/// also carry capability badges and the full current-jobs list.
 #[derive(Template)]
-#[template(path = "builders.html")]
-struct BuildersTemplate {
+#[template(path = "hosts.html")]
+struct HostsTemplate {
     /// Drives the header logo's `argunix-spin` class. True iff any
     /// builder has at least one current job in flight.
     cluster_active: bool,
+    /// The argunix coordinator card. Always rendered, even when the
+    /// host has no live samples yet (template falls back to "—").
+    coordinator: CoordinatorRow,
     rows: Vec<BuilderRow>,
     online: usize,
     known: usize,
+}
+
+/// Coordinator-host row for the `/hosts` page header card. Capability
+/// fields are absent because the coordinator doesn't run builds
+/// itself — it only orchestrates them.
+struct CoordinatorRow {
+    /// Display name shown on the card. Pulled from `gethostname()` at
+    /// render time; falls back to `"argunix"` if the syscall fails.
+    hostname: String,
+    /// Wall-clock since daemon startup, humanized
+    /// (`"3h 12m"` / `"42s"`).
+    uptime: String,
 }
 
 /// Polled fragment of the status page: the section content plus an
@@ -441,26 +457,51 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
     })?))
 }
 
-/// `GET /builders` — dedicated page with one rich card per builder.
-/// Each card carries live sparklines (cpu / load1 / mem) polled
-/// per-card from `/api/builders/{name}/stats`, plus the current job
-/// list with phase badges. Designed mobile-first: 1 col on phones, 2
-/// on tablets, 3 on desktop.
-pub async fn builders(State(state): State<AppState>) -> Result<Html<String>, UiError> {
-    let view = collect_builders_only(&state).await?;
+/// `GET /hosts` — dedicated page with the argunix coordinator card on
+/// top and one rich card per builder below. Both card types carry live
+/// sparklines (cpu / load1 / mem) — coordinator polls `/api/host/stats`,
+/// builders poll `/api/builders/{name}/stats`. Builder cards also list
+/// their current jobs with phase badges. Designed mobile-first: 1 col
+/// on phones, 2 on tablets, 3 on desktop.
+pub async fn hosts(State(state): State<AppState>) -> Result<Html<String>, UiError> {
+    let view = collect_hosts_only(&state).await?;
     let cluster_active = view.rows.iter().any(|b| !b.current_jobs.is_empty());
-    Ok(Html(render(&BuildersTemplate {
+    Ok(Html(render(&HostsTemplate {
         cluster_active,
+        coordinator: build_coordinator_row(&state),
         rows: view.rows,
         online: view.online,
         known: view.known,
     })?))
 }
 
+fn build_coordinator_row(state: &AppState) -> CoordinatorRow {
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "argunix".to_string());
+    let uptime = humanize_uptime(state.started_at.elapsed());
+    CoordinatorRow { hostname, uptime }
+}
+
+fn humanize_uptime(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else if secs < 86400 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+    }
+}
+
 /// Builder list independent of the eval/queue queries the status page
-/// runs. Shared between the `/builders` page and the `/api/builders`
-/// JSON endpoint so both render exactly the same view.
-async fn collect_builders_only(state: &AppState) -> Result<BuildersView, UiError> {
+/// runs. Shared between the `/hosts` page and the `/api/hosts` JSON
+/// endpoint so both render exactly the same view.
+async fn collect_hosts_only(state: &AppState) -> Result<HostsView, UiError> {
     let roster = <argunix_store::SqlxStore as BuilderStore>::list_all(&state.store).await?;
     let live = state.builder_registry.list();
     let phases = state.builder_registry.phase_snapshot();
@@ -508,12 +549,14 @@ async fn collect_builders_only(state: &AppState) -> Result<BuildersView, UiError
     ))
 }
 
-/// `GET /api/builders` — same data as the `/builders` page, JSON.
+/// `GET /api/hosts` — same per-builder data as the `/hosts` page, JSON.
 /// Returned as one array so polling clients (the page itself, future
 /// status-strip live updates) avoid N+1'ing per-builder endpoints just
-/// to refresh status / current-job state.
-pub async fn builders_json(State(state): State<AppState>) -> Result<Response, UiError> {
-    let view = collect_builders_only(&state).await?;
+/// to refresh status / current-job state. The coordinator's stats are
+/// served separately by [`host_stats`] to match the per-builder
+/// `/api/builders/{name}/stats` shape the page already polls.
+pub async fn hosts_json(State(state): State<AppState>) -> Result<Response, UiError> {
+    let view = collect_hosts_only(&state).await?;
     let body: Vec<_> = view
         .rows
         .into_iter()
@@ -591,9 +634,9 @@ struct StatusView {
 }
 
 /// Result of [`collect_builders`]: the per-builder rows (offline + online),
-/// plus a few aggregates the `/builders` page surfaces in its header
+/// plus a few aggregates the `/hosts` page surfaces in its header
 /// summary.
-struct BuildersView {
+struct HostsView {
     rows: Vec<BuilderRow>,
     online: usize,
     known: usize,
@@ -613,7 +656,7 @@ fn collect_builders(
     live: &[argunix_builders::BuilderSnapshot],
     mut current_jobs_by_builder: HashMap<String, Vec<CurrentJob>>,
     now: chrono::DateTime<chrono::Utc>,
-) -> BuildersView {
+) -> HostsView {
     let live_by_name: HashMap<String, &argunix_builders::BuilderSnapshot> = live
         .iter()
         .map(|s| (s.name.as_str().to_string(), s))
@@ -633,7 +676,7 @@ fn collect_builders(
         })
         .collect();
 
-    BuildersView {
+    HostsView {
         rows,
         online,
         known,
@@ -1283,6 +1326,37 @@ async fn cluster_is_active(state: &AppState) -> Result<bool, UiError> {
     Ok(!running.is_empty())
 }
 
+/// `GET /api/host/stats` — JSON ring of recent stats samples for the
+/// argunix coordinator host (cpu / load1 / mem). Same shape as
+/// [`builder_stats`] so the `/hosts` page can reuse the same fetch +
+/// sparkline JS for both card kinds. Empty list (200) until the
+/// background sampler has produced its first sample (~5s after boot).
+pub async fn host_stats(State(state): State<AppState>) -> Result<Response, UiError> {
+    let body: Vec<_> = state
+        .host_stats
+        .snapshot()
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "ts": s.ts.to_rfc3339(),
+                "load1": s.stats.load1,
+                "cpu_percent": s.stats.cpu_percent,
+                "mem_used_bytes": s.stats.mem_used_bytes,
+                "mem_total_bytes": s.stats.mem_total_bytes,
+            })
+        })
+        .collect();
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        serde_json::to_vec(&body).map_err(UiError::Json)?,
+    )
+        .into_response())
+}
+
 /// `GET /api/builders/{name}/stats` — JSON ring of recent heartbeat
 /// stats samples for one connected builder. Polled every ~5s by the
 /// job page's sparkline JS. Returns an empty list (200) for a
@@ -1713,10 +1787,18 @@ mod tests {
         }
     }
 
+    fn fixture_coordinator() -> CoordinatorRow {
+        CoordinatorRow {
+            hostname: "argunix-test".into(),
+            uptime: "1m 20s".into(),
+        }
+    }
+
     #[test]
-    fn builders_template_empty_state_mentions_enrollment_help() {
-        let html = BuildersTemplate {
+    fn hosts_template_empty_state_mentions_enrollment_help() {
+        let html = HostsTemplate {
             cluster_active: false,
+            coordinator: fixture_coordinator(),
             rows: vec![],
             online: 0,
             known: 0,
@@ -1727,10 +1809,13 @@ mod tests {
         // — without it the "no builders" line is a dead-end.
         assert!(html.contains("No builders enrolled yet"));
         assert!(html.contains("services.argunix-builder.enable"));
+        // Coordinator card is rendered even with zero builders.
+        assert!(html.contains("argunix-test"));
+        assert!(html.contains("coordinator"));
     }
 
     #[test]
-    fn builders_template_renders_busy_card_with_phase_and_link() {
+    fn hosts_template_renders_busy_card_with_phase_and_link() {
         let job = CurrentJob {
             attr_path: "packages.x86_64-linux.hello".into(),
             eval_id: 42,
@@ -1739,8 +1824,9 @@ mod tests {
             phase: "build",
             phase_class: "bg-info-soft text-info-strong",
         };
-        let html = BuildersTemplate {
+        let html = HostsTemplate {
             cluster_active: true,
+            coordinator: fixture_coordinator(),
             rows: vec![make_builder_row("alpha", true, vec![job])],
             online: 1,
             known: 1,
@@ -1753,7 +1839,7 @@ mod tests {
         // Phase badge present so operators can tell push/build/pull
         // at a glance.
         assert!(html.contains(">build</span>"));
-        // Link points at the per-job page (not /builders) so a click
+        // Link points at the per-job page (not /hosts) so a click
         // drills into the active build, not back to the same view.
         assert!(html.contains("/r/github/owner/repo/eval/42/job/packages.x86_64-linux.hello"));
         // Sparkline JS attaches via [data-online="1"] selector — must
@@ -1762,9 +1848,10 @@ mod tests {
     }
 
     #[test]
-    fn builders_template_renders_idle_card_without_sparklines_for_offline() {
-        let html = BuildersTemplate {
+    fn hosts_template_renders_idle_card_without_sparklines_for_offline() {
+        let html = HostsTemplate {
             cluster_active: false,
+            coordinator: fixture_coordinator(),
             rows: vec![make_builder_row("beta", false, vec![])],
             online: 0,
             known: 1,
@@ -1772,12 +1859,13 @@ mod tests {
         .render()
         .unwrap();
         assert!(html.contains("beta"));
-        // Offline cards skip the sparkline figure block — drawing
-        // sparklines for a builder whose stats endpoint returns []
-        // would just paint a flat line forever. Match on the actual
-        // SVG element rather than the literal selector in the script
-        // (which is unconditionally present).
-        assert!(!html.contains(r#"<svg data-spark="cpu""#));
+        // Offline builder cards skip the sparkline figure block —
+        // drawing sparklines for a builder whose stats endpoint
+        // returns [] would just paint a flat line forever. The
+        // coordinator card always carries one sparkline set, so we
+        // assert exactly one `<svg data-spark="cpu"` (the
+        // coordinator's), not zero.
+        assert_eq!(html.matches(r#"<svg data-spark="cpu""#).count(), 1);
         assert!(html.contains("last seen 5m ago"));
         assert!(html.contains(r#"data-online="0""#));
     }
@@ -1815,9 +1903,9 @@ mod tests {
         let html = tmpl.render().unwrap();
         assert!(html.contains("checks.x86_64-linux.smoke"));
         assert!(html.contains(">push</span>"));
-        // Strip card always links to the dedicated /builders page so
+        // Strip card always links to the dedicated /hosts page so
         // the homepage stays the cluster overview.
-        assert!(html.contains(r#"href="/builders""#));
+        assert!(html.contains(r#"href="/hosts""#));
     }
 
     #[test]

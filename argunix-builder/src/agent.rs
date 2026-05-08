@@ -256,7 +256,7 @@ async fn serve_one_connection(
     hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Skip the immediate first tick.
     hb_interval.tick().await;
-    let mut stats_sampler = crate::stats::StatsSampler::new();
+    let mut stats_sampler = argunix_builders::StatsSampler::new();
 
     // M14b: outbound control queue. Build tasks send `BuildStarted /
     // BuildLogChunk / BuildFinished` here; the main loop drains the
