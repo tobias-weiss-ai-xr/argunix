@@ -12,7 +12,7 @@
     <tr>
       <th class="py-2 pr-4">forge</th>
       <th class="py-2 pr-4">repo</th>
-      <th class="py-2 pr-4">description</th>
+      <th class="py-2 pr-4 hidden md:table-cell">description</th>
       <th class="py-2">latest evaluation</th>
     </tr>
   </thead>
@@ -38,7 +38,7 @@
         </div>
         {% endif %}
       </td>
-      <td class="py-2 pr-4 text-muted">{% if let Some(d) = r.description %}{{ d }}{% else %}—{% endif %}</td>
+      <td class="py-2 pr-4 text-muted hidden md:table-cell">{% if let Some(d) = r.description %}{{ d }}{% else %}—{% endif %}</td>
       <td class="py-2">
         {% if let Some(id) = r.latest_eval_id %}
         <a
