@@ -12,7 +12,7 @@
       <th class="py-2 pr-4">forge</th>
       <th class="py-2 pr-4">repo</th>
       <th class="py-2 pr-4">description</th>
-      <th class="py-2">latest</th>
+      <th class="py-2">latest evaluation</th>
     </tr>
   </thead>
   <tbody>
@@ -26,17 +26,14 @@
         {% endif %}
       </td>
       <td class="py-2 pr-4">
-        <a
-          class="text-blue-600 hover:underline"
-          href="/r/{{ r.forge }}/{{ r.slug }}"
-          >{% if let Some(n) = r.name %}{{ n }}{% else %}{{ r.slug }}{% endif %}</a
-        >
-        {% if let Some(_) = r.name %}
-        <div class="text-xs text-slate-500 font-mono">{{ r.slug }}</div>
-        {% endif %}
+        <a class="text-blue-600 hover:underline" href="/r/{{ r.forge }}/{{ r.slug }}" >
+          {{ r.slug }}
+        </a>
         {% if !r.repo_url.is_empty() %}
         <div class="text-xs">
-          <a class="text-slate-500 hover:underline" href="{{ r.repo_url }}">↗ on forge</a>
+          <a class="text-slate-500 hover:underline" href="{{ r.repo_url }}">
+            ↗ on forge
+          </a>
         </div>
         {% endif %}
       </td>
@@ -46,7 +43,7 @@
         <a
           class="text-blue-600 hover:underline"
           href="/r/{{ r.forge }}/{{ r.slug }}/eval/{{ id }}"
-          >eval #{{ id }}</a
+          >#{{ id }}</a
         >
         {% else %}
         <span class="text-slate-400">—</span>
@@ -83,7 +80,7 @@
         {% endif %}
       </td>
       <td class="py-2">
-        <span class="font-mono">{{ r.slug }}</span>
+        {{ r.slug }}
         {% if !r.repo_url.is_empty() %}
         <span class="ml-2 text-xs">
           <a class="text-slate-500 hover:underline" href="{{ r.repo_url }}">↗ on forge</a>
