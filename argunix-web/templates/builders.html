@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block title %}builders — argunix{% endblock %}
+{% block content %}
+<div class="flex items-baseline justify-between mb-4 flex-wrap gap-2">
+  <h1 class="text-2xl font-semibold">Builders</h1>
+  <p class="text-sm text-muted">
+    {{ online }} online · {{ known }} known
+  </p>
+</div>
+
+{% if rows.is_empty() %}
+<p class="text-muted">
+  No builders enrolled yet. Set <code class="text-xs font-mono">services.argunix-builder.enable = true;</code>
+  on a host (with the enrollment token from
+  <code class="text-xs font-mono">builder_enrollment.token_path</code>) to add capacity.
+</p>
+{% else %}
+<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+  {% for b in rows %}
+  <article class="rounded border border-border bg-surface p-4 flex flex-col gap-3"
+           data-builder="{{ b.name }}"
+           data-online="{% if b.is_online %}1{% else %}0{% endif %}">
+    <header class="flex items-baseline justify-between gap-2">
+      <h2 class="font-mono text-base font-semibold truncate" title="{{ b.name }}">{{ b.name }}</h2>
+      <span class="inline-block px-2 py-0.5 rounded text-xs whitespace-nowrap {{ b.status_class }}">{{ b.status }}</span>
+    </header>
+
+    <div class="text-xs text-muted flex flex-wrap gap-x-4 gap-y-1">
+      {% if b.is_online %}
+      <span><span class="text-fg font-mono" data-field="load">—</span> load</span>
+      <span><span class="text-fg font-mono" data-field="cpu">—</span> cpu</span>
+      <span><span class="text-fg font-mono" data-field="mem">—</span> mem</span>
+      <span class="ml-auto">{{ b.in_flight }} / {{ b.max_jobs }} slots</span>
+      {% else %}
+      <span>last seen {{ b.last_seen }}</span>
+      {% endif %}
+    </div>
+
+    {% if b.is_online %}
+    <div class="grid grid-cols-3 gap-2 text-[11px]">
+      <figure class="border border-border rounded p-1.5">
+        <figcaption class="text-muted leading-none mb-1">cpu</figcaption>
+        <svg data-spark="cpu" viewBox="0 0 120 24" class="w-full h-6" preserveAspectRatio="none">
+          <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
+        </svg>
+      </figure>
+      <figure class="border border-border rounded p-1.5">
+        <figcaption class="text-muted leading-none mb-1">load1</figcaption>
+        <svg data-spark="load" viewBox="0 0 120 24" class="w-full h-6" preserveAspectRatio="none">
+          <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
+        </svg>
+      </figure>
+      <figure class="border border-border rounded p-1.5">
+        <figcaption class="text-muted leading-none mb-1">mem</figcaption>
+        <svg data-spark="mem" viewBox="0 0 120 24" class="w-full h-6" preserveAspectRatio="none">
+          <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
+        </svg>
+      </figure>
+    </div>
+    {% endif %}
+
+    <div class="text-xs">
+      {% if !b.is_online %}
+      <p class="text-muted">offline — no live builds</p>
+      {% else if b.current_jobs.is_empty() %}
+      <p class="text-muted">ready · waiting for work</p>
+      {% else %}
+      <p class="text-muted mb-1">now building</p>
+      <ul class="space-y-1">
+        {% for j in b.current_jobs %}
+        <li class="flex items-start gap-2 min-w-0">
+          <a class="text-link hover:underline font-mono truncate flex-1 min-w-0"
+             title="{{ j.attr_path }}"
+             href="/r/{{ j.forge }}/{{ j.slug }}/eval/{{ j.eval_id }}/job/{{ j.attr_path }}">{{ j.attr_path }}</a>
+          {% if !j.phase.is_empty() %}
+          <span class="inline-block px-1.5 py-0.5 rounded text-[10px] whitespace-nowrap {{ j.phase_class }}">{{ j.phase }}</span>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </div>
+
+    <footer class="border-t border-border pt-2 text-[11px] leading-5 flex flex-col gap-1">
+      <div class="flex flex-wrap items-baseline gap-1">
+        <span class="text-muted">systems</span>
+        {% for s in b.systems %}
+        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-chip text-chip-fg font-mono">{{ s }}</span>
+        {% endfor %}
+      </div>
+      <div class="flex flex-wrap items-baseline gap-1">
+        <span class="text-muted">features</span>
+        {% if b.features.is_empty() %}
+        <span class="text-subtle">—</span>
+        {% else %}{% for f in b.features %}
+        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-chip text-chip-fg font-mono">{{ f }}</span>
+        {% endfor %}{% endif %}
+      </div>
+      <div class="text-muted">nix <span class="font-mono text-fg">{{ b.nix_version }}</span></div>
+    </footer>
+  </article>
+  {% endfor %}
+</div>
+
+<script>
+  (() => {
+    const cards = document.querySelectorAll('article[data-builder][data-online="1"]');
+    if (!cards.length) return;
+
+    const drawSpark = (svg, values, opts) => {
+      if (!values.length) return;
+      const lo = opts.lo ?? Math.min(...values);
+      const hi = opts.hi ?? Math.max(...values);
+      const span = Math.max(hi - lo, 1e-6);
+      const w = 120, h = 24;
+      const stepX = values.length > 1 ? w / (values.length - 1) : 0;
+      const pts = values
+        .map((v, i) => {
+          const y = h - ((v - lo) / span) * h;
+          return `${(i * stepX).toFixed(2)},${y.toFixed(2)}`;
+        })
+        .join(" ");
+      svg.querySelector("polyline").setAttribute("points", pts);
+    };
+
+    const fmtBytes = (b) => {
+      const u = ["B", "KB", "MB", "GB", "TB"];
+      let i = 0, v = b;
+      while (v >= 1024 && i + 1 < u.length) { v /= 1024; i++; }
+      return `${v.toFixed(1)} ${u[i]}`;
+    };
+
+    const refreshCard = async (card) => {
+      const name = card.dataset.builder;
+      try {
+        const r = await fetch(`/api/builders/${encodeURIComponent(name)}/stats`);
+        if (!r.ok) return;
+        const samples = await r.json();
+        if (!samples.length) return;
+        const cpu = samples.map((s) => s.cpu_percent);
+        const load = samples.map((s) => s.load1);
+        const memPct = samples.map((s) =>
+          s.mem_total_bytes ? (s.mem_used_bytes / s.mem_total_bytes) * 100 : 0,
+        );
+        const last = samples[samples.length - 1];
+        const fLoad = card.querySelector('[data-field="load"]');
+        const fCpu = card.querySelector('[data-field="cpu"]');
+        const fMem = card.querySelector('[data-field="mem"]');
+        if (fLoad) fLoad.textContent = last.load1.toFixed(2);
+        if (fCpu) fCpu.textContent = `${last.cpu_percent.toFixed(1)}%`;
+        if (fMem)
+          fMem.textContent = `${fmtBytes(last.mem_used_bytes)} / ${fmtBytes(last.mem_total_bytes)}`;
+        const sCpu = card.querySelector('[data-spark="cpu"]');
+        const sLoad = card.querySelector('[data-spark="load"]');
+        const sMem = card.querySelector('[data-spark="mem"]');
+        if (sCpu) drawSpark(sCpu, cpu, { lo: 0, hi: 100 });
+        if (sLoad) drawSpark(sLoad, load, { lo: 0 });
+        if (sMem) drawSpark(sMem, memPct, { lo: 0, hi: 100 });
+      } catch (_) { /* network blip; next tick will catch up */ }
+    };
+
+    const tick = () => cards.forEach(refreshCard);
+    tick();
+    setInterval(tick, 5000);
+  })();
+</script>
+{% endif %}
+{% endblock %}

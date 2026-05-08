@@ -44,6 +44,20 @@ struct StatusTemplate {
     queued_truncated: bool,
 }
 
+/// Dedicated `/builders` page. Renders the same per-builder data as
+/// the homepage strip but with sparklines + capabilities + the full
+/// list of current jobs.
+#[derive(Template)]
+#[template(path = "builders.html")]
+struct BuildersTemplate {
+    /// Drives the header logo's `argunix-spin` class. True iff any
+    /// builder has at least one current job in flight.
+    cluster_active: bool,
+    rows: Vec<BuilderRow>,
+    online: usize,
+    known: usize,
+}
+
 /// Polled fragment of the status page: the section content plus an
 /// `hx-swap-oob` image that re-targets the header logo, so the
 /// `argunix-spin` class tracks `cluster_active` between full
@@ -96,7 +110,7 @@ struct BuilderRow {
     is_online: bool,
     in_flight: u32,
     max_jobs: u32,
-    /// Rendered as small pill badges in `status.html`. Stored as
+    /// Rendered as small pill badges in templates. Stored as
     /// `Vec<String>` rather than a comma-joined string so the template
     /// can iterate.
     systems: Vec<String>,
@@ -105,6 +119,21 @@ struct BuilderRow {
     /// Suppressed in the template when `is_online` is true (we already
     /// know it's live; "last seen" reads as past tense).
     last_seen: String,
+    /// Builds currently dispatched to this builder. Populated for
+    /// online builders only; offline / revoked rows always carry an
+    /// empty list. Cards render the head as a "now building" line and
+    /// a count for the rest.
+    current_jobs: Vec<CurrentJob>,
+}
+
+/// One in-flight job on a builder, as carried by [`BuilderRow`].
+struct CurrentJob {
+    attr_path: String,
+    eval_id: i64,
+    forge: String,
+    slug: String,
+    phase: &'static str,
+    phase_class: &'static str,
 }
 
 struct RunningRow {
@@ -416,6 +445,119 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
     })?))
 }
 
+/// `GET /builders` — dedicated page with one rich card per builder.
+/// Each card carries live sparklines (cpu / load1 / mem) polled
+/// per-card from `/api/builders/{name}/stats`, plus the current job
+/// list with phase badges. Designed mobile-first: 1 col on phones, 2
+/// on tablets, 3 on desktop.
+pub async fn builders(State(state): State<AppState>) -> Result<Html<String>, UiError> {
+    let view = collect_builders_only(&state).await?;
+    let cluster_active = view.rows.iter().any(|b| !b.current_jobs.is_empty());
+    Ok(Html(render(&BuildersTemplate {
+        cluster_active,
+        rows: view.rows,
+        online: view.online,
+        known: view.known,
+    })?))
+}
+
+/// Builder list independent of the eval/queue queries the status page
+/// runs. Shared between the `/builders` page and the `/api/builders`
+/// JSON endpoint so both render exactly the same view.
+async fn collect_builders_only(state: &AppState) -> Result<BuildersView, UiError> {
+    let roster = <argunix_store::SqlxStore as BuilderStore>::list_all(&state.store).await?;
+    let live = state.builder_registry.list();
+    let phases = state.builder_registry.phase_snapshot();
+    let running_jobs = <argunix_store::SqlxStore as JobStore>::list_running(&state.store).await?;
+
+    let id_to_name: HashMap<i64, String> = roster
+        .iter()
+        .map(|r| (r.id.get(), r.name.as_str().to_string()))
+        .collect();
+
+    let mut current_jobs_by_builder: HashMap<String, Vec<CurrentJob>> = HashMap::new();
+    for j in &running_jobs {
+        let Some(builder_id) = j.job.builder_id else {
+            continue;
+        };
+        let Some(name) = id_to_name.get(&builder_id.get()).cloned() else {
+            continue;
+        };
+        let live_phase = phases.get(&(name.clone(), j.job.id.get())).copied();
+        let (phase, phase_class) = match live_phase {
+            Some(argunix_builders::BuildPhase::Push) => ("push", "bg-warn-soft text-warn-strong"),
+            Some(argunix_builders::BuildPhase::Build) => ("build", "bg-info-soft text-info-strong"),
+            Some(argunix_builders::BuildPhase::Pull) => ("pull", "bg-ok-soft text-ok-strong"),
+            None => ("", ""),
+        };
+        current_jobs_by_builder
+            .entry(name)
+            .or_default()
+            .push(CurrentJob {
+                attr_path: j.job.attr_path.to_string(),
+                eval_id: j.job.eval_id.get(),
+                forge: j.forge.clone(),
+                slug: j.slug.as_str().to_string(),
+                phase,
+                phase_class,
+            });
+    }
+
+    let now = chrono::Utc::now();
+    Ok(collect_builders(
+        &roster,
+        &live,
+        current_jobs_by_builder,
+        now,
+    ))
+}
+
+/// `GET /api/builders` — same data as the `/builders` page, JSON.
+/// Returned as one array so polling clients (the page itself, future
+/// status-strip live updates) avoid N+1'ing per-builder endpoints just
+/// to refresh status / current-job state.
+pub async fn builders_json(State(state): State<AppState>) -> Result<Response, UiError> {
+    let view = collect_builders_only(&state).await?;
+    let body: Vec<_> = view
+        .rows
+        .into_iter()
+        .map(|b| {
+            serde_json::json!({
+                "name": b.name,
+                "status": b.status,
+                "is_online": b.is_online,
+                "in_flight": b.in_flight,
+                "max_jobs": b.max_jobs,
+                "systems": b.systems,
+                "features": b.features,
+                "nix_version": b.nix_version,
+                "last_seen": b.last_seen,
+                "current_jobs": b.current_jobs.iter().map(|j| serde_json::json!({
+                    "attr_path": j.attr_path,
+                    "eval_id": j.eval_id,
+                    "forge": j.forge,
+                    "slug": j.slug,
+                    "phase": j.phase,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        serde_json::to_vec(&serde_json::json!({
+            "online": view.online,
+            "known": view.known,
+            "builders": body,
+        }))
+        .map_err(UiError::Json)?,
+    )
+        .into_response())
+}
+
 /// Polled htmx fragment for the status page: re-renders just the
 /// section content (totals / builders / evaluating / running /
 /// queued) so the wrapper div in `status.html` can swap it in every
@@ -452,23 +594,65 @@ struct StatusView {
     queued_truncated: bool,
 }
 
-async fn collect_status_view(state: &AppState) -> Result<StatusView, UiError> {
-    // Persistent roster: every builder ever enrolled, including offline
-    // / revoked ones. Live registry is the runtime overlay.
-    let roster = <argunix_store::SqlxStore as BuilderStore>::list_all(&state.store).await?;
-    let live = state.builder_registry.list();
+/// Result of [`collect_builders`]: the per-builder rows (offline + online),
+/// plus a few aggregates the `/builders` page surfaces in its header
+/// summary.
+struct BuildersView {
+    rows: Vec<BuilderRow>,
+    online: usize,
+    known: usize,
+}
+
+/// Build the canonical list of [`BuilderRow`]s. Driven by the persistent
+/// roster (so offline / revoked rows still appear) and overlaid with the
+/// live registry (so capabilities + in-flight + current-job phases come
+/// from the running daemon, not from a stale snapshot in the DB).
+///
+/// `current_jobs_by_builder` is consumed: each builder's entry is moved
+/// out of the map so a caller can detect leftover entries (jobs whose
+/// builder name doesn't match any roster row — should never happen, but
+/// the contract is "an empty map after this call").
+fn collect_builders(
+    roster: &[argunix_store::BuilderRecord],
+    live: &[argunix_builders::BuilderSnapshot],
+    mut current_jobs_by_builder: HashMap<String, Vec<CurrentJob>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BuildersView {
     let live_by_name: HashMap<String, &argunix_builders::BuilderSnapshot> = live
         .iter()
         .map(|s| (s.name.as_str().to_string(), s))
         .collect();
 
-    let now = chrono::Utc::now();
-    let builders: Vec<BuilderRow> = roster
+    let online = live.iter().filter(|b| b.state == ConnState::Active).count();
+    let known = roster.len();
+
+    let rows: Vec<BuilderRow> = roster
         .iter()
-        .map(|row| build_builder_row(row, live_by_name.get(row.name.as_str()).copied(), now))
+        .map(|row| {
+            let live = live_by_name.get(row.name.as_str()).copied();
+            let current_jobs = current_jobs_by_builder
+                .remove(row.name.as_str())
+                .unwrap_or_default();
+            build_builder_row(row, live, now, current_jobs)
+        })
         .collect();
 
-    let builders_online = live.iter().filter(|b| b.state == ConnState::Active).count();
+    BuildersView {
+        rows,
+        online,
+        known,
+    }
+}
+
+async fn collect_status_view(state: &AppState) -> Result<StatusView, UiError> {
+    // Persistent roster: every builder ever enrolled, including offline
+    // / revoked ones. Live registry is the runtime overlay.
+    let roster = <argunix_store::SqlxStore as BuilderStore>::list_all(&state.store).await?;
+    let live = state.builder_registry.list();
+
+    // We need the running rows before building BuilderRows so each card
+    // can carry its `current_jobs`. Run the running-jobs query first,
+    // bucket by builder name, then call collect_builders.
 
     // BuilderId → display name map so running rows can show the operator
     // name rather than the opaque numeric id stored on the job row.
@@ -516,6 +700,33 @@ async fn collect_status_view(state: &AppState) -> Result<StatusView, UiError> {
             }
         })
         .collect();
+
+    // Group running rows by their dispatched builder so each builder
+    // card can render "now building <attr_path>" without re-walking the
+    // running list. Skip the placeholder `—` (jobs without a recorded
+    // builder, e.g. local-fallback path).
+    let mut current_jobs_by_builder: HashMap<String, Vec<CurrentJob>> = HashMap::new();
+    for r in &running {
+        if r.builder == "—" {
+            continue;
+        }
+        current_jobs_by_builder
+            .entry(r.builder.clone())
+            .or_default()
+            .push(CurrentJob {
+                attr_path: r.attr_path.clone(),
+                eval_id: r.eval_id,
+                forge: r.forge.clone(),
+                slug: r.slug.clone(),
+                phase: r.phase,
+                phase_class: r.phase_class,
+            });
+    }
+
+    let now = chrono::Utc::now();
+    let builders_view = collect_builders(&roster, &live, current_jobs_by_builder, now);
+    let builders = builders_view.rows;
+    let builders_online = builders_view.online;
 
     // Pull `LIMIT + 1` so we can tell whether the queue extends past the
     // display cap without an extra COUNT round-trip.
@@ -596,6 +807,7 @@ fn build_builder_row(
     row: &argunix_store::BuilderRecord,
     live: Option<&argunix_builders::BuilderSnapshot>,
     now: chrono::DateTime<chrono::Utc>,
+    current_jobs: Vec<CurrentJob>,
 ) -> BuilderRow {
     // The live registry is the authoritative source for in_flight and
     // for whether this builder is *currently* online. The persistent
@@ -649,6 +861,10 @@ fn build_builder_row(
         features: caps.features.clone(),
         nix_version: caps.nix_version.clone(),
         last_seen: humanize_last_seen(row.last_seen, now),
+        // Offline / revoked rows always carry an empty list — the
+        // caller passes `current_jobs` from the live running-jobs
+        // index, which only matches a builder name that's online.
+        current_jobs: if is_online { current_jobs } else { Vec::new() },
     }
 }
 
@@ -1479,6 +1695,133 @@ mod tests {
         };
         let html = tmpl.render().unwrap();
         assert!(html.contains("argunix-spin"));
+    }
+
+    fn make_builder_row(name: &str, online: bool, jobs: Vec<CurrentJob>) -> BuilderRow {
+        BuilderRow {
+            name: name.into(),
+            status: if online { "online" } else { "offline" },
+            status_class: if online {
+                "bg-ok-soft text-ok-strong"
+            } else {
+                "bg-chip text-chip-fg"
+            },
+            is_online: online,
+            in_flight: jobs.len() as u32,
+            max_jobs: 4,
+            systems: vec!["x86_64-linux".into()],
+            features: vec!["big-parallel".into()],
+            nix_version: "2.18.1".into(),
+            last_seen: "5m ago".into(),
+            current_jobs: jobs,
+        }
+    }
+
+    #[test]
+    fn builders_template_empty_state_mentions_enrollment_help() {
+        let html = BuildersTemplate {
+            cluster_active: false,
+            rows: vec![],
+            online: 0,
+            known: 0,
+        }
+        .render()
+        .unwrap();
+        // Operator with zero builders gets a hint about how to add one
+        // — without it the "no builders" line is a dead-end.
+        assert!(html.contains("No builders enrolled yet"));
+        assert!(html.contains("services.argunix-builder.enable"));
+    }
+
+    #[test]
+    fn builders_template_renders_busy_card_with_phase_and_link() {
+        let job = CurrentJob {
+            attr_path: "packages.x86_64-linux.hello".into(),
+            eval_id: 42,
+            forge: "github".into(),
+            slug: "owner/repo".into(),
+            phase: "build",
+            phase_class: "bg-info-soft text-info-strong",
+        };
+        let html = BuildersTemplate {
+            cluster_active: true,
+            rows: vec![make_builder_row("alpha", true, vec![job])],
+            online: 1,
+            known: 1,
+        }
+        .render()
+        .unwrap();
+        // Card shape + identifying data.
+        assert!(html.contains("alpha"));
+        assert!(html.contains("packages.x86_64-linux.hello"));
+        // Phase badge present so operators can tell push/build/pull
+        // at a glance.
+        assert!(html.contains(">build</span>"));
+        // Link points at the per-job page (not /builders) so a click
+        // drills into the active build, not back to the same view.
+        assert!(html.contains("/r/github/owner/repo/eval/42/job/packages.x86_64-linux.hello"));
+        // Sparkline JS attaches via [data-online="1"] selector — must
+        // be present on busy cards.
+        assert!(html.contains(r#"data-online="1""#));
+    }
+
+    #[test]
+    fn builders_template_renders_idle_card_without_sparklines_for_offline() {
+        let html = BuildersTemplate {
+            cluster_active: false,
+            rows: vec![make_builder_row("beta", false, vec![])],
+            online: 0,
+            known: 1,
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("beta"));
+        // Offline cards skip the sparkline figure block — drawing
+        // sparklines for a builder whose stats endpoint returns []
+        // would just paint a flat line forever. Match on the actual
+        // SVG element rather than the literal selector in the script
+        // (which is unconditionally present).
+        assert!(!html.contains(r#"<svg data-spark="cpu""#));
+        assert!(html.contains("last seen 5m ago"));
+        assert!(html.contains(r#"data-online="0""#));
+    }
+
+    #[test]
+    fn status_inner_renders_builder_card_with_now_building_attr_path() {
+        // Mirrors the homepage strip path: `_status_inner.html`'s
+        // builder section should render the head of `current_jobs`
+        // inline so an operator scanning the home page can see what
+        // each box is chewing on without clicking through.
+        let job = CurrentJob {
+            attr_path: "checks.x86_64-linux.smoke".into(),
+            eval_id: 7,
+            forge: "github".into(),
+            slug: "a/b".into(),
+            phase: "push",
+            phase_class: "bg-warn-soft text-warn-strong",
+        };
+        let tmpl = StatusInnerTemplate {
+            cluster_active: true,
+            totals: ClusterTotals {
+                builders_online: 1,
+                builders_known: 1,
+                running: 1,
+                queued_total: 0,
+            },
+            builders: vec![make_builder_row("gamma", true, vec![job])],
+            evaluating: vec![],
+            eval_queue_depth: 0,
+            running: vec![],
+            queued: vec![],
+            queued_shown: 0,
+            queued_truncated: false,
+        };
+        let html = tmpl.render().unwrap();
+        assert!(html.contains("checks.x86_64-linux.smoke"));
+        assert!(html.contains(">push</span>"));
+        // Strip card always links to the dedicated /builders page so
+        // the homepage stays the cluster overview.
+        assert!(html.contains(r#"href="/builders""#));
     }
 
     #[test]

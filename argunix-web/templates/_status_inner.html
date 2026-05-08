@@ -16,55 +16,46 @@
 </section>
 
 <section class="mb-8">
-  <h2 class="text-lg font-semibold mb-2">builders</h2>
+  <div class="flex items-baseline justify-between mb-2">
+    <h2 class="text-lg font-semibold">builders</h2>
+    <a class="text-link hover:underline text-sm" href="/builders">all builders →</a>
+  </div>
   {% if builders.is_empty() %}
   <p class="text-muted">No builders enrolled yet.</p>
   {% else %}
-  <div class="overflow-x-auto">
-  <table class="w-full min-w-[40rem] text-sm border-collapse">
-    <thead class="text-left text-muted">
-      <tr>
-        <th class="py-2 pr-4">name</th>
-        <th class="py-2 pr-4">status</th>
-        <th class="py-2 pr-4">in flight</th>
-        <th class="py-2 pr-4">systems</th>
-        <th class="py-2 pr-4">features</th>
-        <th class="py-2 pr-4">nix</th>
-        <th class="py-2">last seen</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for b in builders %}
-      <tr class="border-t border-border">
-        <td class="py-2 pr-4 font-mono">{{ b.name }}</td>
-        <td class="py-2 pr-4">
-          <span class="inline-block px-2 py-0.5 rounded text-xs {{ b.status_class }}"
-            >{{ b.status }}</span
-          >
-        </td>
-        <td class="py-2 pr-4">
-          {% if b.is_online %}{{ b.in_flight }} / {{ b.max_jobs }}{% else %}—{% endif %}
-        </td>
-        <td class="py-2 pr-4 text-xs leading-6">
-          {% for s in b.systems %}
-          <span class="inline-block whitespace-nowrap px-1.5 mr-1 rounded bg-chip text-chip-fg font-mono text-xs">{{ s }}</span>
-          {% endfor %}
-        </td>
-        <td class="py-2 pr-4 text-xs leading-6">
-          {% if b.features.is_empty() %}
-          <span class="text-subtle">—</span>
-          {% else %} {% for f in b.features %}
-          <span class="inline-block whitespace-nowrap px-1.5 mr-1 rounded bg-chip text-chip-fg font-mono text-xs">{{ f }}</span>
-          {% endfor %} {% endif %}
-        </td>
-        <td class="py-2 pr-4 font-mono text-xs">{{ b.nix_version }}</td>
-        <td class="py-2 text-muted text-xs">
-          {% if b.is_online %}<span class="text-subtle">—</span>{% else %}{{ b.last_seen }}{% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+    {% for b in builders %}
+    <a href="/builders" class="block rounded border border-border bg-surface p-3 hover:border-link no-underline text-fg">
+      <div class="flex items-center justify-between gap-2">
+        <span class="font-mono text-sm truncate">{{ b.name }}</span>
+        <span class="inline-block px-2 py-0.5 rounded text-xs {{ b.status_class }}">{{ b.status }}</span>
+      </div>
+      <div class="mt-2 text-xs">
+        {% if b.is_online %}
+          {% if b.current_jobs.is_empty() %}
+          <div class="text-muted">ready · 0 / {{ b.max_jobs }} slots</div>
+          {% else %}
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-muted">building</span>
+            <span class="font-mono">{{ b.in_flight }} / {{ b.max_jobs }}</span>
+          </div>
+          {% let head = b.current_jobs.first().unwrap() %}
+          <div class="mt-1 flex items-center gap-2 min-w-0">
+            <span class="font-mono truncate flex-1 min-w-0" title="{{ head.attr_path }}">{{ head.attr_path }}</span>
+            {% if !head.phase.is_empty() %}
+            <span class="inline-block px-1.5 py-0.5 rounded text-[10px] {{ head.phase_class }}">{{ head.phase }}</span>
+            {% endif %}
+          </div>
+          {% if b.current_jobs.len() > 1 %}
+          <div class="text-subtle text-[11px] mt-0.5">+{{ b.current_jobs.len() - 1 }} more</div>
+          {% endif %}
+          {% endif %}
+        {% else %}
+        <div class="text-muted">last seen {{ b.last_seen }}</div>
+        {% endif %}
+      </div>
+    </a>
+    {% endfor %}
   </div>
   {% endif %}
 </section>
