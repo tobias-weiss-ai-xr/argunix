@@ -15,6 +15,8 @@ let
       || file.hasExt "css"
       || file.hasExt "html"
       || file.hasExt "svg"
+      || file.hasExt "js"
+      || file.hasExt "LICENSE"
       || file.name == "Cargo.toml"
       || file.name == "Cargo.lock"
     ) ./..;

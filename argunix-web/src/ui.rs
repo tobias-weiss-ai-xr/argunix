@@ -44,6 +44,29 @@ struct StatusTemplate {
     queued_truncated: bool,
 }
 
+/// Polled fragment of the status page: the section content plus an
+/// `hx-swap-oob` image that re-targets the header logo, so the
+/// `argunix-spin` class tracks `cluster_active` between full
+/// navigations. The wrapper template (`_status_fragment.html`)
+/// emits the OOB image and then `{% include %}`s the same partial
+/// (`_status_inner.html`) that the full page renders inline — so
+/// the section markup stays defined in exactly one place.
+#[derive(Template)]
+#[template(path = "_status_fragment.html")]
+struct StatusInnerTemplate {
+    /// Drives the OOB image's `argunix-spin` class. Recomputed each
+    /// poll from the same predicate the full-page render uses.
+    cluster_active: bool,
+    totals: ClusterTotals,
+    builders: Vec<BuilderRow>,
+    evaluating: Vec<EvalRow2>,
+    eval_queue_depth: usize,
+    running: Vec<RunningRow>,
+    queued: Vec<QueuedRow>,
+    queued_shown: usize,
+    queued_truncated: bool,
+}
+
 /// Status-page row for an evaluation in `Evaluating` (or, when
 /// `eval_queue_depth > 0`, the head-of-queue we surface alongside).
 /// Distinct from the `EvalRow` used by the repo page so the column
@@ -374,9 +397,62 @@ fn repo_url_for(repo_web_url: Option<&str>, forge_cfg: Option<&ForgeConfig>, slu
 }
 
 /// Cluster status overview — at-a-glance view of every known builder
-/// and what the cluster is doing right now. Auto-refreshes via meta tag
-/// (see `templates/status.html`).
+/// and what the cluster is doing right now. The page wraps the section
+/// content in an htmx polling div that swaps in fresh markup from
+/// [`status_fragment`] every 5s — no full-page reloads.
 pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiError> {
+    let view = collect_status_view(&state).await?;
+    let cluster_active = !view.evaluating.is_empty() || !view.running.is_empty();
+    Ok(Html(render(&StatusTemplate {
+        cluster_active,
+        totals: view.totals,
+        builders: view.builders,
+        evaluating: view.evaluating,
+        eval_queue_depth: view.eval_queue_depth,
+        running: view.running,
+        queued: view.queued,
+        queued_shown: view.queued_shown,
+        queued_truncated: view.queued_truncated,
+    })?))
+}
+
+/// Polled htmx fragment for the status page: re-renders just the
+/// section content (totals / builders / evaluating / running /
+/// queued) so the wrapper div in `status.html` can swap it in every
+/// 5s without a full navigation. Returns the same data the full-page
+/// handler would, minus the page chrome.
+pub async fn status_fragment(State(state): State<AppState>) -> Result<Html<String>, UiError> {
+    let view = collect_status_view(&state).await?;
+    let cluster_active = !view.evaluating.is_empty() || !view.running.is_empty();
+    Ok(Html(render(&StatusInnerTemplate {
+        cluster_active,
+        totals: view.totals,
+        builders: view.builders,
+        evaluating: view.evaluating,
+        eval_queue_depth: view.eval_queue_depth,
+        running: view.running,
+        queued: view.queued,
+        queued_shown: view.queued_shown,
+        queued_truncated: view.queued_truncated,
+    })?))
+}
+
+/// Bag of every row + total the status page shows. Built once per
+/// request by [`collect_status_view`]; the full-page and fragment
+/// handlers both consume it so the queries — and the truncation /
+/// limit logic — stay defined in one place.
+struct StatusView {
+    totals: ClusterTotals,
+    builders: Vec<BuilderRow>,
+    evaluating: Vec<EvalRow2>,
+    eval_queue_depth: usize,
+    running: Vec<RunningRow>,
+    queued: Vec<QueuedRow>,
+    queued_shown: usize,
+    queued_truncated: bool,
+}
+
+async fn collect_status_view(state: &AppState) -> Result<StatusView, UiError> {
     // Persistent roster: every builder ever enrolled, including offline
     // / revoked ones. Live registry is the runtime overlay.
     let roster = <argunix_store::SqlxStore as BuilderStore>::list_all(&state.store).await?;
@@ -502,9 +578,7 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
         queued_total,
     };
 
-    let cluster_active = !evaluating.is_empty() || !running.is_empty();
-    Ok(Html(render(&StatusTemplate {
-        cluster_active,
+    Ok(StatusView {
         totals,
         builders,
         evaluating,
@@ -513,7 +587,7 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
         queued,
         queued_shown,
         queued_truncated,
-    })?))
+    })
 }
 
 fn build_builder_row(
@@ -1303,7 +1377,8 @@ mod tests {
     #[test]
     fn status_template_renders_empty_cluster() {
         // Smoke: no builders, nothing running, nothing queued. Verifies
-        // the template's empty-state branches all compile + render.
+        // the template's empty-state branches all compile + render,
+        // including the included `_status_inner.html` partial.
         let tmpl = StatusTemplate {
             cluster_active: false,
             totals: ClusterTotals {
@@ -1325,6 +1400,83 @@ mod tests {
         assert!(html.contains("No builders enrolled yet"));
         assert!(html.contains("Nothing is building"));
         assert!(html.contains("Queue is empty"));
+        // The wrapper div is what htmx polls — without it the page
+        // would silently regress to a static snapshot.
+        assert!(html.contains(r#"hx-get="/_/status""#));
+        assert!(html.contains(r#"hx-trigger="every 5s""#));
+    }
+
+    #[test]
+    fn status_inner_template_renders_empty_cluster() {
+        // The fragment endpoint must produce the same section content
+        // as the include path on first load — guard that the include
+        // and the standalone render stay in sync.
+        let tmpl = StatusInnerTemplate {
+            cluster_active: false,
+            totals: ClusterTotals {
+                builders_online: 0,
+                builders_known: 0,
+                running: 0,
+                queued_total: 0,
+            },
+            builders: vec![],
+            evaluating: vec![],
+            eval_queue_depth: 0,
+            running: vec![],
+            queued: vec![],
+            queued_shown: 0,
+            queued_truncated: false,
+        };
+        let html = tmpl.render().unwrap();
+        assert!(html.contains("No builders enrolled yet"));
+        assert!(html.contains("Nothing is building"));
+        assert!(html.contains("Queue is empty"));
+        // The fragment is *only* the inner content + the OOB logo
+        // swap — no <h1>, no polling wrapper. If the page heading or
+        // the wrapper leak in, the polling swap would inject a
+        // duplicate every 5s.
+        assert!(!html.contains("cluster status"));
+        assert!(!html.contains("hx-get"));
+        // Logo OOB swap is what keeps the header spinner in sync.
+        assert!(html.contains(r#"id="argunix-logo""#));
+        assert!(html.contains(r#"hx-swap-oob="true""#));
+        // Idle cluster → no spin class on the OOB image.
+        assert!(!html.contains("argunix-spin"));
+    }
+
+    #[test]
+    fn status_inner_template_marks_logo_active_when_running() {
+        // One running job is enough to flip the spinner on.
+        let tmpl = StatusInnerTemplate {
+            cluster_active: true,
+            totals: ClusterTotals {
+                builders_online: 0,
+                builders_known: 0,
+                running: 1,
+                queued_total: 0,
+            },
+            builders: vec![],
+            evaluating: vec![],
+            eval_queue_depth: 0,
+            running: vec![RunningRow {
+                forge: "github".into(),
+                slug: "owner/repo".into(),
+                eval_id: 1,
+                attr_path: "packages.x86_64-linux.hello".into(),
+                system: "x86_64-linux".into(),
+                git_ref: "main".into(),
+                short_sha: "abcdef0".into(),
+                builder: "—".into(),
+                started: "—".into(),
+                phase: "",
+                phase_class: "",
+            }],
+            queued: vec![],
+            queued_shown: 0,
+            queued_truncated: false,
+        };
+        let html = tmpl.render().unwrap();
+        assert!(html.contains("argunix-spin"));
     }
 
     #[test]

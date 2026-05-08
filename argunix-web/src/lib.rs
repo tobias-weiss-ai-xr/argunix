@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(ui::status))
+        .route("/_/status", get(ui::status_fragment))
         .route("/repos", get(ui::index))
         .route("/healthz", get(healthz))
         .route("/r/{forge}/{*tail}", get(ui::dispatch_repo))
