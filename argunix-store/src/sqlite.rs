@@ -76,6 +76,7 @@ fn map_eval(row: &SqliteRow) -> Result<EvalRecord, StoreError> {
     let status: String = row.try_get("status")?;
     let pr_number: Option<i64> = row.try_get("pr_number")?;
     let building_started_at: Option<DateTime<Utc>> = row.try_get("building_started_at")?;
+    let failure_reason: Option<String> = row.try_get("failure_reason")?;
     Ok(EvalRecord {
         id: EvalId::new(id),
         repo_id: RepoId::new(repo_id),
@@ -87,6 +88,7 @@ fn map_eval(row: &SqliteRow) -> Result<EvalRecord, StoreError> {
         status: to_eval_status(&status)?,
         pr_number: pr_number.and_then(|n| u32::try_from(n).ok()),
         building_started_at,
+        failure_reason,
     })
 }
 
@@ -395,7 +397,7 @@ impl EvalStore for SqlxStore {
 
     async fn get(&self, id: EvalId) -> Result<Option<EvalRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at, failure_reason
              FROM evaluations WHERE id = ?1",
         )
         .bind(id.get())
@@ -443,6 +445,26 @@ impl EvalStore for SqlxStore {
         Ok(())
     }
 
+    async fn fail_with_reason(
+        &self,
+        id: EvalId,
+        reason: &str,
+        finished_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE evaluations
+             SET status = ?1, finished_at = ?2, failure_reason = ?3
+             WHERE id = ?4",
+        )
+        .bind(EvalStatus::EvaluationFailed.as_str())
+        .bind(finished_at)
+        .bind(reason)
+        .bind(id.get())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn mark_building(
         &self,
         id: EvalId,
@@ -467,7 +489,7 @@ impl EvalStore for SqlxStore {
         limit: u32,
     ) -> Result<Vec<EvalRecord>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at, failure_reason
              FROM evaluations
              WHERE repo_id = ?1
              ORDER BY id DESC
@@ -491,7 +513,7 @@ impl EvalStore for SqlxStore {
         // we look for `<key>` exactly OR `<key>:%`.
         let like_pattern = format!("{}:%", branch_key_prefix.replace('\\', "\\\\"));
         let rows = sqlx::query(
-            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at, failure_reason
              FROM evaluations
              WHERE repo_id = ?1
                AND status IN ('queued', 'evaluating', 'building')
@@ -525,7 +547,7 @@ impl EvalStore for SqlxStore {
         let rows = sqlx::query(
             "SELECT e.id, e.repo_id, e.trigger, e.git_ref, e.sha,
                     e.started_at, e.finished_at, e.status, e.pr_number,
-                    e.building_started_at,
+                    e.building_started_at, e.failure_reason,
                     r.forge AS r_forge, r.slug AS r_slug
              FROM evaluations e
              JOIN repos r ON e.repo_id = r.id

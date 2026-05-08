@@ -45,6 +45,13 @@
     <dt class="text-slate-500">total</dt><dd class="font-mono">{{ total }}</dd>
   </dl>
 
+  {% if let Some(reason) = failure_reason %}
+    <div class="mb-6 rounded border border-red-200 bg-red-50 p-3">
+      <div class="text-sm font-semibold text-red-800 mb-1">evaluation failed</div>
+      <pre class="text-xs font-mono text-red-900 whitespace-pre-wrap break-words">{{ reason }}</pre>
+    </div>
+  {% endif %}
+
   <h2 class="text-lg font-semibold mb-2">{{ job_heading }}</h2>
   {% if jobs.is_empty() %}
     <p class="text-slate-500">{{ empty_jobs_msg }}</p>

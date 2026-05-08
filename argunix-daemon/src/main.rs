@@ -575,14 +575,23 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
     let jobs = match argunix_eval::evaluate(&eval_request).await {
         Ok(j) => j,
         Err(e) => {
-            <argunix_store::SqlxStore as EvalStore>::finish(
+            // Stamp the failure reason onto the eval row so the UI
+            // can show *why* the eval failed rather than just the
+            // bare status. The CLI path has no outer error trap
+            // (unlike the worker loop), so we capture it here.
+            // Convert through anyhow so `{:#}` walks the source chain
+            // — `Display` on the bare `EvalError` would only show the
+            // outermost message.
+            let err = anyhow::Error::from(e).context("evaluation failed");
+            let chained = format!("{err:#}");
+            <argunix_store::SqlxStore as EvalStore>::fail_with_reason(
                 &store,
                 eval_id,
-                EvalStatus::EvaluationFailed,
+                &chained,
                 Utc::now(),
             )
             .await?;
-            return Err(anyhow::Error::from(e).context("evaluation failed"));
+            return Err(err);
         }
     };
     <argunix_store::SqlxStore as EvalStore>::mark_building(&store, eval_id, Utc::now()).await?;

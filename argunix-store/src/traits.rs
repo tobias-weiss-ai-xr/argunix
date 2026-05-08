@@ -116,6 +116,18 @@ pub trait EvalStore: Send + Sync {
         status: EvalStatus,
         finished_at: DateTime<Utc>,
     ) -> Result<(), StoreError>;
+    /// Mark the eval as `EvaluationFailed` and record the worker's
+    /// captured error string in `failure_reason`. The UI surfaces
+    /// this on the per-eval page so operators can see *why* an eval
+    /// failed (clone timeout, nix-eval-jobs stderr, …) without
+    /// digging through daemon logs. Use this instead of plain
+    /// `finish(EvaluationFailed)` when a reason is available.
+    async fn fail_with_reason(
+        &self,
+        id: EvalId,
+        reason: &str,
+        finished_at: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
     /// Mark the `Evaluating → Building` transition: flips status and
     /// stamps `building_started_at`. Drives the eval/build wall-clock
     /// split on the per-eval UI page. Use this instead of `set_status`

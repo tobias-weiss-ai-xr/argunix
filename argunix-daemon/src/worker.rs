@@ -161,11 +161,19 @@ pub fn spawn(
                 // backtrace but get the cause. Without this you only see
                 // the topmost `.context("…")` and the actual root failure
                 // (a nix-eval-jobs stderr, a git error, …) is invisible.
-                tracing::error!(error = %format!("{e:#}"), "evaluation failed in worker");
-                let _ = <SqlxStore as EvalStore>::finish(
+                let chained = format!("{e:#}");
+                tracing::error!(error = %chained, "evaluation failed in worker");
+                // Same chained string lands on the eval row so the UI
+                // can show *why* the eval failed without operators
+                // having to grep daemon logs. The inner failure handlers
+                // (clone, nix-eval-jobs) may already have written a
+                // more specific reason via `fail_with_reason`; this is
+                // the safety net for unexpected errors that propagated
+                // out of `process` without a reason being recorded.
+                let _ = <SqlxStore as EvalStore>::fail_with_reason(
                     &ctx.store,
                     eval_id,
-                    EvalStatus::EvaluationFailed,
+                    &chained,
                     Utc::now(),
                 )
                 .await;
@@ -265,18 +273,13 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     let jobs = match jobs {
         Ok(jobs) => jobs,
         Err(e) => {
-            <SqlxStore as EvalStore>::finish(
-                &ctx.store,
-                eval_id,
-                EvalStatus::EvaluationFailed,
-                Utc::now(),
-            )
-            .await?;
             // Q52: surface eval-time failure as a single failed forge
-            // check. Github's status `description` field is capped at 140
-            // chars, so we truncate the (often multi-line) nix-eval-jobs
-            // error before posting; the full chain still goes to the
-            // daemon log via the worker's outer error trap.
+            // check. Github's status `description` field is capped at
+            // 140 chars, so we truncate the (often multi-line)
+            // nix-eval-jobs error before posting. The eval row's
+            // status + `failure_reason` are written by the worker's
+            // outer error trap (see `spawn_worker`) using the full
+            // chained error, so the UI gets the unsummarised text.
             let detail = summarise_for_check(&e.to_string(), 130);
             post_overall_check(
                 ctx,

@@ -221,6 +221,10 @@ struct EvalTemplate {
     /// Project page on the forge. Empty when no forge URL can be
     /// constructed; template degrades the project link to plain text.
     repo_url: String,
+    /// Worker-captured failure detail for `EvaluationFailed` rows
+    /// (clone error, nix-eval-jobs stderr, …). `None` for every
+    /// other status; the template hides the box when absent.
+    failure_reason: Option<String>,
     /// Forge-side link to the PR (when `pr_number.is_some()`) or the
     /// branch (otherwise). Empty when no forge URL can be built.
     ref_link: String,
@@ -855,6 +859,7 @@ async fn eval_page(
         empty_jobs_msg,
         jobs: job_rows,
         pr_number: eval.pr_number,
+        failure_reason: eval.failure_reason,
         repo_url,
         ref_link,
         commit_link,

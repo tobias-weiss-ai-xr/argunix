@@ -53,6 +53,12 @@ pub struct EvalRecord {
     /// never reached `Building` (eval-failed, cancelled mid-eval) or
     /// that finished before this column existed.
     pub building_started_at: Option<DateTime<Utc>>,
+    /// Worker-captured error detail for `EvaluationFailed` rows —
+    /// typically the chained anyhow `{:#}` message
+    /// (`cloning <repo>: timed out`, multi-line nix-eval-jobs
+    /// stderr, etc.). `None` on all other terminal states and on
+    /// rows that pre-date this column.
+    pub failure_reason: Option<String>,
 }
 
 /// Fields supplied when creating a new job row.
