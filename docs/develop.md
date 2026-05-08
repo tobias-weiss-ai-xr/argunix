@@ -98,7 +98,7 @@ There's no live-reload script injected into the page yet — refresh
 manually after a CSS or template edit. Adding `tower-livereload`
 would be a small change if it gets annoying.
 
-## what the dev binary does *not* exercise
+## what the dev binary does _not_ exercise
 
 - **Webhooks** (`POST /webhook/<forge_kind>`) — handlers are mounted
   but the worker dispatcher channel is a black hole. Hits won't crash

@@ -1406,7 +1406,9 @@ pub async fn dispatch_pool_build(
     let grace = Duration::from_secs(60);
     let timeout_deadline = tokio::time::Instant::now() + build_timeout + grace;
     let mut output_paths: Vec<String> = Vec::new();
-    let mut final_status = BuildOutcomeStatus::Failure;
+    // Set in every loop-exit path (Finished / channel-closed / timeout)
+    // before the loop breaks; read after the loop.
+    let mut final_status: BuildOutcomeStatus;
     let mut exit_code: Option<i32> = None;
     let mut aborted = false;
     let mut timed_out = false;

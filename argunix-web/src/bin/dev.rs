@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use argunix_builders::{BuilderRegistry, ConnectedBuilder, ConnState};
+use argunix_builders::{BuilderRegistry, ConnState, ConnectedBuilder};
 use argunix_config::Config;
 use argunix_domain::{
     AttrPath, BuilderCapabilities, BuilderId, BuilderName, BuilderPubkey, EvalId, EvalStatus,
@@ -414,15 +414,7 @@ async fn seed_argunix_evals(
     t0: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     // e1: a clean Done eval on main with a mix of job outcomes.
-    let e1 = create_eval(
-        store,
-        repo_id,
-        "push",
-        "main",
-        sha("a1"),
-        None,
-    )
-    .await?;
+    let e1 = create_eval(store, repo_id, "push", "main", sha("a1"), None).await?;
     let started = t0 - chrono::Duration::hours(3);
     let building = started + chrono::Duration::seconds(40);
     let finished = started + chrono::Duration::minutes(7);
@@ -448,15 +440,7 @@ async fn seed_argunix_evals(
     seed_jobs_for_in_flight_eval(store, e2, building).await?;
 
     // e3: cancelled mid-build.
-    let e3 = create_eval(
-        store,
-        repo_id,
-        "push",
-        "feature/cancelled",
-        sha("c3"),
-        None,
-    )
-    .await?;
+    let e3 = create_eval(store, repo_id, "push", "feature/cancelled", sha("c3"), None).await?;
     let started = t0 - chrono::Duration::hours(6);
     let finished = started + chrono::Duration::minutes(2);
     <SqlxStore as EvalStore>::start(store, e3, started, EvalStatus::Evaluating).await?;
@@ -487,15 +471,7 @@ async fn seed_argunix_evals(
     .await?;
 
     // e5: queued (just landed, worker hasn't picked up).
-    let _e5 = create_eval(
-        store,
-        repo_id,
-        "push",
-        "main",
-        sha("e5"),
-        None,
-    )
-    .await?;
+    let _e5 = create_eval(store, repo_id, "push", "main", sha("e5"), None).await?;
 
     Ok(())
 }
@@ -505,15 +481,7 @@ async fn seed_widgets_evals(
     repo_id: RepoId,
     t0: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let e6 = create_eval(
-        store,
-        repo_id,
-        "push",
-        "develop",
-        sha("f6"),
-        None,
-    )
-    .await?;
+    let e6 = create_eval(store, repo_id, "push", "develop", sha("f6"), None).await?;
     let started = t0 - chrono::Duration::hours(5);
     let building = started + chrono::Duration::seconds(20);
     let finished = started + chrono::Duration::minutes(4);
@@ -586,15 +554,7 @@ async fn seed_widgets_evals(
     .await?;
 
     // e8: currently evaluating — nothing in jobs yet.
-    let e8 = create_eval(
-        store,
-        repo_id,
-        "push",
-        "main",
-        sha("88"),
-        None,
-    )
-    .await?;
+    let e8 = create_eval(store, repo_id, "push", "main", sha("88"), None).await?;
     let started = t0 - chrono::Duration::seconds(45);
     <SqlxStore as EvalStore>::start(store, e8, started, EvalStatus::Evaluating).await?;
     Ok(())
@@ -605,15 +565,7 @@ async fn seed_infra_evals(
     repo_id: RepoId,
     t0: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let e = create_eval(
-        store,
-        repo_id,
-        "push",
-        "main",
-        sha("99"),
-        None,
-    )
-    .await?;
+    let e = create_eval(store, repo_id, "push", "main", sha("99"), None).await?;
     let started = t0 - chrono::Duration::hours(12);
     let building = started + chrono::Duration::seconds(60);
     let finished = started + chrono::Duration::minutes(15);
@@ -845,7 +797,14 @@ async fn finish_job(
     metrics: Option<JobPhaseMetrics>,
     finished_at: DateTime<Utc>,
 ) -> anyhow::Result<JobId> {
-    let id = create_job(store, eval_id, attr, system, Some("/nix/store/zz-fixture.drv")).await?;
+    let id = create_job(
+        store,
+        eval_id,
+        attr,
+        system,
+        Some("/nix/store/zz-fixture.drv"),
+    )
+    .await?;
     <SqlxStore as JobStore>::start(store, id, finished_at - chrono::Duration::seconds(90)).await?;
     let log_path = if has_log {
         Some("/dev/null/fixture.log.zst")

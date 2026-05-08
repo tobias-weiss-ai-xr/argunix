@@ -221,8 +221,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
     use tokio::io::BufReader;
 

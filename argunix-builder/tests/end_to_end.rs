@@ -7,7 +7,6 @@
 //!   - shutdown signal sends a `Shutdown` control message and
 //!     transitions the registry entry to `Disconnecting`.
 
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

@@ -195,9 +195,6 @@ struct RepoRow {
     /// for this repo and no forge config to fall back to; template
     /// degrades the slug to plain text in that case.
     repo_url: String,
-    /// Forge-supplied display name. Falls back to `slug` in the
-    /// template when `None`.
-    name: Option<String>,
     description: Option<String>,
     /// `Some(id)` if the repo has at least one evaluation; the template
     /// renders a "latest eval" link to it.
@@ -378,7 +375,6 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiErro
             forge_url,
             slug: slug_str,
             repo_url,
-            name: db.and_then(|r| r.name.clone()),
             description: db.and_then(|r| r.description.clone()),
             latest_eval_id,
         };

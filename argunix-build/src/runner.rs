@@ -250,7 +250,7 @@ mod tests {
     /// a fake `nix-store` that records its argv to a file, runs
     /// run_build(), and asserts that `-L` never appears.
     #[tokio::test]
-    async fn does_not_pass_minus_L_to_nix_store() {
+    async fn does_not_pass_minus_l_to_nix_store() {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         use tempfile::tempdir;
