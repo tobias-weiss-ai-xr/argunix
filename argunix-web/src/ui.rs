@@ -120,7 +120,16 @@ const QUEUED_DISPLAY_LIMIT: u32 = 50;
 #[template(path = "index.html")]
 struct IndexTemplate {
     cluster_active: bool,
-    repos: Vec<RepoRow>,
+    /// Configured repos that have produced at least one evaluation —
+    /// the table renders the full set of columns (description, latest
+    /// eval link, etc.).
+    active_repos: Vec<RepoRow>,
+    /// Configured repos that have not yet produced any evaluation.
+    /// Either no webhook has arrived, or every webhook so far was
+    /// dropped by policy (unwatched branch, untrusted PR author, …).
+    /// Surfaced separately so operators can spot misconfigured
+    /// webhooks at a glance.
+    pending_repos: Vec<RepoRow>,
 }
 
 struct RepoRow {
@@ -272,33 +281,62 @@ struct PhaseMetricsRow {
 pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiError> {
     let cluster_active = cluster_is_active(&state).await?;
     let snap = state.current.load_full();
-    let raw = state.store.list().await?;
-    let mut repos: Vec<RepoRow> = Vec::with_capacity(raw.len());
-    for r in raw {
-        // One latest-eval lookup per repo. Cheap (LIMIT 1, indexed); we
-        // skip a join here so the query stays trivially correct.
-        let latest_eval_id =
-            <argunix_store::SqlxStore as EvalStore>::list_by_repo(&state.store, r.id, 1)
+
+    // Index DB rows by (forge, slug) so we can look up by configured
+    // identity in O(1). Repos that landed in the DB but aren't (or no
+    // longer are) in the config are dropped from the page — Q42-style
+    // pruning happens elsewhere; the index only shows what the
+    // operator currently has configured.
+    let db_rows = state.store.list().await?;
+    let mut by_key: HashMap<(String, String), argunix_store::RepoRecord> = HashMap::new();
+    for r in db_rows {
+        by_key.insert((r.forge.clone(), r.slug.as_str().to_string()), r);
+    }
+
+    let mut active_repos: Vec<RepoRow> = Vec::new();
+    let mut pending_repos: Vec<RepoRow> = Vec::new();
+
+    for repo in &snap.config.repos {
+        let forge_cfg = snap.config.forges.get(&repo.forge);
+        let slug_str = repo.slug.as_str().to_string();
+        let db = by_key.get(&(repo.forge.clone(), slug_str.clone()));
+
+        let latest_eval_id = if let Some(rec) = db {
+            <argunix_store::SqlxStore as EvalStore>::list_by_repo(&state.store, rec.id, 1)
                 .await?
                 .into_iter()
                 .next()
-                .map(|e| e.id.get());
-        let forge_cfg = snap.config.forges.get(&r.forge);
-        let forge_url = forge_url_for(forge_cfg, r.slug.as_str());
-        let repo_url = repo_url_for(r.web_url.as_deref(), forge_cfg, r.slug.as_str());
-        repos.push(RepoRow {
-            forge: r.forge,
+                .map(|e| e.id.get())
+        } else {
+            None
+        };
+
+        let forge_url = forge_url_for(forge_cfg, repo.slug.as_str());
+        let repo_url = repo_url_for(
+            db.and_then(|r| r.web_url.as_deref()),
+            forge_cfg,
+            repo.slug.as_str(),
+        );
+        let row = RepoRow {
+            forge: repo.forge.clone(),
             forge_url,
-            slug: r.slug.as_str().to_string(),
+            slug: slug_str,
             repo_url,
-            name: r.name,
-            description: r.description,
+            name: db.and_then(|r| r.name.clone()),
+            description: db.and_then(|r| r.description.clone()),
             latest_eval_id,
-        });
+        };
+        if latest_eval_id.is_some() {
+            active_repos.push(row);
+        } else {
+            pending_repos.push(row);
+        }
     }
+
     Ok(Html(render(&IndexTemplate {
         cluster_active,
-        repos,
+        active_repos,
+        pending_repos,
     })?))
 }
 

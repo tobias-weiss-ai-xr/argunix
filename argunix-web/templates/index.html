@@ -1,9 +1,12 @@
 {% extends "base.html" %} {% block title %}argunix{% endblock %} {% block content %}
 <h1 class="text-2xl font-semibold mb-4">Repositories</h1>
-{% if repos.is_empty() %}
-<p class="text-slate-500">No repos have produced an evaluation yet.</p>
-{% else %}
-<table class="w-full text-sm border-collapse">
+
+{% if active_repos.is_empty() && pending_repos.is_empty() %}
+<p class="text-slate-500">No repos are configured.</p>
+{% endif %}
+
+{% if !active_repos.is_empty() %}
+<table class="w-full text-sm border-collapse mb-8">
   <thead class="text-left text-slate-500">
     <tr>
       <th class="py-2 pr-4">forge</th>
@@ -13,7 +16,7 @@
     </tr>
   </thead>
   <tbody>
-    {% for r in repos %}
+    {% for r in active_repos %}
     <tr class="border-t border-slate-200 align-top">
       <td class="py-2 pr-4">
         {% if r.forge_url.is_empty() %}
@@ -53,4 +56,44 @@
     {% endfor %}
   </tbody>
 </table>
-{% endif %} {% endblock %}
+{% endif %}
+
+{% if !pending_repos.is_empty() %}
+<h2 class="text-lg font-semibold mb-2 text-slate-700">Awaiting first evaluation</h2>
+<p class="text-xs text-slate-500 mb-2">
+  Configured repos that haven't produced an evaluation yet — either no
+  webhook has arrived, or every webhook so far was dropped by policy
+  (unwatched branch, untrusted PR author, …).
+</p>
+<table class="w-full text-sm border-collapse">
+  <thead class="text-left text-slate-500">
+    <tr>
+      <th class="py-2 pr-4">forge</th>
+      <th class="py-2">repo</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in pending_repos %}
+    <tr class="border-t border-slate-200 align-top">
+      <td class="py-2 pr-4">
+        {% if r.forge_url.is_empty() %}
+        {{ r.forge }}
+        {% else %}
+        <a class="text-blue-600 hover:underline" href="{{ r.forge_url }}">{{ r.forge }}</a>
+        {% endif %}
+      </td>
+      <td class="py-2">
+        <span class="font-mono">{{ r.slug }}</span>
+        {% if !r.repo_url.is_empty() %}
+        <span class="ml-2 text-xs">
+          <a class="text-slate-500 hover:underline" href="{{ r.repo_url }}">↗ on forge</a>
+        </span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% endblock %}
