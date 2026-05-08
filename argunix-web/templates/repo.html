@@ -8,6 +8,10 @@
 {% endif %}
 <p class="mb-4">
   <a class="text-blue-600 hover:underline" href="/repos">← all repos</a>
+  {% if !repo_url.is_empty() %}
+  <span class="mx-2 text-slate-300">·</span>
+  <a class="text-blue-600 hover:underline" href="{{ repo_url }}">↗ on forge</a>
+  {% endif %}
 </p>
 {% if evals.is_empty() %}
 <p class="text-slate-500">No evaluations yet.</p>
@@ -33,8 +37,20 @@
           >#{{ e.id }}</a
         >
       </td>
-      <td class="py-2 pr-4 font-mono">{{ e.git_ref }}</td>
-      <td class="py-2 pr-4 font-mono">{{ e.short_sha }}</td>
+      <td class="py-2 pr-4 font-mono">
+        {% if e.forge_link.is_empty() %}
+          {% if let Some(n) = e.pr_number %}PR #{{ n }}{% else %}{{ e.git_ref }}{% endif %}
+        {% else %}
+          <a class="text-blue-600 hover:underline" href="{{ e.forge_link }}">{% if let Some(n) = e.pr_number %}PR #{{ n }}{% else %}{{ e.git_ref }}{% endif %}</a>
+        {% endif %}
+      </td>
+      <td class="py-2 pr-4 font-mono">
+        {% if e.commit_link.is_empty() %}
+          {{ e.short_sha }}
+        {% else %}
+          <a class="text-blue-600 hover:underline" href="{{ e.commit_link }}">{{ e.short_sha }}</a>
+        {% endif %}
+      </td>
       <td class="py-2 pr-4">{{ e.status }}</td>
       <td class="py-2 pr-4 text-slate-500">{{ e.finished }}</td>
       <td class="py-2 font-mono">{{ e.total }}</td>

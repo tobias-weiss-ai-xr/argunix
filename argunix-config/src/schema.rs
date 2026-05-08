@@ -190,13 +190,41 @@ pub struct EvalOverrides {
 /// during deserialization; not serde-derived itself because the YAML
 /// shape has an extra `repos` map that doesn't belong on the runtime
 /// type.
+///
+/// The user provides the *web* URL — the URL they paste from a
+/// browser — and we derive the API URL from it per [`ForgeKind`]
+/// using the version we pin against. github.com is the only forge
+/// where the API lives on a different host (`api.github.com`); GHES,
+/// GitLab, and Forgejo all expose their API at a stable suffix on
+/// the same host (`/api/v3`, `/api/v4`, `/api/v1`).
 #[derive(Debug, Clone)]
 pub struct ForgeConfig {
     pub kind: ForgeKind,
-    pub api_url: String,
+    pub web_url: String,
     pub token_path: Option<SecretFile>,
     pub app_id: Option<u64>,
     pub app_private_key_path: Option<SecretFile>,
+}
+
+impl ForgeConfig {
+    /// Construct the API base URL for this forge from `web_url` +
+    /// `kind`. Trailing slashes on `web_url` are tolerated.
+    pub fn api_url(&self) -> String {
+        let web = self.web_url.trim_end_matches('/');
+        match self.kind {
+            // github.com SaaS: API on a separate hostname.
+            ForgeKind::Github if web == "https://github.com" => {
+                "https://api.github.com".to_string()
+            }
+            ForgeKind::Github if web == "http://github.com" => "http://api.github.com".to_string(),
+            // GitHub Enterprise: API on the same host under /api/v3.
+            ForgeKind::Github => format!("{web}/api/v3"),
+            // GitLab pins to /api/v4.
+            ForgeKind::Gitlab => format!("{web}/api/v4"),
+            // Forgejo / Gitea pin to /api/v1.
+            ForgeKind::Forgejo => format!("{web}/api/v1"),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -309,7 +337,7 @@ pub enum CloneMethod {
 //   forges:
 //     gh:
 //       kind: github
-//       api_url: https://api.github.com
+//       web_url: https://github.com
 //       token_path: /run/credentials/argunix.service/gh-token
 //       repos:
 //         myorg/myrepo:
@@ -353,7 +381,12 @@ struct WireConfig {
 #[serde(deny_unknown_fields)]
 struct WireForgeConfig {
     kind: ForgeKind,
-    api_url: String,
+    /// User-facing web URL of the forge instance — the URL pasted
+    /// from a browser (`https://github.com`, `https://gitlab.example.com`,
+    /// `https://codeberg.org`). Used directly for forge org-level
+    /// links in the UI; the API URL is derived per `kind` (see
+    /// [`ForgeConfig::api_url`]).
+    web_url: String,
     token_path: Option<SecretFile>,
     app_id: Option<u64>,
     app_private_key_path: Option<SecretFile>,
@@ -407,7 +440,7 @@ impl TryFrom<WireConfig> for Config {
                 forge_name,
                 ForgeConfig {
                     kind: wire_forge.kind,
-                    api_url: wire_forge.api_url,
+                    web_url: wire_forge.web_url,
                     token_path: wire_forge.token_path,
                     app_id: wire_forge.app_id,
                     app_private_key_path: wire_forge.app_private_key_path,
@@ -450,7 +483,7 @@ external_url: https://argunix.example.com
 forges:
   github-myorg:
     kind: github
-    api_url: https://api.github.com
+    web_url: https://github.com
     token_path: /tmp/argunix-test/tok
     repos:
       myorg/myrepo: {}
@@ -492,7 +525,7 @@ external_url: https://argunix.example.com
 forges:
   github-myorg:
     kind: github
-    api_url: https://api.github.com
+    web_url: https://github.com
     token_path: /tmp/tok
     repos:
       myorg/myrepo:
@@ -509,7 +542,7 @@ external_url: https://argunix.example.com
 forges:
   gl:
     kind: gitlab
-    api_url: https://gitlab.example.com/api/v4
+    web_url: https://gitlab.example.com
     token_path: /tmp/tok
     repos:
       myorg/marketing/marketing-project-1: {}
@@ -533,13 +566,13 @@ external_url: https://argunix.example.com
 forges:
   gh:
     kind: github
-    api_url: https://api.github.com
+    web_url: https://github.com
     token_path: /tmp/tok
     repos:
       tfc/pprintpp: {}
   cb:
     kind: forgejo
-    api_url: https://codeberg.org/api/v1
+    web_url: https://codeberg.org
     token_path: /tmp/tok2
     repos:
       tfc/pprintpp: {}
@@ -560,7 +593,7 @@ external_url: https://argunix.example.com
 forges:
   github-myorg:
     kind: github
-    api_url: https://api.github.com
+    web_url: https://github.com
     app_id: 12345
     app_private_key_path: /tmp/key.pem
 "#;
@@ -579,7 +612,7 @@ external_url: https://argunix.example.com
 forges:
   github-myorg:
     kind: github
-    api_url: https://api.github.com
+    web_url: https://github.com
 "#;
         let c = parse(s);
         assert_eq!(
@@ -595,7 +628,7 @@ external_url: https://argunix.example.com
 forges:
   github-myorg:
     kind: github
-    api_url: https://api.github.com
+    web_url: https://github.com
     token_path: /tmp/tok
     app_id: 12345
     app_private_key_path: /tmp/key.pem
@@ -614,12 +647,63 @@ external_url: https://argunix.example.com
 forges:
   github-myorg:
     kind: github
-    api_url: https://api.github.com
+    web_url: https://github.com
     token_path: /tmp/tok
     repos:
       invalid-no-slash: {}
 "#;
         let err = serde_yaml::from_str::<Config>(s).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("slug"));
+    }
+
+    fn forge(kind: ForgeKind, web_url: &str) -> ForgeConfig {
+        ForgeConfig {
+            kind,
+            web_url: web_url.to_string(),
+            token_path: None,
+            app_id: None,
+            app_private_key_path: None,
+        }
+    }
+
+    #[test]
+    fn api_url_github_com_uses_api_subdomain() {
+        assert_eq!(
+            forge(ForgeKind::Github, "https://github.com").api_url(),
+            "https://api.github.com",
+        );
+        // Trailing slash tolerated.
+        assert_eq!(
+            forge(ForgeKind::Github, "https://github.com/").api_url(),
+            "https://api.github.com",
+        );
+    }
+
+    #[test]
+    fn api_url_github_enterprise_appends_v3() {
+        assert_eq!(
+            forge(ForgeKind::Github, "https://ghe.example.com").api_url(),
+            "https://ghe.example.com/api/v3",
+        );
+    }
+
+    #[test]
+    fn api_url_gitlab_appends_v4() {
+        assert_eq!(
+            forge(ForgeKind::Gitlab, "https://gitlab.example.com").api_url(),
+            "https://gitlab.example.com/api/v4",
+        );
+        assert_eq!(
+            forge(ForgeKind::Gitlab, "https://gitlab.com").api_url(),
+            "https://gitlab.com/api/v4",
+        );
+    }
+
+    #[test]
+    fn api_url_forgejo_appends_v1() {
+        assert_eq!(
+            forge(ForgeKind::Forgejo, "https://codeberg.org").api_url(),
+            "https://codeberg.org/api/v1",
+        );
     }
 }

@@ -54,12 +54,14 @@ fn map_repo(row: &SqliteRow) -> Result<RepoRecord, StoreError> {
     let slug: String = row.try_get("slug")?;
     let name: Option<String> = row.try_get("name")?;
     let description: Option<String> = row.try_get("description")?;
+    let web_url: Option<String> = row.try_get("web_url")?;
     Ok(RepoRecord {
         id: RepoId::new(id),
         forge,
         slug: to_slug(id, slug)?,
         name,
         description,
+        web_url,
     })
 }
 
@@ -73,6 +75,7 @@ fn map_eval(row: &SqliteRow) -> Result<EvalRecord, StoreError> {
     let finished_at: Option<DateTime<Utc>> = row.try_get("finished_at")?;
     let status: String = row.try_get("status")?;
     let pr_number: Option<i64> = row.try_get("pr_number")?;
+    let building_started_at: Option<DateTime<Utc>> = row.try_get("building_started_at")?;
     Ok(EvalRecord {
         id: EvalId::new(id),
         repo_id: RepoId::new(repo_id),
@@ -83,6 +86,7 @@ fn map_eval(row: &SqliteRow) -> Result<EvalRecord, StoreError> {
         finished_at,
         status: to_eval_status(&status)?,
         pr_number: pr_number.and_then(|n| u32::try_from(n).ok()),
+        building_started_at,
     })
 }
 
@@ -225,16 +229,18 @@ impl RepoStore for SqlxStore {
     }
 
     async fn get(&self, id: RepoId) -> Result<Option<RepoRecord>, StoreError> {
-        let row = sqlx::query("SELECT id, forge, slug, name, description FROM repos WHERE id = ?1")
-            .bind(id.get())
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT id, forge, slug, name, description, web_url FROM repos WHERE id = ?1",
+        )
+        .bind(id.get())
+        .fetch_optional(&self.pool)
+        .await?;
         row.as_ref().map(map_repo).transpose()
     }
 
     async fn find(&self, forge: &str, slug: &Slug) -> Result<Option<RepoRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, forge, slug, name, description FROM repos WHERE forge = ?1 AND slug = ?2",
+            "SELECT id, forge, slug, name, description, web_url FROM repos WHERE forge = ?1 AND slug = ?2",
         )
         .bind(forge)
         .bind(slug.as_str())
@@ -244,9 +250,11 @@ impl RepoStore for SqlxStore {
     }
 
     async fn list(&self) -> Result<Vec<RepoRecord>, StoreError> {
-        let rows = sqlx::query("SELECT id, forge, slug, name, description FROM repos ORDER BY id")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(
+            "SELECT id, forge, slug, name, description, web_url FROM repos ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(map_repo).collect()
     }
 
@@ -289,10 +297,12 @@ impl RepoStore for SqlxStore {
         repo_id: RepoId,
         name: Option<&str>,
         description: Option<&str>,
+        web_url: Option<&str>,
     ) -> Result<(), StoreError> {
-        sqlx::query("UPDATE repos SET name = ?1, description = ?2 WHERE id = ?3")
+        sqlx::query("UPDATE repos SET name = ?1, description = ?2, web_url = ?3 WHERE id = ?4")
             .bind(name)
             .bind(description)
+            .bind(web_url)
             .bind(repo_id.get())
             .execute(&self.pool)
             .await?;
@@ -305,7 +315,7 @@ impl RepoStore for SqlxStore {
     ) -> Result<Vec<RepoRecord>, StoreError> {
         let mut tx = self.pool.begin().await?;
 
-        let all_rows = sqlx::query("SELECT id, forge, slug, name, description FROM repos")
+        let all_rows = sqlx::query("SELECT id, forge, slug, name, description, web_url FROM repos")
             .fetch_all(&mut *tx)
             .await?;
         let all: Vec<RepoRecord> = all_rows.iter().map(map_repo).collect::<Result<_, _>>()?;
@@ -385,7 +395,7 @@ impl EvalStore for SqlxStore {
 
     async fn get(&self, id: EvalId) -> Result<Option<EvalRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at
              FROM evaluations WHERE id = ?1",
         )
         .bind(id.get())
@@ -433,13 +443,31 @@ impl EvalStore for SqlxStore {
         Ok(())
     }
 
+    async fn mark_building(
+        &self,
+        id: EvalId,
+        building_started_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE evaluations
+             SET status = ?1, building_started_at = ?2
+             WHERE id = ?3",
+        )
+        .bind(EvalStatus::Building.as_str())
+        .bind(building_started_at)
+        .bind(id.get())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn list_by_repo(
         &self,
         repo_id: RepoId,
         limit: u32,
     ) -> Result<Vec<EvalRecord>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at
              FROM evaluations
              WHERE repo_id = ?1
              ORDER BY id DESC
@@ -463,7 +491,7 @@ impl EvalStore for SqlxStore {
         // we look for `<key>` exactly OR `<key>:%`.
         let like_pattern = format!("{}:%", branch_key_prefix.replace('\\', "\\\\"));
         let rows = sqlx::query(
-            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at
              FROM evaluations
              WHERE repo_id = ?1
                AND status IN ('queued', 'evaluating', 'building')
@@ -497,6 +525,7 @@ impl EvalStore for SqlxStore {
         let rows = sqlx::query(
             "SELECT e.id, e.repo_id, e.trigger, e.git_ref, e.sha,
                     e.started_at, e.finished_at, e.status, e.pr_number,
+                    e.building_started_at,
                     r.forge AS r_forge, r.slug AS r_slug
              FROM evaluations e
              JOIN repos r ON e.repo_id = r.id

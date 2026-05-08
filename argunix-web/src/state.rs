@@ -91,19 +91,20 @@ async fn build_one(
     external_url: &str,
 ) -> Result<Arc<dyn Provider>, BuildProvidersError> {
     let token = read_token(name, forge_cfg).await?;
+    let api_url = forge_cfg.api_url();
     match forge_cfg.kind {
         ForgeKind::Github => Ok(Arc::new(GithubProvider::new(
-            forge_cfg.api_url.clone(),
+            api_url,
             token,
             external_url.to_string(),
         )) as Arc<dyn Provider>),
         ForgeKind::Gitlab => Ok(Arc::new(GitlabProvider::new(
-            forge_cfg.api_url.clone(),
+            api_url,
             token,
             external_url.to_string(),
         )) as Arc<dyn Provider>),
         ForgeKind::Forgejo => Ok(Arc::new(ForgejoProvider::new(
-            forge_cfg.api_url.clone(),
+            api_url,
             token,
             external_url.to_string(),
         )) as Arc<dyn Provider>),

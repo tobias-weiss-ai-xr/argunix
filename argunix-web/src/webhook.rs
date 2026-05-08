@@ -244,46 +244,66 @@ async fn persist(
     provider: &Arc<dyn Provider>,
     event: NormalizedEvent,
 ) -> Result<(), WebhookError> {
-    let (slug, git_ref, sha, trigger, pr_number, repo_name, repo_description) = match &event {
-        NormalizedEvent::Push(PushEvent {
-            slug,
-            git_ref,
-            sha,
-            repo_name,
-            repo_description,
-            ..
-        }) => (
-            slug.clone(),
-            git_ref.clone(),
-            sha.clone(),
-            "push".to_string(),
-            None,
-            repo_name.clone(),
-            repo_description.clone(),
-        ),
-        NormalizedEvent::PullRequest(PullRequestEvent {
-            slug,
-            pr_number,
-            head_sha,
-            head_ref,
-            repo_name,
-            repo_description,
-            ..
-        }) => (
-            slug.clone(),
-            format!("refs/pull/{pr_number}/head:{head_ref}"),
-            head_sha.clone(),
-            "pull_request".to_string(),
-            u32::try_from(*pr_number).ok(),
-            repo_name.clone(),
-            repo_description.clone(),
-        ),
-    };
+    let (slug, git_ref, sha, trigger, pr_number, repo_name, repo_description, repo_web_url) =
+        match &event {
+            NormalizedEvent::Push(PushEvent {
+                slug,
+                git_ref,
+                sha,
+                repo_name,
+                repo_description,
+                repo_web_url,
+                ..
+            }) => (
+                slug.clone(),
+                // Strip the `refs/heads/` prefix on storage so the UI can
+                // render `git_ref` directly and branch links can be built
+                // as `{repo_url}/tree/{git_ref}`. Tag pushes are filtered
+                // by `policy::branch_matches` upstream, so non-matching
+                // shapes never reach this point. PR-triggered evals use
+                // the synthetic `refs/pull/<n>/head:<branch>` form below
+                // and are not affected.
+                git_ref
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(git_ref)
+                    .to_string(),
+                sha.clone(),
+                "push".to_string(),
+                None,
+                repo_name.clone(),
+                repo_description.clone(),
+                repo_web_url.clone(),
+            ),
+            NormalizedEvent::PullRequest(PullRequestEvent {
+                slug,
+                pr_number,
+                head_sha,
+                head_ref,
+                repo_name,
+                repo_description,
+                repo_web_url,
+                ..
+            }) => (
+                slug.clone(),
+                format!("refs/pull/{pr_number}/head:{head_ref}"),
+                head_sha.clone(),
+                "pull_request".to_string(),
+                u32::try_from(*pr_number).ok(),
+                repo_name.clone(),
+                repo_description.clone(),
+                repo_web_url.clone(),
+            ),
+        };
 
     let repo_id = state.store.upsert(forge_name, &slug).await?;
     if let Err(e) = state
         .store
-        .set_metadata(repo_id, repo_name.as_deref(), repo_description.as_deref())
+        .set_metadata(
+            repo_id,
+            repo_name.as_deref(),
+            repo_description.as_deref(),
+            repo_web_url.as_deref(),
+        )
         .await
     {
         // Cosmetic data — log and continue rather than failing the

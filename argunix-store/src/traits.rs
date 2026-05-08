@@ -70,17 +70,19 @@ pub trait RepoStore: Send + Sync {
         secret: &[u8],
         hook_id: &str,
     ) -> Result<(), StoreError>;
-    /// Update the forge-supplied display fields for `repo_id`. Both
-    /// `name` and `description` are optional — pass `None` to clear,
-    /// `Some(_)` to overwrite. Called from each webhook handler so the
-    /// UI's `/repos` and per-repo pages stay current with whatever the
-    /// forge surfaces; on push events both forges include these on the
-    /// `repository` / `project` payload object.
+    /// Update the forge-supplied display fields for `repo_id`. All
+    /// three fields are optional — pass `None` to clear, `Some(_)` to
+    /// overwrite. Called from each webhook handler so the UI's
+    /// `/repos` and per-repo pages stay current with whatever the
+    /// forge surfaces; on push and PR events all three forges include
+    /// these on the `repository` / `project` payload object
+    /// (`html_url` for GitHub / Forgejo, `web_url` for GitLab).
     async fn set_metadata(
         &self,
         repo_id: RepoId,
         name: Option<&str>,
         description: Option<&str>,
+        web_url: Option<&str>,
     ) -> Result<(), StoreError>;
     /// Delete every repo (and its cascaded evaluations / jobs / queue
     /// rows / forge_status rows) whose `(forge, slug)` does not appear
@@ -113,6 +115,16 @@ pub trait EvalStore: Send + Sync {
         id: EvalId,
         status: EvalStatus,
         finished_at: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+    /// Mark the `Evaluating → Building` transition: flips status and
+    /// stamps `building_started_at`. Drives the eval/build wall-clock
+    /// split on the per-eval UI page. Use this instead of `set_status`
+    /// for the entry into `Building` so the timestamp is always
+    /// recorded atomically with the status change.
+    async fn mark_building(
+        &self,
+        id: EvalId,
+        building_started_at: DateTime<Utc>,
     ) -> Result<(), StoreError>;
     /// Most-recent evaluations for `repo_id`, newest first, capped at `limit`.
     /// Used by the read-only UI's repo page.

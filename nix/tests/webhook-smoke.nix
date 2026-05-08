@@ -48,7 +48,7 @@ let
     listen = "127.0.0.1:0"; # bind to an ephemeral port; we override at CLI
     forges.github-myorg = {
       kind = "github";
-      api_url = "API_URL_PLACEHOLDER";
+      web_url = "WEB_URL_PLACEHOLDER";
       token_path = "${token}";
       repos = {
         "myorg/myrepo" = { };
@@ -102,7 +102,7 @@ runCommand "argunix-webhook-smoke"
       sleep 0.05
     done
     test -n "$forge_addr"
-    sed "s|API_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > argunix.yaml
+    sed "s|WEB_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > argunix.yaml
 
     argunix serve --config "$workdir/argunix.yaml" --listen "127.0.0.1:0" \
       > daemon.stdout 2> daemon.stderr &
@@ -210,7 +210,7 @@ runCommand "argunix-webhook-smoke"
     sha=$(sqlite3 db.sqlite 'SELECT sha FROM evaluations LIMIT 1;')
     test "$sha" = "0123456789abcdef0123456789abcdef01234567"
     git_ref=$(sqlite3 db.sqlite 'SELECT git_ref FROM evaluations LIMIT 1;')
-    test "$git_ref" = "refs/heads/main"
+    test "$git_ref" = "main"
 
     # Hard shutdown — daemon worker rx never closes by itself, so a
     # graceful TERM can wait forever for the worker to drain.

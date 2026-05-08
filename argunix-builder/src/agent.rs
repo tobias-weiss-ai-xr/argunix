@@ -82,6 +82,13 @@ pub struct AgentConfig {
     /// where the daemon's host key is regenerated per VM. Production
     /// deployments should always set this.
     pub argunix_host_key_path: Option<PathBuf>,
+    /// Directory under which the agent stores throwaway gcroots
+    /// for in-flight builds when the daemon does not supply its
+    /// own gcroot path. Without this, `nix-store --realise` emits
+    /// `warning: you did not specify '--add-root'…` on every build,
+    /// which ends up in the captured build log. The link is removed
+    /// once the build reaches a terminal state.
+    pub build_gcroot_dir: PathBuf,
 }
 
 impl AgentConfig {
@@ -93,6 +100,9 @@ impl AgentConfig {
     }
     pub fn default_nix_daemon_socket() -> PathBuf {
         PathBuf::from("/nix/var/nix/daemon-socket/socket")
+    }
+    pub fn default_build_gcroot_dir() -> PathBuf {
+        PathBuf::from("/var/lib/argunix-builder/build-gcroots")
     }
 }
 
@@ -313,11 +323,32 @@ async fn serve_one_connection(
                                 let nix_store_bin = cfg.nix_store_bin.clone();
                                 let out_tx = out_tx.clone();
                                 let in_flight_for_task = in_flight.clone();
+                                // If the daemon supplied a gcroot path it
+                                // owns the lifetime; otherwise we plant a
+                                // throwaway under our state dir solely to
+                                // silence `nix-store`'s "you did not
+                                // specify '--add-root'…" warning. Either
+                                // way we hand the agent path to handle_build
+                                // and `agent_owns_gcroot` tells it whether
+                                // to clean up after the build.
+                                let (effective_gcroot, agent_owns_gcroot) = match gc_root {
+                                    Some(p) => (Some(p), false),
+                                    None => (
+                                        Some(
+                                            cfg.build_gcroot_dir
+                                                .join(build_id.to_string())
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                        ),
+                                        true,
+                                    ),
+                                };
                                 tokio::spawn(async move {
                                     handle_build(
                                         build_id,
                                         drv_path,
-                                        gc_root,
+                                        effective_gcroot,
+                                        agent_owns_gcroot,
                                         timeout_secs,
                                         max_log_bytes,
                                         &nix_store_bin,
@@ -368,16 +399,36 @@ async fn serve_one_connection(
 /// Errors that prevent the subprocess from running are surfaced as
 /// `BuildFinished{status: SpawnFailed}` so the daemon side never hangs
 /// waiting for a terminal message.
+/// `agent_owns_gcroot` is true iff `gc_root` was synthesised by the
+/// agent (the daemon passed `None`). We then remove the link once the
+/// build reaches a terminal state — daemon-supplied gcroots are left
+/// alone for the daemon to manage.
 async fn handle_build(
     build_id: i64,
     drv_path: String,
     gc_root: Option<String>,
+    agent_owns_gcroot: bool,
     timeout_secs: u64,
     max_log_bytes: u64,
     nix_store_bin: &Path,
     out_tx: mpsc::UnboundedSender<Vec<u8>>,
     abort_rx: oneshot::Receiver<()>,
 ) {
+    if agent_owns_gcroot {
+        if let Some(ref g) = gc_root {
+            if let Some(parent) = std::path::Path::new(g).parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    tracing::warn!(
+                        build_id,
+                        error = %e,
+                        path = %parent.display(),
+                        "failed to create agent-owned gcroot dir; \
+                         nix-store will warn about --add-root",
+                    );
+                }
+            }
+        }
+    }
     let mut cmd = Command::new(nix_store_bin);
     cmd.arg("--realise");
     if let Some(ref g) = gc_root {
@@ -454,7 +505,28 @@ async fn handle_build(
     };
 
     let log_truncated = stderr_task.await.unwrap_or(false);
-    let output_paths = stdout_task.await.unwrap_or_default();
+    let mut output_paths = stdout_task.await.unwrap_or_default();
+
+    // When the agent owns the gcroot, `nix-store --realise --add-root
+    // <path>` prints the symlink path on stdout, not the underlying
+    // `/nix/store/<hash>-<name>`. The daemon will `nix copy --from`
+    // *the agent's nix store* and needs the real store path, not a
+    // path that only exists on the agent's filesystem. Resolve every
+    // symlink we emitted before reporting.
+    if agent_owns_gcroot {
+        for p in output_paths.iter_mut() {
+            match tokio::fs::read_link(&p).await {
+                Ok(target) => *p = target.to_string_lossy().into_owned(),
+                Err(e) => tracing::warn!(
+                    build_id,
+                    error = %e,
+                    path = %p,
+                    "could not resolve agent-owned gcroot symlink; \
+                     reporting raw path (daemon will likely fail to pull)",
+                ),
+            }
+        }
+    }
 
     let (status, exit_code) = match exit_status {
         Ok(s) => {
@@ -496,6 +568,31 @@ async fn handle_build(
         }
         .encode_line(),
     );
+
+    // Best-effort cleanup of the throwaway gcroot symlink(s). For a
+    // multi-output drv `nix-store --realise --add-root <root>` may
+    // emit `<root>` plus `<root>-<output>` siblings, so we sweep the
+    // parent directory by build-id prefix. Failures are non-fatal —
+    // the daemon already has its own gcroot; these links only existed
+    // to silence the `nix-store --add-root` warning.
+    if agent_owns_gcroot {
+        if let Some(ref g) = gc_root {
+            let path = std::path::Path::new(g);
+            if let (Some(parent), Some(file_name)) =
+                (path.parent(), path.file_name().and_then(|n| n.to_str()))
+            {
+                if let Ok(mut rd) = tokio::fs::read_dir(parent).await {
+                    while let Ok(Some(entry)) = rd.next_entry().await {
+                        let name = entry.file_name();
+                        let name_s = name.to_string_lossy();
+                        if name_s == file_name || name_s.starts_with(&format!("{file_name}-")) {
+                            let _ = tokio::fs::remove_file(entry.path()).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `Command::spawn` wrapper that retries `ETXTBSY` ("Text file busy")
@@ -948,6 +1045,7 @@ exit 0
             42,
             "/nix/store/aaa-deriv.drv".to_string(),
             None,
+            false,
             0,
             64 * 1024,
             &bin,
@@ -1019,6 +1117,7 @@ exit 7
             1,
             "/nix/store/x.drv".into(),
             None,
+            false,
             0,
             64 * 1024,
             &bin,
@@ -1055,6 +1154,7 @@ exit 7
             9,
             "/nix/store/x.drv".into(),
             None,
+            false,
             0,
             64 * 1024,
             &bin,
@@ -1095,6 +1195,7 @@ exit 0
                 77,
                 "/nix/store/x.drv".into(),
                 None,
+                false,
                 0,
                 64 * 1024,
                 &bin_owned,
@@ -1175,6 +1276,7 @@ exit 0
             5,
             "/nix/store/x.drv".into(),
             None,
+            false,
             0,
             cap,
             &bin,

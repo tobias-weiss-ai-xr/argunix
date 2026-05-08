@@ -420,6 +420,7 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
         full_name: String,
         name: Option<String>,
         description: Option<String>,
+        html_url: Option<String>,
     }
     #[derive(Deserialize)]
     struct Pusher {
@@ -440,6 +441,7 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
         pusher: view.pusher.and_then(|p| p.username.or(p.login)),
         repo_name: view.repository.name,
         repo_description: view.repository.description.filter(|s| !s.is_empty()),
+        repo_web_url: view.repository.html_url.filter(|s| !s.is_empty()),
     })
 }
 
@@ -456,6 +458,7 @@ fn parse_pull_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
         full_name: String,
         name: Option<String>,
         description: Option<String>,
+        html_url: Option<String>,
     }
     #[derive(Deserialize)]
     struct PullRequest {
@@ -516,6 +519,7 @@ fn parse_pull_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
         is_fork,
         repo_name: view.repository.name,
         repo_description: view.repository.description.filter(|s| !s.is_empty()),
+        repo_web_url: view.repository.html_url.filter(|s| !s.is_empty()),
     })
 }
 

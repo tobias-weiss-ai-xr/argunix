@@ -151,7 +151,7 @@ let
     listen = "127.0.0.1:0";
     forges.github-myorg = {
       kind = "github";
-      api_url = "API_URL_PLACEHOLDER";
+      web_url = "WEB_URL_PLACEHOLDER";
       token_path = "${token}";
       repos = {
         "myorg/myrepo" = { };
@@ -200,7 +200,7 @@ runCommand "argunix-serve-pipeline-smoke"
       sleep 0.05
     done
     test -n "$forge_addr"
-    sed "s|API_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > argunix.yaml
+    sed "s|WEB_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > argunix.yaml
 
     argunix serve \
       --config "$workdir/argunix.yaml" \

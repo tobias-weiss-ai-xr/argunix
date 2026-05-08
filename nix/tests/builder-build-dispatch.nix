@@ -64,7 +64,7 @@ in
         };
         forges.gh = {
           kind = "github";
-          api_url = "https://api.github.com";
+          web_url = "https://github.com";
           token_path = "$CREDENTIALS_DIRECTORY/gh-token";
           repos = { };
         };

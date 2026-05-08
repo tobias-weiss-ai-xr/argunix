@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         // future server-key swap is caught at TOFU rather than
         // silently accepted.
         argunix_host_key_path: Some(cli.state_dir.join("argunix-host-key.pub")),
+        build_gcroot_dir: cli.state_dir.join("build-gcroots"),
     };
 
     tracing::info!(

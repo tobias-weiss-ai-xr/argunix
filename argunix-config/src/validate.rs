@@ -111,7 +111,7 @@ external_url: https://m.example.com
 forges:
   fg:
     kind: forgejo
-    api_url: https://forge.example.com/api/v1
+    web_url: https://forge.example.com
     token_path: /tmp/tok
     repos:
       a/b: {}
@@ -128,7 +128,7 @@ external_url: https://m.example.com
 forges:
   fg:
     kind: forgejo
-    api_url: https://forge.example.com/api/v1
+    web_url: https://forge.example.com
     token_path: /tmp/tok
     repos:
       a/b:
@@ -148,7 +148,7 @@ external_url: https://m.example.com
 forges:
   fg:
     kind: forgejo
-    api_url: https://forge.example.com/api/v1
+    web_url: https://forge.example.com
     token_path: /tmp/argunix-definitely-not-a-real-path-zzz
 "#,
         );
@@ -167,7 +167,7 @@ external_url: https://m.example.com
 forges:
   fg:
     kind: forgejo
-    api_url: https://forge.example.com/api/v1
+    web_url: https://forge.example.com
     token_path: /tmp/tok
 "#,
         );
@@ -184,7 +184,7 @@ builder_enrollment:
 forges:
   fg:
     kind: forgejo
-    api_url: https://forge.example.com/api/v1
+    web_url: https://forge.example.com
     token_path: /tmp/tok
 "#,
         );
@@ -203,7 +203,7 @@ builder_enrollment:
 forges:
   fg:
     kind: forgejo
-    api_url: https://forge.example.com/api/v1
+    web_url: https://forge.example.com
     token_path: /tmp/tok
 "#,
         );
@@ -222,7 +222,7 @@ builder_enrollment:
 forges:
   fg:
     kind: forgejo
-    api_url: https://forge.example.com/api/v1
+    web_url: https://forge.example.com
     token_path: /tmp/tok
 "#,
         );
@@ -241,7 +241,7 @@ builder_enrollment: {}
 forges:
   fg:
     kind: forgejo
-    api_url: https://forge.example.com/api/v1
+    web_url: https://forge.example.com
     token_path: /tmp/tok
 "#;
         let err = serde_yaml::from_str::<Config>(s).unwrap_err();
@@ -261,7 +261,7 @@ builder_enrollment:
 forges:
   fg:
     kind: forgejo
-    api_url: https://forge.example.com/api/v1
+    web_url: https://forge.example.com
     token_path: {tok}
 "#,
             tok = tok.display(),
@@ -285,7 +285,7 @@ external_url: https://m.example.com
 forges:
   fg:
     kind: forgejo
-    api_url: https://forge.example.com/api/v1
+    web_url: https://forge.example.com
     token_path: {tok}
 "#,
             tok = tok.display(),

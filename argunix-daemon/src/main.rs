@@ -105,9 +105,10 @@ struct BuildArgs {
     /// Forge name (matches the `forges:` key in the YAML config).
     #[arg(long, value_name = "FORGE")]
     forge: String,
-    /// Git ref recorded for the evaluation, e.g. `refs/heads/main`.
-    /// Defaults to a placeholder so callers without git context still work.
-    #[arg(long, value_name = "REF", default_value = "refs/heads/HEAD")]
+    /// Git ref recorded for the evaluation, e.g. `main`. Stored as
+    /// the short branch name (no `refs/heads/` prefix) — webhook
+    /// ingestion normalizes the same way.
+    #[arg(long, value_name = "REF", default_value = "HEAD")]
     git_ref: String,
     /// 40-hex-char SHA recorded for the evaluation. If omitted, a synthetic
     /// zero SHA is recorded (real cloning lands in M5).
@@ -584,8 +585,7 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
             return Err(anyhow::Error::from(e).context("evaluation failed"));
         }
     };
-    <argunix_store::SqlxStore as EvalStore>::set_status(&store, eval_id, EvalStatus::Building)
-        .await?;
+    <argunix_store::SqlxStore as EvalStore>::mark_building(&store, eval_id, Utc::now()).await?;
     tracing::info!(count = jobs.len(), "evaluation finished");
 
     let caches: Vec<argunix_build::CacheRef> = config

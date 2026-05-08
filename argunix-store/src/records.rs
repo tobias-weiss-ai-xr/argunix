@@ -14,6 +14,11 @@ pub struct RepoRecord {
     pub name: Option<String>,
     /// Forge-supplied description. Same population rules as `name`.
     pub description: Option<String>,
+    /// Forge-supplied project web URL. `repository.html_url` on
+    /// GitHub / Forgejo, `repository.web_url` on GitLab. `None` until
+    /// the first matching webhook lands; UI falls back to a URL
+    /// constructed from the YAML config until then.
+    pub web_url: Option<String>,
 }
 
 /// Fields supplied when creating a new evaluation row.
@@ -41,6 +46,13 @@ pub struct EvalRecord {
     pub status: EvalStatus,
     /// PR number for pull-request evals. See [`NewEvaluation::pr_number`].
     pub pr_number: Option<u32>,
+    /// Stamp set when the eval transitioned `Evaluating → Building`.
+    /// Splits the eval's total wall-clock into eval time
+    /// (`building_started_at - started_at`) and build time
+    /// (`finished_at - building_started_at`). `None` for rows that
+    /// never reached `Building` (eval-failed, cancelled mid-eval) or
+    /// that finished before this column existed.
+    pub building_started_at: Option<DateTime<Utc>>,
 }
 
 /// Fields supplied when creating a new job row.

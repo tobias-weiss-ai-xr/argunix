@@ -38,7 +38,7 @@ in
           external_url = "https://argunix.example.com";
           forges.gh = {
             kind = "github";
-            api_url = "https://api.github.com";
+            web_url = "https://github.com";
             token_path = "$CREDENTIALS_DIRECTORY/gh-token";
             # Empty repos {} — without it the auto-install pass would
             # try to reach api.github.com from within the test VM.

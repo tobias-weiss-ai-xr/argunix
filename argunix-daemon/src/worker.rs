@@ -291,7 +291,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             return Err(anyhow::Error::from(e).context("evaluation failed"));
         }
     };
-    <SqlxStore as EvalStore>::set_status(&ctx.store, eval_id, EvalStatus::Building).await?;
+    <SqlxStore as EvalStore>::mark_building(&ctx.store, eval_id, Utc::now()).await?;
     tracing::info!(count = jobs.len(), "evaluation finished");
 
     let caches: Vec<argunix_build::CacheRef> = snap

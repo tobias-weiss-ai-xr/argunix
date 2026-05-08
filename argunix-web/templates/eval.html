@@ -12,14 +12,36 @@
       {{ status_label }}
     </span>
   </h1>
-  <p class="mb-4"><a class="text-blue-600 hover:underline" href="/r/{{ forge }}/{{ slug }}">← {{ slug }}</a></p>
+  <p class="mb-4">
+    <a class="text-blue-600 hover:underline" href="/r/{{ forge }}/{{ slug }}">← {{ slug }}</a>
+    {% if !repo_url.is_empty() %}
+    <span class="mx-2 text-slate-300">·</span>
+    <a class="text-blue-600 hover:underline" href="{{ repo_url }}">↗ on forge</a>
+    {% endif %}
+  </p>
 
   <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm mb-6">
     <dt class="text-slate-500">trigger</dt><dd>{{ trigger }}</dd>
-    <dt class="text-slate-500">ref</dt><dd class="font-mono">{{ git_ref }}</dd>
-    <dt class="text-slate-500">sha</dt><dd class="font-mono">{{ sha }}</dd>
+    <dt class="text-slate-500">ref</dt>
+    <dd class="font-mono">
+      {% if ref_link.is_empty() %}
+        {% if let Some(n) = pr_number %}PR #{{ n }} ({{ git_ref }}){% else %}{{ git_ref }}{% endif %}
+      {% else %}
+        <a class="text-blue-600 hover:underline" href="{{ ref_link }}">{% if let Some(n) = pr_number %}PR #{{ n }} ({{ git_ref }}){% else %}{{ git_ref }}{% endif %}</a>
+      {% endif %}
+    </dd>
+    <dt class="text-slate-500">sha</dt>
+    <dd class="font-mono">
+      {% if commit_link.is_empty() %}
+        {{ sha }}
+      {% else %}
+        <a class="text-blue-600 hover:underline" href="{{ commit_link }}">{{ sha }}</a>
+      {% endif %}
+    </dd>
     <dt class="text-slate-500">started</dt><dd class="text-slate-500">{{ started }}</dd>
     <dt class="text-slate-500">finished</dt><dd class="text-slate-500">{{ finished }}</dd>
+    <dt class="text-slate-500">eval time</dt><dd class="font-mono">{{ eval_time }}</dd>
+    <dt class="text-slate-500">build time</dt><dd class="font-mono">{{ build_time }}</dd>
     <dt class="text-slate-500">total</dt><dd class="font-mono">{{ total }}</dd>
   </dl>
 

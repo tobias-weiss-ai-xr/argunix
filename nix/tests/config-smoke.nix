@@ -11,7 +11,7 @@ let
     external_url = "https://argunix.example.com";
     forges.github-myorg = {
       kind = "github";
-      api_url = "https://api.github.com";
+      web_url = "https://github.com";
       token_path = "${token}";
       repos = {
         "myorg/myrepo" = { };

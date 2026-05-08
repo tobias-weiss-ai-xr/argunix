@@ -181,6 +181,7 @@ mod tests {
             pusher: Some("alice".into()),
             repo_name: None,
             repo_description: None,
+            repo_web_url: None,
         })
     }
 
@@ -196,6 +197,7 @@ mod tests {
             is_fork: true,
             repo_name: None,
             repo_description: None,
+            repo_web_url: None,
         })
     }
 

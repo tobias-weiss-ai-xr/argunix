@@ -19,6 +19,7 @@
 
 use crate::state::AppState;
 use argunix_builders::ConnState;
+use argunix_config::ForgeConfig;
 use argunix_domain::{EvalId, EvalStatus, JobStatus, Slug};
 use argunix_store::{BuilderStore, EvalStore, JobStore, RepoStore};
 use askama::Template;
@@ -124,7 +125,15 @@ struct IndexTemplate {
 
 struct RepoRow {
     forge: String,
+    /// Link target for the forge column — points at the repo's
+    /// owning org / namespace on the forge web UI. Empty string when
+    /// no forge config matches (template suppresses the link).
+    forge_url: String,
     slug: String,
+    /// Project page on the forge. Empty when we have no `web_url`
+    /// for this repo and no forge config to fall back to; template
+    /// degrades the slug to plain text in that case.
+    repo_url: String,
     /// Forge-supplied display name. Falls back to `slug` in the
     /// template when `None`.
     name: Option<String>,
@@ -142,6 +151,10 @@ struct RepoTemplate {
     slug: String,
     name: Option<String>,
     description: Option<String>,
+    /// Project page on the forge. Empty when neither
+    /// `repo.web_url` nor a forge config is available; template
+    /// suppresses the link in that case.
+    repo_url: String,
     evals: Vec<EvalRow>,
 }
 
@@ -154,6 +167,17 @@ struct EvalRow {
     /// Wall-clock between `started_at` and `finished_at`, humanized.
     /// `"—"` when either is missing.
     total: String,
+    /// PR number if this eval was triggered by a pull/merge request,
+    /// otherwise `None`. Drives the `git_ref` cell rendering — PRs
+    /// show as "PR #N" rather than the synthetic ref shape.
+    pr_number: Option<u32>,
+    /// Forge-side link target for this eval row. When `pr_number` is
+    /// set, points at the PR; otherwise at the branch. Empty when
+    /// no forge URL can be constructed (no webhook + no forge cfg).
+    forge_link: String,
+    /// Forge-side link target for the eval's commit SHA. Empty when
+    /// no forge URL can be constructed.
+    commit_link: String,
 }
 
 #[derive(Template)]
@@ -172,9 +196,28 @@ struct EvalTemplate {
     finished: String,
     /// Wall-clock between `started_at` and `finished_at`, humanized.
     total: String,
+    /// Wall-clock between `started_at` and `building_started_at` —
+    /// the eval-only portion of the run. `"—"` when the row hasn't
+    /// reached `Building` (still evaluating, or eval-failed /
+    /// cancelled mid-eval), or pre-dates the column.
+    eval_time: String,
+    /// Wall-clock between `building_started_at` and `finished_at` —
+    /// the build-only portion. Same fallback rules as `eval_time`.
+    build_time: String,
     job_heading: String,
     empty_jobs_msg: &'static str,
     jobs: Vec<JobRow>,
+    /// PR number when this eval was triggered by a pull/merge request.
+    pr_number: Option<u32>,
+    /// Project page on the forge. Empty when no forge URL can be
+    /// constructed; template degrades the project link to plain text.
+    repo_url: String,
+    /// Forge-side link to the PR (when `pr_number.is_some()`) or the
+    /// branch (otherwise). Empty when no forge URL can be built.
+    ref_link: String,
+    /// Forge-side link to the commit. Empty when no forge URL can be
+    /// built.
+    commit_link: String,
 }
 
 struct JobRow {
@@ -228,6 +271,7 @@ struct PhaseMetricsRow {
 
 pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiError> {
     let cluster_active = cluster_is_active(&state).await?;
+    let snap = state.current.load_full();
     let raw = state.store.list().await?;
     let mut repos: Vec<RepoRow> = Vec::with_capacity(raw.len());
     for r in raw {
@@ -239,9 +283,14 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiErro
                 .into_iter()
                 .next()
                 .map(|e| e.id.get());
+        let forge_cfg = snap.config.forges.get(&r.forge);
+        let forge_url = forge_url_for(forge_cfg, r.slug.as_str());
+        let repo_url = repo_url_for(r.web_url.as_deref(), forge_cfg, r.slug.as_str());
         repos.push(RepoRow {
             forge: r.forge,
+            forge_url,
             slug: r.slug.as_str().to_string(),
+            repo_url,
             name: r.name,
             description: r.description,
             latest_eval_id,
@@ -251,6 +300,35 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiErro
         cluster_active,
         repos,
     })?))
+}
+
+/// Forge-column link: project namespace / org page on the forge.
+/// Falls back to the forge root if the slug has no namespace
+/// component, or to an empty string if no forge config exists.
+fn forge_url_for(forge_cfg: Option<&ForgeConfig>, slug: &str) -> String {
+    let Some(cfg) = forge_cfg else {
+        return String::new();
+    };
+    let base = cfg.web_url.trim_end_matches('/');
+    match slug.split_once('/') {
+        Some((org, _)) => format!("{base}/{org}"),
+        None => base.to_string(),
+    }
+}
+
+/// Project page URL for a repo. Prefers the forge-supplied
+/// `repo.web_url` (populated from webhook payloads); falls back to
+/// `{forge.web_url}/{slug}` when no webhook has landed yet. Returns
+/// an empty string when neither source is available.
+fn repo_url_for(repo_web_url: Option<&str>, forge_cfg: Option<&ForgeConfig>, slug: &str) -> String {
+    if let Some(u) = repo_web_url.filter(|s| !s.is_empty()) {
+        return u.trim_end_matches('/').to_string();
+    }
+    let Some(cfg) = forge_cfg else {
+        return String::new();
+    };
+    let base = cfg.web_url.trim_end_matches('/');
+    format!("{base}/{slug}")
 }
 
 /// Cluster status overview — at-a-glance view of every known builder
@@ -599,15 +677,31 @@ async fn repo_page(
         .ok_or(UiError::NotFound)?;
     let evals = state.store.list_by_repo(repo.id, 50).await?;
 
+    let snap = state.current.load_full();
+    let forge_cfg = snap.config.forges.get(&forge);
+    let repo_url = repo_url_for(repo.web_url.as_deref(), forge_cfg, slug.as_str());
+
     let evals = evals
         .into_iter()
-        .map(|e| EvalRow {
-            id: e.id.get(),
-            git_ref: e.git_ref,
-            short_sha: short_sha(e.sha.as_str()).to_string(),
-            status: eval_status_label(&e.status),
-            finished: fmt_opt_time(e.finished_at),
-            total: humanize_duration(e.started_at, e.finished_at),
+        .map(|e| {
+            let (forge_link, commit_link) = forge_links_for_eval(
+                &repo_url,
+                forge_cfg,
+                &e.git_ref,
+                e.pr_number,
+                e.sha.as_str(),
+            );
+            EvalRow {
+                id: e.id.get(),
+                git_ref: display_git_ref(&e.git_ref),
+                short_sha: short_sha(e.sha.as_str()).to_string(),
+                status: eval_status_label(&e.status),
+                finished: fmt_opt_time(e.finished_at),
+                total: humanize_duration(e.started_at, e.finished_at),
+                pr_number: e.pr_number,
+                forge_link,
+                commit_link,
+            }
         })
         .collect();
 
@@ -618,9 +712,51 @@ async fn repo_page(
         slug: slug.as_str().to_string(),
         name: repo.name,
         description: repo.description,
+        repo_url,
         evals,
     })?;
     Ok(Html(html).into_response())
+}
+
+/// Normalise a stored `git_ref` for display. Push-triggered evals
+/// already store the short branch name post-ingest. PR-triggered
+/// evals store a synthetic `refs/pull/<n>/head:<headref>` form for
+/// branch-key matching; surface only the trailing `<headref>` part
+/// so the cell reads as just the source branch name.
+fn display_git_ref(git_ref: &str) -> String {
+    git_ref
+        .rsplit_once(':')
+        .map(|(_, branch)| branch)
+        .unwrap_or(git_ref)
+        .to_string()
+}
+
+/// Build `(branch_or_pr_url, commit_url)` for one eval row. Both are
+/// empty strings when no forge URL can be constructed.
+///
+/// The branch link uses the *short* form of `git_ref` — push refs are
+/// already stored that way (M-refs-normalize); PR-triggered evals
+/// store a synthetic `refs/pull/N/head:<branch>` shape and link to
+/// the PR via `pr_number` instead, ignoring `git_ref`.
+fn forge_links_for_eval(
+    repo_url: &str,
+    forge_cfg: Option<&ForgeConfig>,
+    git_ref: &str,
+    pr_number: Option<u32>,
+    sha: &str,
+) -> (String, String) {
+    let Some(cfg) = forge_cfg else {
+        return (String::new(), String::new());
+    };
+    if repo_url.is_empty() {
+        return (String::new(), String::new());
+    }
+    let primary = match pr_number {
+        Some(n) => cfg.kind.pr_url(repo_url, n),
+        None => cfg.kind.branch_url(repo_url, git_ref),
+    };
+    let commit = cfg.kind.commit_url(repo_url, sha);
+    (primary, commit)
 }
 
 async fn eval_page(
@@ -648,6 +784,19 @@ async fn eval_page(
         })
         .collect();
 
+    let snap = state.current.load_full();
+    let forge_cfg = snap.config.forges.get(&forge);
+    let repo = state.store.find(&forge, &slug).await?;
+    let repo_web_url = repo.as_ref().and_then(|r| r.web_url.as_deref());
+    let repo_url = repo_url_for(repo_web_url, forge_cfg, slug.as_str());
+    let (ref_link, commit_link) = forge_links_for_eval(
+        &repo_url,
+        forge_cfg,
+        &eval.git_ref,
+        eval.pr_number,
+        eval.sha.as_str(),
+    );
+
     let cluster_active = cluster_is_active(&state).await?;
     let html = render(&EvalTemplate {
         cluster_active,
@@ -657,14 +806,20 @@ async fn eval_page(
         status_label: eval_status_label(&eval.status),
         phase_class: eval_status_phase_class(&eval.status),
         trigger: eval.trigger.to_string(),
-        git_ref: eval.git_ref,
+        git_ref: display_git_ref(&eval.git_ref),
         sha: eval.sha.to_string(),
         started: fmt_opt_time(eval.started_at),
         finished: fmt_opt_time(eval.finished_at),
         total: humanize_duration(eval.started_at, eval.finished_at),
+        eval_time: humanize_duration(eval.started_at, eval.building_started_at),
+        build_time: humanize_duration(eval.building_started_at, eval.finished_at),
         job_heading,
         empty_jobs_msg,
         jobs: job_rows,
+        pr_number: eval.pr_number,
+        repo_url,
+        ref_link,
+        commit_link,
     })?;
     Ok(Html(html).into_response())
 }

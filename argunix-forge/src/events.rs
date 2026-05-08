@@ -23,6 +23,10 @@ pub struct PushEvent {
     /// Forge-supplied description (`repository.description` /
     /// `project.description`). `None` if absent or empty.
     pub repo_description: Option<String>,
+    /// Forge-supplied project web URL (`repository.html_url` on
+    /// GitHub / Forgejo, `repository.web_url` / `project.web_url` on
+    /// GitLab). `None` if absent.
+    pub repo_web_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +46,8 @@ pub struct PullRequestEvent {
     pub repo_name: Option<String>,
     /// Forge-supplied repo description. See [`PushEvent::repo_description`].
     pub repo_description: Option<String>,
+    /// Forge-supplied project web URL. See [`PushEvent::repo_web_url`].
+    pub repo_web_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

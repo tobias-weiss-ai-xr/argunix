@@ -112,6 +112,7 @@ async fn token_first_then_pubkey_subsequent() {
         nix_store_bin: AgentConfig::default_nix_store_bin(),
         nix_daemon_socket: AgentConfig::default_nix_daemon_socket(),
         argunix_host_key_path: None,
+        build_gcroot_dir: AgentConfig::default_build_gcroot_dir(),
     };
     let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
     let cfg_a = cfg.clone();
@@ -177,6 +178,7 @@ async fn nix_daemon_stdio_side_channel_end_to_end() {
         nix_store_bin: AgentConfig::default_nix_store_bin(),
         nix_daemon_socket: PathBuf::from(&fake_socket),
         argunix_host_key_path: None,
+        build_gcroot_dir: AgentConfig::default_build_gcroot_dir(),
     };
     let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
     let cfg_a = cfg.clone();

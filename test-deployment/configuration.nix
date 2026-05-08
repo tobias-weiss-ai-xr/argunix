@@ -65,7 +65,7 @@ in
       forges = {
         github = {
           kind = "github";
-          api_url = "https://api.github.com";
+          web_url = "https://github.com";
           token_path = "$CREDENTIALS_DIRECTORY/gh-token";
           repos = {
             "tfc/attoparsecpp".watched_branches = [ "master" ];
@@ -78,7 +78,7 @@ in
         };
         gitlab = {
           kind = "gitlab";
-          api_url = "https://gitlab.com/api/v4";
+          web_url = "https://gitlab.com";
           token_path = "$CREDENTIALS_DIRECTORY/gl-token";
           repos = {
             "jonge/pprintpp" = {
@@ -88,7 +88,7 @@ in
         };
         codeberg = {
           kind = "forgejo";
-          api_url = "https://codeberg.org/api/v1";
+          web_url = "https://codeberg.org";
           token_path = "$CREDENTIALS_DIRECTORY/fj-token";
           repos = {
             "tfc/pprintpp" = {

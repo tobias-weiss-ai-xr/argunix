@@ -15,7 +15,13 @@
   <tbody>
     {% for r in repos %}
     <tr class="border-t border-slate-200 align-top">
-      <td class="py-2 pr-4">{{ r.forge }}</td>
+      <td class="py-2 pr-4">
+        {% if r.forge_url.is_empty() %}
+        {{ r.forge }}
+        {% else %}
+        <a class="text-blue-600 hover:underline" href="{{ r.forge_url }}">{{ r.forge }}</a>
+        {% endif %}
+      </td>
       <td class="py-2 pr-4">
         <a
           class="text-blue-600 hover:underline"
@@ -24,6 +30,11 @@
         >
         {% if let Some(_) = r.name %}
         <div class="text-xs text-slate-500 font-mono">{{ r.slug }}</div>
+        {% endif %}
+        {% if !r.repo_url.is_empty() %}
+        <div class="text-xs">
+          <a class="text-slate-500 hover:underline" href="{{ r.repo_url }}">↗ on forge</a>
+        </div>
         {% endif %}
       </td>
       <td class="py-2 pr-4 text-slate-600">{% if let Some(d) = r.description %}{{ d }}{% else %}—{% endif %}</td>

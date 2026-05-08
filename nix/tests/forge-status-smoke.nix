@@ -5,7 +5,7 @@
 # - A small Python http.server stands in for github's API. It accepts
 #   `POST /repos/.../statuses/<sha>`, logs every request body to a file,
 #   and replies with `201 {"id":N}`.
-# - `argunix serve` is configured with `api_url = http://<fake forge>`.
+# - `argunix serve` is configured with `web_url = http://<fake forge>`.
 # - We send a webhook, wait for the daemon to finish, and grep the forge
 #   log for the sequence of expected checks.
 {
@@ -168,7 +168,7 @@ let
     listen = "127.0.0.1:0";
     forges.github-myorg = {
       kind = "github";
-      api_url = "API_URL_PLACEHOLDER";
+      web_url = "WEB_URL_PLACEHOLDER";
       token_path = "${token}";
       repos = {
         "myorg/myrepo" = { };
@@ -242,8 +242,8 @@ runCommand "argunix-forge-status-smoke"
     test -n "$forge_addr"
     echo "fake forge listening on $forge_addr"
 
-    # 2. Materialise argunix.yaml with the right api_url.
-    sed "s|API_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > argunix.yaml
+    # 2. Materialise argunix.yaml with the right web_url.
+    sed "s|WEB_URL_PLACEHOLDER|http://$forge_addr|" ${configTemplate} > argunix.yaml
 
     # 3. Start argunix serve.
     argunix serve \
@@ -306,7 +306,9 @@ runCommand "argunix-forge-status-smoke"
 
     # 7. Assertions on the recorded posts.
     sha=0123456789abcdef0123456789abcdef01234567
-    grep -F "POST /repos/myorg/myrepo/statuses/$sha" forge.log
+    # GHES-style API path: web_url has no `api.` subdomain so the
+    # provider derives `<web>/api/v3` (see ForgeConfig::api_url).
+    grep -F "POST /api/v3/repos/myorg/myrepo/statuses/$sha" forge.log
 
     # Initial pending check.
     grep -F '"state":"pending"' forge.log | grep -F '"context":"argunix: evaluation"'
