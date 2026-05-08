@@ -54,6 +54,7 @@ in
       gh-token = "/var/lib/argunix-credentials/gh-token";
       gl-token = "/var/lib/argunix-credentials/gl-token";
       fj-token = "/var/lib/argunix-credentials/fj-token";
+      opencode-token = "/var/lib/argunix-credentials/opencode-token";
       builder-enrollment-token = "/var/lib/argunix-credentials/builder-enrollment-token";
     };
     settings = {
@@ -94,6 +95,14 @@ in
             "tfc/pprintpp" = {
               watched_branches = [ "master" ];
             };
+          };
+        };
+        opencode = {
+          kind = "gitlab";
+          web_url = "https://gitlab.opencode.de";
+          token_path = "$CREDENTIALS_DIRECTORY/opencode-token";
+          repos = {
+            "oci-community/images/applicative-systems/example-build-and-attest" = { };
           };
         };
       };
