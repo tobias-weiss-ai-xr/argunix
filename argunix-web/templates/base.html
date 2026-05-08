@@ -12,9 +12,9 @@
     </style>
     {% block head_extra %}{% endblock %}
   </head>
-  <body class="bg-slate-50 text-slate-900 font-sans">
+  <body class="bg-bg text-fg font-sans">
     <header class="max-w-5xl mx-auto px-4 pt-6 pb-2 flex items-center justify-between">
-      <a class="flex items-center gap-3 no-underline text-slate-900" href="/">
+      <a class="flex items-center gap-3 no-underline text-fg" href="/">
         <img
           id="argunix-logo"
           src="/static/img/argunix-logo-square.svg"
@@ -24,14 +24,14 @@
         <span class="text-xl font-semibold">argunix</span>
       </a>
       <nav class="text-sm flex items-center gap-4">
-        <a class="text-blue-600 hover:underline" href="/">status</a>
-        <a class="text-blue-600 hover:underline" href="/repos">repos</a>
+        <a class="text-link hover:underline" href="/">status</a>
+        <a class="text-link hover:underline" href="/repos">repos</a>
       </nav>
     </header>
     <main class="max-w-5xl mx-auto px-4 py-6">
       {% block content %}{% endblock %}
     </main>
-    <footer class="max-w-5xl mx-auto px-4 py-4 text-xs text-slate-500">
+    <footer class="max-w-5xl mx-auto px-4 py-4 text-xs text-muted">
       argunix CI
     </footer>
   </body>

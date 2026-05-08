@@ -492,11 +492,13 @@ async fn collect_status_view(state: &AppState) -> Result<StatusView, UiError> {
                 .unwrap_or_else(|| "—".to_string());
             let live_phase = phases.get(&(builder.clone(), j.job.id.get())).copied();
             let (phase, phase_class) = match live_phase {
-                Some(argunix_builders::BuildPhase::Push) => ("push", "bg-amber-100 text-amber-700"),
-                Some(argunix_builders::BuildPhase::Build) => ("build", "bg-blue-100 text-blue-700"),
-                Some(argunix_builders::BuildPhase::Pull) => {
-                    ("pull", "bg-emerald-100 text-emerald-700")
+                Some(argunix_builders::BuildPhase::Push) => {
+                    ("push", "bg-warn-soft text-warn-strong")
                 }
+                Some(argunix_builders::BuildPhase::Build) => {
+                    ("build", "bg-info-soft text-info-strong")
+                }
+                Some(argunix_builders::BuildPhase::Pull) => ("pull", "bg-ok-soft text-ok-strong"),
                 None => ("", ""),
             };
             RunningRow {
@@ -604,7 +606,7 @@ fn build_builder_row(
     let (status, status_class, is_online, in_flight, caps) = if row.revoked_at.is_some() {
         (
             "revoked",
-            "bg-rose-100 text-rose-800",
+            "bg-fail-soft text-fail-strong",
             false,
             0u32,
             &row.capabilities,
@@ -613,14 +615,14 @@ fn build_builder_row(
         match snap.state {
             ConnState::Active => (
                 "online",
-                "bg-emerald-100 text-emerald-800",
+                "bg-ok-soft text-ok-strong",
                 true,
                 snap.in_flight,
                 &snap.capabilities,
             ),
             ConnState::Disconnecting => (
                 "draining",
-                "bg-amber-100 text-amber-800",
+                "bg-warn-soft text-warn-strong",
                 true,
                 snap.in_flight,
                 &snap.capabilities,
@@ -629,7 +631,7 @@ fn build_builder_row(
     } else {
         (
             "offline",
-            "bg-slate-200 text-slate-700",
+            "bg-chip text-chip-fg",
             false,
             0u32,
             &row.capabilities,

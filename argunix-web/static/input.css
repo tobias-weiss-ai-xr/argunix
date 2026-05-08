@@ -4,7 +4,19 @@
  * which is what the daemon serves under `/static/ui.css`.
  *
  * Compiled by `nix/package.nix`'s postInstall step; the stale
- * `static/ui.css` checked into the repo is overwritten there. */
+ * `static/ui.css` checked into the repo is overwritten there.
+ *
+ * Theme model
+ * -----------
+ * Colours are addressed through *semantic* tokens (bg, surface, fg,
+ * muted, link, ok-soft, fail-strong, …) rather than raw palette names.
+ * The tokens live as CSS variables in `:root` for light mode and get
+ * overridden inside a `prefers-color-scheme: dark` media block, so the
+ * UI follows the OS preference automatically. The `@theme` block then
+ * publishes each variable as a Tailwind utility — `bg-bg`, `text-fg`,
+ * `border-border`, `bg-ok-soft text-ok-strong`, etc. — and templates
+ * use only those. To re-skin the whole app, edit the values in `:root`
+ * once; nothing else has to change. */
 @import "tailwindcss";
 
 /* Explicit globs so Tailwind v4's source detection works in clean build
@@ -12,9 +24,119 @@
  * package.json near input.css for the automatic root-walking heuristic
  * to latch onto). */
 @source "../templates/**/*.html";
-/* Status-badge colour classes (`bg-emerald-100`, `bg-rose-100`, …) are
+/* Status-badge colour classes (`bg-ok-soft`, `bg-fail-soft`, …) are
  * built in Rust handlers and only ever appear in the rendered HTML at
  * runtime — Tailwind can't see them in the templates. Pointing the
  * scanner at the crate's src/ too lets it pick those literals up from
  * the .rs files. */
 @source "../src/**/*.rs";
+
+@layer base {
+  :root {
+    color-scheme: light;
+
+    /* Surfaces & text */
+    --bg: #f8fafc; /* slate-50  — page background */
+    --surface: #ffffff; /* white     — cards / panels */
+    --fg: #0f172a; /* slate-900 — primary text */
+    --muted: #64748b; /* slate-500 — secondary text */
+    --subtle: #94a3b8; /* slate-400 — tertiary / placeholder text */
+    --border: #e2e8f0; /* slate-200 — table rows, separators */
+    --link: #2563eb; /* blue-600  — anchor colour */
+
+    /* Inline tags / chips (system + feature pills, neutral status) */
+    --chip-bg: #e2e8f0; /* slate-200 */
+    --chip-fg: #334155; /* slate-700 */
+
+    /* Code / log surfaces — kept terminal-dark in both modes */
+    --code-bg: #0f172a; /* slate-900 */
+    --code-fg: #f1f5f9; /* slate-100 */
+
+    /* Status-badge pairs (soft = background tint, strong = text) */
+    --ok-soft: #d1fae5; /* emerald-100 */
+    --ok-strong: #065f46; /* emerald-800 */
+    --info-soft: #dbeafe; /* blue-100 */
+    --info-strong: #1e40af; /* blue-800 */
+    --warn-soft: #fef3c7; /* amber-100 */
+    --warn-strong: #b45309; /* amber-700 */
+    --fail-soft: #ffe4e6; /* rose-100 */
+    --fail-strong: #9f1239; /* rose-800 */
+
+    /* Failure call-out box (lighter background, distinct border) */
+    --fail-faint: #fef2f2; /* red-50 */
+    --fail-edge: #fecaca; /* red-200 */
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+
+      --bg: #020617; /* slate-950 */
+      --surface: #0f172a; /* slate-900 */
+      --fg: #f1f5f9; /* slate-100 */
+      --muted: #94a3b8; /* slate-400 */
+      --subtle: #64748b; /* slate-500 */
+      --border: #1e293b; /* slate-800 */
+      --link: #60a5fa; /* blue-400 */
+
+      --chip-bg: #1e293b; /* slate-800 */
+      --chip-fg: #cbd5e1; /* slate-300 */
+
+      --code-bg: #020617; /* slate-950 */
+      --code-fg: #f1f5f9; /* slate-100 */
+
+      --ok-soft: #064e3b; /* emerald-900 */
+      --ok-strong: #6ee7b7; /* emerald-300 */
+      --info-soft: #1e3a8a; /* blue-900 */
+      --info-strong: #93c5fd; /* blue-300 */
+      --warn-soft: #78350f; /* amber-900 */
+      --warn-strong: #fcd34d; /* amber-300 */
+      --fail-soft: #881337; /* rose-900 */
+      --fail-strong: #fda4af; /* rose-300 */
+
+      --fail-faint: #450a0a; /* red-950 */
+      --fail-edge: #7f1d1d; /* red-900 */
+    }
+  }
+
+  body {
+    background-color: var(--bg);
+    color: var(--fg);
+    transition:
+      background-color 0.2s ease,
+      color 0.2s ease;
+  }
+}
+
+@theme {
+  /* Surfaces & text */
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+  --color-border: var(--border);
+  --color-link: var(--link);
+
+  /* Chips */
+  --color-chip: var(--chip-bg);
+  --color-chip-fg: var(--chip-fg);
+
+  /* Code / log */
+  --color-code: var(--code-bg);
+  --color-code-fg: var(--code-fg);
+
+  /* Status-badge pairs */
+  --color-ok-soft: var(--ok-soft);
+  --color-ok-strong: var(--ok-strong);
+  --color-info-soft: var(--info-soft);
+  --color-info-strong: var(--info-strong);
+  --color-warn-soft: var(--warn-soft);
+  --color-warn-strong: var(--warn-strong);
+  --color-fail-soft: var(--fail-soft);
+  --color-fail-strong: var(--fail-strong);
+
+  /* Failure call-out box */
+  --color-fail-faint: var(--fail-faint);
+  --color-fail-edge: var(--fail-edge);
+}

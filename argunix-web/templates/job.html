@@ -2,31 +2,31 @@
 <h1 class="text-2xl font-semibold font-mono mb-2">{{ attr_path }}</h1>
 <p class="mb-4">
   <a
-    class="text-blue-600 hover:underline"
+    class="text-link hover:underline"
     href="/r/{{ forge }}/{{ slug }}/eval/{{ eval_id }}"
     >← eval #{{ eval_id }}</a
   >
 </p>
 
 <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm mb-4">
-  <dt class="text-slate-500">system</dt>
+  <dt class="text-muted">system</dt>
   <dd class="font-mono">{{ system }}</dd>
-  <dt class="text-slate-500">status</dt>
+  <dt class="text-muted">status</dt>
   <dd>{{ status_label }}</dd>
-  <dt class="text-slate-500">started</dt>
-  <dd class="text-slate-500">{{ started }}</dd>
-  <dt class="text-slate-500">finished</dt>
-  <dd class="text-slate-500">{{ finished }}</dd>
-  <dt class="text-slate-500">total</dt>
+  <dt class="text-muted">started</dt>
+  <dd class="text-muted">{{ started }}</dd>
+  <dt class="text-muted">finished</dt>
+  <dd class="text-muted">{{ finished }}</dd>
+  <dt class="text-muted">total</dt>
   <dd class="font-mono">{{ total }}</dd>
   {% if let Some(d) = drv_path %}
-  <dt class="text-slate-500">derivation</dt>
+  <dt class="text-muted">derivation</dt>
   <dd class="font-mono break-all">{{ d }}</dd>
   {% endif %} {% if let Some(o) = output_path %}
-  <dt class="text-slate-500">output</dt>
+  <dt class="text-muted">output</dt>
   <dd class="font-mono break-all">{{ o }}</dd>
   {% endif %} {% if let Some(b) = live_builder %}
-  <dt class="text-slate-500">builder</dt>
+  <dt class="text-muted">builder</dt>
   <dd class="font-mono">{{ b }}</dd>
   {% endif %}
 </dl>
@@ -35,25 +35,25 @@
 <section class="mb-6" id="live-stats" data-builder="{{ builder_name }}">
   <h2 class="text-lg font-semibold mb-2">live (5s)</h2>
   <div class="grid grid-cols-3 gap-4 text-sm">
-    <figure class="border border-slate-200 rounded p-2">
-      <figcaption class="text-slate-500 mb-1">
-        cpu <span data-field="cpu" class="font-mono text-slate-800">—</span>
+    <figure class="border border-border rounded p-2">
+      <figcaption class="text-muted mb-1">
+        cpu <span data-field="cpu" class="font-mono text-fg">—</span>
       </figcaption>
       <svg data-spark="cpu" viewBox="0 0 120 30" class="w-full h-8" preserveAspectRatio="none">
         <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
       </svg>
     </figure>
-    <figure class="border border-slate-200 rounded p-2">
-      <figcaption class="text-slate-500 mb-1">
-        load1 <span data-field="load" class="font-mono text-slate-800">—</span>
+    <figure class="border border-border rounded p-2">
+      <figcaption class="text-muted mb-1">
+        load1 <span data-field="load" class="font-mono text-fg">—</span>
       </figcaption>
       <svg data-spark="load" viewBox="0 0 120 30" class="w-full h-8" preserveAspectRatio="none">
         <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
       </svg>
     </figure>
-    <figure class="border border-slate-200 rounded p-2">
-      <figcaption class="text-slate-500 mb-1">
-        mem <span data-field="mem" class="font-mono text-slate-800">—</span>
+    <figure class="border border-border rounded p-2">
+      <figcaption class="text-muted mb-1">
+        mem <span data-field="mem" class="font-mono text-fg">—</span>
       </figcaption>
       <svg data-spark="mem" viewBox="0 0 120 30" class="w-full h-8" preserveAspectRatio="none">
         <polyline fill="none" stroke="currentColor" stroke-width="1" points="" />
@@ -64,21 +64,21 @@
 
 <section class="mb-6">
   <h2 class="text-lg font-semibold mb-2">live log</h2>
-  <pre id="live-log" data-job-id="{{ job_id }}" class="bg-slate-900 text-slate-100 text-xs font-mono p-3 rounded h-96 overflow-auto whitespace-pre-wrap"></pre>
+  <pre id="live-log" data-job-id="{{ job_id }}" class="bg-code text-code-fg text-xs font-mono p-3 rounded h-96 overflow-auto whitespace-pre-wrap"></pre>
 </section>
 {% endif %}
 
 {% if phase_metrics.has_any %}
 <section class="mb-6">
   <h2 class="text-lg font-semibold mb-2">transport &amp; build</h2>
-  <p class="text-xs text-slate-500 mb-2">
+  <p class="text-xs text-muted mb-2">
     Time and data spent uploading the build inputs to the builder,
     running the build, and downloading the outputs back. Bytes are
     measured between argunix and the builder; the build duration is
     the build itself, not including transfer.
   </p>
   <table class="text-sm border-collapse">
-    <thead class="text-left text-slate-500">
+    <thead class="text-left text-muted">
       <tr>
         <th class="py-1 pr-6">phase</th>
         <th class="py-1 pr-6">duration</th>
@@ -86,17 +86,17 @@
       </tr>
     </thead>
     <tbody>
-      <tr class="border-t border-slate-200">
+      <tr class="border-t border-border">
         <td class="py-1 pr-6">push (drv closure → builder)</td>
         <td class="py-1 pr-6 font-mono">{{ phase_metrics.push_ms }}</td>
         <td class="py-1 font-mono">{{ phase_metrics.push_bytes }}</td>
       </tr>
-      <tr class="border-t border-slate-200">
+      <tr class="border-t border-border">
         <td class="py-1 pr-6">build (net, on builder)</td>
         <td class="py-1 pr-6 font-mono">{{ phase_metrics.build_ms }}</td>
-        <td class="py-1 text-slate-400">—</td>
+        <td class="py-1 text-subtle">—</td>
       </tr>
-      <tr class="border-t border-slate-200">
+      <tr class="border-t border-border">
         <td class="py-1 pr-6">pull (output closure ← builder)</td>
         <td class="py-1 pr-6 font-mono">{{ phase_metrics.pull_ms }}</td>
         <td class="py-1 font-mono">{{ phase_metrics.pull_bytes }}</td>
@@ -109,7 +109,7 @@
 {% if has_log %}
 <p>
   <a
-    class="text-blue-600 hover:underline"
+    class="text-link hover:underline"
     href="/r/{{ forge }}/{{ slug }}/eval/{{ eval_id }}/job/{{ attr_path }}/log"
     >view build log</a
   >
