@@ -222,10 +222,19 @@ async fn handle_inner(
         return Ok(StatusCode::ACCEPTED);
     };
 
+    // Repo metadata (display name, description, forge web_url) is a
+    // property of the repo itself, not of the event. Refresh it on
+    // every signature-verified webhook — including ones the policy
+    // is about to drop — so e.g. a push to an unwatched branch
+    // still keeps `name` / `web_url` current and the /repos page's
+    // "pending" table doesn't sit forever with empty fields.
+    let repo_id = state.store.upsert(&repo_cfg.forge, &slug).await?;
+    refresh_repo_metadata(&state, repo_id, &event).await;
+
     match crate::policy::evaluate(&provider, repo_cfg, &event, &repo_cfg.forge, &state.pauses).await
     {
         crate::policy::Decision::Build => {
-            persist(&state, &repo_cfg.forge, &provider, event).await?;
+            persist(&state, &repo_cfg.forge, &provider, event, repo_id).await?;
         }
         decision => {
             tracing::info!(
@@ -238,82 +247,86 @@ async fn handle_inner(
     Ok(StatusCode::ACCEPTED)
 }
 
-async fn persist(
+/// Pull `(repo_name, repo_description, repo_web_url)` from a
+/// normalised event and write it onto the repo row. Failures are
+/// logged at WARN — metadata is cosmetic and the event-driven
+/// build path downstream is what matters for correctness.
+async fn refresh_repo_metadata(
     state: &AppState,
-    forge_name: &str,
-    provider: &Arc<dyn Provider>,
-    event: NormalizedEvent,
-) -> Result<(), WebhookError> {
-    let (slug, git_ref, sha, trigger, pr_number, repo_name, repo_description, repo_web_url) =
-        match &event {
-            NormalizedEvent::Push(PushEvent {
-                slug,
-                git_ref,
-                sha,
-                repo_name,
-                repo_description,
-                repo_web_url,
-                ..
-            }) => (
-                slug.clone(),
-                // Strip the `refs/heads/` prefix on storage so the UI can
-                // render `git_ref` directly and branch links can be built
-                // as `{repo_url}/tree/{git_ref}`. Tag pushes are filtered
-                // by `policy::branch_matches` upstream, so non-matching
-                // shapes never reach this point. PR-triggered evals use
-                // the synthetic `refs/pull/<n>/head:<branch>` form below
-                // and are not affected.
-                git_ref
-                    .strip_prefix("refs/heads/")
-                    .unwrap_or(git_ref)
-                    .to_string(),
-                sha.clone(),
-                "push".to_string(),
-                None,
-                repo_name.clone(),
-                repo_description.clone(),
-                repo_web_url.clone(),
-            ),
-            NormalizedEvent::PullRequest(PullRequestEvent {
-                slug,
-                pr_number,
-                head_sha,
-                head_ref,
-                repo_name,
-                repo_description,
-                repo_web_url,
-                ..
-            }) => (
-                slug.clone(),
-                format!("refs/pull/{pr_number}/head:{head_ref}"),
-                head_sha.clone(),
-                "pull_request".to_string(),
-                u32::try_from(*pr_number).ok(),
-                repo_name.clone(),
-                repo_description.clone(),
-                repo_web_url.clone(),
-            ),
-        };
-
-    let repo_id = state.store.upsert(forge_name, &slug).await?;
+    repo_id: argunix_domain::RepoId,
+    event: &NormalizedEvent,
+) {
+    let (name, description, web_url) = match event {
+        NormalizedEvent::Push(p) => (
+            p.repo_name.as_deref(),
+            p.repo_description.as_deref(),
+            p.repo_web_url.as_deref(),
+        ),
+        NormalizedEvent::PullRequest(p) => (
+            p.repo_name.as_deref(),
+            p.repo_description.as_deref(),
+            p.repo_web_url.as_deref(),
+        ),
+    };
     if let Err(e) = state
         .store
-        .set_metadata(
-            repo_id,
-            repo_name.as_deref(),
-            repo_description.as_deref(),
-            repo_web_url.as_deref(),
-        )
+        .set_metadata(repo_id, name, description, web_url)
         .await
     {
-        // Cosmetic data — log and continue rather than failing the
-        // webhook ack.
         tracing::warn!(
             error = %e,
             repo_id = repo_id.get(),
             "set_metadata failed; continuing without updating display fields",
         );
     }
+}
+
+async fn persist(
+    state: &AppState,
+    forge_name: &str,
+    provider: &Arc<dyn Provider>,
+    event: NormalizedEvent,
+    repo_id: argunix_domain::RepoId,
+) -> Result<(), WebhookError> {
+    // `forge_name` is retained because the cancel-on-new-push log
+    // line and provider-side check posts both use it; the repo row
+    // itself was already upserted (and its metadata refreshed) by
+    // the caller before the policy check.
+    let _ = forge_name;
+    let (slug, git_ref, sha, trigger, pr_number) = match &event {
+        NormalizedEvent::Push(PushEvent {
+            slug, git_ref, sha, ..
+        }) => (
+            slug.clone(),
+            // Strip the `refs/heads/` prefix on storage so the UI can
+            // render `git_ref` directly and branch links can be built
+            // as `{repo_url}/tree/{git_ref}`. Tag pushes are filtered
+            // by `policy::branch_matches` upstream, so non-matching
+            // shapes never reach this point. PR-triggered evals use
+            // the synthetic `refs/pull/<n>/head:<branch>` form below
+            // and are not affected.
+            git_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(git_ref)
+                .to_string(),
+            sha.clone(),
+            "push".to_string(),
+            None,
+        ),
+        NormalizedEvent::PullRequest(PullRequestEvent {
+            slug,
+            pr_number,
+            head_sha,
+            head_ref,
+            ..
+        }) => (
+            slug.clone(),
+            format!("refs/pull/{pr_number}/head:{head_ref}"),
+            head_sha.clone(),
+            "pull_request".to_string(),
+            u32::try_from(*pr_number).ok(),
+        ),
+    };
 
     // Q99: drop duplicate `(repo_id, sha)` events within the configured
     // window. GitHub sends both a `push` and a `pull_request.synchronize`
