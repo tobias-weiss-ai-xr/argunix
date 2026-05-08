@@ -515,12 +515,26 @@ fn parse_pull_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
             .username
             .or(view.pull_request.user.login)
             .unwrap_or_default(),
-        action: PullRequestAction::from_str(&view.action),
+        action: PullRequestAction::from_str(map_forgejo_action(&view.action)),
         is_fork,
         repo_name: view.repository.name,
         repo_description: view.repository.description.filter(|s| !s.is_empty()),
         repo_web_url: view.repository.html_url.filter(|s| !s.is_empty()),
     })
+}
+
+/// Translate Forgejo / Gitea PR action labels into the GitHub-style
+/// vocabulary that `PullRequestAction::from_str` expects. The two
+/// forges agree on most names (`opened`, `closed`, `reopened`,
+/// `edited`); the load-bearing difference is `synchronized` (past
+/// tense) for "new commits pushed to PR" — GitHub uses
+/// `synchronize`. Without this mapping every push to an existing
+/// Forgejo PR would arrive as `Other` and be dropped by policy.
+fn map_forgejo_action(s: &str) -> &str {
+    match s {
+        "synchronized" => "synchronize",
+        other => other,
+    }
 }
 
 #[cfg(test)]

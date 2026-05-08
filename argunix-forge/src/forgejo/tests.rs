@@ -107,6 +107,45 @@ async fn parses_pull_request_event() {
 }
 
 #[tokio::test]
+async fn synchronized_action_normalizes_to_synchronize() {
+    // Forgejo / Gitea sends `synchronized` (past tense) when new
+    // commits land on an existing PR; GitHub uses `synchronize`.
+    // Without the per-forge mapping this would arrive as `Other`
+    // and policy would drop it as `DropPrIgnoredAction`.
+    let p = ForgejoProvider::new("http://unused".into(), "tok".into(), "https://m".into());
+    let body = serde_json::json!({
+        "action": "synchronized",
+        "number": 7,
+        "repository": { "full_name": "alice/myrepo" },
+        "pull_request": {
+            "user": { "username": "alice" },
+            "head": {
+                "ref": "feature-x",
+                "sha": "1111111111111111111111111111111111111111",
+                "repo": { "full_name": "alice/myrepo" }
+            },
+            "base": {
+                "ref": "main",
+                "sha": "2222222222222222222222222222222222222222",
+                "repo": { "full_name": "alice/myrepo" }
+            }
+        }
+    })
+    .to_string();
+    let headers = vec![("X-Gitea-Event".to_string(), "pull_request".to_string())];
+    let evt = p
+        .parse_event(&headers, body.as_bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    let NormalizedEvent::PullRequest(pr) = evt else {
+        panic!("expected PR")
+    };
+    assert_eq!(pr.action, PullRequestAction::Synchronize);
+    assert!(pr.action.should_evaluate());
+}
+
+#[tokio::test]
 async fn ping_event_is_dropped() {
     let p = ForgejoProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let headers = vec![("X-Gitea-Event".to_string(), "ping".to_string())];
