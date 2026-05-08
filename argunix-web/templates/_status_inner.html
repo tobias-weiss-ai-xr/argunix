@@ -91,7 +91,7 @@
             >#{{ e.eval_id }}</a
           >
         </td>
-        <td class="py-2 pr-4">
+        <td class="py-2 pr-4 flex flex-col">
           <a class="text-link hover:underline" href="/r/{{ e.forge }}/{{ e.slug }}"
             >{{ e.forge }}/{{ e.slug }}</a
           >
@@ -119,10 +119,10 @@
         <th class="py-2 pr-4">repo</th>
         <th class="py-2 pr-4">eval</th>
         <th class="py-2 pr-4">attr</th>
-        <th class="py-2 pr-4">system</th>
-        <th class="py-2 pr-4">builder</th>
-        <th class="py-2 pr-4">phase</th>
-        <th class="py-2">started</th>
+        <th class="py-2 pr-4 hidden md:table-cell">system</th>
+        <th class="py-2 pr-4 hidden md:table-cell">builder</th>
+        <th class="py-2 pr-4 hidden md:table-cell">phase</th>
+        <th class="py-2 hidden md:table-cell">started</th>
       </tr>
     </thead>
     <tbody>
@@ -148,9 +148,9 @@
             >{{ r.attr_path }}</a
           >
         </td>
-        <td class="py-2 pr-4 font-mono text-xs">{{ r.system }}</td>
-        <td class="py-2 pr-4 font-mono text-xs">{{ r.builder }}</td>
-        <td class="py-2 pr-4">
+        <td class="py-2 pr-4 font-mono text-xs hidden md:table-cell">{{ r.system }}</td>
+        <td class="py-2 pr-4 font-mono text-xs hidden md:table-cell">{{ r.builder }}</td>
+        <td class="py-2 pr-4 hidden md:table-cell">
           {% if r.phase.is_empty() %}
           <span class="text-subtle text-xs">—</span>
           {% else %}
@@ -159,7 +159,7 @@
           >
           {% endif %}
         </td>
-        <td class="py-2 text-muted text-xs">{{ r.started }}</td>
+        <td class="py-2 text-muted text-xs hidden md:table-cell">{{ r.started }}</td>
       </tr>
       {% endfor %}
     </tbody>
