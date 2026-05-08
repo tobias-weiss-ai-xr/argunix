@@ -1,0 +1,89 @@
+@startuml closure-transfer
+' note that we need to add some hypen utf letter instead of real dash
+' for stuff like --add --bla so plantuml does not think it's meant
+' for strike-through text. ‐‐‐‐
+title Argunix: Derivation closure push, build, and result closure pull
+
+skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 12
+skinparam BoxPadding 10
+
+box "argunix-daemon (host)" #FAF3E0
+participant "worker\n(build_one /\ndispatch_pool_build)" as W
+participant "BuilderDispatcher\n(dispatcher.rs)" as DISP
+participant "nix copy\n(subprocess)" as NCP
+participant "Unix socket\n/tmp/.../nix-daemon.sock" as USOCK
+end box
+
+box "SSH transport (russh)" #E8F1FA
+participant "control channel\n(persistent, JSON-lines)" as CTRL
+participant "side channel\n(ephemeral, binary)" as SIDE
+end box
+
+box "argunix-builder (remote agent)" #EAF7E8
+participant "agent\n(serve_one_connection /\nhandle_build)" as AG
+participant "side_channel\ndispatch_inbound" as SCI
+participant "system nix-daemon\n(/nix/var/nix/daemon-socket)" as ND
+participant "nix-store --realise" as NSR
+end box
+
+== Connection setup (once, at agent startup) ==
+AG -> CTRL : SSH connect, auth (pubkey/TOFU)
+AG -> CTRL : Hello { name, systems, features, max_jobs }
+CTRL --> AG : Welcome { builder_id }
+note over AG, CTRL : Control channel stays open;\nperiodic Heartbeat { ts, stats }
+
+== Phase 1: PUSH derivation closure to builder ==
+W -> DISP : nix_copy_over_pool(To, [drv_path])
+DISP -> USOCK : bind temp Unix socket
+DISP -> NCP : spawn  nix copy --to\n  ssh-ng://localhost?remote-program=tunnel.sh%20<sock>\n  <drv_path>
+NCP -> USOCK : connect (speaks nix-daemon protocol)
+DISP -> SIDE : open_channel() + write\nSideChannelHeader { kind: NixDaemonStdio, build_id }
+SIDE -> SCI  : header + raw daemon-protocol bytes
+SCI -> ND    : connect /nix/var/nix/daemon-socket
+USOCK <-> SIDE : bidirectional pipe (channel_io::with_channel_io)
+SIDE   <-> SCI  : bidirectional pipe
+SCI    <-> ND   : bidirectional pipe
+note over NCP, ND
+  nix copy expands the closure and streams per-file via the daemon protocol — no whole-NAR buffering, bounded memory.
+end note
+NCP --> DISP : exit 0   (closure now in agent's store)
+
+== Phase 2: Build control message ==
+W -> DISP : dispatch_build(build_id, drv_path, gc_root, timeout, max_log_bytes)
+DISP -> CTRL : ControlMessage::Build { ... } as JSON line
+CTRL -> AG : decode (LineFramer) -> spawn handle_build
+AG -> NSR : nix-store --realise <drv_path>\n  [‐-add-root <gc_root>] [--option build-timeout N]
+AG -> CTRL : BuildStarted { build_id, pid }
+CTRL -> W  : BuildLifecycle::Started { pid }
+
+loop while build is running
+  NSR --> AG  : stderr chunk
+  AG -> CTRL : BuildLogChunk { bytes_b64 }   (capped at max_log_bytes)
+  CTRL -> W  : BuildLifecycle::LogChunk
+end
+
+NSR --> AG  : exit + stdout = output paths
+AG -> CTRL : BuildFinished { status, exit_code, output_paths, log_truncated }
+CTRL -> W  : BuildLifecycle::Finished
+
+alt cancellation requested
+  W -> CTRL : ControlMessage::Abort { build_id }
+  CTRL -> AG : abort_rx fires -> SIGKILL child
+end
+
+== Phase 3: PULL output closure from builder ==
+W -> DISP : nix_copy_over_pool(From, output_paths)
+DISP -> USOCK : bind another temp Unix socket
+DISP -> NCP : spawn  nix copy --from\n  ssh-ng://localhost?remote-program=tunnel.sh%20<sock>\n  <output_paths>
+DISP -> SIDE : open_channel() + SideChannelHeader { NixDaemonStdio }
+SIDE -> SCI  : header + bytes
+SCI -> ND    : connect /nix/var/nix/daemon-socket
+USOCK <-> SIDE : bidirectional pipe
+SIDE   <-> SCI  : bidirectional pipe
+SCI    <-> ND   : bidirectional pipe
+NCP --> DISP : exit 0   (outputs now in daemon's store)
+
+W -> W : nix-store ‐-add-root --indirect (anchor outputs vs GC)
+
+@enduml
