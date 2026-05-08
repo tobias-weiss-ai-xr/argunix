@@ -130,12 +130,40 @@ impl Default for Schedule {
     }
 }
 
-/// Retention rules. Defaults: keep everything forever (Q11).
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Retention rules. Defaults: keep everything forever (Q11) and tick
+/// hourly (Q25 / M10). `interval_minutes` and `max_size_gb` are global
+/// only — sizing across repos is the budget operators actually care
+/// about, and one ticker fits all. Per-repo override is a separate
+/// [`RepoRetention`] carried on each [`Repo`].
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Retention {
     pub max_age_days: Option<u32>,
     pub max_size_gb: Option<u64>,
+    #[serde(default = "default_retention_interval_minutes")]
+    pub interval_minutes: u32,
+}
+
+fn default_retention_interval_minutes() -> u32 {
+    60
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            max_age_days: None,
+            max_size_gb: None,
+            interval_minutes: default_retention_interval_minutes(),
+        }
+    }
+}
+
+/// Per-repo retention override. Only `max_age_days` is overridable;
+/// the size budget and tick interval are global.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoRetention {
+    pub max_age_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -296,6 +324,16 @@ pub struct Repo {
     pub eval: EvalOverrides,
     pub collapsed_check_threshold: Option<u32>,
     pub weight: u32,
+    pub retention: RepoRetention,
+}
+
+impl Repo {
+    /// Effective `max_age_days` for this repo: the per-repo override
+    /// when set, falling back to the global `Retention.max_age_days`.
+    /// `None` from both means "no age cap for this repo".
+    pub fn effective_max_age_days(&self, global: &Retention) -> Option<u32> {
+        self.retention.max_age_days.or(global.max_age_days)
+    }
 }
 
 fn default_watched_branches() -> Vec<String> {
@@ -410,6 +448,8 @@ struct WireRepo {
     collapsed_check_threshold: Option<u32>,
     #[serde(default = "default_weight")]
     weight: u32,
+    #[serde(default)]
+    retention: RepoRetention,
 }
 
 impl TryFrom<WireConfig> for Config {
@@ -434,6 +474,7 @@ impl TryFrom<WireConfig> for Config {
                     eval: wire_repo.eval,
                     collapsed_check_threshold: wire_repo.collapsed_check_threshold,
                     weight: wire_repo.weight,
+                    retention: wire_repo.retention,
                 });
             }
             forges.insert(
@@ -508,6 +549,54 @@ forges:
             c.forges["github-myorg"].auth().unwrap(),
             ForgeAuth::Token { .. }
         ));
+    }
+
+    #[test]
+    fn retention_defaults_keep_forever_with_hourly_tick() {
+        let c = parse(&minimal_yaml());
+        assert!(c.retention.max_age_days.is_none());
+        assert!(c.retention.max_size_gb.is_none());
+        assert_eq!(c.retention.interval_minutes, 60);
+        assert!(c.repos[0].retention.max_age_days.is_none());
+        assert_eq!(c.repos[0].effective_max_age_days(&c.retention), None);
+    }
+
+    #[test]
+    fn parses_retention_with_per_repo_override() {
+        let s = r#"
+external_url: https://argunix.example.com
+retention:
+  max_age_days: 30
+  max_size_gb: 50
+  interval_minutes: 15
+forges:
+  gh:
+    kind: github
+    web_url: https://github.com
+    token_path: /tmp/tok
+    repos:
+      slow/burner: {}
+      fast/churn:
+        retention:
+          max_age_days: 3
+"#;
+        let c = parse(s);
+        assert_eq!(c.retention.max_age_days, Some(30));
+        assert_eq!(c.retention.max_size_gb, Some(50));
+        assert_eq!(c.retention.interval_minutes, 15);
+
+        let by_slug: std::collections::BTreeMap<_, _> =
+            c.repos.iter().map(|r| (r.slug.as_str(), r)).collect();
+        // No override → falls back to global 30.
+        assert_eq!(
+            by_slug["slow/burner"].effective_max_age_days(&c.retention),
+            Some(30)
+        );
+        // Override wins → 3.
+        assert_eq!(
+            by_slug["fast/churn"].effective_max_age_days(&c.retention),
+            Some(3)
+        );
     }
 
     #[test]

@@ -177,6 +177,37 @@ pub trait EvalStore: Send + Sync {
         status: EvalStatus,
         limit: u32,
     ) -> Result<Vec<EvalWithRepo>, StoreError>;
+
+    /// Retention pickers (M10). Both filter to *terminal* statuses
+    /// (`evaluation_failed`, `done`, `cancelled`) — in-flight evals are
+    /// never returned. Both also require `finished_at IS NOT NULL` so a
+    /// terminal row that somehow lost its timestamp can't be selected.
+    ///
+    /// Age-based picker: every terminal eval for `repo_id` whose
+    /// `finished_at` is at or before `cutoff`. Used by the per-repo
+    /// max-age sweep.
+    async fn list_terminal_evals_older_than(
+        &self,
+        repo_id: RepoId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<EvalRecord>, StoreError>;
+
+    /// Size-based picker: terminal evals across all repos, oldest
+    /// `finished_at` first, capped at `limit`. The GC walks this list
+    /// deleting one eval at a time, re-measuring on-disk size after
+    /// each, until under the budget.
+    async fn list_terminal_evals_oldest_first(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<EvalRecord>, StoreError>;
+
+    /// Cascade-delete one evaluation: removes its `queue` rows,
+    /// `forge_status` rows, `jobs` rows, and the `evaluations` row
+    /// itself in a single transaction. Mirrors the cascade shape used
+    /// by `RepoStore::prune_repos_not_in`. The caller is responsible
+    /// for cleaning up on-disk state (logs, GC roots) keyed on
+    /// `<repo_id>/<eval_id>/`. No-op if the row doesn't exist.
+    async fn delete_eval_cascade(&self, eval_id: EvalId) -> Result<(), StoreError>;
 }
 
 #[async_trait]

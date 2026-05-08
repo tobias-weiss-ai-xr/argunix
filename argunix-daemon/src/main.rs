@@ -1,4 +1,5 @@
 mod control;
+mod gc;
 mod worker;
 
 use anyhow::{Context, anyhow};
@@ -333,6 +334,16 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     )
     .await
     .context("starting builder enrollment server")?;
+    // Retention GC (M10). Background ticker; aborted at shutdown
+    // alongside the control + builder tasks. No-op on a config with
+    // no `retention.max_age_days` and no `retention.max_size_gb`.
+    let gc_handle = gc::spawn(gc::GcContext {
+        current: current.clone(),
+        store: store.clone(),
+        log_dir: log_dir.clone(),
+        gc_root_dir: gc_root_dir.clone(),
+    });
+
     let control_handle = control::spawn(control::ControlContext {
         socket_path: control_path,
         app_state: app_state.clone(),
@@ -403,6 +414,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     //   3. Drop the local `app_state` Arc held by main itself.
     control_handle.abort();
     let _ = control_handle.await;
+    gc_handle.abort();
+    let _ = gc_handle.await;
     drop(app_state);
 
     // Stop the builder enrollment server cleanly when configured.

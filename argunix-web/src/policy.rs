@@ -170,6 +170,7 @@ mod tests {
             eval: EvalOverrides::default(),
             collapsed_check_threshold: None,
             weight: 1,
+            retention: argunix_config::RepoRetention::default(),
         }
     }
 

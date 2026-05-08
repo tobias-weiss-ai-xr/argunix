@@ -284,6 +284,7 @@ dependencies = [
  "russh",
  "sd-notify",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

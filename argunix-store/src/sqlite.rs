@@ -569,6 +569,70 @@ impl EvalStore for SqlxStore {
             })
             .collect()
     }
+
+    async fn list_terminal_evals_older_than(
+        &self,
+        repo_id: RepoId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<EvalRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at, failure_reason
+             FROM evaluations
+             WHERE repo_id = ?1
+               AND status IN ('evaluation_failed', 'done', 'cancelled')
+               AND finished_at IS NOT NULL
+               AND finished_at <= ?2
+             ORDER BY finished_at ASC, id ASC",
+        )
+        .bind(repo_id.get())
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_eval).collect()
+    }
+
+    async fn list_terminal_evals_oldest_first(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<EvalRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at, failure_reason
+             FROM evaluations
+             WHERE status IN ('evaluation_failed', 'done', 'cancelled')
+               AND finished_at IS NOT NULL
+             ORDER BY finished_at ASC, id ASC
+             LIMIT ?1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_eval).collect()
+    }
+
+    async fn delete_eval_cascade(&self, eval_id: EvalId) -> Result<(), StoreError> {
+        // Order matters: queue → forge_status → jobs → evaluations,
+        // mirroring the per-repo prune cascade in `prune_repos_not_in`.
+        let mut tx = self.pool.begin().await?;
+        let id = eval_id.get();
+        sqlx::query("DELETE FROM queue WHERE job_id IN (SELECT id FROM jobs WHERE eval_id = ?1)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM forge_status WHERE eval_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM jobs WHERE eval_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM evaluations WHERE id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1405,6 +1469,221 @@ mod tests {
             .unwrap();
         assert_eq!(pruned.len(), 0);
         assert_eq!(<SqlxStore as RepoStore>::list(&s).await.unwrap().len(), 1);
+    }
+
+    /// Helper for the retention tests: create an eval, finish it with the
+    /// supplied status + timestamp, optionally with a job. The job lets
+    /// us verify the cascade reaches it on delete.
+    async fn make_finished_eval(
+        s: &SqlxStore,
+        repo_id: RepoId,
+        sha_pad: char,
+        status: EvalStatus,
+        finished_at: DateTime<Utc>,
+        with_job: bool,
+    ) -> EvalId {
+        let eval_id = <SqlxStore as EvalStore>::create(
+            s,
+            NewEvaluation {
+                repo_id,
+                trigger: "push".into(),
+                git_ref: "refs/heads/main".into(),
+                sha: Sha::new(sha_pad.to_string().repeat(40)).unwrap(),
+                pr_number: None,
+            },
+        )
+        .await
+        .unwrap();
+        if with_job {
+            let _ = <SqlxStore as JobStore>::create(
+                s,
+                NewJob {
+                    eval_id,
+                    attr_path: AttrPath::new(format!("packages.x86_64-linux.j{sha_pad}")),
+                    drv_path: None,
+                    system: "x86_64-linux".into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        <SqlxStore as EvalStore>::finish(s, eval_id, status, finished_at)
+            .await
+            .unwrap();
+        eval_id
+    }
+
+    #[tokio::test]
+    async fn list_terminal_evals_older_than_filters_status_and_age() {
+        let s = store().await;
+        let repo_id = <SqlxStore as RepoStore>::upsert(&s, "gh", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let day = chrono::Duration::days(1);
+
+        let old_done =
+            make_finished_eval(&s, repo_id, '1', EvalStatus::Done, now - day * 30, false).await;
+        let old_failed = make_finished_eval(
+            &s,
+            repo_id,
+            '2',
+            EvalStatus::EvaluationFailed,
+            now - day * 20,
+            false,
+        )
+        .await;
+        let recent_done =
+            make_finished_eval(&s, repo_id, '3', EvalStatus::Done, now - day * 2, false).await;
+
+        // A non-terminal eval that is *technically* older than the cutoff
+        // — it must never be selected, even with a finished_at backstop.
+        let evaluating = <SqlxStore as EvalStore>::create(
+            &s,
+            NewEvaluation {
+                repo_id,
+                trigger: "push".into(),
+                git_ref: "refs/heads/main".into(),
+                sha: Sha::new("4".repeat(40)).unwrap(),
+                pr_number: None,
+            },
+        )
+        .await
+        .unwrap();
+        <SqlxStore as EvalStore>::set_status(&s, evaluating, EvalStatus::Evaluating)
+            .await
+            .unwrap();
+
+        // Cutoff = 7 days ago: only the two old terminal evals should match.
+        let cutoff = now - day * 7;
+        let picked = <SqlxStore as EvalStore>::list_terminal_evals_older_than(&s, repo_id, cutoff)
+            .await
+            .unwrap();
+        let ids: Vec<EvalId> = picked.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![old_done, old_failed]);
+        assert!(!ids.contains(&recent_done));
+        assert!(!ids.contains(&evaluating));
+    }
+
+    #[tokio::test]
+    async fn list_terminal_evals_oldest_first_orders_globally() {
+        let s = store().await;
+        let r1 = <SqlxStore as RepoStore>::upsert(&s, "gh", &Slug::new("a/one").unwrap())
+            .await
+            .unwrap();
+        let r2 = <SqlxStore as RepoStore>::upsert(&s, "gh", &Slug::new("a/two").unwrap())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let day = chrono::Duration::days(1);
+
+        let oldest = make_finished_eval(&s, r1, '1', EvalStatus::Done, now - day * 10, false).await;
+        let middle =
+            make_finished_eval(&s, r2, '2', EvalStatus::Cancelled, now - day * 5, false).await;
+        let newest = make_finished_eval(&s, r1, '3', EvalStatus::Done, now - day, false).await;
+
+        let picked = <SqlxStore as EvalStore>::list_terminal_evals_oldest_first(&s, 10)
+            .await
+            .unwrap();
+        let ids: Vec<EvalId> = picked.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![oldest, middle, newest]);
+
+        // Limit is honored.
+        let picked = <SqlxStore as EvalStore>::list_terminal_evals_oldest_first(&s, 2)
+            .await
+            .unwrap();
+        assert_eq!(picked.len(), 2);
+        assert_eq!(picked[0].id, oldest);
+        assert_eq!(picked[1].id, middle);
+    }
+
+    #[tokio::test]
+    async fn delete_eval_cascade_removes_eval_and_dependents() {
+        let s = store().await;
+        let repo_id = <SqlxStore as RepoStore>::upsert(&s, "gh", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let target = make_finished_eval(
+            &s,
+            repo_id,
+            '1',
+            EvalStatus::Done,
+            now - chrono::Duration::days(40),
+            true,
+        )
+        .await;
+        let neighbour = make_finished_eval(
+            &s,
+            repo_id,
+            '2',
+            EvalStatus::Done,
+            now - chrono::Duration::days(2),
+            true,
+        )
+        .await;
+
+        // forge_status row to confirm it's swept too.
+        <SqlxStore as ForgeStatusStore>::upsert(&s, target, "github", Some("status:1234"))
+            .await
+            .unwrap();
+
+        <SqlxStore as EvalStore>::delete_eval_cascade(&s, target)
+            .await
+            .unwrap();
+
+        assert!(
+            <SqlxStore as EvalStore>::get(&s, target)
+                .await
+                .unwrap()
+                .is_none(),
+            "evaluation row should be gone"
+        );
+        assert_eq!(
+            <SqlxStore as JobStore>::list_by_eval(&s, target)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "job rows should be gone"
+        );
+        assert!(
+            <SqlxStore as ForgeStatusStore>::get(&s, target, "github")
+                .await
+                .unwrap()
+                .is_none(),
+            "forge_status rows should be gone"
+        );
+        // Neighbour eval untouched.
+        assert!(
+            <SqlxStore as EvalStore>::get(&s, neighbour)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            <SqlxStore as JobStore>::list_by_eval(&s, neighbour)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // Repo row also untouched — retention deletes evals, never repos.
+        assert!(
+            <SqlxStore as RepoStore>::get(&s, repo_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_eval_cascade_is_no_op_for_unknown_id() {
+        let s = store().await;
+        let phantom = EvalId::new(99999);
+        <SqlxStore as EvalStore>::delete_eval_cascade(&s, phantom)
+            .await
+            .unwrap();
     }
 
     fn caps(systems: &[&str], features: &[&str], max_jobs: u32) -> BuilderCapabilities {
