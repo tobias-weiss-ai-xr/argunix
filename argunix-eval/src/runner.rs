@@ -38,13 +38,22 @@ pub enum FragmentKind {
     /// Walk `<output>.<system>` once per system in the request.
     /// Standard for `packages`, `checks`, `devShells`.
     PerSystem,
-    /// Walk `<output>` once with no per-system fan-out and apply
-    /// `fn_expr` to each leaf to extract the buildable derivation.
-    /// The system is read off the resulting derivation rather than
-    /// imposed by the caller — that's how `nixosConfigurations.<name>`
-    /// (system-less attribute path, system determined by the module
-    /// itself) ends up with a correct `system` field downstream.
-    Apply { fn_expr: String },
+    /// Walk the flake's top-level `<output>` attrset once (no
+    /// per-system fan-out). `value_expr` is a Nix expression that, in
+    /// scope of one attribute value bound to `c`, evaluates to the
+    /// derivation we want to build — e.g.
+    /// `c.config.system.build.toplevel` for `nixosConfigurations`.
+    ///
+    /// We wrap that into nix-eval-jobs' `--select`, which transforms
+    /// the evaluation root *before* traversal. `--select` is the
+    /// right knob here because the values under `nixosConfigurations`
+    /// aren't derivations themselves — nix-eval-jobs would skip them
+    /// silently. (`--apply` does NOT help: it only enriches
+    /// already-found derivations with extra metadata; it doesn't
+    /// change what counts as a derivation during traversal.) The
+    /// system is read off each resulting derivation, so per-job
+    /// system filtering still works downstream.
+    Select { value_expr: String },
 }
 
 /// One flake output to walk during an evaluation.
@@ -112,16 +121,34 @@ pub async fn evaluate(request: &EvalRequest) -> Result<Vec<JobSpec>, EvalError> 
             FragmentKind::PerSystem => {
                 for system in &request.systems {
                     let fragment = format!("{}.{}", output.name, system);
-                    let mut produced =
-                        run_one(&request.source_path, &fragment, None, request.timeout).await?;
+                    let mut produced = run_one(
+                        &request.source_path,
+                        Some(fragment.as_str()),
+                        &fragment,
+                        None,
+                        request.timeout,
+                    )
+                    .await?;
                     jobs.append(&mut produced);
                 }
             }
-            FragmentKind::Apply { fn_expr } => {
+            FragmentKind::Select { value_expr } => {
+                // We invoke nix-eval-jobs against the bare flake (no
+                // `#fragment`) and rewrite the root via `--select`,
+                // which then gives our function the `{outputs, inputs}`
+                // attrset. Reaching into `f.outputs.<name>` ourselves
+                // lets us guard with `or {}` for flakes that don't
+                // expose this output at all — they cleanly produce
+                // zero jobs instead of a missing-attribute eval error.
+                let select_fn = format!(
+                    "f: builtins.mapAttrs (_: c: {value_expr}) (f.outputs.{name} or {{}})",
+                    name = output.name,
+                );
                 let mut produced = run_one(
                     &request.source_path,
+                    None,
                     &output.name,
-                    Some(fn_expr.as_str()),
+                    Some(select_fn.as_str()),
                     request.timeout,
                 )
                 .await?;
@@ -132,14 +159,28 @@ pub async fn evaluate(request: &EvalRequest) -> Result<Vec<JobSpec>, EvalError> 
     Ok(jobs)
 }
 
+/// Spawn one `nix-eval-jobs` subprocess and parse its JSON-lines output.
+///
+/// - `fragment_suffix` is the flake fragment after `#` (e.g.
+///   `packages.x86_64-linux`) or `None` for a bare-flake invocation
+///   (used with `--select`).
+/// - `attr_prefix` is what we prepend to each emitted `attr` to build
+///   the argunix-side attribute path. For PerSystem this matches the
+///   fragment; for Select it's the top-level output name.
+/// - `select` is an optional Nix function passed via `--select` that
+///   rewrites the evaluation root before traversal.
 async fn run_one(
     source: &Path,
-    fragment: &str,
-    apply: Option<&str>,
+    fragment_suffix: Option<&str>,
+    attr_prefix: &str,
+    select: Option<&str>,
     wall_clock: Duration,
 ) -> Result<Vec<JobSpec>, EvalError> {
-    let flake_uri = format!("{}#{fragment}", source.display());
-    tracing::debug!(fragment, %flake_uri, ?apply, "spawning nix-eval-jobs");
+    let flake_uri = match fragment_suffix {
+        Some(suffix) => format!("{}#{suffix}", source.display()),
+        None => source.display().to_string(),
+    };
+    tracing::debug!(attr_prefix, %flake_uri, ?select, "spawning nix-eval-jobs");
 
     // `--extra-experimental-features` is additive, so we don't override
     // anything an operator already has in `nix.conf`. We just guarantee
@@ -151,14 +192,8 @@ async fn run_one(
         .arg("--flake")
         .arg(&flake_uri)
         .arg("--meta");
-    if let Some(expr) = apply {
-        // `--apply <fn>` runs after each leaf attr is resolved and
-        // before nix-eval-jobs decides whether the attr is a
-        // derivation. For `nixosConfigurations.<name>` we apply
-        // `(x: x.config.system.build.toplevel)` so the system's
-        // toplevel derivation gets emitted instead of the
-        // configuration attrset itself.
-        cmd.arg("--apply").arg(expr);
+    if let Some(expr) = select {
+        cmd.arg("--select").arg(expr);
     }
     let mut child = cmd
         .stdin(Stdio::null())
@@ -191,7 +226,7 @@ async fn run_one(
         Err(_) => {
             let _ = child.start_kill();
             return Err(EvalError::Timeout {
-                fragment: fragment.to_string(),
+                fragment: attr_prefix.to_string(),
                 seconds: wall_clock.as_secs(),
             });
         }
@@ -202,29 +237,29 @@ async fn run_one(
         Err(_) => {
             let _ = child.start_kill();
             return Err(EvalError::Timeout {
-                fragment: fragment.to_string(),
+                fragment: attr_prefix.to_string(),
                 seconds: wall_clock.as_secs(),
             });
         }
     };
 
     if !status.success() {
-        if stderr_indicates_missing_fragment(fragment, &stderr_buf) {
+        if stderr_indicates_missing_fragment(attr_prefix, &stderr_buf) {
             tracing::debug!(
-                fragment,
+                attr_prefix,
                 "flake does not provide fragment; treating as no jobs"
             );
             return Ok(Vec::new());
         }
         return Err(EvalError::Subprocess {
-            fragment: fragment.to_string(),
+            fragment: attr_prefix.to_string(),
             status: status.code(),
             stderr: stderr_buf,
         });
     }
 
-    parse_lines(fragment, &stdout_buf).map_err(|e| EvalError::Parse {
-        fragment: fragment.to_string(),
+    parse_lines(attr_prefix, &stdout_buf).map_err(|e| EvalError::Parse {
+        fragment: attr_prefix.to_string(),
         source: e,
     })
 }
@@ -334,8 +369,8 @@ exit 0
                 },
                 FlakeOutput {
                     name: "nixosConfigurations".into(),
-                    kind: FragmentKind::Apply {
-                        fn_expr: "x: x.config.system.build.toplevel".into(),
+                    kind: FragmentKind::Select {
+                        value_expr: "c.config.system.build.toplevel".into(),
                     },
                 },
             ],
@@ -354,10 +389,10 @@ exit 0
         assert_eq!(
             calls.len(),
             2,
-            "expected 2 nix-eval-jobs invocations (1 per-system + 1 apply), got {calls:?}",
+            "expected 2 nix-eval-jobs invocations (1 per-system + 1 select), got {calls:?}",
         );
 
-        // First call: PerSystem `packages.x86_64-linux`. No --apply.
+        // First call: PerSystem `packages.x86_64-linux`. No --select.
         let pkgs = &calls[0];
         let flag_idx = pkgs
             .iter()
@@ -380,32 +415,32 @@ exit 0
             "per-system flake URI should end with #packages.x86_64-linux, got {pkgs:?}",
         );
         assert!(
-            !pkgs.iter().any(|a| *a == "--apply"),
-            "PerSystem call must NOT pass --apply; got {pkgs:?}",
+            !pkgs.iter().any(|a| *a == "--select"),
+            "PerSystem call must NOT pass --select; got {pkgs:?}",
         );
 
-        // Second call: Apply on `nixosConfigurations`. --apply with the
-        // toplevel-extracting function; flake URI without per-system suffix.
+        // Second call: Select on `nixosConfigurations`. Bare flake URL
+        // (no `#fragment`); --select wraps the value_expr into a
+        // function that maps over `f.outputs.nixosConfigurations or {}`.
         let nixos = &calls[1];
-        let apply_idx = nixos
+        let select_idx = nixos
             .iter()
-            .position(|a| *a == "--apply")
-            .expect("--apply missing from nixosConfigurations argv");
+            .position(|a| *a == "--select")
+            .expect("--select missing from nixosConfigurations argv");
+        let select_fn = nixos.get(select_idx + 1).copied().unwrap_or("");
         assert_eq!(
-            nixos.get(apply_idx + 1).copied(),
-            Some("x: x.config.system.build.toplevel"),
-            "expected toplevel-extracting fn after --apply, got {nixos:?}",
+            select_fn,
+            "f: builtins.mapAttrs (_: c: c.config.system.build.toplevel) (f.outputs.nixosConfigurations or {})",
+            "expected wrapped select function for nixosConfigurations, got {nixos:?}",
         );
         let nixos_flake_idx = nixos
             .iter()
             .position(|a| *a == "--flake")
             .expect("--flake missing from nixosConfigurations argv");
+        let nixos_flake_uri = nixos.get(nixos_flake_idx + 1).copied().unwrap_or("");
         assert!(
-            nixos
-                .get(nixos_flake_idx + 1)
-                .map(|u| u.ends_with("#nixosConfigurations"))
-                .unwrap_or(false),
-            "Apply flake URI should end with #nixosConfigurations (no system suffix), got {nixos:?}",
+            !nixos_flake_uri.contains('#'),
+            "Select call must use a bare flake URI (no `#fragment`), got `{nixos_flake_uri}`",
         );
     }
 

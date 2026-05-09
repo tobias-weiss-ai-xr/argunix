@@ -4,12 +4,13 @@
 //!
 //! - `packages.<system>`, `checks.<system>`, `devShells.<system>` for
 //!   each requested system (per-system fan-out).
-//! - `nixosConfigurations.<name>` and `homeConfigurations.<name>` once
-//!   each, with `--apply` extracting the buildable derivation (the
-//!   toplevel system / the activation package). The system is taken
-//!   from the resulting derivation, so per-job system filtering
-//!   downstream still works without our caller knowing the target
-//!   architecture up front.
+//! - `nixosConfigurations` and `homeConfigurations` once each, using
+//!   nix-eval-jobs' `--select` to rewrite the root attrset into one
+//!   whose values are the buildable derivations (the toplevel system
+//!   / the activation package). The system is taken from each
+//!   resulting derivation, so per-job system filtering downstream
+//!   still works without our caller knowing the target architecture
+//!   up front.
 //!
 //! Non-flake mode, `hydraJobs`, and `darwinConfigurations` are not
 //! covered. Each fragment is evaluated by spawning `nix-eval-jobs`
@@ -27,8 +28,9 @@ pub use runner::{EvalError, EvalRequest, FlakeOutput, FragmentKind, evaluate};
 pub use systems::detect_local_systems;
 
 /// The flake outputs argunix walks by default. Three per-system
-/// fan-outs (`packages`, `checks`, `devShells`) and two `--apply`
-/// outputs (`nixosConfigurations`, `homeConfigurations`).
+/// fan-outs (`packages`, `checks`, `devShells`) and two `--select`
+/// outputs (`nixosConfigurations`, `homeConfigurations`) that rewrite
+/// the root attrset into derivations before traversal.
 pub fn default_flake_outputs() -> Vec<FlakeOutput> {
     vec![
         FlakeOutput {
@@ -45,14 +47,14 @@ pub fn default_flake_outputs() -> Vec<FlakeOutput> {
         },
         FlakeOutput {
             name: "nixosConfigurations".into(),
-            kind: FragmentKind::Apply {
-                fn_expr: "x: x.config.system.build.toplevel".into(),
+            kind: FragmentKind::Select {
+                value_expr: "c.config.system.build.toplevel".into(),
             },
         },
         FlakeOutput {
             name: "homeConfigurations".into(),
-            kind: FragmentKind::Apply {
-                fn_expr: "x: x.activationPackage".into(),
+            kind: FragmentKind::Select {
+                value_expr: "c.activationPackage".into(),
             },
         },
     ]

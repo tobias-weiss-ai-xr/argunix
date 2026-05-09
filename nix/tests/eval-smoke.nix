@@ -15,15 +15,15 @@ let
   fakeNixEvalJobs = writeShellScriptBin "nix-eval-jobs" ''
     set -eu
     flake=""
-    apply=""
+    select_fn=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --flake)
           flake="$2"
           shift 2
           ;;
-        --apply)
-          apply="$2"
+        --select)
+          select_fn="$2"
           shift 2
           ;;
         *)
@@ -31,6 +31,10 @@ let
           ;;
       esac
     done
+    # PerSystem fragments come through as `<flake>#<output>.<system>`.
+    # Select fragments come through as a bare `<flake>` URL (no `#`)
+    # plus a `--select` function that names the output it's reaching
+    # into (`f.outputs.<output> or {}`); we dispatch on that.
     case "$flake" in
       *"#packages.x86_64-linux"*)
         echo '{"attr":"hello","drvPath":"/nix/store/aaaa-hello.drv","system":"x86_64-linux"}'
@@ -45,33 +49,27 @@ let
       *"#packages.aarch64-linux"*)
         echo '{"attr":"hello","drvPath":"/nix/store/eeee-hello-aarch64.drv","system":"aarch64-linux"}'
         ;;
-      *"#nixosConfigurations"*)
-        # argunix walks nixosConfigurations once with
-        # `--apply '(x: x.config.system.build.toplevel)'` so each entry
-        # surfaces as the system's toplevel derivation. Sanity-check the
-        # apply expression is what we expect, then emit one toplevel job.
-        case "$apply" in
-          *"config.system.build.toplevel"*) ;;
-          *) echo "fake nix-eval-jobs: nixosConfigurations called without expected --apply (got: $apply)" >&2
-             exit 2 ;;
-        esac
-        echo '{"attr":"laptop","drvPath":"/nix/store/ffff-nixos-laptop.drv","system":"x86_64-linux"}'
-        ;;
-      *"#homeConfigurations"*)
-        # Same shape, different `--apply`.
-        case "$apply" in
-          *"activationPackage"*) ;;
-          *) echo "fake nix-eval-jobs: homeConfigurations called without expected --apply (got: $apply)" >&2
-             exit 2 ;;
-        esac
-        echo '{"attr":"alice","drvPath":"/nix/store/gggg-home-alice.drv","system":"x86_64-linux"}'
+      *"#"*)
+        # Some other fragment we don't have a fixture for; mirror
+        # nix-eval-jobs' "no such output" behaviour by exiting
+        # non-zero with empty stderr (runner treats that as zero jobs).
+        exit 1
         ;;
       *)
-        # No output for fragments argunix asked about that aren't in this
-        # fixture. Mirror nix-eval-jobs' "no such output" behaviour by
-        # exiting non-zero with empty stderr; argunix treats that as zero
-        # jobs (see runner.rs).
-        exit 1
+        # Bare flake URL: this is a Select call. Distinguish on the
+        # --select function body.
+        case "$select_fn" in
+          *"f.outputs.nixosConfigurations"*"config.system.build.toplevel"*)
+            echo '{"attr":"laptop","drvPath":"/nix/store/ffff-nixos-laptop.drv","system":"x86_64-linux"}'
+            ;;
+          *"f.outputs.homeConfigurations"*"activationPackage"*)
+            echo '{"attr":"alice","drvPath":"/nix/store/gggg-home-alice.drv","system":"x86_64-linux"}'
+            ;;
+          *)
+            echo "fake nix-eval-jobs: bare flake invocation with unrecognised --select: $select_fn" >&2
+            exit 2
+            ;;
+        esac
         ;;
     esac
   '';
