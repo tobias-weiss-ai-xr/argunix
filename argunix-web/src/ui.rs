@@ -38,6 +38,11 @@ struct StatusTemplate {
     builders: Vec<BuilderRow>,
     evaluating: Vec<EvalRow2>,
     eval_queue_depth: usize,
+    /// Up to `UPCOMING_EVALS_LIMIT` queued evals, oldest first — what
+    /// the worker will pick up next. Length may be < `eval_queue_depth`
+    /// when truncated; the template uses both to render
+    /// "showing N of M" copy.
+    upcoming_evals: Vec<EvalRow2>,
     running: Vec<RunningRow>,
     queued: Vec<QueuedRow>,
     queued_shown: usize,
@@ -91,6 +96,7 @@ struct StatusInnerTemplate {
     builders: Vec<BuilderRow>,
     evaluating: Vec<EvalRow2>,
     eval_queue_depth: usize,
+    upcoming_evals: Vec<EvalRow2>,
     running: Vec<RunningRow>,
     queued: Vec<QueuedRow>,
     queued_shown: usize,
@@ -184,6 +190,11 @@ struct QueuedRow {
 /// large queues. Anything beyond this just gets summarised in the count.
 const QUEUED_DISPLAY_LIMIT: u32 = 50;
 
+/// Hard cap on the upcoming-evaluations table on the status page.
+/// Eval queue depth is normally small (single-digit), so this is more
+/// of a safety net than a typical case.
+const UPCOMING_EVALS_LIMIT: u32 = 20;
+
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate {
@@ -229,6 +240,14 @@ struct RepoTemplate {
     /// `repo.web_url` nor a forge config is available; template
     /// suppresses the link in that case.
     repo_url: String,
+    /// Absolute URL of the SVG status badge for this repo, default
+    /// branch (i.e. any branch — `pick_eval` picks the latest
+    /// terminal eval). Surfaced on the repo page so users can copy a
+    /// markdown snippet into their README.
+    badge_url: String,
+    /// Markdown snippet for `[![argunix](badge_url)](repo_url)`. Copy
+    /// button on the page writes this to the clipboard.
+    badge_markdown: String,
     evals: Vec<EvalRow>,
 }
 
@@ -426,7 +445,11 @@ fn forge_url_for(forge_cfg: Option<&ForgeConfig>, slug: &str) -> String {
 /// `repo.web_url` (populated from webhook payloads); falls back to
 /// `{forge.web_url}/{slug}` when no webhook has landed yet. Returns
 /// an empty string when neither source is available.
-fn repo_url_for(repo_web_url: Option<&str>, forge_cfg: Option<&ForgeConfig>, slug: &str) -> String {
+pub(crate) fn repo_url_for(
+    repo_web_url: Option<&str>,
+    forge_cfg: Option<&ForgeConfig>,
+    slug: &str,
+) -> String {
     if let Some(u) = repo_web_url.filter(|s| !s.is_empty()) {
         return u.trim_end_matches('/').to_string();
     }
@@ -450,6 +473,7 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
         builders: view.builders,
         evaluating: view.evaluating,
         eval_queue_depth: view.eval_queue_depth,
+        upcoming_evals: view.upcoming_evals,
         running: view.running,
         queued: view.queued,
         queued_shown: view.queued_shown,
@@ -611,6 +635,7 @@ pub async fn status_fragment(State(state): State<AppState>) -> Result<Html<Strin
         builders: view.builders,
         evaluating: view.evaluating,
         eval_queue_depth: view.eval_queue_depth,
+        upcoming_evals: view.upcoming_evals,
         running: view.running,
         queued: view.queued,
         queued_shown: view.queued_shown,
@@ -627,6 +652,7 @@ struct StatusView {
     builders: Vec<BuilderRow>,
     evaluating: Vec<EvalRow2>,
     eval_queue_depth: usize,
+    upcoming_evals: Vec<EvalRow2>,
     running: Vec<RunningRow>,
     queued: Vec<QueuedRow>,
     queued_shown: usize,
@@ -814,9 +840,34 @@ async fn collect_status_view(state: &AppState) -> Result<StatusView, UiError> {
             started: fmt_opt_time(r.eval.started_at),
         })
         .collect();
-    // For the queue depth, we don't need the rows themselves — just
-    // the count. Cap at LIMIT+1 isn't needed here either (sqlite
-    // reads are cheap and we want the actual depth for display).
+    // Render up to UPCOMING_EVALS_LIMIT queued evals so operators
+    // can see *what* is waiting, not just a count. Beyond the limit
+    // the template surfaces "N of M" copy. We fetch LIMIT+1 to know
+    // whether truncation occurred without an extra COUNT(*) query —
+    // though we still call list_queued_ids for the authoritative
+    // depth so the header count matches the queue exactly even if
+    // a row terminated between the two reads.
+    let upcoming_rows = <argunix_store::SqlxStore as EvalStore>::list_by_status(
+        &state.store,
+        EvalStatus::Queued,
+        UPCOMING_EVALS_LIMIT,
+    )
+    .await?;
+    let upcoming_evals: Vec<EvalRow2> = upcoming_rows
+        .into_iter()
+        .map(|r| EvalRow2 {
+            eval_id: r.eval.id.get(),
+            forge: r.forge,
+            slug: r.slug.as_str().to_string(),
+            git_ref: r.eval.git_ref,
+            short_sha: r.eval.sha.short().to_string(),
+            trigger: r.eval.trigger,
+            // Queued rows have no `started_at` yet — fmt_opt_time
+            // renders "—". The eval id is monotonic, so older waiting
+            // evals naturally sort first.
+            started: fmt_opt_time(r.eval.started_at),
+        })
+        .collect();
     let eval_queue_depth = <argunix_store::SqlxStore as EvalStore>::list_queued_ids(&state.store)
         .await?
         .len();
@@ -835,6 +886,7 @@ async fn collect_status_view(state: &AppState) -> Result<StatusView, UiError> {
         builders,
         evaluating,
         eval_queue_depth,
+        upcoming_evals,
         running,
         queued,
         queued_shown,
@@ -1079,6 +1131,10 @@ async fn repo_page(
         .collect();
 
     let cluster_active = cluster_is_active(&state).await?;
+    let external_url = &snap.config.external_url;
+    let badge_url = crate::badge::badge_url(external_url, &forge, slug.as_str());
+    let badge_markdown =
+        crate::badge::markdown_snippet(external_url, &forge, slug.as_str(), &repo_url);
     let html = render(&RepoTemplate {
         cluster_active,
         forge,
@@ -1086,6 +1142,8 @@ async fn repo_page(
         name: repo.name,
         description: repo.description,
         repo_url,
+        badge_url,
+        badge_markdown,
         evals,
     })?;
     Ok(Html(html).into_response())
@@ -1678,6 +1736,7 @@ mod tests {
             builders: vec![],
             evaluating: vec![],
             eval_queue_depth: 0,
+            upcoming_evals: vec![],
             running: vec![],
             queued: vec![],
             queued_shown: 0,
@@ -1710,6 +1769,7 @@ mod tests {
             builders: vec![],
             evaluating: vec![],
             eval_queue_depth: 0,
+            upcoming_evals: vec![],
             running: vec![],
             queued: vec![],
             queued_shown: 0,
@@ -1746,6 +1806,7 @@ mod tests {
             builders: vec![],
             evaluating: vec![],
             eval_queue_depth: 0,
+            upcoming_evals: vec![],
             running: vec![RunningRow {
                 forge: "github".into(),
                 slug: "owner/repo".into(),
@@ -1895,6 +1956,7 @@ mod tests {
             builders: vec![make_builder_row("gamma", true, vec![job])],
             evaluating: vec![],
             eval_queue_depth: 0,
+            upcoming_evals: vec![],
             running: vec![],
             queued: vec![],
             queued_shown: 0,

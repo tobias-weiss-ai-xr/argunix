@@ -9,6 +9,7 @@
 //! later (M6).
 
 mod auto_install;
+mod badge;
 mod cancel;
 mod coalesce;
 mod host_stats;
@@ -48,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/hosts", get(ui::hosts))
         .route("/healthz", get(healthz))
         .route("/r/{forge}/{*tail}", get(ui::dispatch_repo))
+        .route("/badge/{forge}/{*tail}", get(badge::handle))
         .route("/api/hosts", get(ui::hosts_json))
         .route("/api/host/stats", get(ui::host_stats))
         .route("/api/builders/{name}/stats", get(ui::builder_stats))

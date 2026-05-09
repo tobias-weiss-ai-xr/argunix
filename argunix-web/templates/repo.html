@@ -13,6 +13,27 @@
   <a class="text-link hover:underline" href="{{ repo_url }}">↗ on forge</a>
   {% endif %}
 </p>
+
+<section class="mb-6 rounded border border-border bg-surface p-3">
+  <div class="flex items-center gap-3 mb-2 flex-wrap">
+    <img src="{{ badge_url }}" alt="argunix status badge" height="20" />
+    <span class="text-sm text-muted">Status badge — paste into your README:</span>
+  </div>
+  <div class="flex items-stretch gap-2">
+    <input
+      type="text"
+      readonly
+      value="{{ badge_markdown }}"
+      class="flex-1 min-w-0 font-mono text-xs px-2 py-1 rounded border border-border bg-bg text-fg"
+      data-badge-snippet
+    />
+    <button
+      type="button"
+      class="px-3 py-1 rounded border border-border text-sm hover:border-link"
+      data-copy-target="data-badge-snippet"
+    >copy</button>
+  </div>
+</section>
 {% if evals.is_empty() %}
 <p class="text-muted">No evaluations yet.</p>
 {% else %}
@@ -60,4 +81,28 @@
   </tbody>
 </table>
 </div>
-{% endif %} {% endblock %}
+{% endif %}
+
+<script>
+  (() => {
+    const btn = document.querySelector('button[data-copy-target="data-badge-snippet"]');
+    const input = document.querySelector('input[data-badge-snippet]');
+    if (!btn || !input) return;
+    btn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(input.value);
+        const original = btn.textContent;
+        btn.textContent = 'copied';
+        setTimeout(() => { btn.textContent = original; }, 1200);
+      } catch (_) {
+        {# Fallback for environments without the async clipboard API
+           (older Safari, http:// origins). select() + execCommand still
+           works in those cases and degrades silently if both fail. #}
+        input.focus();
+        input.select();
+        try { document.execCommand('copy'); } catch (_) { /* give up */ }
+      }
+    });
+  })();
+</script>
+{% endblock %}

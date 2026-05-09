@@ -61,7 +61,54 @@ pub async fn discover_capabilities(nix_bin: &str) -> Result<Capabilities, Capabi
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         });
     }
-    parse_show_config(&output.stdout)
+    let mut caps = parse_show_config(&output.stdout)?;
+    // Nix 2.24+ dropped `nix-version` from `config show --json`.
+    // Fall back to parsing `nix --version` so the hosts page doesn't
+    // render "nix unknown".
+    if caps.inner.nix_version == "unknown" {
+        if let Some(v) = nix_version_via_cli(nix_bin).await {
+            caps.inner.nix_version = v;
+        }
+    }
+    Ok(caps)
+}
+
+/// Run `nix --version` and extract the semver-ish token from the
+/// output. Returns `None` on any failure — the caller keeps the
+/// "unknown" placeholder rather than blowing up capability discovery
+/// over a cosmetic field.
+async fn nix_version_via_cli(nix_bin: &str) -> Option<String> {
+    let output = tokio::process::Command::new(nix_bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_nix_version(&stdout)
+}
+
+/// Pull the version token out of `nix --version` output.
+/// Examples seen in the wild:
+///   `nix (Nix) 2.18.1`
+///   `nix (Lix, like Nix) 2.91.0`
+///   `nix (Snix) 0.1.0`
+/// We grab the last whitespace-separated token on the first line.
+pub fn parse_nix_version(output: &str) -> Option<String> {
+    let first = output.lines().next()?.trim();
+    let token = first.split_whitespace().last()?;
+    // Sanity-check: must start with a digit. Anything else means we
+    // misread the line — better to keep "unknown" than to surface
+    // garbage.
+    if !token.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 /// Public-for-tests: parses the JSON shape `nix show-config --json`
@@ -183,6 +230,39 @@ mod tests {
         }"#;
         let caps = parse_show_config(json).unwrap();
         assert_eq!(caps.inner.max_jobs, 8);
+    }
+
+    #[test]
+    fn parses_nix_version_classic() {
+        assert_eq!(
+            parse_nix_version("nix (Nix) 2.18.1\n"),
+            Some("2.18.1".into())
+        );
+    }
+
+    #[test]
+    fn parses_nix_version_lix() {
+        // Lix masquerades as nix; we want its actual version token.
+        assert_eq!(
+            parse_nix_version("nix (Lix, like Nix) 2.91.0\n"),
+            Some("2.91.0".into()),
+        );
+    }
+
+    #[test]
+    fn parses_nix_version_snix() {
+        assert_eq!(
+            parse_nix_version("nix (Snix) 0.1.0\n"),
+            Some("0.1.0".into())
+        );
+    }
+
+    #[test]
+    fn parses_nix_version_rejects_non_numeric() {
+        // Defensive: if `nix --version` ever changes shape, we'd
+        // rather render "unknown" than something nonsensical.
+        assert_eq!(parse_nix_version("usage: nix [options]"), None);
+        assert_eq!(parse_nix_version(""), None);
     }
 
     #[test]
