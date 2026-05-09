@@ -251,10 +251,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     let request = argunix_eval::EvalRequest {
         source_path: work_dir.clone(),
         systems: ctx.systems.clone(),
-        outputs: argunix_eval::DEFAULT_FLAKE_OUTPUTS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect(),
+        outputs: argunix_eval::default_flake_outputs(),
         timeout: ctx.eval_timeout,
     };
     let jobs = tokio::select! {

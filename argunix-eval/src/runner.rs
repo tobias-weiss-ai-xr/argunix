@@ -32,15 +32,40 @@ pub enum EvalError {
     },
 }
 
+/// How a flake output is walked by `nix-eval-jobs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentKind {
+    /// Walk `<output>.<system>` once per system in the request.
+    /// Standard for `packages`, `checks`, `devShells`.
+    PerSystem,
+    /// Walk `<output>` once with no per-system fan-out and apply
+    /// `fn_expr` to each leaf to extract the buildable derivation.
+    /// The system is read off the resulting derivation rather than
+    /// imposed by the caller — that's how `nixosConfigurations.<name>`
+    /// (system-less attribute path, system determined by the module
+    /// itself) ends up with a correct `system` field downstream.
+    Apply { fn_expr: String },
+}
+
+/// One flake output to walk during an evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlakeOutput {
+    /// Top-level attribute name, e.g. `packages` or `nixosConfigurations`.
+    pub name: String,
+    pub kind: FragmentKind,
+}
+
 #[derive(Debug, Clone)]
 pub struct EvalRequest {
     /// Path to a local checkout containing a `flake.nix`.
     pub source_path: PathBuf,
-    /// Systems to evaluate fragments under, e.g. `["x86_64-linux"]`.
+    /// Systems to evaluate `PerSystem` fragments under, e.g.
+    /// `["x86_64-linux"]`. Ignored for `Apply` outputs — those run
+    /// once regardless of this list.
     pub systems: Vec<String>,
-    /// Top-level flake outputs to walk per system. Defaults to
-    /// [`crate::DEFAULT_FLAKE_OUTPUTS`] when empty.
-    pub outputs: Vec<String>,
+    /// Top-level flake outputs to walk. Defaults to
+    /// [`crate::default_flake_outputs`] when empty.
+    pub outputs: Vec<FlakeOutput>,
     /// Wall-clock cap on each `nix-eval-jobs` subprocess.
     pub timeout: Duration,
 }
@@ -50,10 +75,7 @@ impl EvalRequest {
         Self {
             source_path,
             systems,
-            outputs: crate::DEFAULT_FLAKE_OUTPUTS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
+            outputs: crate::default_flake_outputs(),
             timeout: Duration::from_secs(600),
         }
     }
@@ -76,23 +98,35 @@ pub async fn evaluate(request: &EvalRequest) -> Result<Vec<JobSpec>, EvalError> 
         return Err(EvalError::NotAFlake(request.source_path.clone()));
     }
 
-    let default_outputs: Vec<String>;
-    let outputs: &[String] = if request.outputs.is_empty() {
-        default_outputs = crate::DEFAULT_FLAKE_OUTPUTS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
+    let default_outputs: Vec<FlakeOutput>;
+    let outputs: &[FlakeOutput] = if request.outputs.is_empty() {
+        default_outputs = crate::default_flake_outputs();
         &default_outputs
     } else {
         &request.outputs
     };
 
     let mut jobs = Vec::new();
-    for system in &request.systems {
-        for output in outputs {
-            let fragment = format!("{output}.{system}");
-            let mut produced = run_one(&request.source_path, &fragment, request.timeout).await?;
-            jobs.append(&mut produced);
+    for output in outputs {
+        match &output.kind {
+            FragmentKind::PerSystem => {
+                for system in &request.systems {
+                    let fragment = format!("{}.{}", output.name, system);
+                    let mut produced =
+                        run_one(&request.source_path, &fragment, None, request.timeout).await?;
+                    jobs.append(&mut produced);
+                }
+            }
+            FragmentKind::Apply { fn_expr } => {
+                let mut produced = run_one(
+                    &request.source_path,
+                    &output.name,
+                    Some(fn_expr.as_str()),
+                    request.timeout,
+                )
+                .await?;
+                jobs.append(&mut produced);
+            }
         }
     }
     Ok(jobs)
@@ -101,21 +135,32 @@ pub async fn evaluate(request: &EvalRequest) -> Result<Vec<JobSpec>, EvalError> 
 async fn run_one(
     source: &Path,
     fragment: &str,
+    apply: Option<&str>,
     wall_clock: Duration,
 ) -> Result<Vec<JobSpec>, EvalError> {
     let flake_uri = format!("{}#{fragment}", source.display());
-    tracing::debug!(fragment, %flake_uri, "spawning nix-eval-jobs");
+    tracing::debug!(fragment, %flake_uri, ?apply, "spawning nix-eval-jobs");
 
     // `--extra-experimental-features` is additive, so we don't override
     // anything an operator already has in `nix.conf`. We just guarantee
     // that the two features `--flake` URIs depend on are on for the
     // spawned subprocess — otherwise argunix breaks on any host whose
     // system-wide nix.conf hasn't been opted in.
-    let mut child = Command::new("nix-eval-jobs")
-        .args(["--extra-experimental-features", "nix-command flakes"])
+    let mut cmd = Command::new("nix-eval-jobs");
+    cmd.args(["--extra-experimental-features", "nix-command flakes"])
         .arg("--flake")
         .arg(&flake_uri)
-        .arg("--meta")
+        .arg("--meta");
+    if let Some(expr) = apply {
+        // `--apply <fn>` runs after each leaf attr is resolved and
+        // before nix-eval-jobs decides whether the attr is a
+        // derivation. For `nixosConfigurations.<name>` we apply
+        // `(x: x.config.system.build.toplevel)` so the system's
+        // toplevel derivation gets emitted instead of the
+        // configuration attrset itself.
+        cmd.arg("--apply").arg(expr);
+    }
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -211,25 +256,24 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
-    /// Stand up a fake `nix-eval-jobs` script in `dir/bin/` that records
-    /// its argv to `dir/argv.txt` (one arg per line, NUL-terminated would
-    /// be safer but newlines are fine for the flag we're checking) and
-    /// then prints an empty (zero-jobs) JSON-lines stream so the runner
-    /// returns Ok([]). Returns the directory; the caller must keep it
-    /// alive for the duration of the test.
+    /// Stand up a fake `nix-eval-jobs` script in `dir/bin/` that
+    /// appends its argv to `dir/argv.txt` (one arg per line, with a
+    /// `===` delimiter line between invocations so the test can
+    /// distinguish per-fragment calls) and then prints an empty
+    /// (zero-jobs) JSON-lines stream so the runner returns Ok([]).
+    /// Returns the directory; the caller must keep it alive for the
+    /// duration of the test.
     fn fake_nix_eval_jobs_recording_argv(dir: &Path) {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let script = bin.join("nix-eval-jobs");
         let mut f = std::fs::File::create(&script).unwrap();
-        // Write argv ($0 plus all args) one per line into argv.txt next
-        // to the script.
         writeln!(
             f,
             r#"#!/bin/sh
 out="$(dirname "$0")/../argv.txt"
-: > "$out"
 for a in "$@"; do printf '%s\n' "$a" >> "$out"; done
+printf '===\n' >> "$out"
 exit 0
 "#
         )
@@ -239,8 +283,28 @@ exit 0
         std::fs::set_permissions(&script, perm).unwrap();
     }
 
+    /// Split an argv.txt body into one Vec<&str> per `===`-delimited
+    /// invocation.
+    fn split_invocations(argv: &str) -> Vec<Vec<&str>> {
+        let mut out = Vec::new();
+        let mut current = Vec::new();
+        for line in argv.lines() {
+            if line == "===" {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            } else {
+                current.push(line);
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+        out
+    }
+
     #[tokio::test]
-    async fn passes_extra_experimental_features_to_nix_eval_jobs() {
+    async fn nix_eval_jobs_argv_per_fragment_kind() {
         let bin_root = tempdir().unwrap();
         fake_nix_eval_jobs_recording_argv(bin_root.path());
 
@@ -263,7 +327,18 @@ exit 0
         let request = EvalRequest {
             source_path: src.path().to_path_buf(),
             systems: vec!["x86_64-linux".into()],
-            outputs: vec!["packages".into()],
+            outputs: vec![
+                FlakeOutput {
+                    name: "packages".into(),
+                    kind: FragmentKind::PerSystem,
+                },
+                FlakeOutput {
+                    name: "nixosConfigurations".into(),
+                    kind: FragmentKind::Apply {
+                        fn_expr: "x: x.config.system.build.toplevel".into(),
+                    },
+                },
+            ],
             timeout: Duration::from_secs(10),
         };
         let result = evaluate(&request).await;
@@ -275,24 +350,63 @@ exit 0
 
         let argv =
             std::fs::read_to_string(bin_root.path().join("argv.txt")).expect("fake recorded argv");
-        let lines: Vec<&str> = argv.lines().collect();
+        let calls = split_invocations(&argv);
+        assert_eq!(
+            calls.len(),
+            2,
+            "expected 2 nix-eval-jobs invocations (1 per-system + 1 apply), got {calls:?}",
+        );
 
-        // Expect contiguous "--extra-experimental-features" "nix-command flakes"
-        // somewhere in the args, before --flake.
-        let flag_idx = lines
+        // First call: PerSystem `packages.x86_64-linux`. No --apply.
+        let pkgs = &calls[0];
+        let flag_idx = pkgs
             .iter()
             .position(|a| *a == "--extra-experimental-features")
-            .expect("--extra-experimental-features missing from argv");
+            .expect("--extra-experimental-features missing from per-system argv");
         assert_eq!(
-            lines.get(flag_idx + 1).copied(),
+            pkgs.get(flag_idx + 1).copied(),
             Some("nix-command flakes"),
-            "expected experimental-features value `nix-command flakes`, got argv {lines:?}",
+            "expected experimental-features value `nix-command flakes` in per-system call, got {pkgs:?}",
         );
-        let flake_idx = lines
+        let flake_idx = pkgs
             .iter()
             .position(|a| *a == "--flake")
-            .expect("--flake missing");
+            .expect("--flake missing from per-system argv");
         assert!(flag_idx < flake_idx, "feature flag must precede --flake");
+        assert!(
+            pkgs.get(flake_idx + 1)
+                .map(|u| u.ends_with("#packages.x86_64-linux"))
+                .unwrap_or(false),
+            "per-system flake URI should end with #packages.x86_64-linux, got {pkgs:?}",
+        );
+        assert!(
+            !pkgs.iter().any(|a| *a == "--apply"),
+            "PerSystem call must NOT pass --apply; got {pkgs:?}",
+        );
+
+        // Second call: Apply on `nixosConfigurations`. --apply with the
+        // toplevel-extracting function; flake URI without per-system suffix.
+        let nixos = &calls[1];
+        let apply_idx = nixos
+            .iter()
+            .position(|a| *a == "--apply")
+            .expect("--apply missing from nixosConfigurations argv");
+        assert_eq!(
+            nixos.get(apply_idx + 1).copied(),
+            Some("x: x.config.system.build.toplevel"),
+            "expected toplevel-extracting fn after --apply, got {nixos:?}",
+        );
+        let nixos_flake_idx = nixos
+            .iter()
+            .position(|a| *a == "--flake")
+            .expect("--flake missing from nixosConfigurations argv");
+        assert!(
+            nixos
+                .get(nixos_flake_idx + 1)
+                .map(|u| u.ends_with("#nixosConfigurations"))
+                .unwrap_or(false),
+            "Apply flake URI should end with #nixosConfigurations (no system suffix), got {nixos:?}",
+        );
     }
 
     #[test]

@@ -15,10 +15,15 @@ let
   fakeNixEvalJobs = writeShellScriptBin "nix-eval-jobs" ''
     set -eu
     flake=""
+    apply=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --flake)
           flake="$2"
+          shift 2
+          ;;
+        --apply)
+          apply="$2"
           shift 2
           ;;
         *)
@@ -39,6 +44,27 @@ let
         ;;
       *"#packages.aarch64-linux"*)
         echo '{"attr":"hello","drvPath":"/nix/store/eeee-hello-aarch64.drv","system":"aarch64-linux"}'
+        ;;
+      *"#nixosConfigurations"*)
+        # argunix walks nixosConfigurations once with
+        # `--apply '(x: x.config.system.build.toplevel)'` so each entry
+        # surfaces as the system's toplevel derivation. Sanity-check the
+        # apply expression is what we expect, then emit one toplevel job.
+        case "$apply" in
+          *"config.system.build.toplevel"*) ;;
+          *) echo "fake nix-eval-jobs: nixosConfigurations called without expected --apply (got: $apply)" >&2
+             exit 2 ;;
+        esac
+        echo '{"attr":"laptop","drvPath":"/nix/store/ffff-nixos-laptop.drv","system":"x86_64-linux"}'
+        ;;
+      *"#homeConfigurations"*)
+        # Same shape, different `--apply`.
+        case "$apply" in
+          *"activationPackage"*) ;;
+          *) echo "fake nix-eval-jobs: homeConfigurations called without expected --apply (got: $apply)" >&2
+             exit 2 ;;
+        esac
+        echo '{"attr":"alice","drvPath":"/nix/store/gggg-home-alice.drv","system":"x86_64-linux"}'
         ;;
       *)
         # No output for fragments argunix asked about that aren't in this
@@ -87,12 +113,17 @@ runCommand "argunix-eval-smoke"
     echo "--- jobs json ---"
     cat out.json
 
-    # Five jobs: 2 packages.x86_64 + 1 checks.x86_64 + 1 devShells.x86_64
-    # + 1 packages.aarch64. devShells/checks for aarch64 contribute 0
-    # (fake exits 1, runner treats empty-stderr-non-zero as no jobs).
+    # Seven jobs:
+    #   2 packages.x86_64 + 1 checks.x86_64 + 1 devShells.x86_64
+    # + 1 packages.aarch64
+    # + 1 nixosConfigurations.laptop + 1 homeConfigurations.alice.
+    # devShells/checks for aarch64 contribute 0 (fake exits 1, runner
+    # treats empty-stderr-non-zero as no jobs). nixosConfigurations
+    # and homeConfigurations are walked once each (no per-system
+    # fan-out) with the expected --apply.
     count=$(grep -c '"attr_path"' out.json || true)
     echo "found $count jobs"
-    test "$count" -eq 5
+    test "$count" -eq 7
 
     # Spot-check a couple of full attr paths.
     grep -q '"packages.x86_64-linux.hello"' out.json
@@ -100,6 +131,14 @@ runCommand "argunix-eval-smoke"
     grep -q '"packages.aarch64-linux.hello"' out.json
     grep -q '/nix/store/aaaa-hello.drv' out.json
     grep -q '/nix/store/eeee-hello-aarch64.drv' out.json
+
+    # nixosConfigurations + homeConfigurations: assert the toplevel /
+    # activationPackage drv landed and the attr path has no system
+    # segment (system comes from the drv, not the path).
+    grep -q '"nixosConfigurations.laptop"' out.json
+    grep -q '/nix/store/ffff-nixos-laptop.drv' out.json
+    grep -q '"homeConfigurations.alice"' out.json
+    grep -q '/nix/store/gggg-home-alice.drv' out.json
 
     touch $out
   ''

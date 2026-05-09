@@ -521,10 +521,7 @@ async fn eval(args: EvalArgs) -> anyhow::Result<()> {
             .canonicalize()
             .with_context(|| format!("resolving --src path {}", args.src.display()))?,
         systems: systems.clone(),
-        outputs: argunix_eval::DEFAULT_FLAKE_OUTPUTS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect(),
+        outputs: argunix_eval::default_flake_outputs(),
         timeout: Duration::from_secs(args.timeout_seconds),
     };
     tracing::info!(src = %request.source_path.display(), ?systems, "starting offline evaluation");
@@ -595,10 +592,7 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
             .canonicalize()
             .with_context(|| format!("resolving --src path {}", args.src.display()))?,
         systems: systems.clone(),
-        outputs: argunix_eval::DEFAULT_FLAKE_OUTPUTS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect(),
+        outputs: argunix_eval::default_flake_outputs(),
         timeout: Duration::from_secs(args.eval_timeout_seconds),
     };
     let jobs = match argunix_eval::evaluate(&eval_request).await {
