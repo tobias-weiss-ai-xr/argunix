@@ -330,6 +330,14 @@ struct JobRow {
     attr_path: String,
     system: String,
     status: &'static str,
+    /// Unicode glyph rendered in place of the status text (✓, ✗, …).
+    /// The visible text label moves into `aria-label` on the wrapping
+    /// span so screen readers still announce the status.
+    glyph: &'static str,
+    /// Tailwind text-colour class for the glyph wrapper. Keyed off the
+    /// same ok/fail/info/warn/muted buckets used by the eval-status
+    /// pill so the palette stays consistent across the UI.
+    glyph_class: &'static str,
     finished: String,
     has_log: bool,
     /// Per-job wall-clock; `"—"` when missing.
@@ -1237,6 +1245,8 @@ async fn eval_page(
             attr_path: j.attr_path.to_string(),
             system: j.system,
             status: job_status_label(&j.status),
+            glyph: job_status_glyph(&j.status),
+            glyph_class: job_status_glyph_class(&j.status),
             finished: fmt_opt_time(j.finished_at),
             has_log: j.log_path.is_some(),
             duration: humanize_duration(j.started_at, j.finished_at),
@@ -1711,6 +1721,34 @@ fn job_status_label(s: &JobStatus) -> &'static str {
         JobStatus::Cancelled => "cancelled",
         JobStatus::Interrupted => "interrupted",
         JobStatus::SkippedNoBuilder => "skipped",
+    }
+}
+
+/// Single Unicode glyph used in the eval-page jobs table in place of
+/// the textual status. Picked so each bucket is *shape*-distinct (not
+/// just colour-distinct) — a colourblind reader can still tell ✓
+/// apart from ✗ without seeing the green/red.
+fn job_status_glyph(s: &JobStatus) -> &'static str {
+    match s {
+        JobStatus::Success | JobStatus::Cached => "✓",
+        JobStatus::Failure => "✗",
+        JobStatus::Interrupted => "⚠",
+        JobStatus::Cancelled | JobStatus::SkippedNoBuilder => "⊘",
+        JobStatus::Running => "⋯",
+        JobStatus::Queued => "○",
+    }
+}
+
+/// Tailwind colour class for the glyph wrapper. Mirrors the ok / fail
+/// / info / warn / muted buckets used by the eval-status pill so the
+/// palette stays consistent across pages.
+fn job_status_glyph_class(s: &JobStatus) -> &'static str {
+    match s {
+        JobStatus::Success | JobStatus::Cached => "text-ok-strong",
+        JobStatus::Failure => "text-fail-strong",
+        JobStatus::Interrupted => "text-warn-strong",
+        JobStatus::Running => "text-info-strong",
+        JobStatus::Queued | JobStatus::Cancelled | JobStatus::SkippedNoBuilder => "text-muted",
     }
 }
 

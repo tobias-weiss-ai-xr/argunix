@@ -60,26 +60,29 @@
     <table class="w-full min-w-160 text-sm border-collapse">
       <thead class="text-left text-muted">
         <tr>
-          <th class="py-2 pr-4">attr</th>
-          <th class="py-2 pr-4">system</th>
-          <th class="py-2 pr-4">status</th>
-          <th class="py-2 pr-4">finished</th>
-          <th class="py-2 pr-4">duration</th>
-          <th class="py-2">log</th>
+          <th class="py-2 pr-2">attr</th>
+          <th class="py-2 px-2 text-center">system</th>
+          <th class="py-2 px-2 text-center">status</th>
+          <th class="py-2 px-2">finished</th>
+          <th class="py-2 px-2">duration</th>
+          <th class="py-2 pl-2">log</th>
         </tr>
       </thead>
       <tbody>
         {% for j in jobs %}
           <tr class="border-t border-border">
-            <td class="py-2 pr-4 font-mono">
+            <td class="py-2 pr-2 font-mono">
               <a class="text-link hover:underline"
                  href="/r/{{ forge }}/{{ slug }}/eval/{{ eval_id }}/job/{{ j.attr_path }}">{{ j.attr_path }}</a>
             </td>
-            <td class="py-2 pr-4 font-mono text-xs">{{ j.system }}</td>
-            <td class="py-2 pr-4">{{ j.status }}</td>
-            <td class="py-2 pr-4 text-muted">{{ j.finished }}</td>
-            <td class="py-2 pr-4 font-mono">{{ j.duration }}</td>
-            <td class="py-2">
+            <td class="py-2 px-2 font-mono text-xs text-center">{{ j.system }}</td>
+            <td class="py-2 px-2 text-center">
+              <span role="img" aria-label="{{ j.status }}" title="{{ j.status }}"
+                    class="text-base leading-none {{ j.glyph_class }}">{{ j.glyph }}</span>
+            </td>
+            <td class="py-2 px-2 text-muted">{{ j.finished }}</td>
+            <td class="py-2 px-2 font-mono">{{ j.duration }}</td>
+            <td class="py-2 pl-2">
               {% if j.has_log %}
                 <a class="text-link hover:underline"
                    href="/r/{{ forge }}/{{ slug }}/eval/{{ eval_id }}/job/{{ j.attr_path }}/log">log</a>
