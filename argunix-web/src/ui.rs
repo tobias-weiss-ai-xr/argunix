@@ -1161,13 +1161,8 @@ async fn repo_page(
     let snippet_branch_ref = Some(snippet_branch.as_str());
     let badge_url =
         crate::badge::badge_url(external_url, &forge, slug.as_str(), snippet_branch_ref);
-    let badge_markdown = crate::badge::markdown_snippet(
-        external_url,
-        &forge,
-        slug.as_str(),
-        &repo_url,
-        snippet_branch_ref,
-    );
+    let badge_markdown =
+        crate::badge::markdown_snippet(external_url, &forge, slug.as_str(), snippet_branch_ref);
     let html = render(&RepoTemplate {
         cluster_active,
         forge,

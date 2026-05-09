@@ -283,15 +283,16 @@ pub fn snippet_branch(default_branch: Option<&str>, evals: &[argunix_store::Eval
 /// it out. When the default branch isn't known yet (no webhook
 /// landed), we emit the bare form, which the badge endpoint resolves
 /// to the same any-branch fallback at request time.
-pub fn markdown_snippet(
-    host: &str,
-    forge: &str,
-    slug: &str,
-    repo_url: &str,
-    branch: Option<&str>,
-) -> String {
+///
+/// The link target is the argunix per-repo overview page
+/// (`<host>/r/<forge>/<slug>`), not the upstream forge URL — clicking
+/// the badge in a README should land on the CI status page for that
+/// repo, which is the point of having the badge in the first place.
+pub fn markdown_snippet(host: &str, forge: &str, slug: &str, branch: Option<&str>) -> String {
     let url = badge_url(host, forge, slug, branch);
-    format!("[![argunix]({url})]({repo_url})")
+    let host_trim = host.trim_end_matches('/');
+    let link = format!("{host_trim}/r/{forge}/{slug}");
+    format!("[![argunix]({url})]({link})")
 }
 
 /// Build the badge URL itself — used both by the markdown snippet and
@@ -493,12 +494,11 @@ mod tests {
             "https://argunix.example.com/",
             "github",
             "owner/repo",
-            "https://github.com/owner/repo",
             None,
         );
         assert_eq!(
             snippet,
-            "[![argunix](https://argunix.example.com/badge/github/owner/repo.svg)](https://github.com/owner/repo)"
+            "[![argunix](https://argunix.example.com/badge/github/owner/repo.svg)](https://argunix.example.com/r/github/owner/repo)"
         );
     }
 
@@ -511,12 +511,11 @@ mod tests {
             "https://argunix.example.com",
             "github",
             "owner/repo",
-            "https://github.com/owner/repo",
             Some("main"),
         );
         assert_eq!(
             snippet,
-            "[![argunix](https://argunix.example.com/badge/github/owner/repo/main.svg)](https://github.com/owner/repo)"
+            "[![argunix](https://argunix.example.com/badge/github/owner/repo/main.svg)](https://argunix.example.com/r/github/owner/repo)"
         );
     }
 
