@@ -137,7 +137,7 @@ async fn token_first_then_pubkey_subsequent() {
     let _ = tokio::time::timeout(Duration::from_secs(3), agent_handle).await;
 }
 
-/// M16 end-to-end: spawn a real argunix server + a real agent over
+/// End-to-end: spawn a real argunix server + a real agent over
 /// SSH, open a side channel from the daemon side, write a
 /// `NixDaemonStdio` header + payload, and assert every byte
 /// round-trips back through the agent's socket tunnel. The fake

@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 /// User permission on a repository. Forge-agnostic; per-forge providers
 /// translate their native permission strings to this enum.
 ///
-/// `can_trigger_ci()` is the predicate Q3 hinges on: "committers/maintainers
-/// are fine, strangers should not be able to trigger random PRs".
+/// `can_trigger_ci()` is the live half of the PR allowlist gate:
+/// committers/maintainers are fine; strangers should not be able to
+/// trigger random PRs. See [docs/concepts/allowlist.md].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {

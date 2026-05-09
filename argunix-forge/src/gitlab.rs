@@ -156,7 +156,7 @@ impl Provider for GitlabProvider {
         // GitLab MR's `merge_commit_sha` is null until merged. There's
         // also `head_pipeline.sha` and `diff_refs.base_sha`, but for
         // the prospective-merge use case we just return None and let
-        // the caller fall back to the head SHA (Q66).
+        // the caller fall back to the head SHA.
         let url = format!(
             "{}/projects/{}/merge_requests/{}",
             self.api_url,

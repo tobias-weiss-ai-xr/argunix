@@ -295,7 +295,7 @@ impl Handler for ConnectionHandler {
 }
 
 impl ConnectionHandler {
-    /// M14b: forward a build lifecycle event onto the registry's
+    /// Forward a build lifecycle event onto the registry's
     /// per-(builder, build_id) mpsc, if a worker has registered one.
     /// Silently no-ops if the event arrives for an unknown build —
     /// most likely the worker already gave up (cancel / disconnect)

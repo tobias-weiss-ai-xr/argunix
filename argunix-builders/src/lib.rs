@@ -1,4 +1,4 @@
-//! Dynamic builder pool for argunix (M13 / `design/builders.md`).
+//! Dynamic builder pool for argunix.
 //!
 //! Builders dial argunix over SSH (russh server) and authenticate either
 //! with a shared enrollment token (first connect) or a per-builder

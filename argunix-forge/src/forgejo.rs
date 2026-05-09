@@ -9,7 +9,7 @@
 //! - The status API uses the same `/repos/{owner}/{repo}/statuses/{sha}`
 //!   path but the response body shape is slightly different (no
 //!   numeric `id`; we fall back to the URL).
-//! - `api_url` is operator-configured per Q86 — there's no SaaS host.
+//! - `api_url` is operator-configured — there's no SaaS host.
 //!
 //! Code consciously written from scratch (not derived from any
 //! GPL/EUPL'd reference). Shape that matches GitHub's is convergent —
@@ -134,7 +134,7 @@ impl Provider for ForgejoProvider {
     ) -> Result<Option<Sha>, ForgeError> {
         // Forgejo doesn't pre-compute a "prospective merge SHA" the
         // way GitHub does, so this just returns the PR's `merge_base`
-        // when present. Callers fall back to the head SHA per Q66.
+        // when present. Callers fall back to the head SHA when absent.
         let url = format!(
             "{}/repos/{}/pulls/{}",
             self.api_url,

@@ -2,19 +2,18 @@
 //!
 //! The unit of work is a single derivation, identified by its `.drv` path.
 //! For each one we either skip the build (the output is already in a
-//! configured binary cache, Q59) or run `nix-store --realise` and capture the
+//! configured binary cache) or run `nix-store --realise` and capture the
 //! build log to a zstd-compressed file. Successful builds get a GC root
-//! under `/nix/var/nix/gcroots/per-user/argunix/<repo>/<eval>/<job>` (Q47/Q48).
+//! under `/nix/var/nix/gcroots/argunix/<repo>/<eval>/<job>` — see
+//! [docs/concepts/gc-roots.md].
 //!
-//! v1 scope (M3):
+//! Scope:
 //! - synchronous build per job (the daemon's offline `argunix build`
 //!   subcommand iterates jobs sequentially);
 //! - cache-skip via `nix path-info --store <cache> <output-path>`;
 //! - log capture: stream nix-store stderr to memory (capped at the
 //!   configured size), write a single zstd-compressed file at the end;
 //! - GC root: post-success `nix-store --add-root <root> --indirect <output>`.
-//!
-//! Cache push (Q17) is async-background and lands with the scheduler in M4.
 
 mod cache;
 mod gc_root;

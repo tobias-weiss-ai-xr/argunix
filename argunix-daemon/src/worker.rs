@@ -11,11 +11,6 @@
 //! 5. Persists each discovered job and runs the build pipeline (argunix-build),
 //! 6. Updates the evaluation's terminal status.
 //!
-//! What's deferred to M5c3/d:
-//! - cancel-on-new-push,
-//! - merge-ref retry for fork PRs,
-//! - per-job vs collapsed check threshold (M5c3 ships per-job for any size).
-//!
 //! PR permission/allowlist and watched-branches gating happen earlier in
 //! the pipeline — see `argunix_web::policy` — so by the time the worker
 //! picks an evaluation up, it's already been authorised.
@@ -40,7 +35,7 @@ use tokio::sync::mpsc;
 use tracing::{Instrument, info_span};
 
 /// RAII guard that reserves an `in_flight` slot on a specific builder
-/// for the lifetime of one dispatched derivation (M14). Increments
+/// for the lifetime of one dispatched derivation. Increments
 /// on construction; decrements on drop (including when the build
 /// future is dropped due to cancellation).
 struct BuilderSlot {
@@ -118,7 +113,7 @@ pub struct WorkerContext {
     pub cancellations: Arc<CancelRegistry>,
     /// Shared registry of currently-connected builders. The worker
     /// picks one per derivation via `pick_builder_for_spec`; on a
-    /// match, dispatch goes through M14b side channels (push closure
+    /// match, dispatch goes through the side channels (push closure
     /// → `Build` control message → drain lifecycle → pull outputs).
     /// On no match, the worker falls back to a local `nix-store
     /// --realise` (which itself may use the host's `nix.buildMachines`).
@@ -138,7 +133,7 @@ pub struct WorkerContext {
     /// Tests inject a fake; in production `"nix"` on PATH.
     pub nix_bin: PathBuf,
     /// Maximum number of derivations to build in parallel across the
-    /// whole evaluation (M14). Per-builder concurrency is additionally
+    /// whole evaluation. Per-builder concurrency is additionally
     /// gated by each builder's advertised `max_jobs`. Set in
     /// `main.rs`; clamped to ≥1 at use.
     pub build_concurrency: usize,
@@ -186,10 +181,12 @@ pub fn spawn(
 async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     tracing::info!("worker picked up evaluation");
 
-    // Q39: register a cancel token *before* checking the DB row, so a
+    // Register a cancel token *before* checking the DB row, so a
     // cancel that arrives after this point but before we start work is
     // captured. If the DB already says Cancelled (cancel arrived before
-    // the worker picked it up), bail without doing anything.
+    // the worker picked it up), bail without doing anything. See
+    // [docs/concepts/cancel-on-push.md] for the broader cancellation
+    // model.
     let cancel = ctx.cancellations.register(eval_id);
     let _guard = CancelGuard {
         registry: &ctx.cancellations,
@@ -199,7 +196,8 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     // Snapshot the swappable bundle for this evaluation. A reload that
     // lands while we're mid-eval will swap the daemon's pointer but
     // this snapshot remains valid — we finish on the config we
-    // started with (Q22 / Q70).
+    // started with, so the eval doesn't see provider/repo changes
+    // mid-flight.
     let snap = ctx.current.load_full();
 
     let eval = <SqlxStore as EvalStore>::get(&ctx.store, eval_id)
@@ -235,7 +233,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         biased;
         r = clone_fut => r.with_context(|| format!("cloning {} at {}", repo.slug, eval.sha))?,
         _ = cancel.cancelled() => {
-            tracing::info!("evaluation cancelled during clone (Q39)");
+            tracing::info!("evaluation cancelled during clone");
             <SqlxStore as EvalStore>::finish(
                 &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
             ).await?;
@@ -244,7 +242,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     };
 
     if cancel.is_cancelled() {
-        tracing::info!("evaluation cancelled before eval phase (Q39)");
+        tracing::info!("evaluation cancelled before eval phase");
         <SqlxStore as EvalStore>::finish(&ctx.store, eval_id, EvalStatus::Cancelled, Utc::now())
             .await?;
         return Ok(());
@@ -263,7 +261,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         biased;
         res = argunix_eval::evaluate(&request) => res,
         _ = cancel.cancelled() => {
-            tracing::info!("evaluation cancelled during nix-eval-jobs (Q39)");
+            tracing::info!("evaluation cancelled during nix-eval-jobs");
             <SqlxStore as EvalStore>::finish(
                 &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
             ).await?;
@@ -273,7 +271,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     let jobs = match jobs {
         Ok(jobs) => jobs,
         Err(e) => {
-            // Q52: surface eval-time failure as a single failed forge
+            // Surface eval-time failure as a single failed forge
             // check. Github's status `description` field is capped at
             // 140 chars, so we truncate the (often multi-line)
             // nix-eval-jobs error before posting. The eval row's
@@ -307,13 +305,14 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         })
         .collect();
 
-    // Q5/Q19: above the threshold we collapse per-job checks into a
-    // single rolling `argunix: evaluation` status whose description is
+    // Above the threshold we collapse per-job checks into a single
+    // rolling `argunix: evaluation` status whose description is
     // updated as jobs finish. PAT path (commit statuses) caps the
     // description at 140 chars — no markdown bullets — so the full
     // job list lives in argunix's UI, reachable via the status's
-    // target_url. Markdown summaries land with GitHub-App / Checks
-    // API in M5c.
+    // target_url. Richer markdown summaries become possible once the
+    // GitHub-App Checks API path is wired up. See
+    // [docs/concepts/collapsed-checks.md].
     let repo_cfg = snap
         .config
         .repos
@@ -328,7 +327,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         tracing::info!(
             jobs = total,
             threshold,
-            "collapsed check mode active; per-job statuses suppressed (Q19)",
+            "collapsed check mode active; per-job statuses suppressed",
         );
     }
 
@@ -346,8 +345,9 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         persisted.push((spec, job_id));
     }
 
-    // Replace the initial Q51 "evaluating…" overall check with a
-    // "building N jobs" pending update. Without this, the GitHub /
+    // Replace the initial "evaluating…" overall check (posted at
+    // webhook time) with a "building N jobs" pending update.
+    // Without this, the GitHub /
     // GitLab / Forgejo UI shows "evaluating…" the entire time builds
     // are running, which is misleading once eval is actually done.
     // In collapsed_mode the rolling tally updates further refine
@@ -386,7 +386,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     let summary_debounce = std::time::Duration::from_secs(2);
     let mut last_summary_post: Option<std::time::Instant> = None;
 
-    // M14: parallelise the per-eval build loop. Up to
+    // Parallelise the per-eval build loop. Up to
     // `ctx.build_concurrency` derivations build in parallel; per-builder
     // capacity is gated separately by each builder's `max_jobs` (read
     // inside `pick_builder_for_spec` via `BuilderRegistry::eligible`).
@@ -464,7 +464,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
                 tracing::info!(
                     in_flight = set.len(),
                     remaining_done = tally.success + tally.cached + tally.failure,
-                    "evaluation cancelled mid-build-loop (Q39); awaiting graceful shutdown of in-flight builds",
+                    "evaluation cancelled mid-build-loop; awaiting graceful shutdown of in-flight builds",
                 );
                 // Drain naturally — each in-flight build observes
                 // the cancel token through its own future and
@@ -506,10 +506,10 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         };
         tally.record(final_status);
         if collapsed_mode {
-            // Q69: debounce. Only post a summary update if 2s elapsed
+            // Debounce. Only post a summary update if 2s elapsed
             // since the last one. The unconditional final post after
             // the loop will catch any tail tally that the debounce
-            // dropped.
+            // dropped. See [docs/concepts/collapsed-checks.md].
             let elapsed_ok = match last_summary_post {
                 None => true,
                 Some(t) => t.elapsed() >= summary_debounce,
@@ -577,8 +577,8 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Q19/Q102: in-progress description for the rolling collapsed check.
-/// GitHub commit-status descriptions are capped at 140 chars; this is
+/// In-progress description for the rolling collapsed check. GitHub
+/// commit-status descriptions are capped at 140 chars; this is
 /// generously inside that.
 fn collapsed_progress(tally: &JobTally, total: usize) -> String {
     let done = tally.success + tally.cached + tally.failure;
@@ -610,7 +610,7 @@ fn summarise_for_check(err: &str, max_chars: usize) -> String {
     }
 }
 
-/// Pick the builder this derivation should run on (M14). Walks
+/// Pick the builder this derivation should run on. Walks
 /// `BuilderRegistry::eligible(system, required_features, exclude={})`
 /// and takes the first entry — which `eligible()` already sorts
 /// least-loaded-first. Returns `None` when:
@@ -817,10 +817,10 @@ fn post_overall_check(
     );
 }
 
-/// Q82: skip post_check entirely if the forge is paused; mark the forge
+/// Skip post_check entirely if the forge is paused; mark the forge
 /// healthy on a successful post and pause it on 401. Other errors leave
 /// the registry alone — those are transient and don't indicate a broken
-/// credential.
+/// credential. See [docs/concepts/forge-pause.md].
 fn spawn_post_check(
     provider: Arc<dyn Provider>,
     post: CheckPost,
@@ -830,7 +830,7 @@ fn spawn_post_check(
     if pauses.is_paused(&forge_name) {
         tracing::info!(
             forge = %forge_name,
-            "skipping forge post_check: forge paused (Q82)",
+            "skipping forge post_check: forge paused",
         );
         return;
     }
@@ -981,7 +981,7 @@ async fn build_one(
     // matching system, fail fast. Without this, nix's remote-build
     // scheduler silently retries internally for many minutes before
     // printing "Failed to find a machine" — visible to the operator
-    // only when the build finally gives up. See `bugs.md`.
+    // only when the build finally gives up.
     if !spec.required_system_features.is_empty() {
         if let Some(system) = spec.system.as_deref() {
             let eligible = ctx.builder_registry.eligible(
@@ -1021,7 +1021,7 @@ async fn build_one(
         }
     }
 
-    // M14: pick a specific builder for this derivation and pin nix to
+    // Pick a specific builder for this derivation and pin nix to
     // it. `eligible()` already returns least-loaded-first, filtered by
     // (system, requiredSystemFeatures, max_jobs cap). We reserve the
     // slot before recording dispatch + starting the build so a
@@ -1041,8 +1041,8 @@ async fn build_one(
     <SqlxStore as JobStore>::start(&ctx.store, job_id, Utc::now()).await?;
     if let Some(b) = &chosen {
         // Surfaces the chosen builder in the read-only UI's running
-        // table and lets future M14 work (per-builder running counts
-        // grouped from the DB) be honest.
+        // table and keeps per-builder running counts grouped from the
+        // DB honest.
         <SqlxStore as JobStore>::dispatch(&ctx.store, job_id, b.builder_id, Utc::now()).await?;
     }
 
@@ -1062,18 +1062,19 @@ async fn build_one(
         pinned_builder = chosen.as_ref().map(|b| b.name.as_str()),
         "dispatching build",
     );
-    // Q39 / Q104 / Q105: race the build against the eval's cancel
-    // signal. `biased;` polls the build first — if it just resolved
-    // with success we honour that even if cancel arrived in the same
-    // event-loop tick (Q105). On cancel-wins we drop the build future;
-    // for the local fallback path, `Command::kill_on_drop(true)` reaps
-    // the child; for the remote (pool) path, `dispatch_build_via_pool`
-    // sends an `Abort` control message and drains the resulting
-    // `BuildFinished{Killed}` itself.
+    // Race the build against the eval's cancel signal. `biased;`
+    // polls the build first — if it just resolved with success we
+    // honour that even if cancel arrived in the same event-loop tick
+    // (cancellation is cooperative; a green build is not retroactively
+    // failed). On cancel-wins we drop the build future; for the local
+    // fallback path, `Command::kill_on_drop(true)` reaps the child;
+    // for the remote (pool) path, `dispatch_build_via_pool` sends an
+    // `Abort` control message and drains the resulting
+    // `BuildFinished{Killed}` itself. See [docs/concepts/cancel-on-push.md].
     let (outcome, phase_metrics) = match &chosen {
         Some(b) => {
-            // M14b: dispatch via the dynamic builder pool through
-            // side channels. The helper drives push-closure → Build
+            // Dispatch via the dynamic builder pool through side
+            // channels. The helper drives push-closure → Build
             // → drain lifecycle → pull-closure → register-gcroot
             // entirely; the `cancel` token is honoured inside.
             dispatch_build_via_pool(
@@ -1108,7 +1109,7 @@ async fn build_one(
                     tracing::info!(
                         job_id = job_id.get(),
                         attr = %spec.attr_path,
-                        "build cancelled by new push (Q39); killing nix-store",
+                        "build cancelled by new push; killing nix-store",
                     );
                     <SqlxStore as JobStore>::finish(
                         &ctx.store, job_id, JobStatus::Cancelled, Utc::now(), None, None,
@@ -1244,7 +1245,7 @@ async fn dispatch_build_via_pool(
     }
 }
 
-/// M14b daemon-side build orchestration.
+/// Daemon-side build orchestration for the dynamic builder pool.
 ///
 /// Drives one derivation through the pool: push the drv's input
 /// closure to the chosen builder over a `ClosurePush` side channel,

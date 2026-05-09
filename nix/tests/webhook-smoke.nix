@@ -1,4 +1,4 @@
-# Sandboxed test of the M5b webhook ingestion path.
+# Sandboxed test of the webhook ingestion path.
 #
 # Starts `argunix serve` in the background, posts a few webhooks via curl
 # (with HMAC computed by openssl), verifies HTTP responses and the rows
@@ -79,7 +79,7 @@ runCommand "argunix-webhook-smoke"
       python3
       sqlite
     ];
-    meta.description = "M5b: argunix serve accepts validated webhooks and queues evaluations";
+    meta.description = "argunix serve accepts validated webhooks and queues evaluations";
   }
   ''
     set -euo pipefail

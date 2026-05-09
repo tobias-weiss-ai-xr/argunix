@@ -90,8 +90,8 @@ pub struct JobRecord {
     pub log_path: Option<String>,
     pub output_path: Option<String>,
     /// The most recent builder this job was dispatched to. None means the
-    /// job has never been dispatched (still queued) or pre-dates M13. The
-    /// dispatcher reads this on re-queue to set anti-affinity.
+    /// job has never been dispatched (still queued). The dispatcher reads
+    /// this on re-queue to set anti-affinity.
     pub builder_id: Option<BuilderId>,
     /// How many times this job has been interrupted by transport drop /
     /// graceful builder shutdown. Capped by `MAX_INTERRUPTIONS`; on
@@ -100,9 +100,8 @@ pub struct JobRecord {
     /// Set when a job fails for a non-build-process reason (currently only
     /// "exceeded interruption retry limit"). NULL for build-level failures.
     pub failure_reason: Option<String>,
-    /// Per-phase accounting for pool-dispatched builds (M16). All `None`
-    /// for jobs that were never dispatched, built locally, or finished
-    /// before this column-set existed.
+    /// Per-phase accounting for pool-dispatched builds. All `None`
+    /// for jobs that were never dispatched or built locally.
     pub phase_metrics: JobPhaseMetrics,
 }
 

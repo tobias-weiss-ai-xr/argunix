@@ -22,7 +22,7 @@ in
 runCommand "argunix-config-smoke"
   {
     nativeBuildInputs = [ argunix ];
-    meta.description = "M1: load YAML, open sqlite, run migrations, print 'ready'";
+    meta.description = "load YAML, open sqlite, run migrations, print 'ready'";
   }
   ''
     set -euo pipefail

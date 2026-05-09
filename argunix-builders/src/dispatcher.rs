@@ -1,12 +1,12 @@
 //! Build-channel dispatcher.
 //!
 //! The piece that — given `(system, features, exclude_set)` — picks a
-//! connected builder and opens a fresh SSH session channel into it. In
-//! M14b the channel is used for one of the side-channel directions
+//! connected builder and opens a fresh SSH session channel into it. The
+//! channel is used for one of the side-channel directions
 //! (`ClosurePush` from daemon, `ClosurePull` from agent) or for sending
 //! a `Build` control message; see [`crate::side_channel`].
 //!
-//! **Note on `in_flight`** (M14). The dispatcher does not touch
+//! **Note on `in_flight`.** The dispatcher does not touch
 //! `BuilderRegistry::in_flight`; the worker owns that counter and
 //! increments exactly once per dispatched derivation so the status
 //! page reflects running *builds* rather than open channels.
@@ -57,7 +57,7 @@ impl BuilderDispatcher {
     /// the next eligible candidate. Only when every candidate has been
     /// tried do we return `Err`.
     ///
-    /// `in_flight` accounting is the worker's responsibility (M14):
+    /// `in_flight` accounting is the worker's responsibility:
     /// the worker increments before calling here and decrements when
     /// the build finishes. This function does not touch the counter.
     pub async fn dispatch(
@@ -107,7 +107,7 @@ impl BuilderDispatcher {
     }
 
     /// Open a fresh SSH session channel into a *specific* builder.
-    /// The M14b daemon-side worker uses this to open a `ClosurePush`
+    /// The daemon-side worker uses this to open a `ClosurePush`
     /// channel (to ship the drv closure) and a `ClosurePull` channel
     /// (to fetch the built outputs); see [`crate::side_channel`] for
     /// the framing.
@@ -132,7 +132,7 @@ impl BuilderDispatcher {
         }
     }
 
-    /// M14b: register a build in the registry's in-flight map and send
+    /// Register a build in the registry's in-flight map and send
     /// a `Build` control message on the named builder's control
     /// channel. Returns the lifecycle receiver. The worker drains it
     /// (BuildStarted → BuildLogChunk* → BuildFinished) and is
@@ -188,7 +188,7 @@ impl BuilderDispatcher {
         Ok(rx)
     }
 
-    /// M14b: send an `Abort` control message on the named builder's
+    /// Send an `Abort` control message on the named builder's
     /// control channel and unregister the in-flight entry. The
     /// worker should still drain its lifecycle receiver until
     /// `Finished{Killed}` arrives so `BuildSlot` accounting closes.
@@ -214,9 +214,9 @@ impl BuilderDispatcher {
 }
 
 /// Owner of an opened build channel against a registered builder.
-/// In M13 this also held an `in_flight` slot via Drop; M14 moved that
-/// accounting to the worker, so this struct is now just a typed
-/// channel-plus-name wrapper.
+/// `in_flight` accounting is the worker's responsibility (it
+/// increments once per dispatched derivation), so this struct is
+/// just a typed channel-plus-name wrapper.
 pub struct DispatchedBuild {
     pub name: BuilderName,
     channel: Option<Channel<Msg>>,

@@ -1,4 +1,4 @@
-# M16 stress test: prove that the closure-pull path streams per-file
+# Stress test: prove that the closure-pull path streams per-file
 # with bounded memory, by transferring an output that is *much*
 # bigger than each VM's RAM and capping each daemon's cgroup memory
 # below the file size.
@@ -7,7 +7,7 @@
 #   - `nix copy --from ssh-ng://localhost?remote-program=...` does not
 #     buffer the NAR end-to-end. With the legacy `nix-store --import`
 #     path, a 5 GiB single-NAR pull peaked the daemon at ~3 GiB RSS;
-#     the M16 daemon-protocol path should stay well below the cap
+#     the daemon-protocol path should stay well below the cap
 #     enforced by `MemoryMax=512M`.
 #   - The full closure round-trip works for outputs that don't fit
 #     in tmpfs — the writable-store overlay must be on disk

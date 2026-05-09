@@ -1,4 +1,4 @@
-# End-to-end M5c1 test: webhook → worker → eval+build → DB.
+# End-to-end test: webhook → worker → eval+build → DB.
 #
 # `argunix serve` runs in the background. Stand-in `git`, `nix-eval-jobs`,
 # `nix-store`, and `nix` (path-info) replace the real binaries so we can
@@ -179,7 +179,7 @@ runCommand "argunix-serve-pipeline-smoke"
       python3
       sqlite
     ];
-    meta.description = "M5c1: webhook triggers worker, which clones, evals, builds, and updates DB";
+    meta.description = "webhook triggers worker, which clones, evals, builds, and updates DB";
   }
   ''
     set -euo pipefail

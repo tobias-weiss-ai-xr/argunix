@@ -29,11 +29,11 @@ enum Command {
     },
     /// Print the daemon's current state (uptime, repos, paused forges).
     Status,
-    /// Manage the dynamic builder pool (M13).
+    /// Manage the dynamic builder pool.
     #[command(subcommand)]
     Builders(BuildersCommand),
     /// Test-only: dispatch a local drv path to the named builder over
-    /// the M14b side-channel transport. Used by the NixOS test that
+    /// the side-channel transport. Used by the NixOS test that
     /// exercises the dynamic-pool path without standing up a fake
     /// forge. Not part of the operator surface.
     #[command(name = "test-dispatch-drv", hide = true)]

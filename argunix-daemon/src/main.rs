@@ -20,11 +20,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the argunix daemon (M1 service-mode skeleton).
+    /// Run the argunix daemon (service-mode skeleton).
     Run(RunArgs),
     /// Evaluate a local flake and print discovered jobs as JSON.
     Eval(EvalArgs),
-    /// Evaluate and build a local flake end-to-end (M3 single-shot pipeline).
+    /// Evaluate and build a local flake end-to-end (single-shot pipeline).
     Build(BuildArgs),
     /// Run as an HTTP daemon: accept webhooks, queue evaluations.
     Serve(ServeArgs),
@@ -112,7 +112,7 @@ struct BuildArgs {
     #[arg(long, value_name = "REF", default_value = "HEAD")]
     git_ref: String,
     /// 40-hex-char SHA recorded for the evaluation. If omitted, a synthetic
-    /// zero SHA is recorded (real cloning lands in M5).
+    /// zero SHA is recorded (single-shot mode skips the clone step).
     #[arg(
         long,
         value_name = "SHA",
@@ -231,7 +231,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         argunix_web::ensure_webhooks(&snap.config, &snap.providers, &store).await;
     }
 
-    // M13: shared registry of currently-connected builders. Created
+    // Shared registry of currently-connected builders. Created
     // before the worker so it can compose `--builders` per dispatch;
     // BuilderServer (when `builder_enrollment` is configured) writes
     // into the same Arc; argunixctl reads it via the control socket.
@@ -239,12 +239,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let live_logs = argunix_web::LiveLogRegistry::new();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    // M16 simplification: closure transfer is now `nix copy` over a
-    // tunneled `nix-daemon --stdio`. The daemon-protocol streams
-    // per-file with bounded memory, so the previous `pull_sem`
-    // throttle (which existed to bound concurrent multi-GB
-    // `nix-store --import` subprocesses) is no longer needed.
-    // `build_concurrency` remains as the global cap on parallel
+    // Closure transfer is `nix copy` over a tunneled
+    // `nix-daemon --stdio`, which streams per-file with bounded
+    // memory. `build_concurrency` is the global cap on parallel
     // in-flight builds.
     let build_concurrency: usize = 4;
     let worker_ctx = worker::WorkerContext {
@@ -273,7 +270,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // those, and re-running `process()` would re-execute
     // `nix-eval-jobs` and `persist_job` for every spec, duplicating
     // every job row for the eval. Per-job redispatch for in-flight
-    // evals is a separate, larger change tracked in `bugs.md`.
+    // evals is a separate, larger change.
     match <argunix_store::SqlxStore as EvalStore>::list_queued_ids(&store).await {
         Ok(ids) if !ids.is_empty() => {
             tracing::info!(
@@ -353,7 +350,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     )
     .await
     .context("starting builder enrollment server")?;
-    // Retention GC (M10). Background ticker; aborted at shutdown
+    // Retention GC. Background ticker; aborted at shutdown
     // alongside the control + builder tasks. No-op on a config with
     // no `retention.max_age_days` and no `retention.max_size_gb`.
     let gc_handle = gc::spawn(gc::GcContext {

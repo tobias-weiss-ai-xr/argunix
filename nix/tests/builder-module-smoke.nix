@@ -1,4 +1,4 @@
-# M13b NixOS test: enable services.argunix-builder, assert the unit
+# NixOS test: enable services.argunix-builder, assert the unit
 # comes up and the agent runs through identity + capability discovery
 # before entering its reconnect-backoff loop.
 #

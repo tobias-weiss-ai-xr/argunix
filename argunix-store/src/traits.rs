@@ -151,8 +151,9 @@ pub trait EvalStore: Send + Sync {
     ) -> Result<Vec<EvalRecord>, StoreError>;
     /// All non-terminal evaluations (queued / evaluating / building) for
     /// `repo_id` whose `git_ref` *starts with* `branch_key_prefix`. Used by
-    /// cancel-on-new-push (Q39): a fresh push on a branch finds all
+    /// cancel-on-new-push: a fresh push on a branch finds all
     /// in-flight evals for that branch and cancels them.
+    /// See [docs/concepts/cancel-on-push.md].
     async fn list_active_by_branch_key(
         &self,
         repo_id: RepoId,
@@ -182,7 +183,7 @@ pub trait EvalStore: Send + Sync {
         limit: u32,
     ) -> Result<Vec<EvalWithRepo>, StoreError>;
 
-    /// Retention pickers (M10). Both filter to *terminal* statuses
+    /// Retention pickers. Both filter to *terminal* statuses
     /// (`evaluation_failed`, `done`, `cancelled`) — in-flight evals are
     /// never returned. Both also require `finished_at IS NOT NULL` so a
     /// terminal row that somehow lost its timestamp can't be selected.
@@ -247,7 +248,7 @@ pub trait JobStore: Send + Sync {
         output_path: Option<&str>,
         metrics: &JobPhaseMetrics,
     ) -> Result<(), StoreError>;
-    /// Used at boot (Q79): mark every still-`running` job as `interrupted`.
+    /// Used at boot: mark every still-`running` job as `interrupted`.
     /// Returns the number of rows updated. Does NOT touch `interrupt_count`
     /// — boot-time interruption is argunix's fault, not the builder's, and
     /// shouldn't push the job toward the per-job retry cap.
@@ -263,13 +264,14 @@ pub trait JobStore: Send + Sync {
         started_at: DateTime<Utc>,
     ) -> Result<(), StoreError>;
 
-    /// Transport-failure recovery (M13 / design/builders.md Q109). Under a
-    /// single transaction: increment `interrupt_count`; if the new count is
-    /// ≤ `MAX_INTERRUPTIONS`, flip status to `Interrupted`; otherwise flip
-    /// to `Failure`, stamp `finished_at`, and write
-    /// `failure_reason="exceeded interruption retry limit"`. Returns the
-    /// outcome and (when re-queueing) the prior builder so the caller can
-    /// build an anti-affinity exclude-set for the next dispatch.
+    /// Transport-failure recovery for the dynamic builder pool. Under
+    /// a single transaction: increment `interrupt_count`; if the new
+    /// count is ≤ `MAX_INTERRUPTIONS`, flip status to `Interrupted`;
+    /// otherwise flip to `Failure`, stamp `finished_at`, and write
+    /// `failure_reason="exceeded interruption retry limit"`. Returns
+    /// the outcome and (when re-queueing) the prior builder so the
+    /// caller can build an anti-affinity exclude-set for the next
+    /// dispatch.
     async fn record_interruption(
         &self,
         id: JobId,
@@ -308,7 +310,7 @@ pub trait BuilderStore: Send + Sync {
     /// Pubkey-auth lookup. Skips revoked rows so a revoked builder is forced
     /// back through the enrollment-token path. None means "no active row
     /// matches this pubkey" — auth fails and the agent retries with the
-    /// enrollment token (see design/builders.md).
+    /// enrollment token.
     async fn find_active_by_pubkey(
         &self,
         pubkey: &BuilderPubkey,

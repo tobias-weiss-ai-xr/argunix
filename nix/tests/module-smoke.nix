@@ -1,4 +1,4 @@
-# M9-lite NixOS test: enable services.argunix, hit /healthz.
+# NixOS smoke test: enable services.argunix, hit /healthz.
 #
 # Pass directly to `pkgs.testers.runNixOSTest`. The `pkgs` argument is
 # the host's pkgs (with the argunix overlay already applied), so the VM

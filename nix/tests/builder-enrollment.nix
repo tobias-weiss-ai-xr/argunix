@@ -1,4 +1,4 @@
-# M13b NixOS test: end-to-end builder enrollment.
+# NixOS test: end-to-end builder enrollment.
 #
 # Two nodes:
 #   - `argunix`  — the daemon with `builder_enrollment` configured.

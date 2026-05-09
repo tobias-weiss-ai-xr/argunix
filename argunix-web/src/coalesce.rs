@@ -1,4 +1,4 @@
-//! Webhook coalescing (Q99).
+//! Webhook coalescing — see [docs/concepts/webhook-coalescing.md].
 //!
 //! GitHub (and every other forge we've looked at) fires multiple webhook
 //! events for the same `(repo, sha)` within milliseconds — a `push` plus

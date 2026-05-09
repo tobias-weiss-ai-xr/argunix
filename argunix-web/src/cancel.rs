@@ -1,4 +1,4 @@
-//! Per-evaluation cancellation tokens (Q39 / Q104 / Q105).
+//! Per-evaluation cancellation tokens.
 //!
 //! Layout:
 //! - Each in-flight evaluation has a [`CancelToken`]: a cheap-to-clone
@@ -11,11 +11,12 @@
 //!   token to fire the cancellation; the worker registers the token on
 //!   eval pickup and removes it on terminal status.
 //!
-//! Q105: cancellation is *cooperative*. The worker checks the token at
+//! Cancellation is *cooperative*: the worker checks the token at
 //! safe points (between phases, between jobs) and the build subprocess
 //! is interrupted via `select!`, but a build that just succeeded keeps
 //! its success — we honour the result we have rather than racing to
-//! kill a process that's already exited.
+//! kill a process that's already exited. See
+//! [docs/concepts/cancel-on-push.md].
 
 use argunix_domain::EvalId;
 use std::collections::HashMap;

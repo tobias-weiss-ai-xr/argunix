@@ -1,14 +1,11 @@
 //! End-to-end auth-state-machine tests. We spin the argunix builder
 //! server on an ephemeral port and drive it with a real russh client.
-//! Verifies the four auth outcomes from `design/builders.md`:
+//! Verifies the four auth outcomes:
 //!
 //! 1. Correct enrollment token (password) → accept (FreshEnrollment).
 //! 2. Wrong enrollment token → reject.
 //! 3. Pubkey matching an active `builders` row → accept (Established).
 //! 4. Pubkey matching a *revoked* row → reject (forces re-enrollment).
-//!
-//! PR #5 will add a fifth case ("unknown pubkey, then fall back to
-//! token") once the agent's reconnect protocol is wired up.
 
 use std::sync::Arc;
 use std::time::Duration;

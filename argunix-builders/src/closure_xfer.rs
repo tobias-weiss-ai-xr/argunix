@@ -33,7 +33,7 @@ use tokio::process::Command;
 
 /// Per-call byte-count + wall-clock for one `nix_copy_over_pool`
 /// invocation. Returned to the worker so it can persist per-job
-/// transport metrics (M16) without instrumenting the full nix-copy
+/// transport metrics without instrumenting the full nix-copy
 /// stderr.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NixCopyMetrics {

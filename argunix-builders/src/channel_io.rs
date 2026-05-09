@@ -1,4 +1,4 @@
-//! `russh::Channel` ↔ `AsyncRead`+`AsyncWrite` adapter (M14b).
+//! `russh::Channel` ↔ `AsyncRead`+`AsyncWrite` adapter.
 //!
 //! Bridges the message-oriented russh channel API (`channel.wait()`
 //! returning `ChannelMsg::Data { data: CryptoVec }` events) to a

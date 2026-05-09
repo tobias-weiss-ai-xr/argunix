@@ -1,6 +1,6 @@
 //! GitHub forge provider with Personal-Access-Token auth.
 //!
-//! What this covers (M5a):
+//! Covers:
 //! - HMAC-SHA256 webhook verification (`X-Hub-Signature-256: sha256=<hex>`).
 //! - Webhook event parsing for `push` and `pull_request`.
 //! - Commit-status posting via `POST /repos/{owner}/{repo}/statuses/{sha}`.
@@ -8,7 +8,8 @@
 //!   `GET /repos/{owner}/{repo}/collaborators/{user}/permission`.
 //! - Merge-ref fetching for fork PRs via the pull-request endpoint.
 //!
-//! GitHub Apps auth (richer Checks API, per-output annotations) is M5c.
+//! GitHub-App auth (richer Checks API with per-output annotations and
+//! markdown summaries) is not yet implemented.
 
 use crate::errors::ForgeError;
 use crate::events::{NormalizedEvent, PullRequestAction, PullRequestEvent, PushEvent};

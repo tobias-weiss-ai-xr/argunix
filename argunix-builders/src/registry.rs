@@ -1,4 +1,4 @@
-//! In-memory map of currently-connected builders (M13 / `design/builders.md`).
+//! In-memory map of currently-connected builders.
 //!
 //! Backs both the dispatcher (PR #7 — "give me a builder that can build
 //! `<system>` and isn't at `max_jobs`") and `argunixctl builders`. Lifetime
@@ -84,7 +84,7 @@ pub struct BuilderSnapshot {
     pub in_flight: u32,
 }
 
-/// M16: which transport/build phase a `(builder, build_id)` pair is
+/// Which transport/build phase a `(builder, build_id)` pair is
 /// in right now. Set by the worker as it walks through
 /// `dispatch_pool_build`; cleared on every exit (success, failure,
 /// cancel, timeout) via [`PhaseGuard`] in the daemon. Surfaced to the
@@ -116,7 +116,7 @@ pub struct BuilderRegistry {
     /// Monotonic counter for `connection_id`. Wraps after 2^64 connects,
     /// which is fine.
     next_conn_id: AtomicU64,
-    /// M14b: per-(builder, build_id) lifecycle event channels. The
+    /// Per-(builder, build_id) lifecycle event channels. The
     /// worker registers a sender via `register_in_flight_build` before
     /// emitting a `Build` control message; the connection handler
     /// looks up `(name, build_id)` on every `BuildStarted /
@@ -125,7 +125,7 @@ pub struct BuilderRegistry {
     /// reused build_id across builders (unlikely with sqlite-allocated
     /// JobIds, but cheap to defend) doesn't cross-fire.
     in_flight_builds: Mutex<HashMap<(BuilderName, i64), mpsc::Sender<BuildLifecycle>>>,
-    /// M16: per-(builder, build_id) live phase. Worker writes via
+    /// Per-(builder, build_id) live phase. Worker writes via
     /// [`Self::set_phase`] and clears via [`Self::clear_phase`] (or a
     /// `PhaseGuard` so exit paths can't forget). Read by the status
     /// page to annotate running-job rows.
@@ -138,7 +138,7 @@ pub struct BuilderRegistry {
     stats: Mutex<HashMap<BuilderName, VecDeque<StatsSample>>>,
 }
 
-/// M14b: a single event in a build's lifecycle. The daemon's worker
+/// A single event in a build's lifecycle. The daemon's worker
 /// task drains a `mpsc::Receiver<BuildLifecycle>` returned by
 /// [`BuilderRegistry::register_in_flight_build`] (registered before
 /// the `Build` control message is sent) until it sees `Finished` or
@@ -291,7 +291,7 @@ impl BuilderRegistry {
     }
 
     /// Bump the per-builder in-flight build count. Called by the build
-    /// worker (M14) once per dispatched derivation: increment before
+    /// worker once per dispatched derivation: increment before
     /// the build starts, decrement when it returns. This is the
     /// authoritative "how busy is this builder" gauge that drives both
     /// `eligible()`'s capacity check and the status page's per-builder
@@ -317,7 +317,7 @@ impl BuilderRegistry {
         }
     }
 
-    /// M14b: register a `(builder, build_id)` so subsequent
+    /// Register a `(builder, build_id)` so subsequent
     /// `BuildStarted / BuildLogChunk / BuildFinished` events arriving
     /// on that builder's control channel get forwarded to the returned
     /// `Receiver`. The caller is expected to:
@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(lst[1].name.as_str(), "big");
     }
 
-    // ---------- M14b: in-flight build routing ----------
+    // ---------- in-flight build routing ----------
 
     #[tokio::test]
     async fn forward_build_event_delivers_to_registered_receiver() {

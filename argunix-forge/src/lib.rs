@@ -10,8 +10,9 @@
 //! - check whether a user has CI-trigger permission on a repo,
 //! - post commit statuses / checks back to the forge.
 //!
-//! M5a ships the trait + the github implementation with PAT auth; gitlab,
-//! forgejo, and github-app auth land later.
+//! All three forges (github, gitlab, forgejo) are wired up with PAT
+//! auth. GitHub-App auth (richer Checks API, per-output annotations)
+//! is not yet implemented.
 
 pub mod forgejo;
 pub mod github;
@@ -59,7 +60,7 @@ pub struct CheckPost {
     pub state: CheckState,
     /// Human-readable one-liner shown alongside the state.
     pub description: Option<String>,
-    /// Click-through URL to argunix's UI (Q101).
+    /// Click-through URL to argunix's UI.
     pub target_url: Option<String>,
 }
 
@@ -112,7 +113,7 @@ pub trait Provider: Send + Sync {
 
     /// Build a clone URL for `slug` that includes whatever auth this
     /// provider uses. v1 covers HTTPS-with-token; SSH and per-repo
-    /// `clone.method` overrides are deferred to M7.
+    /// `clone.method` overrides are not yet supported.
     fn clone_url(&self, slug: &Slug) -> String;
 }
 

@@ -25,7 +25,7 @@ pub struct Config {
     pub forges: BTreeMap<String, ForgeConfig>,
     pub binary_caches: Vec<BinaryCache>,
     pub repos: Vec<Repo>,
-    /// Dynamic builder pool listener (M13). Absent ⇒ argunix falls back to
+    /// Dynamic builder pool listener. Absent ⇒ argunix falls back to
     /// the host's existing `nix.buildMachines`. Present ⇒ argunix runs an
     /// embedded SSH server that accepts incoming builder enrollments and
     /// reverse-tunnel registrations on `listen`.
@@ -34,8 +34,8 @@ pub struct Config {
 
 /// Top-level YAML block that turns on the dynamic builder pool.
 ///
-/// One block, set once, never edited per-builder — see `design/builders.md`.
-/// Operators rotate the token by replacing the file on disk and triggering
+/// One block, set once, never edited per-builder. Operators rotate
+/// the token by replacing the file on disk and triggering
 /// `argunixctl reload`; existing builders keep their pubkey-based connections,
 /// only fresh enrollments need the new token.
 #[derive(Debug, Clone)]
@@ -101,14 +101,16 @@ fn default_control_socket() -> std::path::PathBuf {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Schedule {
-    /// Number of jobs above which we collapse per-job forge checks into a
-    /// single check with a markdown summary. See Q19.
+    /// Number of jobs above which we collapse per-job forge checks
+    /// into a single rolling check. See
+    /// [docs/concepts/collapsed-checks.md].
     #[serde(default = "default_collapsed_threshold")]
     pub collapsed_check_threshold: u32,
     /// Window during which duplicate `(repo_id, sha)` webhook events are
     /// dropped. GitHub fires a `push` and a `pull_request.synchronize`
     /// for the same SHA milliseconds apart on every PR push; without
-    /// coalescing argunix would run the same eval twice. Q99.
+    /// coalescing argunix would run the same eval twice. See
+    /// [docs/concepts/webhook-coalescing.md].
     #[serde(default = "default_webhook_coalesce_seconds")]
     pub webhook_coalesce_seconds: u32,
 }
@@ -130,10 +132,10 @@ impl Default for Schedule {
     }
 }
 
-/// Retention rules. Defaults: keep everything forever (Q11) and tick
-/// hourly (Q25 / M10). `interval_minutes` and `max_size_gb` are global
-/// only — sizing across repos is the budget operators actually care
-/// about, and one ticker fits all. Per-repo override is a separate
+/// Retention rules. Defaults: keep everything forever and tick
+/// hourly. `interval_minutes` and `max_size_gb` are global only —
+/// sizing across repos is the budget operators actually care about,
+/// and one ticker fits all. Per-repo override is a separate
 /// [`RepoRetention`] carried on each [`Repo`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

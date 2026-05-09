@@ -230,7 +230,7 @@ in
 
         # `ProtectSystem=strict` makes the rest of the FS read-only.
         # Punch a single hole for the GC roots argunix creates after every
-        # successful build (Q47), without giving it write access to any
+        # successful build, without giving it write access to any
         # other path under /nix/var.
         ReadWritePaths = [
           "/nix/var/nix/gcroots/per-user/${cfg.user}"

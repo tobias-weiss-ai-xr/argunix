@@ -1,4 +1,4 @@
--- argunix v1 schema. See design/questions-answers.md Q73.
+-- argunix v1 schema.
 -- Timestamps are stored as RFC 3339 TEXT (UTC) to keep raw SQL inspection
 -- readable; sqlx maps them to chrono::DateTime<Utc>.
 

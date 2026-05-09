@@ -5,10 +5,6 @@
 //! flush. This is intentionally text-based so an operator can poke
 //! the socket with `socat`/`nc` for ad-hoc debugging.
 //!
-//! Per Q76 the framing is "tiny RPC … probably bincode + length-
-//! prefix; could be JSON-lines for debuggability — leaning JSON-
-//! lines". We picked the latter.
-//!
 //! The protocol is request/response with no pipelining: client sends
 //! one request, server sends one response, connection closes. Adding
 //! streaming responses (e.g. `tail-log`) is a future extension —
@@ -51,11 +47,11 @@ pub enum Request {
     /// Rename `old → new`. Fails if `old` doesn't exist or if `new`
     /// already exists.
     BuildersRename { old: String, new: String },
-    /// Test-only (M14b VM test driver): take an existing local drv
-    /// path, push its closure to the named builder over a side
-    /// channel, send a `Build` control message, drain the lifecycle,
-    /// pull the output closure back, and register a transient
-    /// gcroot. Returns the realised output paths on success.
+    /// Test-only VM driver: take an existing local drv path, push
+    /// its closure to the named builder over a side channel, send a
+    /// `Build` control message, drain the lifecycle, pull the output
+    /// closure back, and register a transient gcroot. Returns the
+    /// realised output paths on success.
     ///
     /// Not intended for operator use — the read-only worker pipeline
     /// is the supported path. Used by the NixOS test that exercises

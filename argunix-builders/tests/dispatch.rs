@@ -228,14 +228,14 @@ async fn dispatch_opens_channel_to_eligible_builder() {
     }
     assert_eq!(&got, payload, "echoed bytes should round-trip");
 
-    // M14: opening a channel must NOT touch in_flight. The counter is
-    // owned by the build worker now; the channel layer is transparent.
+    // Opening a channel must NOT touch in_flight. The counter is
+    // owned by the build worker; the channel layer is transparent.
     let snap = registry
         .snapshot(&BuilderName::new("echo-builder").unwrap())
         .unwrap();
     assert_eq!(
         snap.in_flight, 0,
-        "channel open does not increment in_flight (M14: counter is worker-owned)"
+        "channel open does not increment in_flight (counter is worker-owned)"
     );
 
     drop(argunix_channel);

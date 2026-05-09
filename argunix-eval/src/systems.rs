@@ -1,9 +1,9 @@
 //! Detection of available builder systems.
 //!
-//! v1 only knows about the local system. `/etc/nix/machines` parsing comes
-//! when M3 needs it for filtering; for now anything beyond the local system
-//! must be supplied explicitly by the caller (e.g. via a `--systems` CLI
-//! flag in tests).
+//! v1 only knows about the local system. Anything beyond the local
+//! system must be supplied explicitly by the caller (e.g. via a
+//! `--systems` CLI flag in tests). `/etc/nix/machines` parsing for
+//! filtering is a future extension.
 
 /// Best-effort detection of the local nix `<arch>-<os>` system tuple.
 ///

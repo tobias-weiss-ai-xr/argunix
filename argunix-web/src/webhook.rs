@@ -330,10 +330,11 @@ async fn persist(
         ),
     };
 
-    // Q99: drop duplicate `(repo_id, sha)` events within the configured
+    // Drop duplicate `(repo_id, sha)` events within the configured
     // window. GitHub sends both a `push` and a `pull_request.synchronize`
     // for the same SHA on every PR push; without this, every PR would
     // produce two parallel evaluations and two sets of forge checks.
+    // See [docs/concepts/webhook-coalescing.md].
     if !state.coalesce.admit(repo_id, sha.clone()) {
         tracing::info!(
             repo_id = repo_id.get(),
@@ -344,10 +345,11 @@ async fn persist(
         return Ok(());
     }
 
-    // Q39: cancel any in-flight evaluations for the same branch with a
+    // Cancel any in-flight evaluations for the same branch with a
     // different SHA. We only fire here if the new SHA is different
     // (matching SHAs were already filtered by the coalesce check, but
     // a new push to the same branch with a different SHA arrives here).
+    // See [docs/concepts/cancel-on-push.md].
     let key = crate::cancel::branch_key(&git_ref);
     let active = state.store.list_active_by_branch_key(repo_id, key).await?;
     for prev in active.iter().filter(|e| e.sha != sha) {
@@ -357,7 +359,7 @@ async fn persist(
             superseded_eval = prev.id.get(),
             superseded_sha = %prev.sha,
             new_sha = %sha,
-            "cancelling in-flight evaluation superseded by new push (Q39)",
+            "cancelling in-flight evaluation superseded by new push",
         );
         // DB-level cancel: covers the case where the worker hasn't
         // picked up this eval yet (cancel arrives before the mpsc
@@ -393,7 +395,7 @@ async fn persist(
         "evaluation queued",
     );
 
-    // Q51: post a `argunix: evaluation` pending check immediately so the
+    // Post a `argunix: evaluation` pending check immediately so the
     // PR shows argunix received the event. We spawn this so a slow forge
     // doesn't slow the webhook ack — the worker still proceeds even if
     // this fails.
@@ -458,7 +460,7 @@ fn spawn_post_check(
     if pauses.is_paused(&forge_name) {
         tracing::info!(
             forge = %forge_name,
-            "skipping forge post_check: forge paused (Q82)",
+            "skipping forge post_check: forge paused",
         );
         return;
     }

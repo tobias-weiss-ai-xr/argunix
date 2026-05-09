@@ -1,4 +1,4 @@
-# M5c2 sandbox test: verify the daemon posts the right forge checks at the
+# Sandbox test: verify the daemon posts the right forge checks at the
 # right times.
 #
 # Architecture:
@@ -196,7 +196,7 @@ runCommand "argunix-forge-status-smoke"
       python3
       sqlite
     ];
-    meta.description = "M5c2: webhook + worker post the expected forge status checks";
+    meta.description = "webhook + worker post the expected forge status checks";
   }
   ''
     set -euo pipefail

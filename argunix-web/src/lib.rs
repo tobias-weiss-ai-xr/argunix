@@ -1,12 +1,11 @@
-//! HTTP surface: webhook ingestion and (later) the read-only UI.
+//! HTTP surface: webhook ingestion and the read-only UI.
 //!
-//! v1 (M5b) ships:
-//! - `POST /webhook/github` — verify HMAC, parse event, persist evaluation,
-//!   return 202.
+//! Endpoints include:
+//! - `POST /webhook/{github,gitlab,forgejo}` — verify HMAC, parse
+//!   event, persist evaluation, return 202.
 //! - `GET /healthz` — always 200, returns "ok".
-//!
-//! Read-only UI, JSON content negotiation, badges, and `/metrics` come
-//! later (M6).
+//! - `GET /` and per-eval / per-job pages — read-only HTML UI with
+//!   JSON content negotiation.
 
 mod auto_install;
 mod badge;

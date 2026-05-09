@@ -1,8 +1,8 @@
 //! YAML configuration for argunix.
 //!
-//! See `design/questions-answers.md` Q83 for the schema and the rules for
-//! secret paths (env-var substitution, never-inline). Unknown keys are
-//! rejected to catch typos early.
+//! Secret paths are env-var-substituted and never inlined into the
+//! YAML itself (see `secret`). Unknown keys are rejected to catch
+//! typos early.
 
 mod path;
 mod schema;

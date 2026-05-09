@@ -1,6 +1,6 @@
 //! Weighted-fair-queueing scheduler.
 //!
-//! Goals (M4 in `design/plan.md`):
+//! Goals:
 //! - per-repo `weight` (default 1) gives a target dispatch ratio,
 //! - no repo is starved as long as it has pending work,
 //! - in-flight count is capped by a configurable global limit,
@@ -30,14 +30,14 @@
 //!
 //! Time-of-day is irrelevant to the algorithm — `tick` is a no-op kept
 //! around so callers don't have to care which formulation is in force.
-//! The scheduler is intentionally synchronous and `&mut self`-driven; the
-//! daemon will wrap it in a `Mutex` once the M5 service mode lands.
+//! The scheduler is intentionally synchronous and `&mut self`-driven;
+//! the daemon wraps it in a `Mutex` for service-mode use.
 
 use argunix_domain::{JobId, RepoId};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-/// Default per-repo weight (Q83 — `repos[].weight` defaults to 1).
+/// Default per-repo weight (`repos[].weight` defaults to 1).
 pub const DEFAULT_WEIGHT: u32 = 1;
 
 /// Returned from [`Scheduler::dispatch`] when a job was selected.

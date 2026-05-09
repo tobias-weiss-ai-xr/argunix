@@ -1,4 +1,4 @@
-//! argunix-builder agent (M13b).
+//! argunix-builder agent.
 //!
 //! The client-side counterpart to argunix-builders' SSH server: dials
 //! argunix, authenticates (pubkey first, fall back to enrollment

@@ -1,18 +1,19 @@
-//! Side-channel framing (M14b → M16).
+//! Side-channel framing.
 //!
 //! A side channel is a fresh russh session channel opened per
 //! closure transfer (one in each direction per build). The channel
 //! starts with a single newline-terminated JSON header describing
 //! what the payload is, followed by raw bytes until channel-close.
 //!
-//! M16 collapsed the protocol to a single binary kind — the agent
+//! Currently the protocol carries a single binary kind: the agent
 //! spawns `nix-daemon --stdio` and tunnels its stdin/stdout
 //! through the channel; the daemon side wires this into a local
 //! Unix socket so `nix copy --from/--to unix:///path` can drive it
-//! as a normal nix-daemon endpoint. This replaces the legacy
-//! `--export | --import` path that OOM'd on multi-GB single-NAR
-//! image outputs because `nix-store --import` buffered each NAR for
-//! hash verification before extracting.
+//! as a normal nix-daemon endpoint. This streams per-file with
+//! bounded memory, instead of the legacy `--export | --import`
+//! path that OOM'd on multi-GB single-NAR image outputs because
+//! `nix-store --import` buffered each NAR for hash verification
+//! before extracting.
 //!
 //! The header still exists so a future protocol change can be
 //! introduced behind a new kind without breaking older agents on
@@ -70,9 +71,9 @@ pub enum SideChannelError {
 }
 
 /// Cap on the side-channel header size. The header is a tiny JSON
-/// line under the new (M16) protocol — no path list — so the cap is
-/// purely a defense against a hostile / runaway peer that opens a
-/// channel and never sends a newline.
+/// line — no path list — so the cap is purely a defense against a
+/// hostile / runaway peer that opens a channel and never sends a
+/// newline.
 pub const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
 
 impl SideChannelHeader {

@@ -1,4 +1,4 @@
--- Dynamic builder pool (M13). Builders dial argunix over SSH (russh server)
+-- Dynamic builder pool. Builders dial argunix over SSH (russh server)
 -- and self-describe their capabilities; argunix never declares them.
 --
 -- Auth model is TOFU:
@@ -9,8 +9,6 @@
 -- Capabilities (`systems`, `features`) are JSON arrays of strings; refreshed
 -- on every reconnect's `hello` message and overwritten in place. The row is
 -- the latest snapshot, not history.
---
--- See design/builders.md.
 
 CREATE TABLE builders (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,7 +27,7 @@ CREATE INDEX idx_builders_pubkey_active ON builders(pubkey) WHERE revoked_at IS 
 
 -- Track which builder ran each job (for anti-affinity on re-queue) and how
 -- many times the job has been interrupted by transport failure / graceful
--- shutdown. Capped at 3 in application code (see design/builders.md Q109);
--- on the 4th interruption, the job flips to `Failure` with a reason.
+-- shutdown. Capped at 3 in application code; on the 4th interruption,
+-- the job flips to `Failure` with a reason.
 ALTER TABLE jobs ADD COLUMN builder_id INTEGER REFERENCES builders(id);
 ALTER TABLE jobs ADD COLUMN interrupt_count INTEGER NOT NULL DEFAULT 0;

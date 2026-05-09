@@ -1,4 +1,4 @@
-# argunix-builder NixOS module (M13b).
+# argunix-builder NixOS module.
 #
 # Runs the `argunix-builder` agent as a systemd unit. The agent dials
 # argunix over SSH on `argunixPort`, authenticates (TOFU on first

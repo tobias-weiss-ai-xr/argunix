@@ -1,8 +1,9 @@
 //! Self-discovery of nix-side capabilities.
 //!
-//! Per `design/builders.md`: capabilities live exclusively on the
-//! builder side and are reported to argunix on every `hello`. The
-//! daemon caches the latest snapshot in `builders.systems` /
+//! Capabilities live exclusively on the builder side and are reported
+//! to argunix on every `hello`, so they cannot drift between what the
+//! daemon believes and what the builder actually supports. The daemon
+//! caches the latest snapshot in `builders.systems` /
 //! `builders.features` / `builders.max_jobs` / `builders.nix_version`
 //! but treats the live channel as truth.
 //!

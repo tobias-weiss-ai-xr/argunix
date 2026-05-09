@@ -6,10 +6,10 @@
 //! `darwinConfigurations` are deferred to a follow-up.
 //!
 //! Each fragment is evaluated by spawning `nix-eval-jobs` once and parsing
-//! its JSON-lines output. Network access is allowed by default (matches the
-//! M2 plan and is required for IFD); a wall-clock timeout from the request
-//! caps each subprocess. Memory limits are enforced by systemd in production
-//! (M9); we only apply timeouts here.
+//! its JSON-lines output. Network access is allowed by default (required
+//! for IFD); a wall-clock timeout from the request caps each subprocess.
+//! Memory limits are enforced by systemd in production; we only apply
+//! timeouts here.
 
 mod jobspec;
 mod runner;
@@ -19,5 +19,5 @@ pub use jobspec::{JobSpec, ParseError, RawJob, parse_lines};
 pub use runner::{EvalError, EvalRequest, evaluate};
 pub use systems::detect_local_systems;
 
-/// Top-level flake outputs argunix walks per system. See M2 in `design/plan.md`.
+/// Top-level flake outputs argunix walks per system.
 pub const DEFAULT_FLAKE_OUTPUTS: &[&str] = &["packages", "checks", "devShells"];

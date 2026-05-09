@@ -27,8 +27,9 @@ which scopes you need:
    → needs **repository contents read**.
 
 If a configured forge starts returning 401, argunix flips into the
-_paused_ state for that forge (per Q82) and stops dispatching
-work — surfaced in the daemon log and on the status page. Rotate
+_paused_ state for that forge (see [concepts/forge-pause.md](concepts/forge-pause.md))
+and stops dispatching work — surfaced in the daemon log and on the
+status page. Rotate
 the token, drop the new value into the path referenced by
 `token_path`, and `argunixctl reload`.
 

@@ -13,7 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 /// `argunixctl reload`. Every handler/worker reads via `load_full()`
 /// to take a snapshot for its own scope; in-flight work keeps using
 /// the snapshot it captured rather than observing a half-replaced
-/// daemon mid-cycle (Q22 / Q70 / Q71).
+/// daemon mid-cycle.
 pub struct ConfigSnapshot {
     pub config: Arc<Config>,
     pub providers: Arc<HashMap<String, Arc<dyn Provider>>>,
@@ -32,12 +32,15 @@ pub struct AppStateInner {
     /// persists an evaluation row, it sends the new id here so the
     /// worker can pick it up immediately rather than polling.
     pub work_dispatcher: UnboundedSender<EvalId>,
-    /// Drops duplicate `(repo_id, sha)` events within a short window
-    /// (Q99). Configured from `Schedule::webhook_coalesce_seconds`.
+    /// Drops duplicate `(repo_id, sha)` events within a short window.
+    /// Configured from `Schedule::webhook_coalesce_seconds`. See
+    /// [docs/concepts/webhook-coalescing.md].
     pub coalesce: Arc<CoalescePool>,
-    /// Tracks which forges are currently paused due to 401s (Q82).
+    /// Tracks which forges are currently paused due to 401s. See
+    /// [docs/concepts/forge-pause.md].
     pub pauses: Arc<PauseRegistry>,
-    /// Per-eval cancellation tokens for cancel-on-new-push (Q39).
+    /// Per-eval cancellation tokens for cancel-on-new-push. See
+    /// [docs/concepts/cancel-on-push.md].
     pub cancellations: Arc<crate::cancel::CancelRegistry>,
     /// Live SSH-side registry of currently-connected builders. Read by
     /// the status page to surface online/offline/in-flight per builder;
@@ -125,7 +128,7 @@ async fn build_one(
 
 /// Read the token file referenced by `forge_cfg.auth().token_path`.
 /// Returns `BuildProvidersError::AppAuthUnsupported` for app-style
-/// configs (M5c work) — those land later when we add Checks API.
+/// configs — those will land alongside Checks API support.
 async fn read_token(name: &str, forge_cfg: &ForgeConfig) -> Result<String, BuildProvidersError> {
     let auth = forge_cfg.auth().map_err(|e| BuildProvidersError::Auth {
         forge: name.to_string(),

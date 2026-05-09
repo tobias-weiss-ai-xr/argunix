@@ -3,14 +3,18 @@
 //! Sits between `Provider::parse_event` and the persist/queue step in the
 //! webhook handler. Two responsibilities:
 //!
-//! - **Push events:** drop pushes whose ref isn't in the repo's
-//!   `watched_branches`. Q84 promises glob support; v1 does exact-match
-//!   against `refs/heads/<name>` and leaves globs for a follow-up.
-//! - **PR events:** enforce the `build_prs` flag, then the Q3/Q31 gate:
-//!   query the author's permission live; on success, allow if they have
-//!   write or above; on either denial or forge failure, fall back to the
-//!   per-repo `pr_allowlist`. Forge failures are logged at warn level
-//!   (per Q31) but never reject a build that the allowlist would accept.
+//! - **Push events:** drop pushes whose ref isn't matched by the repo's
+//!   `watched_branches` (glob patterns, e.g. `release/*`).
+//! - **PR events:** enforce the `build_prs` flag, then the
+//!   permission-and-allowlist gate: query the author's permission
+//!   live; on success, allow if they have write or above; on either
+//!   denial or forge failure, fall back to the per-repo
+//!   `pr_allowlist`. Forge failures are logged at warn level but
+//!   never reject a build that the allowlist would accept.
+//!
+//! See [docs/concepts/allowlist.md] for the full policy and the
+//! reasoning behind it, and [docs/concepts/forge-pause.md] for what
+//! happens when the forge starts returning 401.
 
 use crate::pause::PauseRegistry;
 use argunix_config::Repo;
@@ -32,7 +36,7 @@ pub enum Decision {
 ///
 /// `forge_name` is the configured key under `forges:` and is used as the
 /// PauseRegistry key — when `query_user_permission` returns 401 we mark
-/// the forge paused; on success we mark it healthy. Q82.
+/// the forge paused; on success we mark it healthy.
 pub async fn evaluate(
     provider: &Arc<dyn Provider>,
     repo: &Repo,
@@ -95,13 +99,13 @@ async fn evaluate_pr(
             }
         }
         Err(e) => {
-            // Q82: 401 means the token is broken — pause this forge.
+            // 401 means the token is broken — pause this forge.
             // Other errors (network blips, 5xx) don't pause, just fall
-            // through to the existing Q31 allowlist-fallback behaviour.
+            // through to the allowlist-fallback behaviour below.
             if matches!(e, ForgeError::Unauthorised) {
                 pauses.pause(forge_name, "401 from query_user_permission");
             }
-            // Q31: forge query failed — fall back to allowlist only.
+            // Forge query failed — fall back to allowlist only.
             if author_in_allowlist(&pr.author, &repo.pr_allowlist) {
                 tracing::warn!(
                     error = %e,
@@ -431,7 +435,7 @@ mod tests {
         assert!(matches!(d, Decision::DropPrUntrustedAuthor { .. }));
     }
 
-    /// Q82: a 401 from query_user_permission marks the forge paused.
+    /// A 401 from query_user_permission marks the forge paused.
     #[tokio::test]
     async fn pr_unauthorised_pauses_forge() {
         let repo = repo_with(true, vec![], vec!["main"]);
@@ -448,7 +452,7 @@ mod tests {
         assert!(pauses.is_paused("gh"));
     }
 
-    /// Q82: a successful permission lookup clears any prior pause —
+    /// A successful permission lookup clears any prior pause —
     /// this is how argunix auto-recovers after a token rotation.
     #[tokio::test]
     async fn pr_successful_query_unpauses_forge() {

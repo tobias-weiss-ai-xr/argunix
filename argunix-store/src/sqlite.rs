@@ -165,10 +165,9 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
     let builder_id: Option<i64> = row.try_get("builder_id")?;
     let interrupt_count: i64 = row.try_get("interrupt_count")?;
     let failure_reason: Option<String> = row.try_get("failure_reason")?;
-    // Per-phase metrics (M16). All NULL for jobs that pre-date the
-    // 0005 migration or never went through pool dispatch. Read as
-    // i64 to dodge the rowid signedness; clamp to non-negative on
-    // surface (unsigned in the domain type).
+    // Per-phase metrics. All NULL for jobs that never went through
+    // pool dispatch. Read as i64 to dodge the rowid signedness; clamp
+    // to non-negative on surface (unsigned in the domain type).
     let push_bytes: Option<i64> = row.try_get("push_bytes")?;
     let push_ms: Option<i64> = row.try_get("push_ms")?;
     let build_ms: Option<i64> = row.try_get("build_ms")?;
@@ -1819,7 +1818,8 @@ mod tests {
             .await
             .unwrap();
         // Revoked → pubkey auth must fail; agent then retries with the
-        // enrollment token (see design/builders.md auth state machine).
+        // enrollment token (and its revoked status will reject again
+        // until an operator drops the row).
         assert!(
             <SqlxStore as BuilderStore>::find_active_by_pubkey(&s, &pubkey(7))
                 .await
@@ -2085,7 +2085,7 @@ mod tests {
 
     #[tokio::test]
     async fn boot_recovery_does_not_increment_interrupt_count() {
-        // Coordinator-crash recovery (Q79) is argunix's fault, not the
+        // Coordinator-crash recovery is argunix's fault, not the
         // builder's — it must NOT advance the per-job retry cap.
         let s = store().await;
         let (builder_id, job_id) = fixture_job(&s).await;

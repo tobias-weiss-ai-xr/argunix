@@ -1,4 +1,4 @@
--- Per-job phase accounting for pool-dispatched builds (M16).
+-- Per-job phase accounting for pool-dispatched builds.
 --
 -- Each pool dispatch goes through three phases:
 --   1. PUSH: daemon → builder, the drv's input closure (`nix copy --to`).

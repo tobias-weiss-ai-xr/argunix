@@ -1,4 +1,4 @@
-//! Unix-socket control server (M8).
+//! Unix-socket control server.
 //!
 //! Listens on `socket_path`, accepts JSON-lines requests from
 //! `argunixctl`, dispatches to the right handler, sends a JSON-lines
@@ -30,9 +30,9 @@ pub struct ControlContext {
     pub gc_root_dir: PathBuf,
     pub config_path: PathBuf,
     pub skip_secret_check: bool,
-    /// Runtime view of currently-connected builders (M13). Empty when
-    /// `builder_enrollment` isn't configured. Held as Arc so it can
-    /// also be shared with the BuilderServer once PR #8b wires it up.
+    /// Runtime view of currently-connected builders. Empty when
+    /// `builder_enrollment` isn't configured. Held as Arc so the
+    /// BuilderServer task can write into the same registry.
     pub builder_registry: Arc<BuilderRegistry>,
     /// Path to local `nix-store` (gc-root registration post-pull).
     pub nix_store_bin: PathBuf,
@@ -140,7 +140,7 @@ async fn dispatch(req: Request, ctx: &ControlContext) -> Response {
     }
 }
 
-/// M14b VM test driver: dispatch one drv to a named builder via the
+/// VM test driver: dispatch one drv to a named builder via the
 /// dynamic pool. Bypasses the worker's eval pipeline so a NixOS test
 /// can exercise the transport without standing up a fake forge.
 async fn handle_test_dispatch_drv(
@@ -209,7 +209,7 @@ async fn handle_reload(
 ) -> anyhow::Result<serde_json::Value> {
     tracing::info!(path = %config_path.display(), "reload requested");
 
-    // Q77: validate first, then atomically swap. Any error before the
+    // Validate first, then atomically swap. Any error before the
     // swap leaves the running daemon untouched.
     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Reloading]);
 

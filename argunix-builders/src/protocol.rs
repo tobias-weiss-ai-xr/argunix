@@ -1,15 +1,16 @@
 //! Wire protocol for the argunix-builder control channel.
 //!
-//! Newline-delimited JSON in both directions. The original five
-//! message types (`Hello`/`Welcome`/`Heartbeat`/`Shutdown`/`Kick`)
-//! cover connection lifecycle. M14b adds five build-dispatch types
-//! (`Build`/`BuildStarted`/`BuildLogChunk`/`BuildFinished`/`Abort`)
-//! so the daemon can drive `nix-store --realise` *on the agent host*
-//! over this channel.
-//! Drv closure / output
-//! transport is intentionally *not* part of this protocol — it goes
-//! over a separate side channel (TBD; see `design/plan.md` M14b).
-//! See `design/builders.md` for the rationale.
+//! Newline-delimited JSON in both directions. Two groups of messages:
+//!
+//! - Connection lifecycle: `Hello` / `Welcome` / `Heartbeat` /
+//!   `Shutdown` / `Kick`.
+//! - Build dispatch: `Build` / `BuildStarted` / `BuildLogChunk` /
+//!   `BuildFinished` / `Abort`. These let the daemon drive
+//!   `nix-store --realise` *on the agent host* over this channel.
+//!
+//! Drv closure / output transport is intentionally *not* part of
+//! this protocol — it goes over a separate side channel (see
+//! [`crate::side_channel`]).
 
 use argunix_domain::BuilderName;
 use serde::{Deserialize, Serialize};
@@ -82,7 +83,7 @@ pub enum ControlMessage {
         #[serde(default)]
         reason: String,
     },
-    /// Argunix → builder (M14b). Dispatch a single derivation to be
+    /// Argunix → builder. Dispatch a single derivation to be
     /// realised on the builder host. The daemon is responsible for
     /// having ensured the drv (and its transitive input closure) is
     /// already present in the builder's nix store before sending this

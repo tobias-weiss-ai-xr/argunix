@@ -1,4 +1,4 @@
-//! Retention GC (M10).
+//! Retention GC.
 //!
 //! Background ticker that prunes terminal evaluations and their on-disk
 //! state (log dirs + GC root symlinks) per the YAML retention rules.
@@ -12,7 +12,8 @@
 //! Non-terminal evals (queued / evaluating / building) are never deleted
 //! — those are the redrive bug's territory, not retention's. GC roots
 //! are deleted as symlinks only; nix's automatic GC reclaims the store
-//! path eventually (Q24 / Q47).
+//! path eventually. See [docs/concepts/gc-roots.md] for the broader
+//! retention model.
 //!
 //! Filesystem failures log a warning and continue, matching the posture
 //! of `prune_orphan_state` at startup.

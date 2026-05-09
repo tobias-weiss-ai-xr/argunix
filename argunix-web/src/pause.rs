@@ -1,4 +1,4 @@
-//! Forge-level pause registry (Q82).
+//! Forge-level pause registry — see [docs/concepts/forge-pause.md].
 //!
 //! When a forge call returns `401 Unauthorised`, the credential we're
 //! using is broken (token revoked, rotated, or never had the necessary
@@ -24,9 +24,9 @@ use std::time::Instant;
 
 #[derive(Debug, Clone)]
 struct PauseEntry {
-    /// Read by tests today and intended for `argunixctl status` later
-    /// (when M8 lands). Keeping the field stable so the wire format
-    /// doesn't change when we grow it.
+    /// Read by tests today and intended for surfacing in
+    /// `argunixctl status`. Keeping the field stable so the wire
+    /// format doesn't change when we grow it.
     #[allow(dead_code)]
     since: Instant,
     reason: String,

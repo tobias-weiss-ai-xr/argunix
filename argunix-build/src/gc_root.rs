@@ -20,8 +20,7 @@ pub enum GcRootError {
 }
 
 /// Construct a per-job GC-root path under `base_dir`. The schema is
-/// `<base>/<repo>/<eval>/<job>`, matching the layout in `design/plan.md`
-/// (M3 / Q47).
+/// `<base>/<repo>/<eval>/<job>` — see [docs/concepts/gc-roots.md].
 pub fn gc_root_path(base_dir: &Path, repo: RepoId, eval: EvalId, job: JobId) -> PathBuf {
     base_dir
         .join(repo.get().to_string())
@@ -30,7 +29,7 @@ pub fn gc_root_path(base_dir: &Path, repo: RepoId, eval: EvalId, job: JobId) -> 
 }
 
 /// Add an *indirect* GC root at `root_path` pointing to `output_path`. Only
-/// successful builds get roots (Q48); failed builds leave the log only.
+/// successful builds get roots; failed builds leave the log only.
 ///
 /// The directory containing `root_path` is created first. We delegate the
 /// actual symlink to `nix-store --add-root --indirect <output>` rather than

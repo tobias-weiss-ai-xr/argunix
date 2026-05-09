@@ -258,12 +258,12 @@ async fn serve_one_connection(
     hb_interval.tick().await;
     let mut stats_sampler = argunix_builders::StatsSampler::new();
 
-    // M14b: outbound control queue. Build tasks send `BuildStarted /
+    // Outbound control queue. Build tasks send `BuildStarted /
     // BuildLogChunk / BuildFinished` here; the main loop drains the
     // queue and writes to the SSH channel (which only one task can hold
     // a `&mut` to at a time).
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    // M14b: in-flight build map. `Abort` looks up the oneshot for the
+    // In-flight build map. `Abort` looks up the oneshot for the
     // matching `build_id` and signals the build task to SIGKILL its
     // `nix-store --realise` child.
     let in_flight: Arc<StdMutex<HashMap<i64, oneshot::Sender<()>>>> =
@@ -388,7 +388,7 @@ async fn serve_one_connection(
     }
 }
 
-/// M14b agent-side handler for one `Build` dispatch. Spawns
+/// Agent-side handler for one `Build` dispatch. Spawns
 /// `nix-store --realise <drv> [--add-root <gc_root>] [--option build-timeout <s>]`
 /// (no `--builders` — the agent is the builder), pumps stderr into
 /// `BuildLogChunk` frames (base64, capped at `max_log_bytes`), captures
@@ -667,11 +667,11 @@ where
     truncated
 }
 
-/// russh client Handler. M14b: every inbound session channel is a
-/// **side channel** — the daemon writes a JSON header then either
-/// pushes a closure (`nix-store --import` runs here) or pulls one
-/// (`nix-store --export` runs here). The byte-for-byte pump used
-/// for the legacy `nix-store --serve --write` flow is gone.
+/// russh client Handler. Every inbound session channel is a
+/// **side channel** — the daemon writes a JSON header, then the
+/// channel tunnels stdin/stdout of `nix-daemon --stdio` so the
+/// daemon side can drive `nix copy --from/--to unix:///proxy.sock`
+/// against it.
 ///
 /// `close_signals` works around a russh quirk: on a *server-pushed*
 /// session channel (where argunix initiates the channel into the
@@ -766,7 +766,7 @@ fn signal_close(
     }
 }
 
-/// M16 agent-side channel handler. Wraps the russh channel via
+/// Agent-side side-channel handler. Wraps the russh channel via
 /// [`with_channel_io`] and hands the duplex stream to
 /// [`dispatch_inbound`], which reads the header and forwards bytes
 /// to/from the system `nix-daemon` socket for the lifetime of the

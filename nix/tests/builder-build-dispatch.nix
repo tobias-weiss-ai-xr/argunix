@@ -1,4 +1,4 @@
-# M14b NixOS test: end-to-end build dispatch through the dynamic
+# NixOS test: end-to-end build dispatch through the dynamic
 # builder pool over side channels.
 #
 # Forces dispatch by giving the test derivation a `requiredSystemFeatures`

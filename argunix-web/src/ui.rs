@@ -1,4 +1,4 @@
-//! Read-only HTML UI (M6-lite).
+//! Read-only HTML UI.
 //!
 //! Routes:
 //!   GET /                                                       — index, list of repos
@@ -8,8 +8,8 @@
 //!   GET /r/<forge>/<...slug>/eval/<id>/job/<attr>/log           — decompressed build log
 //!
 //! All `/r/...` paths share a single axum catch-all (`/r/{forge}/{*tail}`)
-//! and dispatch on segment markers (`/eval/`, `/job/`) per Q97 — that's
-//! the only way to support gitlab-subgroup slugs that contain slashes
+//! and dispatch on segment markers (`/eval/`, `/job/`) — that's the
+//! only way to support gitlab-subgroup slugs that contain slashes
 //! without enumerating every depth ahead of time.
 //!
 //! Markup lives in `argunix-web/templates/*.html` and is rendered with
@@ -178,7 +178,7 @@ struct RunningRow {
     builder: String,
     started: String,
     /// Live transport/build phase for jobs currently dispatched to a
-    /// pool builder (M16). `"push"`, `"build"`, `"pull"`, or empty for
+    /// pool builder. `"push"`, `"build"`, `"pull"`, or empty for
     /// jobs that are running locally / haven't reached a pool builder
     /// yet. Sourced from `BuilderRegistry::phase_snapshot()`.
     phase: &'static str,
@@ -358,10 +358,10 @@ struct JobTemplate {
     /// builder — drives the live stats sparkline + log SSE on the
     /// page. `None` for finished jobs and locally-built ones.
     live_builder: Option<String>,
-    /// M16 per-phase transport accounting. Each pair is rendered as
+    /// Per-phase transport accounting. Each pair is rendered as
     /// "<value> (<raw>)" already-formatted; absent fields surface as
     /// "—". The whole block is suppressed in the template when no
-    /// phase has data, so jobs built locally / pre-M16 stay clean.
+    /// phase has data, so jobs built locally stay clean.
     phase_metrics: PhaseMetricsRow,
 }
 
@@ -381,9 +381,9 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiErro
 
     // Index DB rows by (forge, slug) so we can look up by configured
     // identity in O(1). Repos that landed in the DB but aren't (or no
-    // longer are) in the config are dropped from the page — Q42-style
-    // pruning happens elsewhere; the index only shows what the
-    // operator currently has configured.
+    // longer are) in the config are dropped from the page — actual
+    // row pruning happens in the retention pass; the index only shows
+    // what the operator currently has configured.
     let db_rows = state.store.list().await?;
     let mut by_key: HashMap<(String, String), argunix_store::RepoRecord> = HashMap::new();
     for r in db_rows {
@@ -829,7 +829,7 @@ async fn collect_status_view(state: &AppState) -> Result<StatusView, UiError> {
         .collect();
     let queued_shown = queued.len();
 
-    // M16: surface the worker's eval pipeline. Evaluations are
+    // Surface the worker's eval pipeline. Evaluations are
     // processed serially through a single mpsc → single tokio task,
     // so `evaluating` is normally 0 or 1 rows. >1 only if a previous
     // worker died mid-eval and left a stale row — that's worth
@@ -999,8 +999,8 @@ fn humanize_last_seen(
 }
 
 /// Single catch-all for everything under `/r/<forge>/...`. Parses the
-/// trailing path and routes to the right page. Per Q97, the per-job
-/// detail endpoint is content-negotiated: `Accept: application/json`
+/// trailing path and routes to the right page. The per-job detail
+/// endpoint is content-negotiated: `Accept: application/json`
 /// returns the raw record + phase metrics as JSON; anything else
 /// renders the HTML page.
 pub async fn dispatch_repo(
@@ -1350,7 +1350,7 @@ async fn job_page(
 /// JSON shape for the per-job detail endpoint. Returned when the
 /// client sends `Accept: application/json` to the job route. The
 /// shape is the JobRecord's UI-relevant subset plus the per-phase
-/// transport accounting (M16) — bytes through our russh tunnel and
+/// transport accounting — bytes through our russh tunnel and
 /// wall-clock per phase, all `null` when the job wasn't dispatched
 /// to the pool. Pretty-printed for terminal-friendly `curl | jq`.
 async fn job_json(
@@ -1378,8 +1378,8 @@ async fn job_json(
         "drv_path": job.drv_path,
         "output_path": job.output_path,
         "log_path": job.log_path,
-        // M16 per-phase transport accounting. `null` for jobs that
-        // pre-date the column-set or were built locally.
+        // Per-phase transport accounting. `null` for jobs that
+        // were built locally (no remote-transport phases).
         "phase_metrics": {
             "push_bytes": job.phase_metrics.push_bytes,
             "push_ms": job.phase_metrics.push_ms,
@@ -1599,7 +1599,7 @@ fn fmt_opt_time(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
 
 /// Render a byte count with an SI-ish unit (KB/MB/GB at 1024-base) and
 /// the raw byte total in parens. `None` → `"—"`. Used for the per-job
-/// page's M16 transport rows. Three sigfigs is plenty — "523 MB" is
+/// page's transport rows. Three sigfigs is plenty — "523 MB" is
 /// more useful than "523.418 MB", and the raw value is right next to it
 /// for anyone who needs the exact figure.
 fn humanize_bytes(b: Option<u64>) -> String {

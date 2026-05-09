@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-/// Per-build log size cap (Q50). Bytes counted at the *raw* stage; the
+/// Per-build log size cap. Bytes counted at the *raw* stage; the
 /// on-disk file is zstd-compressed and may be smaller.
 #[derive(Debug, Clone, Copy)]
 pub struct LogCaptureLimit {
@@ -9,7 +9,8 @@ pub struct LogCaptureLimit {
 
 impl Default for LogCaptureLimit {
     fn default() -> Self {
-        // 100 MB raw, the v1 default per `design/questions-answers.md` Q50.
+        // 100 MB raw — generous for a single build, miserly for an
+        // attacker.
         Self {
             max_raw_bytes: 100 * 1024 * 1024,
         }

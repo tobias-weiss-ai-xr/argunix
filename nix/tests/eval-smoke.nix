@@ -1,8 +1,8 @@
 # Sandboxed test that exercises the argunix-eval pipeline end-to-end.
 #
 # Real `nix-eval-jobs` would need network and recursive nix to evaluate a
-# flake from inside a build; that lands in M11 with the NixOS test
-# framework. For now we ship a stand-in that pattern-matches on the
+# flake from inside a build; that requires the NixOS test framework.
+# For now we ship a stand-in that pattern-matches on the
 # `--flake` argument and prints canned JSON-lines, which is enough to
 # validate argunix's wiring (subprocess spawn, JSON parsing, prefix
 # rebuilding, output aggregation).
@@ -68,7 +68,7 @@ runCommand "argunix-eval-smoke"
       argunix
       fakeNixEvalJobs
     ];
-    meta.description = "M2: argunix eval spawns nix-eval-jobs, parses output, aggregates per-system jobs";
+    meta.description = "argunix eval spawns nix-eval-jobs, parses output, aggregates per-system jobs";
   }
   ''
     set -euo pipefail

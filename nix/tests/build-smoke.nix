@@ -1,4 +1,4 @@
-# Sandboxed test of the M3 single-shot build pipeline.
+# Sandboxed test of the single-shot build pipeline.
 #
 # Real `nix-store --realise` would need recursive nix and a writable store,
 # neither of which is available in a `runCommand` sandbox. We ship
@@ -98,7 +98,8 @@ let
 
   fakeNix = writeShellScriptBin "nix" ''
     set -eu
-    # Only `nix path-info --store <url> <path>` is invoked by argunix in M3.
+    # Only `nix path-info --store <url> <path>` is invoked by argunix
+    # in the single-shot build pipeline.
     case "$1" in
       path-info)
         shift
@@ -162,7 +163,7 @@ runCommand "argunix-build-smoke"
       sqlite
       zstd
     ];
-    meta.description = "M3: argunix build runs eval, cache-skip, build, log capture, gc roots";
+    meta.description = "argunix build runs eval, cache-skip, build, log capture, gc roots";
   }
   ''
     set -euo pipefail
