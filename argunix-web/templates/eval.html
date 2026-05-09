@@ -27,7 +27,7 @@
       {% if ref_link.is_empty() %}
         {% if let Some(n) = pr_number %}PR #{{ n }} ({{ git_ref }}){% else %}{{ git_ref }}{% endif %}
       {% else %}
-        <a class="text-link hover:underline" href="{{ ref_link }}">{% if let Some(n) = pr_number %}PR #{{ n }} ({{ git_ref }}){% else %}{{ git_ref }}{% endif %}</a>
+        <a class="text-link hover:underline" href="{{ ref_link }}">↗ {% if let Some(n) = pr_number %}PR #{{ n }} ({{ git_ref }}){% else %}{{ git_ref }}{% endif %}</a>
       {% endif %}
     </dd>
     <dt class="text-muted">sha</dt>
@@ -35,7 +35,7 @@
       {% if commit_link.is_empty() %}
         {{ sha }}
       {% else %}
-        <a class="text-link hover:underline" href="{{ commit_link }}">{{ sha }}</a>
+        <a class="text-link hover:underline" href="{{ commit_link }}">↗ {{ sha }}</a>
       {% endif %}
     </dd>
     <dt class="text-muted">started</dt><dd class="text-muted">{{ started }}</dd>

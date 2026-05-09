@@ -38,7 +38,7 @@
 <p class="text-muted">No evaluations yet.</p>
 {% else %}
 <div class="overflow-x-auto">
-<table class="w-full min-w-[36rem] text-sm border-collapse">
+<table class="w-full min-w-xl text-sm border-collapse">
   <thead class="text-left text-muted">
     <tr>
       <th class="py-2 pr-4">id</th>
@@ -63,14 +63,14 @@
         {% if e.forge_link.is_empty() %}
           {% if let Some(n) = e.pr_number %}PR #{{ n }}{% else %}{{ e.git_ref }}{% endif %}
         {% else %}
-          <a class="text-link hover:underline" href="{{ e.forge_link }}">{% if let Some(n) = e.pr_number %}PR #{{ n }}{% else %}{{ e.git_ref }}{% endif %}</a>
+          <a class="text-link hover:underline" href="{{ e.forge_link }}">↗ {% if let Some(n) = e.pr_number %}PR #{{ n }}{% else %}{{ e.git_ref }}{% endif %}</a>
         {% endif %}
       </td>
       <td class="py-2 pr-4 font-mono">
         {% if e.commit_link.is_empty() %}
           {{ e.short_sha }}
         {% else %}
-          <a class="text-link hover:underline" href="{{ e.commit_link }}">{{ e.short_sha }}</a>
+          <a class="text-link hover:underline" href="{{ e.commit_link }}">↗ {{ e.short_sha }}</a>
         {% endif %}
       </td>
       <td class="py-2 pr-4">{{ e.status }}</td>
