@@ -753,7 +753,10 @@ async fn upsert_repo(
 ) -> anyhow::Result<RepoId> {
     let slug = Slug::new(slug_str.to_string()).expect("valid slug");
     let id = <SqlxStore as RepoStore>::upsert(store, forge, &slug).await?;
-    <SqlxStore as RepoStore>::set_metadata(store, id, name, description, web_url).await?;
+    // Dev fixture: every seeded repo has `main` as its default branch
+    // so the badge endpoint exercises the default-branch path.
+    <SqlxStore as RepoStore>::set_metadata(store, id, name, description, web_url, Some("main"))
+        .await?;
     Ok(id)
 }
 

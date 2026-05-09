@@ -256,21 +256,23 @@ async fn refresh_repo_metadata(
     repo_id: argunix_domain::RepoId,
     event: &NormalizedEvent,
 ) {
-    let (name, description, web_url) = match event {
+    let (name, description, web_url, default_branch) = match event {
         NormalizedEvent::Push(p) => (
             p.repo_name.as_deref(),
             p.repo_description.as_deref(),
             p.repo_web_url.as_deref(),
+            p.repo_default_branch.as_deref(),
         ),
         NormalizedEvent::PullRequest(p) => (
             p.repo_name.as_deref(),
             p.repo_description.as_deref(),
             p.repo_web_url.as_deref(),
+            p.repo_default_branch.as_deref(),
         ),
     };
     if let Err(e) = state
         .store
-        .set_metadata(repo_id, name, description, web_url)
+        .set_metadata(repo_id, name, description, web_url, default_branch)
         .await
     {
         tracing::warn!(

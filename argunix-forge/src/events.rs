@@ -27,6 +27,11 @@ pub struct PushEvent {
     /// GitHub / Forgejo, `repository.web_url` / `project.web_url` on
     /// GitLab). `None` if absent.
     pub repo_web_url: Option<String>,
+    /// Forge-reported default branch (`main`, `master`, …). Read from
+    /// `repository.default_branch` (GitHub / Forgejo) or
+    /// `project.default_branch` (GitLab). `None` only if the payload
+    /// somehow omits it.
+    pub repo_default_branch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +53,8 @@ pub struct PullRequestEvent {
     pub repo_description: Option<String>,
     /// Forge-supplied project web URL. See [`PushEvent::repo_web_url`].
     pub repo_web_url: Option<String>,
+    /// Forge-reported default branch. See [`PushEvent::repo_default_branch`].
+    pub repo_default_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

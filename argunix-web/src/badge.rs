@@ -79,18 +79,17 @@ pub async fn handle(
     AxumPath((forge, tail)): AxumPath<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<Response, UiError> {
-    let (slug_str, branch) = parse_badge_tail(&tail).ok_or(UiError::NotFound)?;
+    let path_before_svg = parse_badge_tail(&tail).ok_or(UiError::NotFound)?;
 
-    // Try the unambiguous "no branch" form first: the entire path
-    // before `.svg` is the slug. If we find a repo for it, render the
-    // any-branch badge. Otherwise, treat the last `/`-segment as a
-    // branch and the remainder as the slug.
-    let (repo, branch_filter) = match resolve_repo(&state, &forge, slug_str).await? {
-        Some(r) => (r, branch),
+    // The path before `.svg` is either `<slug>` (when the URL has no
+    // branch) or `<slug>/<branch>` (when it does). We disambiguate
+    // empirically: try the whole thing as a slug first; if that
+    // resolves, there was no branch component. If it doesn't, peel
+    // the trailing `/`-segment off and treat that as the branch.
+    let (repo, explicit_branch) = match resolve_repo(&state, &forge, path_before_svg).await? {
+        Some(r) => (r, None),
         None => {
-            // Pull the trailing segment off and retry with everything
-            // before as the slug. If that still fails, 404.
-            let (parent_slug, last) = slug_str.rsplit_once('/').ok_or(UiError::NotFound)?;
+            let (parent_slug, last) = path_before_svg.rsplit_once('/').ok_or(UiError::NotFound)?;
             let repo = resolve_repo(&state, &forge, parent_slug)
                 .await?
                 .ok_or(UiError::NotFound)?;
@@ -99,10 +98,7 @@ pub async fn handle(
     };
 
     let evals = state.store.list_by_repo(repo.id, 50).await?;
-    let chosen = pick_eval(&evals, branch_filter);
-    let status = chosen
-        .map(|e| classify(&e.status))
-        .unwrap_or(BadgeStatus::Unknown);
+    let status = select_status(&evals, explicit_branch, repo.default_branch.as_deref());
 
     let svg = render_svg(status);
     let mut resp = (StatusCode::OK, svg).into_response();
@@ -120,16 +116,17 @@ pub async fn handle(
     Ok(resp)
 }
 
-/// Strip the `.svg` suffix and return `(path_before_dot_svg, None)`
-/// — the caller decides whether to interpret the trailing segment as
-/// a branch by attempting repo lookups. Returns None if `.svg` is
-/// missing or the path is empty.
-fn parse_badge_tail(tail: &str) -> Option<(&str, Option<&str>)> {
+/// Strip the `.svg` suffix from the path tail. The caller decides
+/// whether to interpret the trailing `/`-segment as a branch by
+/// attempting repo lookups against the full path first, then
+/// against the path-minus-trailing-segment. Returns None when the
+/// suffix is missing or the path is empty.
+fn parse_badge_tail(tail: &str) -> Option<&str> {
     let stripped = tail.strip_suffix(".svg")?;
     if stripped.is_empty() {
         return None;
     }
-    Some((stripped, None))
+    Some(stripped)
 }
 
 async fn resolve_repo(
@@ -142,6 +139,36 @@ async fn resolve_repo(
         Err(_) => return Ok(None),
     };
     Ok(state.store.find(forge, &slug).await?)
+}
+
+/// Decide the [`BadgeStatus`] for a repo given its recent evals and
+/// the two pieces of branch context the endpoint has: an
+/// `explicit_branch` from the URL (`/badge/<forge>/<slug>/<branch>.svg`)
+/// and the repo-level `default_branch` populated from forge webhooks.
+///
+/// Resolution order:
+///  1. `explicit_branch` if present — the URL was specific.
+///  2. `default_branch` otherwise — README badges should reflect main,
+///     not whatever PR last finished.
+///  3. If filtering yields nothing (e.g. brand-new repo where the
+///     only evals so far are PRs), fall back to any-branch so the
+///     badge surfaces *something* rather than "unknown".
+fn select_status(
+    evals: &[argunix_store::EvalRecord],
+    explicit_branch: Option<&str>,
+    default_branch: Option<&str>,
+) -> BadgeStatus {
+    let branch_filter = explicit_branch.or(default_branch);
+    let chosen = pick_eval(evals, branch_filter).or_else(|| {
+        if branch_filter.is_some() {
+            pick_eval(evals, None)
+        } else {
+            None
+        }
+    });
+    chosen
+        .map(|e| classify(&e.status))
+        .unwrap_or(BadgeStatus::Unknown)
 }
 
 /// Pick the eval to badge from a list of recent rows (newest first).
@@ -178,7 +205,7 @@ fn pick_eval<'a>(
 /// glyph-width estimate (6.5px/char @ 11px font) so the badge sizes
 /// itself sensibly without a font-metrics library.
 fn render_svg(status: BadgeStatus) -> String {
-    const LABEL: &str = "argunix";
+    const LABEL: &str = "argunix CI";
     let message = status.label();
     let pad = 12u32;
     let glyph = 6u32; // average glyph advance at 11px Verdana — close enough
@@ -216,27 +243,68 @@ fn render_svg(status: BadgeStatus) -> String {
     )
 }
 
+/// Best-guess branch name to *render in the README snippet URL*. The
+/// goal is UX: a snippet that says `/main.svg` tells the reader the
+/// segment is editable. The badge endpoint *does* honour whatever
+/// branch ends up in the URL — when a request lands, it parses the
+/// trailing segment as `explicit_branch` and feeds it to
+/// [`select_status`]. This helper just decides what branch name to
+/// bake into the snippet at render time so the user has a sensible
+/// starting point. The endpoint never invokes this helper itself; it
+/// reads `repo.default_branch` directly from the row.
+///
+/// Resolution order:
+///  1. `default_branch` from the repo row (set on every webhook).
+///  2. Most-recent `push`-triggered eval's `git_ref`. Covers repos
+///     that pre-date migration 0011 — `default_branch` is `NULL`
+///     until the next webhook lands, but if the daemon has already
+///     evaluated push events for them, those refs are a good proxy
+///     (CI typically only push-triggers on the actual default branch).
+///  3. `"main"` as a final fallback. Even if wrong, the badge
+///     endpoint will fall through to "any branch" at request time, so
+///     the badge still renders sensibly — and the user can edit the
+///     URL.
+pub fn snippet_branch(default_branch: Option<&str>, evals: &[argunix_store::EvalRecord]) -> String {
+    if let Some(b) = default_branch {
+        return b.to_string();
+    }
+    if let Some(e) = evals.iter().find(|e| e.trigger == "push") {
+        return e.git_ref.clone();
+    }
+    "main".to_string()
+}
+
 /// Thin wrapper used by the repo page to render the markdown snippet
 /// users copy into their READMEs. Public to the crate so the UI module
-/// doesn't have to know the URL shape.
-pub fn markdown_snippet(host: &str, forge: &str, slug: &str, repo_url: &str) -> String {
-    // Trailing slash on `host` would produce `host//badge/...` — guard
-    // against that so the snippet is paste-clean.
-    let host = host.trim_end_matches('/');
-    format!(
-        "[![argunix]({host}/badge/{forge}/{slug}.svg)]({repo_url})",
-        host = host,
-        forge = forge,
-        slug = slug,
-        repo_url = repo_url,
-    )
+/// doesn't have to know the URL shape. When `branch` is `Some`, the
+/// emitted URL is the per-branch form
+/// (`/badge/<forge>/<slug>/<branch>.svg`) — this is self-documenting:
+/// readers can see the branch name in the URL and know they can swap
+/// it out. When the default branch isn't known yet (no webhook
+/// landed), we emit the bare form, which the badge endpoint resolves
+/// to the same any-branch fallback at request time.
+pub fn markdown_snippet(
+    host: &str,
+    forge: &str,
+    slug: &str,
+    repo_url: &str,
+    branch: Option<&str>,
+) -> String {
+    let url = badge_url(host, forge, slug, branch);
+    format!("[![argunix]({url})]({repo_url})")
 }
 
 /// Build the badge URL itself — used both by the markdown snippet and
-/// by the repo page's "raw URL" copy field.
-pub fn badge_url(host: &str, forge: &str, slug: &str) -> String {
+/// by the repo page's `<img>` preview. `branch` follows the same
+/// convention as [`markdown_snippet`].
+pub fn badge_url(host: &str, forge: &str, slug: &str, branch: Option<&str>) -> String {
+    // Trailing slash on `host` would produce `host//badge/...` — guard
+    // against that so the snippet is paste-clean.
     let host = host.trim_end_matches('/');
-    format!("{host}/badge/{forge}/{slug}.svg")
+    match branch {
+        Some(b) => format!("{host}/badge/{forge}/{slug}/{b}.svg"),
+        None => format!("{host}/badge/{forge}/{slug}.svg"),
+    }
 }
 
 // repo_url_for stays in ui.rs; we just import it here for snippet
@@ -256,11 +324,8 @@ mod tests {
 
     #[test]
     fn parses_badge_tail_strips_svg() {
-        assert_eq!(
-            parse_badge_tail("owner/repo.svg"),
-            Some(("owner/repo", None))
-        );
-        assert_eq!(parse_badge_tail("a/b/c.svg"), Some(("a/b/c", None)));
+        assert_eq!(parse_badge_tail("owner/repo.svg"), Some("owner/repo"));
+        assert_eq!(parse_badge_tail("a/b/c.svg"), Some("a/b/c"));
     }
 
     #[test]
@@ -342,6 +407,72 @@ mod tests {
     }
 
     #[test]
+    fn select_status_uses_default_branch_over_failing_pr() {
+        // Regression: a failing PR on `feature-x` must NOT turn the
+        // README badge red while `main` is green. Default branch
+        // wins when the URL didn't pin one.
+        let evals = vec![
+            record(
+                3,
+                EvalStatus::EvaluationFailed,
+                "refs/pull/7/head:feature-x",
+            ),
+            record(2, EvalStatus::Done, "main"),
+        ];
+        assert_eq!(
+            select_status(&evals, None, Some("main")),
+            BadgeStatus::Passing
+        );
+    }
+
+    #[test]
+    fn select_status_explicit_branch_overrides_default() {
+        // `/badge/.../feature-x.svg` should report feature-x's status
+        // even when default branch is set.
+        let evals = vec![
+            record(
+                3,
+                EvalStatus::EvaluationFailed,
+                "refs/pull/7/head:feature-x",
+            ),
+            record(2, EvalStatus::Done, "main"),
+        ];
+        assert_eq!(
+            select_status(&evals, Some("feature-x"), Some("main")),
+            BadgeStatus::Failing
+        );
+    }
+
+    #[test]
+    fn select_status_falls_back_to_any_branch_when_default_unmatched() {
+        // Brand-new repo: the only eval seen so far is a PR build,
+        // so the default branch has no terminal eval yet. We'd
+        // rather show the PR's status than "unknown".
+        let evals = vec![record(1, EvalStatus::Done, "refs/pull/3/head:topic")];
+        assert_eq!(
+            select_status(&evals, None, Some("main")),
+            BadgeStatus::Passing
+        );
+    }
+
+    #[test]
+    fn select_status_unknown_when_no_evals_at_all() {
+        let evals: Vec<argunix_store::EvalRecord> = vec![];
+        assert_eq!(
+            select_status(&evals, None, Some("main")),
+            BadgeStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn select_status_no_default_branch_uses_any_branch() {
+        // Repo metadata not populated yet (no webhook seen). Latest
+        // terminal eval wins regardless of branch.
+        let evals = vec![record(1, EvalStatus::Done, "develop")];
+        assert_eq!(select_status(&evals, None, None), BadgeStatus::Passing);
+    }
+
+    #[test]
     fn render_svg_includes_label_and_message() {
         let svg = render_svg(BadgeStatus::Passing);
         assert!(svg.contains("argunix"));
@@ -354,12 +485,16 @@ mod tests {
     }
 
     #[test]
-    fn markdown_snippet_uses_badge_url_and_repo_url() {
+    fn markdown_snippet_without_branch_uses_bare_url() {
+        // Repo with no default-branch metadata yet: snippet falls
+        // back to the bare URL. The endpoint resolves both forms to
+        // the same any-branch behaviour at request time.
         let snippet = markdown_snippet(
             "https://argunix.example.com/",
             "github",
             "owner/repo",
             "https://github.com/owner/repo",
+            None,
         );
         assert_eq!(
             snippet,
@@ -368,10 +503,90 @@ mod tests {
     }
 
     #[test]
+    fn markdown_snippet_with_branch_inlines_it_for_self_documentation() {
+        // Surfacing the branch in the URL is intentional UX: the
+        // reader sees `/main.svg` and immediately understands the URL
+        // can be edited to point at any other branch.
+        let snippet = markdown_snippet(
+            "https://argunix.example.com",
+            "github",
+            "owner/repo",
+            "https://github.com/owner/repo",
+            Some("main"),
+        );
+        assert_eq!(
+            snippet,
+            "[![argunix](https://argunix.example.com/badge/github/owner/repo/main.svg)](https://github.com/owner/repo)"
+        );
+    }
+
+    #[test]
     fn badge_url_strips_trailing_slash_on_host() {
         assert_eq!(
-            badge_url("https://argunix.example.com/", "github", "owner/repo"),
+            badge_url("https://argunix.example.com/", "github", "owner/repo", None),
             "https://argunix.example.com/badge/github/owner/repo.svg"
+        );
+    }
+
+    #[test]
+    fn snippet_branch_prefers_repo_default_branch() {
+        // Authoritative when set: ignore eval history.
+        let evals = vec![record(1, EvalStatus::Done, "develop")];
+        assert_eq!(snippet_branch(Some("main"), &evals), "main");
+    }
+
+    #[test]
+    fn snippet_branch_falls_back_to_recent_push_eval_when_default_unset() {
+        // Repo predates migration 0011: default_branch is NULL but we
+        // have push history. Use the most-recent push branch as a
+        // proxy — CI typically only push-triggers on the actual
+        // default branch.
+        let evals = vec![
+            record(2, EvalStatus::Done, "develop"),
+            record(1, EvalStatus::Done, "develop"),
+        ];
+        assert_eq!(snippet_branch(None, &evals), "develop");
+    }
+
+    #[test]
+    fn snippet_branch_skips_pr_evals_in_fallback() {
+        // PR refs (`refs/pull/...:branch`) shouldn't be picked as the
+        // default-branch proxy. Their `trigger` is "pull_request",
+        // never "push", so they're filtered out.
+        let evals = vec![
+            pr_record(2, EvalStatus::Done, "refs/pull/7/head:feature"),
+            record(1, EvalStatus::Done, "main"),
+        ];
+        assert_eq!(snippet_branch(None, &evals), "main");
+    }
+
+    #[test]
+    fn snippet_branch_defaults_to_main_when_nothing_known() {
+        // Brand-new repo: no default_branch, no push evals. We still
+        // render an editable URL, so "main" is the conventional
+        // guess.
+        let evals: Vec<argunix_store::EvalRecord> = vec![];
+        assert_eq!(snippet_branch(None, &evals), "main");
+    }
+
+    /// PR-triggered eval — its `trigger` is `"pull_request"` rather
+    /// than `"push"`, so the fallback heuristic skips it.
+    fn pr_record(id: i64, status: EvalStatus, git_ref: &str) -> argunix_store::EvalRecord {
+        let mut r = record(id, status, git_ref);
+        r.trigger = "pull_request".into();
+        r
+    }
+
+    #[test]
+    fn badge_url_appends_branch_segment_when_provided() {
+        assert_eq!(
+            badge_url(
+                "https://argunix.example.com",
+                "github",
+                "owner/repo",
+                Some("main")
+            ),
+            "https://argunix.example.com/badge/github/owner/repo/main.svg"
         );
     }
 }

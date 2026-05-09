@@ -168,7 +168,7 @@ async fn parses_push_event() {
     let body = serde_json::json!({
         "ref": "refs/heads/main",
         "after": "0123456789abcdef0123456789abcdef01234567",
-        "project": { "path_with_namespace": "alice/myrepo" },
+        "project": { "path_with_namespace": "alice/myrepo", "default_branch": "main" },
         "user_username": "alice"
     })
     .to_string();
@@ -183,6 +183,7 @@ async fn parses_push_event() {
     };
     assert_eq!(push.slug.as_str(), "alice/myrepo");
     assert_eq!(push.pusher.as_deref(), Some("alice"));
+    assert_eq!(push.repo_default_branch.as_deref(), Some("main"));
 }
 
 #[tokio::test]
@@ -211,7 +212,7 @@ async fn parses_subgroup_push_slug() {
 async fn parses_merge_request_event() {
     let p = GitlabProvider::new("http://unused".into(), "tok".into(), "https://m".into());
     let body = serde_json::json!({
-        "project": { "path_with_namespace": "alice/myrepo" },
+        "project": { "path_with_namespace": "alice/myrepo", "default_branch": "main" },
         "user": { "username": "stranger" },
         "object_attributes": {
             "iid": 42,
@@ -240,6 +241,7 @@ async fn parses_merge_request_event() {
     assert_eq!(pr.author, "stranger");
     assert_eq!(pr.action, PullRequestAction::Opened);
     assert!(pr.is_fork);
+    assert_eq!(pr.repo_default_branch.as_deref(), Some("main"));
 }
 
 #[tokio::test]

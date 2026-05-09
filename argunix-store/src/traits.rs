@@ -71,18 +71,22 @@ pub trait RepoStore: Send + Sync {
         hook_id: &str,
     ) -> Result<(), StoreError>;
     /// Update the forge-supplied display fields for `repo_id`. All
-    /// three fields are optional — pass `None` to clear, `Some(_)` to
+    /// fields are optional — pass `None` to clear, `Some(_)` to
     /// overwrite. Called from each webhook handler so the UI's
     /// `/repos` and per-repo pages stay current with whatever the
     /// forge surfaces; on push and PR events all three forges include
     /// these on the `repository` / `project` payload object
     /// (`html_url` for GitHub / Forgejo, `web_url` for GitLab).
+    /// `default_branch` is consumed by the README badge endpoint so
+    /// `/badge/<forge>/<slug>.svg` reflects the default branch's
+    /// status rather than "any-branch latest".
     async fn set_metadata(
         &self,
         repo_id: RepoId,
         name: Option<&str>,
         description: Option<&str>,
         web_url: Option<&str>,
+        default_branch: Option<&str>,
     ) -> Result<(), StoreError>;
     /// Delete every repo (and its cascaded evaluations / jobs / queue
     /// rows / forge_status rows) whose `(forge, slug)` does not appear

@@ -183,6 +183,7 @@ mod tests {
             repo_name: None,
             repo_description: None,
             repo_web_url: None,
+            repo_default_branch: None,
         })
     }
 
@@ -199,6 +200,7 @@ mod tests {
             repo_name: None,
             repo_description: None,
             repo_web_url: None,
+            repo_default_branch: None,
         })
     }
 

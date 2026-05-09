@@ -1114,13 +1114,20 @@ async fn repo_page(
         .find(&forge, &slug)
         .await?
         .ok_or(UiError::NotFound)?;
-    let evals = state.store.list_by_repo(repo.id, 50).await?;
+    let raw_evals = state.store.list_by_repo(repo.id, 50).await?;
 
     let snap = state.current.load_full();
     let forge_cfg = snap.config.forges.get(&forge);
     let repo_url = repo_url_for(repo.web_url.as_deref(), forge_cfg, slug.as_str());
 
-    let evals = evals
+    // Resolve the branch to surface in the README snippet URL before
+    // we consume `raw_evals` for template rendering. Authoritative
+    // source is `repo.default_branch`; for pre-migration repos with
+    // no webhook yet, fall back to the most-recent push-triggered
+    // git_ref, then to "main".
+    let snippet_branch = crate::badge::snippet_branch(repo.default_branch.as_deref(), &raw_evals);
+
+    let evals = raw_evals
         .into_iter()
         .map(|e| {
             let (forge_link, commit_link) = forge_links_for_eval(
@@ -1146,9 +1153,21 @@ async fn repo_page(
 
     let cluster_active = cluster_is_active(&state).await?;
     let external_url = &snap.config.external_url;
-    let badge_url = crate::badge::badge_url(external_url, &forge, slug.as_str());
-    let badge_markdown =
-        crate::badge::markdown_snippet(external_url, &forge, slug.as_str(), &repo_url);
+    // The snippet URL always carries an explicit `/<branch>.svg`
+    // segment — the badge endpoint reads it and filters by it (see
+    // `badge::handle`), and showing the branch in the rendered
+    // markdown signals to README readers that the segment is
+    // editable.
+    let snippet_branch_ref = Some(snippet_branch.as_str());
+    let badge_url =
+        crate::badge::badge_url(external_url, &forge, slug.as_str(), snippet_branch_ref);
+    let badge_markdown = crate::badge::markdown_snippet(
+        external_url,
+        &forge,
+        slug.as_str(),
+        &repo_url,
+        snippet_branch_ref,
+    );
     let html = render(&RepoTemplate {
         cluster_active,
         forge,

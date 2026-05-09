@@ -55,6 +55,7 @@ fn map_repo(row: &SqliteRow) -> Result<RepoRecord, StoreError> {
     let name: Option<String> = row.try_get("name")?;
     let description: Option<String> = row.try_get("description")?;
     let web_url: Option<String> = row.try_get("web_url")?;
+    let default_branch: Option<String> = row.try_get("default_branch")?;
     Ok(RepoRecord {
         id: RepoId::new(id),
         forge,
@@ -62,6 +63,7 @@ fn map_repo(row: &SqliteRow) -> Result<RepoRecord, StoreError> {
         name,
         description,
         web_url,
+        default_branch,
     })
 }
 
@@ -232,7 +234,7 @@ impl RepoStore for SqlxStore {
 
     async fn get(&self, id: RepoId) -> Result<Option<RepoRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, forge, slug, name, description, web_url FROM repos WHERE id = ?1",
+            "SELECT id, forge, slug, name, description, web_url, default_branch FROM repos WHERE id = ?1",
         )
         .bind(id.get())
         .fetch_optional(&self.pool)
@@ -242,7 +244,7 @@ impl RepoStore for SqlxStore {
 
     async fn find(&self, forge: &str, slug: &Slug) -> Result<Option<RepoRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, forge, slug, name, description, web_url FROM repos WHERE forge = ?1 AND slug = ?2",
+            "SELECT id, forge, slug, name, description, web_url, default_branch FROM repos WHERE forge = ?1 AND slug = ?2",
         )
         .bind(forge)
         .bind(slug.as_str())
@@ -253,7 +255,7 @@ impl RepoStore for SqlxStore {
 
     async fn list(&self) -> Result<Vec<RepoRecord>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, forge, slug, name, description, web_url FROM repos ORDER BY id",
+            "SELECT id, forge, slug, name, description, web_url, default_branch FROM repos ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -300,14 +302,23 @@ impl RepoStore for SqlxStore {
         name: Option<&str>,
         description: Option<&str>,
         web_url: Option<&str>,
+        default_branch: Option<&str>,
     ) -> Result<(), StoreError> {
-        sqlx::query("UPDATE repos SET name = ?1, description = ?2, web_url = ?3 WHERE id = ?4")
-            .bind(name)
-            .bind(description)
-            .bind(web_url)
-            .bind(repo_id.get())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE repos
+             SET name = ?1,
+                 description = ?2,
+                 web_url = ?3,
+                 default_branch = ?4
+             WHERE id = ?5",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(web_url)
+        .bind(default_branch)
+        .bind(repo_id.get())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -317,9 +328,11 @@ impl RepoStore for SqlxStore {
     ) -> Result<Vec<RepoRecord>, StoreError> {
         let mut tx = self.pool.begin().await?;
 
-        let all_rows = sqlx::query("SELECT id, forge, slug, name, description, web_url FROM repos")
-            .fetch_all(&mut *tx)
-            .await?;
+        let all_rows = sqlx::query(
+            "SELECT id, forge, slug, name, description, web_url, default_branch FROM repos",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
         let all: Vec<RepoRecord> = all_rows.iter().map(map_repo).collect::<Result<_, _>>()?;
         let kept: std::collections::HashSet<(&str, &str)> =
             keep.iter().map(|(f, s)| (f.as_str(), s.as_str())).collect();

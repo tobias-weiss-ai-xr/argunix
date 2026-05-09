@@ -19,6 +19,13 @@ pub struct RepoRecord {
     /// the first matching webhook lands; UI falls back to a URL
     /// constructed from the YAML config until then.
     pub web_url: Option<String>,
+    /// Forge-reported default branch (`main`, `master`, …). Populated
+    /// from `repository.default_branch` (GitHub / Forgejo) or
+    /// `project.default_branch` (GitLab) on every webhook payload —
+    /// these forges always include it. `None` until the first matching
+    /// webhook lands; the badge endpoint falls back to "any branch"
+    /// then.
+    pub default_branch: Option<String>,
 }
 
 /// Fields supplied when creating a new evaluation row.

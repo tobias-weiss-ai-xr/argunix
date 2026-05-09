@@ -485,6 +485,7 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
         name: Option<String>,
         description: Option<String>,
         web_url: Option<String>,
+        default_branch: Option<String>,
     }
 
     let view: PushView = serde_json::from_slice(body).map_err(ForgeError::BadPayload)?;
@@ -500,6 +501,7 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
         repo_name: view.project.name,
         repo_description: view.project.description.filter(|s| !s.is_empty()),
         repo_web_url: view.project.web_url.filter(|s| !s.is_empty()),
+        repo_default_branch: view.project.default_branch.filter(|s| !s.is_empty()),
     })
 }
 
@@ -525,6 +527,7 @@ fn parse_merge_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
         name: Option<String>,
         description: Option<String>,
         web_url: Option<String>,
+        default_branch: Option<String>,
     }
     #[derive(Deserialize)]
     struct User {
@@ -589,6 +592,7 @@ fn parse_merge_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
         repo_name: view.project.name,
         repo_description: view.project.description.filter(|s| !s.is_empty()),
         repo_web_url: view.project.web_url.filter(|s| !s.is_empty()),
+        repo_default_branch: view.project.default_branch.filter(|s| !s.is_empty()),
     })
 }
 

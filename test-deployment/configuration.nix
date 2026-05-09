@@ -95,6 +95,7 @@ in
             "tfc/pprintpp" = {
               watched_branches = [ "master" ];
             };
+            "tfc/tulonix" = { };
           };
         };
         opencode = {

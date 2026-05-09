@@ -410,6 +410,7 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
         name: Option<String>,
         description: Option<String>,
         html_url: Option<String>,
+        default_branch: Option<String>,
     }
     #[derive(Deserialize)]
     struct Pusher {
@@ -429,6 +430,7 @@ fn parse_push(body: &[u8]) -> Result<PushEvent, ForgeError> {
         repo_name: view.repository.name,
         repo_description: view.repository.description.filter(|s| !s.is_empty()),
         repo_web_url: view.repository.html_url.filter(|s| !s.is_empty()),
+        repo_default_branch: view.repository.default_branch.filter(|s| !s.is_empty()),
     })
 }
 
@@ -446,6 +448,7 @@ fn parse_pull_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
         name: Option<String>,
         description: Option<String>,
         html_url: Option<String>,
+        default_branch: Option<String>,
     }
     #[derive(Deserialize)]
     struct PullRequest {
@@ -498,6 +501,7 @@ fn parse_pull_request(body: &[u8]) -> Result<PullRequestEvent, ForgeError> {
         repo_name: view.repository.name,
         repo_description: view.repository.description.filter(|s| !s.is_empty()),
         repo_web_url: view.repository.html_url.filter(|s| !s.is_empty()),
+        repo_default_branch: view.repository.default_branch.filter(|s| !s.is_empty()),
     })
 }
 

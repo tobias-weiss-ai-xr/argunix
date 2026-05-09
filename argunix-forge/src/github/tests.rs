@@ -90,7 +90,7 @@ async fn parses_push_event() {
     let body = serde_json::json!({
         "ref": "refs/heads/main",
         "after": "0123456789abcdef0123456789abcdef01234567",
-        "repository": { "full_name": "myorg/myrepo" },
+        "repository": { "full_name": "myorg/myrepo", "default_branch": "main" },
         "pusher": { "name": "alice" }
     })
     .to_string();
@@ -110,6 +110,7 @@ async fn parses_push_event() {
         "0123456789abcdef0123456789abcdef01234567"
     );
     assert_eq!(push.pusher.as_deref(), Some("alice"));
+    assert_eq!(push.repo_default_branch.as_deref(), Some("main"));
 }
 
 #[tokio::test]
@@ -122,7 +123,7 @@ async fn parses_pull_request_event_from_fork() {
     let body = serde_json::json!({
         "action": "opened",
         "number": 42,
-        "repository": { "full_name": "myorg/myrepo" },
+        "repository": { "full_name": "myorg/myrepo", "default_branch": "main" },
         "pull_request": {
             "user": { "login": "stranger" },
             "head": {
@@ -157,6 +158,7 @@ async fn parses_pull_request_event_from_fork() {
     assert_eq!(pr.action, PullRequestAction::Opened);
     assert!(pr.is_fork);
     assert!(pr.action.should_evaluate());
+    assert_eq!(pr.repo_default_branch.as_deref(), Some("main"));
 }
 
 #[tokio::test]
