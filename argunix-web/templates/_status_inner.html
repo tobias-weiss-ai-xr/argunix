@@ -62,8 +62,7 @@
 
 <section class="mb-8">
   <h2 class="text-lg font-semibold mb-2">
-    evaluating right now ({{ evaluating.len() }}{% if eval_queue_depth > 0 %},
-    {{ eval_queue_depth }} waiting{% endif %})
+    evaluating right now
   </h2>
   {% if evaluating.is_empty() %}
   <p class="text-muted">
@@ -211,7 +210,7 @@
 
 <section>
   <h2 class="text-lg font-semibold mb-2">
-    upcoming ({{ queued_shown }}{% if queued_truncated %} of {{ totals.queued_total }} shown{% endif %})
+    upcoming builds ({{ queued_shown }}{% if queued_truncated %} of {{ totals.queued_total }} shown{% endif %})
   </h2>
   {% if queued.is_empty() %}
   <p class="text-muted">Queue is empty.</p>
