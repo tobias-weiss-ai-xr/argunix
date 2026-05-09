@@ -69,12 +69,13 @@ in
           web_url = "https://github.com";
           token_path = "$CREDENTIALS_DIRECTORY/gh-token";
           repos = {
+            "applicative-systems/mkdocs-flake" = { };
+            "applicative-systems/nixos-appliance-ota-update" = { };
+            "applicative-systems/nixos-test-driver-manual" = { };
             "tfc/attoparsecpp".watched_branches = [ "master" ];
             "tfc/cmake_cpp_example".watched_branches = [ "master" ];
+            "tfc/nixos-configs" = { };
             "tfc/pprintpp".watched_branches = [ "master" ];
-            "applicative-systems/mkdocs-flake" = { };
-            "applicative-systems/nixos-test-driver-manual" = { };
-            "applicative-systems/nixos-appliance-ota-update" = { };
           };
         };
         gitlab = {
