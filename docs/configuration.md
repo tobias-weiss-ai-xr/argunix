@@ -2,10 +2,8 @@
 
 ## Forges
 
-Each forge entry under `forges:` in `argunix.yaml` needs an
-authentication credential. Today only personal access tokens (PATs)
-are supported in production; GitHub-App auth is reserved for a later
-milestone.
+Each forge entry under `forges:` in `argunix.yaml` needs an authentication credential.
+Today only personal access tokens (PATs) are supported in production.
 
 ### What argunix actually does with the token
 
