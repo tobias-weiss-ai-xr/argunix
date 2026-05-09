@@ -309,6 +309,17 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // when its handle drops (at daemon shutdown).
     let _host_stats_handle = argunix_web::spawn_host_sampler(host_stats.clone());
 
+    // Probe `nix --version` and `nix-eval-jobs --version` once so the
+    // /hosts page coordinator card can show the toolchain. Detection
+    // never fails — missing/unparsable binaries leave "unknown".
+    // `nix-eval-jobs` is resolved via PATH because that's how
+    // `argunix-eval` invokes it; the `--nix-bin` flag pins `nix`
+    // itself for the worker but not the eval helper.
+    let nix_bin_str = args.nix_bin.to_string_lossy().to_string();
+    let coordinator_versions = std::sync::Arc::new(
+        argunix_web::detect_coordinator_versions(&nix_bin_str, "nix-eval-jobs").await,
+    );
+
     let inner = argunix_web::AppStateInner {
         current: current.clone(),
         store: store.clone(),
@@ -320,6 +331,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         live_logs,
         host_stats,
         started_at: std::time::Instant::now(),
+        coordinator_versions,
     };
     let app_state = std::sync::Arc::new(inner);
     let router = argunix_web::router(app_state.clone());

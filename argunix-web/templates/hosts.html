@@ -49,9 +49,16 @@
     </figure>
   </div>
 
-  <footer class="border-t border-border pt-2 text-[11px] leading-5 text-muted">
-    Webhook ingest, scheduling, and forge integration run here.
-    Builders below execute the actual nix builds.
+  <footer class="border-t border-border pt-2 text-[11px] leading-5 flex flex-col gap-1">
+    <div class="text-muted">
+      nix <span class="font-mono text-fg">{{ coordinator.nix_version }}</span>
+      <span class="mx-1 text-subtle">·</span>
+      nix-eval-jobs <span class="font-mono text-fg">{{ coordinator.nix_eval_jobs_version }}</span>
+    </div>
+    <div class="text-muted">
+      Webhook ingest, scheduling, and forge integration run here.
+      Builders below execute the actual nix builds.
+    </div>
   </footer>
 </article>
 

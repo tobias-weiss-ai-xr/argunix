@@ -69,7 +69,10 @@ struct HostsTemplate {
 
 /// Coordinator-host row for the `/hosts` page header card. Capability
 /// fields are absent because the coordinator doesn't run builds
-/// itself — it only orchestrates them.
+/// itself — it only orchestrates them. The two version fields are
+/// the coordinator's own `nix` / `nix-eval-jobs` toolchain (used to
+/// drive evaluations and store ops); builders report their own
+/// `nix_version` separately on each card below.
 struct CoordinatorRow {
     /// Display name shown on the card. Pulled from `gethostname()` at
     /// render time; falls back to `"argunix"` if the syscall fails.
@@ -77,6 +80,12 @@ struct CoordinatorRow {
     /// Wall-clock since daemon startup, humanized
     /// (`"3h 12m"` / `"42s"`).
     uptime: String,
+    /// `nix --version` token resolved at daemon startup. "unknown"
+    /// if detection failed or the dev fixture didn't populate it.
+    nix_version: String,
+    /// `nix-eval-jobs --version` token resolved at daemon startup.
+    /// "unknown" under the same conditions.
+    nix_eval_jobs_version: String,
 }
 
 /// Polled fragment of the status page: the section content plus an
@@ -506,7 +515,12 @@ fn build_coordinator_row(state: &AppState) -> CoordinatorRow {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "argunix".to_string());
     let uptime = humanize_uptime(state.started_at.elapsed());
-    CoordinatorRow { hostname, uptime }
+    CoordinatorRow {
+        hostname,
+        uptime,
+        nix_version: state.coordinator_versions.nix_version.clone(),
+        nix_eval_jobs_version: state.coordinator_versions.nix_eval_jobs_version.clone(),
+    }
 }
 
 fn humanize_uptime(d: std::time::Duration) -> String {
@@ -1852,6 +1866,8 @@ mod tests {
         CoordinatorRow {
             hostname: "argunix-test".into(),
             uptime: "1m 20s".into(),
+            nix_version: "2.24.10".into(),
+            nix_eval_jobs_version: "2.24.0".into(),
         }
     }
 

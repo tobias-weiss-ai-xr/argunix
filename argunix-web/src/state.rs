@@ -1,4 +1,5 @@
 use crate::coalesce::CoalescePool;
+use crate::coord_versions::CoordinatorVersions;
 use crate::pause::PauseRegistry;
 use arc_swap::ArcSwap;
 use argunix_config::{Config, ForgeAuth, ForgeConfig};
@@ -54,6 +55,12 @@ pub struct AppStateInner {
     pub host_stats: crate::host_stats::HostStatsRing,
     /// Daemon start time for `argunixctl status` uptime reporting.
     pub started_at: std::time::Instant,
+    /// Resolved versions of `nix` and `nix-eval-jobs` on the
+    /// coordinator host. Detected once at daemon startup — these
+    /// binaries don't change while the daemon runs — and rendered on
+    /// the `/hosts` page coordinator card so an operator can see at
+    /// a glance which toolchain is driving evaluations.
+    pub coordinator_versions: Arc<CoordinatorVersions>,
 }
 
 #[derive(Debug, thiserror::Error)]

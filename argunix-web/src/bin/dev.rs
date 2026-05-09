@@ -122,6 +122,13 @@ async fn main() -> anyhow::Result<()> {
         live_logs,
         host_stats,
         started_at: std::time::Instant::now(),
+        // Hard-coded fixture so the dev UI shows realistic values
+        // without depending on the local host having `nix` and
+        // `nix-eval-jobs` on PATH.
+        coordinator_versions: Arc::new(argunix_web::CoordinatorVersions {
+            nix_version: "2.24.10".into(),
+            nix_eval_jobs_version: "2.24.0".into(),
+        }),
     };
     let app_state = Arc::new(inner);
     let router = argunix_web::router(app_state);
