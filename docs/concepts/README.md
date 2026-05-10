@@ -12,4 +12,5 @@ code.
 | [collapsed-checks](collapsed-checks.md) — single rolling check for many-job evals | `argunix-daemon/src/worker.rs`                                 |
 | [forge-pause](forge-pause.md) — auth failures pause the forge                     | `argunix-web/src/pause.rs`, `argunix-web/src/policy.rs`        |
 | [gc-roots](gc-roots.md) — store retention via GC roots                            | `argunix-build/src/gc_root.rs`, `argunix-daemon/src/gc.rs`     |
+| [scheduling](scheduling.md) — eval serial, builds parallel + top-level DAG gating | `argunix-sched/`, `argunix-daemon/src/worker.rs`               |
 | [webhook-coalescing](webhook-coalescing.md) — drop duplicate `(repo, sha)` events | `argunix-web/src/coalesce.rs`                                  |
