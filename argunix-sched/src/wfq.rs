@@ -1,6 +1,9 @@
-//! Weighted-fair-queueing core. Used by [`crate::FlatStrategy`] today;
-//! future strategies can wrap this to compose WFQ fairness with extra
-//! scheduling concerns (e.g. dependency gating).
+//! Weighted-fair-queueing core, generic over the dispatch tag type.
+//! Used by [`crate::FlatStrategy`] (with `T = JobId`) and
+//! [`crate::DagStrategy`] (with `T = DispatchToken`). The tag is whatever
+//! identifier the calling strategy uses to look the popped item up in
+//! its own state — WFQ doesn't care what it means, only that it can
+//! hash and compare.
 //!
 //! Goals:
 //! - per-repo `weight` (default 1) gives a target dispatch ratio,
@@ -30,23 +33,23 @@
 //! the cap saturates). Both formulations meet the same observable spec:
 //! dispatches respect weight, no repo is starved.
 
-use crate::Dispatched;
-use argunix_domain::{JobId, RepoId};
+use argunix_domain::RepoId;
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 
 /// Default per-repo weight (`repos[].weight` defaults to 1).
 pub const DEFAULT_WEIGHT: u32 = 1;
 
 #[derive(Debug)]
-struct RepoState {
+struct RepoState<T> {
     weight: u32,
     virtual_time: f64,
     /// Each entry carries its enqueue seq so the head's seq is the
     /// repo's "earliest pending" without any auxiliary bookkeeping.
-    pending: VecDeque<(u64, JobId)>,
+    pending: VecDeque<(u64, T)>,
 }
 
-impl RepoState {
+impl<T> RepoState<T> {
     fn new(weight: u32) -> Self {
         Self {
             weight: weight.max(1),
@@ -65,14 +68,20 @@ impl RepoState {
 }
 
 #[derive(Debug)]
-pub(crate) struct WfqCore {
-    repos: HashMap<RepoId, RepoState>,
-    in_flight: HashMap<JobId, RepoId>,
+pub(crate) struct Popped<T> {
+    pub tag: T,
+    pub repo_id: RepoId,
+}
+
+#[derive(Debug)]
+pub(crate) struct WfqCore<T: Copy + Eq + Hash> {
+    repos: HashMap<RepoId, RepoState<T>>,
+    in_flight: HashMap<T, RepoId>,
     concurrency_cap: Option<usize>,
     next_seq: u64,
 }
 
-impl WfqCore {
+impl<T: Copy + Eq + Hash> WfqCore<T> {
     pub(crate) fn new(concurrency_cap: Option<usize>) -> Self {
         Self {
             repos: HashMap::new(),
@@ -93,12 +102,12 @@ impl WfqCore {
         state.weight = weight.max(1);
     }
 
-    /// Add a job to its repo's pending queue. Repos auto-register with
+    /// Add a tag to its repo's pending queue. Repos auto-register with
     /// [`DEFAULT_WEIGHT`] if not yet known. If the repo was empty *and*
     /// at least one other repo currently has pending work, its
     /// virtual_time is pulled forward to `system_virtual_time` so the
     /// just-arrived repo doesn't free-ride on idle history.
-    pub(crate) fn enqueue(&mut self, repo_id: RepoId, job_id: JobId) {
+    pub(crate) fn enqueue(&mut self, repo_id: RepoId, tag: T) {
         let snap_to = self.system_virtual_time();
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -114,15 +123,15 @@ impl WfqCore {
                 }
             }
         }
-        state.pending.push_back((seq, job_id));
+        state.pending.push_back((seq, tag));
     }
 
-    /// Pick the next job to dispatch. Selection rules:
+    /// Pick the next tag to dispatch. Selection rules:
     /// 1. Skip if the in-flight cap is full.
     /// 2. Among repos with pending work, pick the one with the lowest
     ///    virtual_time. Ties → smallest earliest-pending seq.
     /// 3. Advance the winner's virtual_time by `1 / weight`.
-    pub(crate) fn dispatch(&mut self) -> Option<Dispatched> {
+    pub(crate) fn dispatch(&mut self) -> Option<Popped<T>> {
         if let Some(cap) = self.concurrency_cap {
             if self.in_flight.len() >= cap {
                 return None;
@@ -150,16 +159,16 @@ impl WfqCore {
 
         let (repo_id, _, _) = best?;
         let state = self.repos.get_mut(&repo_id).expect("found repo above");
-        let (_seq, job_id) = state.pending.pop_front().expect("repo had pending");
+        let (_seq, tag) = state.pending.pop_front().expect("repo had pending");
         state.virtual_time += 1.0 / state.weight as f64;
-        self.in_flight.insert(job_id, repo_id);
-        Some(Dispatched { job_id, repo_id })
+        self.in_flight.insert(tag, repo_id);
+        Some(Popped { tag, repo_id })
     }
 
-    /// Mark a job as finished; frees an in-flight slot.
-    /// Returns the repo the job belonged to, if it was tracked.
-    pub(crate) fn complete(&mut self, job_id: JobId) -> Option<RepoId> {
-        self.in_flight.remove(&job_id)
+    /// Mark a tag as finished; frees an in-flight slot.
+    /// Returns the repo the tag belonged to, if it was tracked.
+    pub(crate) fn complete(&mut self, tag: T) -> Option<RepoId> {
+        self.in_flight.remove(&tag)
     }
 
     pub(crate) fn pending_count(&self) -> usize {

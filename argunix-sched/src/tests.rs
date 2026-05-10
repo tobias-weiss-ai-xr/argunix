@@ -10,16 +10,33 @@ fn rid(n: i64) -> RepoId {
     RepoId::new(n)
 }
 
+/// FlatStrategy ignores everything beyond repo_id + job_id + the head
+/// drv. These tests target FlatStrategy via the trait surface, so the
+/// closure is always empty and head_drv carries placeholder fields
+/// just so the struct can be constructed.
 fn item(repo: RepoId, job: JobId) -> ScheduleItem {
     ScheduleItem {
         repo_id: repo,
         eval_id: EvalId::new(0),
         job_id: job,
-        drv_path: None,
-        system: None,
-        required_features: Vec::new(),
-        input_drvs: None,
+        head_drv: DerivationInfo {
+            drv_path: format!("/nix/store/{}-job{}.drv", "x".repeat(32), job.get()),
+            system: None,
+            required_features: Vec::new(),
+            input_drvs: Vec::new(),
+        },
+        closure: Vec::new(),
     }
+}
+
+/// Pop one Dispatched from the strategy and immediately complete it
+/// with `status`. Returns the dispatch's token + repo so callers can
+/// reason about ordering. Panics if the strategy returned `None`.
+fn dispatch_and_complete(s: &mut dyn ScheduleStrategy, status: JobStatus) -> Dispatched {
+    let d = s.dispatch().expect("expected a dispatch");
+    let token = d.token;
+    let _ = s.complete(token, status);
+    d
 }
 
 #[test]
@@ -35,9 +52,9 @@ fn single_repo_dispatches_in_fifo_order() {
     s.enqueue(item(rid(1), jid(11)));
     s.enqueue(item(rid(1), jid(12)));
 
-    assert_eq!(s.dispatch().unwrap().job_id, jid(10));
-    assert_eq!(s.dispatch().unwrap().job_id, jid(11));
-    assert_eq!(s.dispatch().unwrap().job_id, jid(12));
+    assert_eq!(s.dispatch().unwrap().head_job, Some(jid(10)));
+    assert_eq!(s.dispatch().unwrap().head_job, Some(jid(11)));
+    assert_eq!(s.dispatch().unwrap().head_job, Some(jid(12)));
     assert!(s.dispatch().is_none());
 }
 
@@ -50,19 +67,16 @@ fn two_equal_weight_repos_alternate() {
     s.enqueue(item(rid(2), jid(21)));
 
     // Both at vt=0; tie broken by earliest enqueue seq → repo 1 first.
-    let d1 = s.dispatch().unwrap();
+    let d1 = dispatch_and_complete(&mut s, JobStatus::Success);
     assert_eq!(d1.repo_id, rid(1));
-    s.complete(d1.job_id, JobStatus::Success);
 
     // Repo 1's vt is now 1.0; repo 2 still at 0 → repo 2 wins.
-    let d2 = s.dispatch().unwrap();
+    let d2 = dispatch_and_complete(&mut s, JobStatus::Success);
     assert_eq!(d2.repo_id, rid(2));
-    s.complete(d2.job_id, JobStatus::Success);
 
     // Both back at vt=1.0; tie broken by remaining earliest seq → repo 1.
-    let d3 = s.dispatch().unwrap();
+    let d3 = dispatch_and_complete(&mut s, JobStatus::Success);
     assert_eq!(d3.repo_id, rid(1));
-    s.complete(d3.job_id, JobStatus::Success);
 
     let d4 = s.dispatch().unwrap();
     assert_eq!(d4.repo_id, rid(2));
@@ -87,12 +101,11 @@ fn weight_2_to_1_dispatches_at_2_to_1_ratio() {
             } else {
                 b += 1;
             }
-            s.complete(d.job_id, JobStatus::Success);
+            s.complete(d.token, JobStatus::Success);
         }
     }
 
     let ratio = a as f64 / b as f64;
-    // Expected exactly 2.0 in the limit; allow ±5% slop for the tail.
     assert!(
         ratio > 1.9 && ratio < 2.1,
         "expected ratio ~2:1, got {a}:{b} = {ratio}",
@@ -118,7 +131,7 @@ fn weight_5_to_1_clearly_favours_heavy_repo() {
             } else {
                 b += 1;
             }
-            s.complete(d.job_id, JobStatus::Success);
+            s.complete(d.token, JobStatus::Success);
         }
     }
     let ratio = a as f64 / b as f64;
@@ -140,11 +153,11 @@ fn concurrency_cap_blocks_dispatch_until_complete() {
         "third dispatch should be blocked by cap"
     );
 
-    s.complete(d1.job_id, JobStatus::Success);
+    s.complete(d1.token, JobStatus::Success);
     let d3 = s.dispatch().unwrap();
-    assert_eq!(d3.job_id, jid(3));
-    s.complete(d2.job_id, JobStatus::Success);
-    s.complete(d3.job_id, JobStatus::Success);
+    assert_eq!(d3.head_job, Some(jid(3)));
+    s.complete(d2.token, JobStatus::Success);
+    s.complete(d3.token, JobStatus::Success);
     assert!(s.dispatch().is_none());
     assert_eq!(s.in_flight_count(), 0);
 }
@@ -154,14 +167,16 @@ fn complete_returns_repo_for_known_jobs_and_none_otherwise() {
     let mut s = FlatStrategy::new(None);
     s.enqueue(item(rid(7), jid(100)));
     let d = s.dispatch().unwrap();
-    assert_eq!(s.complete(d.job_id, JobStatus::Success), Some(rid(7)));
-    assert_eq!(s.complete(d.job_id, JobStatus::Success), None);
-    assert_eq!(s.complete(jid(999_999), JobStatus::Success), None);
+    assert_eq!(
+        s.complete(d.token, JobStatus::Success).repo_id,
+        Some(rid(7))
+    );
+    // Same token completed twice: second complete is a no-op (repo None).
+    assert_eq!(s.complete(d.token, JobStatus::Success).repo_id, None);
 }
 
 #[test]
 fn idle_repo_does_not_advance_in_virtual_time() {
-    // Repo 1 has no pending; its virtual_time stays at 0.
     let mut s = FlatStrategy::new(None);
     s.set_weight(rid(1), 1);
     s.set_weight(rid(2), 1);
@@ -173,10 +188,6 @@ fn idle_repo_does_not_advance_in_virtual_time() {
 
 #[test]
 fn long_idle_repo_does_not_get_unbounded_advantage() {
-    // Repo 1 dispatches many times alone, advancing its vt. Then repo 2
-    // arrives. Without the system-vt snap, repo 2 would dispatch all of
-    // its work before repo 1 again — which would starve repo 1. With the
-    // snap, repo 2 enters at repo 1's current vt and they alternate.
     let mut s = FlatStrategy::new(None);
     s.set_weight(rid(1), 1);
     s.set_weight(rid(2), 1);
@@ -184,8 +195,7 @@ fn long_idle_repo_does_not_get_unbounded_advantage() {
         s.enqueue(item(rid(1), jid(n)));
     }
     for _ in 0..30 {
-        let d = s.dispatch().unwrap();
-        s.complete(d.job_id, JobStatus::Success);
+        dispatch_and_complete(&mut s, JobStatus::Success);
     }
     // Repo 1's vt is now 30. Repo 2 arrives.
     s.enqueue(item(rid(2), jid(100)));
@@ -206,9 +216,6 @@ fn tick_is_a_noop() {
 
 #[test]
 fn many_repos_random_arrivals_no_starvation() {
-    // Stress test: 5 repos with mixed weights, deep queues, drive the
-    // scheduler for many rounds and verify every repo's queue eventually
-    // empties.
     let mut s = FlatStrategy::new(Some(3));
     for i in 1..=5 {
         s.set_weight(rid(i), (i as u32 - 1).max(1));
@@ -222,7 +229,7 @@ fn many_repos_random_arrivals_no_starvation() {
     let mut iterations = 0;
     while s.pending_count() > 0 || s.in_flight_count() > 0 {
         if let Some(d) = s.dispatch() {
-            s.complete(d.job_id, JobStatus::Success);
+            s.complete(d.token, JobStatus::Success);
         }
         iterations += 1;
         assert!(
@@ -239,8 +246,6 @@ fn many_repos_random_arrivals_no_starvation() {
 
 #[test]
 fn ties_broken_by_earliest_enqueue() {
-    // Both repos same weight, both at vt=0. Repo 2 enqueues first → wins
-    // the tie even though IDs would suggest repo 1.
     let mut s = FlatStrategy::new(None);
     s.enqueue(item(rid(2), jid(20)));
     s.enqueue(item(rid(1), jid(10)));
@@ -259,9 +264,6 @@ fn auto_registers_unseen_repo_with_default_weight() {
 
 #[test]
 fn newly_arriving_repo_is_not_starved_by_a_busy_high_weight_one() {
-    // Repo 1: weight 10, deep queue, dispatching for a while.
-    // Repo 2: weight 1, arrives later.
-    // Verify repo 2 still gets *some* dispatches in a reasonable horizon.
     let mut s = FlatStrategy::new(None);
     s.set_weight(rid(1), 10);
     s.set_weight(rid(2), 1);
@@ -269,8 +271,7 @@ fn newly_arriving_repo_is_not_starved_by_a_busy_high_weight_one() {
         s.enqueue(item(rid(1), jid(n)));
     }
     for _ in 0..50 {
-        let d = s.dispatch().unwrap();
-        s.complete(d.job_id, JobStatus::Success);
+        dispatch_and_complete(&mut s, JobStatus::Success);
     }
     s.enqueue(item(rid(2), jid(1000)));
     s.enqueue(item(rid(2), jid(1001)));
@@ -282,7 +283,7 @@ fn newly_arriving_repo_is_not_starved_by_a_busy_high_weight_one() {
             if d.repo_id == rid(2) {
                 got_repo_2 += 1;
             }
-            s.complete(d.job_id, JobStatus::Success);
+            s.complete(d.token, JobStatus::Success);
         }
     }
     assert!(
@@ -300,9 +301,392 @@ fn build_factory_returns_a_working_strategy() {
     s.enqueue(item(rid(1), jid(1)));
     s.enqueue(item(rid(1), jid(2)));
     let d = s.dispatch().unwrap();
-    assert_eq!(d.job_id, jid(1));
+    assert_eq!(d.head_job, Some(jid(1)));
     assert!(s.dispatch().is_none(), "cap should block second dispatch");
-    s.complete(d.job_id, JobStatus::Success);
+    s.complete(d.token, JobStatus::Success);
     let d2 = s.dispatch().unwrap();
-    assert_eq!(d2.job_id, jid(2));
+    assert_eq!(d2.head_job, Some(jid(2)));
+}
+
+#[test]
+fn build_factory_constructs_dag_too() {
+    // Smoke-test that DagStrategy is wired into the factory and behaves
+    // like FlatStrategy when items have no closure (degenerate DAG).
+    let mut s = build(SchedulerKind::Dag, None);
+    s.enqueue(item(rid(1), jid(1)));
+    let d = s.dispatch().unwrap();
+    assert_eq!(d.head_job, Some(jid(1)));
+    let eff = s.complete(d.token, JobStatus::Success);
+    assert_eq!(eff.repo_id, Some(rid(1)));
+    assert!(eff.cascaded_skips.is_empty());
+    assert!(s.dispatch().is_none());
+}
+
+#[test]
+fn dispatched_carries_head_drv_metadata_through() {
+    // FlatStrategy reads the head drv from the item and surfaces it on
+    // Dispatched so the daemon can hand it to nix-store --realise
+    // without re-querying the DB.
+    let mut s = FlatStrategy::new(None);
+    s.enqueue(ScheduleItem {
+        repo_id: rid(1),
+        eval_id: EvalId::new(99),
+        job_id: jid(1),
+        head_drv: DerivationInfo {
+            drv_path: "/nix/store/aaaa-hello.drv".into(),
+            system: Some("x86_64-linux".into()),
+            required_features: vec!["kvm".into()],
+            input_drvs: Vec::new(),
+        },
+        closure: Vec::new(),
+    });
+    let d = s.dispatch().unwrap();
+    assert_eq!(d.eval_id, EvalId::new(99));
+    assert_eq!(d.drv_path, "/nix/store/aaaa-hello.drv");
+    assert_eq!(d.system.as_deref(), Some("x86_64-linux"));
+    assert_eq!(d.required_features, vec!["kvm".to_string()]);
+    assert_eq!(d.head_job, Some(jid(1)));
+}
+
+// ---------------------------------------------------------------------
+// DagStrategy tests
+// ---------------------------------------------------------------------
+
+/// Build a DerivationInfo with the given drv path and inputs. System +
+/// required_features are placeholders; the dispatch tests don't rely on
+/// them beyond checking they pass through.
+fn drv(path: &str, inputs: &[&str]) -> DerivationInfo {
+    DerivationInfo {
+        drv_path: path.into(),
+        system: Some("x86_64-linux".into()),
+        required_features: Vec::new(),
+        input_drvs: inputs.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn dag_item(
+    repo: RepoId,
+    eval: EvalId,
+    job: JobId,
+    head: DerivationInfo,
+    closure: Vec<DerivationInfo>,
+) -> ScheduleItem {
+    ScheduleItem {
+        repo_id: repo,
+        eval_id: eval,
+        job_id: job,
+        head_drv: head,
+        closure,
+    }
+}
+
+#[test]
+fn dag_linear_chain_b_waits_for_a() {
+    // The exact case the user opened with: B's drv has A's drv as an
+    // input. Both are top-level Jobs in the same eval. Without DAG
+    // gating, both would dispatch in parallel and B's builder would
+    // rebuild A. With DAG gating, A dispatches first and B only
+    // becomes Ready after A succeeds.
+    let mut s = DagStrategy::new(None);
+    let a_drv = drv("/nix/store/aaaa-a.drv", &[]);
+    let b_drv = drv("/nix/store/bbbb-b.drv", &["/nix/store/aaaa-a.drv"]);
+
+    // Enqueue B with its closure (just A); enqueue A as a top-level too.
+    s.enqueue(dag_item(
+        rid(1),
+        EvalId::new(1),
+        jid(1),
+        a_drv.clone(),
+        vec![],
+    ));
+    s.enqueue(dag_item(
+        rid(1),
+        EvalId::new(1),
+        jid(2),
+        b_drv,
+        vec![a_drv.clone()],
+    ));
+
+    // First dispatch must be A — B is gated.
+    let d_a = s.dispatch().unwrap();
+    assert_eq!(d_a.drv_path, "/nix/store/aaaa-a.drv");
+    assert_eq!(d_a.head_job, Some(jid(1)));
+    assert!(
+        s.dispatch().is_none(),
+        "B must not dispatch until A succeeds",
+    );
+
+    // Complete A: B becomes Ready.
+    let _ = s.complete(d_a.token, JobStatus::Success);
+    let d_b = s.dispatch().unwrap();
+    assert_eq!(d_b.drv_path, "/nix/store/bbbb-b.drv");
+    assert_eq!(d_b.head_job, Some(jid(2)));
+}
+
+#[test]
+fn dag_diamond_c_waits_for_both_a_and_b() {
+    // Diamond: A and B are independent; C depends on both. C dispatches
+    // only after both A and B are done, in either order.
+    let mut s = DagStrategy::new(None);
+    let a_drv = drv("/nix/store/aaaa-a.drv", &[]);
+    let b_drv = drv("/nix/store/bbbb-b.drv", &[]);
+    let c_drv = drv(
+        "/nix/store/cccc-c.drv",
+        &["/nix/store/aaaa-a.drv", "/nix/store/bbbb-b.drv"],
+    );
+
+    s.enqueue(dag_item(
+        rid(1),
+        EvalId::new(1),
+        jid(1),
+        a_drv.clone(),
+        vec![],
+    ));
+    s.enqueue(dag_item(
+        rid(1),
+        EvalId::new(1),
+        jid(2),
+        b_drv.clone(),
+        vec![],
+    ));
+    s.enqueue(dag_item(
+        rid(1),
+        EvalId::new(1),
+        jid(3),
+        c_drv,
+        vec![a_drv, b_drv],
+    ));
+
+    // Pop A and B in some order; C must not appear yet.
+    let d1 = s.dispatch().unwrap();
+    let d2 = s.dispatch().unwrap();
+    assert!(
+        s.dispatch().is_none(),
+        "C must wait until both A and B succeed",
+    );
+    let popped: Vec<&str> = vec![&d1.drv_path, &d2.drv_path];
+    assert!(popped.contains(&"/nix/store/aaaa-a.drv"));
+    assert!(popped.contains(&"/nix/store/bbbb-b.drv"));
+
+    // Complete A only — C still gated by B.
+    let _ = s.complete(d1.token, JobStatus::Success);
+    assert!(s.dispatch().is_none(), "C still gated on the other dep");
+
+    // Complete B — now C becomes Ready.
+    let _ = s.complete(d2.token, JobStatus::Success);
+    let d_c = s.dispatch().unwrap();
+    assert_eq!(d_c.drv_path, "/nix/store/cccc-c.drv");
+}
+
+#[test]
+fn dag_shared_internal_step_dispatched_once() {
+    // The motivating problem: top-level Jobs X and Y both depend on an
+    // internal Z that is NOT a top-level Job. Without dedup, X's builder
+    // and Y's builder would both rebuild Z. With DAG dedup, Z is one
+    // Step, dispatched exactly once with head_job = None, and BOTH X
+    // and Y wait on it.
+    let mut s = DagStrategy::new(None);
+    let z = drv("/nix/store/zzzz-z.drv", &[]);
+    let x = drv("/nix/store/xxxx-x.drv", &["/nix/store/zzzz-z.drv"]);
+    let y = drv("/nix/store/yyyy-y.drv", &["/nix/store/zzzz-z.drv"]);
+
+    // X is enqueued with Z in its closure; Y is enqueued with Z in its
+    // closure. Z must dedup — same drv path, both items list it.
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(1), x, vec![z.clone()]));
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(2), y, vec![z]));
+
+    // First dispatch is Z (the only Ready Step). It's an internal
+    // Step — head_job is None.
+    let d_z = s.dispatch().unwrap();
+    assert_eq!(d_z.drv_path, "/nix/store/zzzz-z.drv");
+    assert_eq!(d_z.head_job, None);
+    assert!(s.dispatch().is_none(), "X and Y both gated on Z");
+
+    // Complete Z once: BOTH X and Y unblock.
+    let _ = s.complete(d_z.token, JobStatus::Success);
+    let d1 = s.dispatch().unwrap();
+    let d2 = s.dispatch().unwrap();
+    assert!(s.dispatch().is_none(), "no more Steps");
+    let popped_heads: Vec<Option<JobId>> = vec![d1.head_job, d2.head_job];
+    assert!(popped_heads.contains(&Some(jid(1))));
+    assert!(popped_heads.contains(&Some(jid(2))));
+}
+
+#[test]
+fn dag_cascade_skip_on_dependency_failure() {
+    // A → B → C. A fails. B and C never dispatch and surface as
+    // CascadedSkips on the CompletionEffects from A's complete.
+    let mut s = DagStrategy::new(None);
+    let a = drv("/nix/store/aaaa-a.drv", &[]);
+    let b = drv("/nix/store/bbbb-b.drv", &["/nix/store/aaaa-a.drv"]);
+    let c = drv("/nix/store/cccc-c.drv", &["/nix/store/bbbb-b.drv"]);
+
+    s.enqueue(dag_item(rid(1), EvalId::new(7), jid(1), a.clone(), vec![]));
+    s.enqueue(dag_item(
+        rid(1),
+        EvalId::new(7),
+        jid(2),
+        b.clone(),
+        vec![a.clone()],
+    ));
+    s.enqueue(dag_item(rid(1), EvalId::new(7), jid(3), c, vec![a, b]));
+
+    let d_a = s.dispatch().unwrap();
+    assert_eq!(d_a.head_job, Some(jid(1)));
+    assert!(s.dispatch().is_none(), "B and C gated");
+
+    // A fails. B and C cascade to Skipped without ever dispatching.
+    let eff = s.complete(d_a.token, JobStatus::Failure);
+    assert_eq!(eff.cascaded_skips.len(), 2, "B and C must cascade");
+    let skipped_jobs: Vec<JobId> = eff.cascaded_skips.iter().map(|c| c.job_id).collect();
+    assert!(skipped_jobs.contains(&jid(2)));
+    assert!(skipped_jobs.contains(&jid(3)));
+    for skip in &eff.cascaded_skips {
+        assert_eq!(skip.eval_id, EvalId::new(7));
+        assert_eq!(skip.repo_id, rid(1));
+        assert_eq!(skip.reason_drv, "/nix/store/aaaa-a.drv");
+    }
+    // No dispatch should ever come for B or C.
+    assert!(s.dispatch().is_none());
+}
+
+#[test]
+fn dag_partial_cascade_skip_does_not_affect_unrelated_branches() {
+    // A → B (fails); X → Y (independent). A's failure must not affect Y.
+    let mut s = DagStrategy::new(None);
+    let a = drv("/nix/store/aaaa-a.drv", &[]);
+    let b = drv("/nix/store/bbbb-b.drv", &["/nix/store/aaaa-a.drv"]);
+    let x = drv("/nix/store/xxxx-x.drv", &[]);
+    let y = drv("/nix/store/yyyy-y.drv", &["/nix/store/xxxx-x.drv"]);
+
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(1), a.clone(), vec![]));
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(2), b, vec![a]));
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(3), x.clone(), vec![]));
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(4), y, vec![x]));
+
+    // Drain the two ready Steps (A and X) in some order.
+    let d1 = s.dispatch().unwrap();
+    let d2 = s.dispatch().unwrap();
+    assert!(s.dispatch().is_none());
+    let (a_dispatch, x_dispatch) = if d1.drv_path.contains("aaaa") {
+        (d1, d2)
+    } else {
+        (d2, d1)
+    };
+    assert!(a_dispatch.drv_path.contains("aaaa"));
+    assert!(x_dispatch.drv_path.contains("xxxx"));
+
+    // X succeeds: Y becomes ready.
+    let eff_x = s.complete(x_dispatch.token, JobStatus::Success);
+    assert!(eff_x.cascaded_skips.is_empty());
+    let d_y = s.dispatch().unwrap();
+    assert_eq!(d_y.head_job, Some(jid(4)));
+
+    // A fails: only B cascades; Y is in flight and unaffected.
+    let eff_a = s.complete(a_dispatch.token, JobStatus::Failure);
+    let skipped: Vec<JobId> = eff_a.cascaded_skips.iter().map(|c| c.job_id).collect();
+    assert_eq!(skipped, vec![jid(2)]);
+}
+
+#[test]
+fn dag_external_inputs_do_not_gate() {
+    // The drv lists input drvs that are NOT in any ScheduleItem (think:
+    // bash, stdenv from nixpkgs that the eval didn't surface as Jobs).
+    // The Step should be Ready immediately — external inputs are
+    // assumed available via substituters.
+    let mut s = DagStrategy::new(None);
+    let a = drv(
+        "/nix/store/aaaa-a.drv",
+        &[
+            "/nix/store/9999-bash.drv",   // external
+            "/nix/store/8888-stdenv.drv", // external
+        ],
+    );
+
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(1), a, vec![]));
+    let d = s.dispatch().unwrap();
+    assert_eq!(d.drv_path, "/nix/store/aaaa-a.drv");
+}
+
+#[test]
+fn dag_cross_repo_wfq_fairness_on_ready_set() {
+    // Two unrelated drvs, one per repo, both immediately Ready. WFQ
+    // should still honour cross-repo fairness on the dispatch order.
+    let mut s = DagStrategy::new(None);
+    s.set_weight(rid(1), 1);
+    s.set_weight(rid(2), 1);
+    let a = drv("/nix/store/aaaa-a.drv", &[]);
+    let b = drv("/nix/store/bbbb-b.drv", &[]);
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(1), a, vec![]));
+    s.enqueue(dag_item(rid(2), EvalId::new(2), jid(2), b, vec![]));
+
+    let d1 = s.dispatch().unwrap();
+    let _ = s.complete(d1.token, JobStatus::Success);
+    let d2 = s.dispatch().unwrap();
+    // After the first dispatch, the loser repo's vt is still 0 → it
+    // wins the second round. So the two repos alternate.
+    assert_ne!(d1.repo_id, d2.repo_id);
+}
+
+#[test]
+fn dag_shared_step_with_one_failed_dep_skips_only_that_branch() {
+    // X → Z and Y → Z. Z succeeds. X fails. Y must NOT be cascade-
+    // skipped (Y depends on Z, not on X).
+    let mut s = DagStrategy::new(None);
+    let z = drv("/nix/store/zzzz-z.drv", &[]);
+    let x = drv("/nix/store/xxxx-x.drv", &["/nix/store/zzzz-z.drv"]);
+    let y = drv("/nix/store/yyyy-y.drv", &["/nix/store/zzzz-z.drv"]);
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(1), x, vec![z.clone()]));
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(2), y, vec![z]));
+
+    let d_z = s.dispatch().unwrap();
+    assert_eq!(d_z.drv_path, "/nix/store/zzzz-z.drv");
+    let _ = s.complete(d_z.token, JobStatus::Success);
+
+    // Now X and Y are both Ready. Pop them.
+    let d1 = s.dispatch().unwrap();
+    let d2 = s.dispatch().unwrap();
+
+    // Fail one (X). The other (Y) is in flight, must not be skipped.
+    let (x_d, _y_d) = if d1.head_job == Some(jid(1)) {
+        (d1, d2)
+    } else {
+        (d2, d1)
+    };
+    let eff = s.complete(x_d.token, JobStatus::Failure);
+    assert!(
+        eff.cascaded_skips.is_empty(),
+        "Y depends on Z (which succeeded), not on X — must not cascade",
+    );
+}
+
+#[test]
+fn dag_concurrency_cap_applies_across_steps() {
+    // Cap at 1: even if multiple Steps are Ready, only one dispatches
+    // at a time. This is just WfqCore's job, but we verify it still
+    // works through the wider trait surface.
+    let mut s = DagStrategy::new(Some(1));
+    let a = drv("/nix/store/aaaa-a.drv", &[]);
+    let b = drv("/nix/store/bbbb-b.drv", &[]);
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(1), a, vec![]));
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(2), b, vec![]));
+
+    let d1 = s.dispatch().unwrap();
+    assert!(s.dispatch().is_none(), "cap blocks second");
+    let _ = s.complete(d1.token, JobStatus::Success);
+    let d2 = s.dispatch().unwrap();
+    assert_ne!(d1.drv_path, d2.drv_path);
+}
+
+#[test]
+#[should_panic(expected = "DagStrategy V1 does not support two top-level Jobs sharing a head_drv")]
+fn dag_v1_panics_on_aliased_head_drv() {
+    // Two ScheduleItems with the same head_drv.drv_path — the V1
+    // limitation documented in dag.rs. Keeping the panic visible in
+    // tests so we can't accidentally remove it without updating the
+    // type to support multi-head.
+    let mut s = DagStrategy::new(None);
+    let d = drv("/nix/store/same-drv.drv", &[]);
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(1), d.clone(), vec![]));
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(2), d, vec![]));
 }
