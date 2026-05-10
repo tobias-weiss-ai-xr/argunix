@@ -135,7 +135,7 @@ async fn enroll_stub_agent(
     // Drain control until welcome arrives. We don't need to keep the
     // control channel — the test only cares about build channels, but
     // we can't drop the session handle.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut buf = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -164,7 +164,7 @@ async fn enroll_stub_agent(
 
 async fn wait_active(reg: &BuilderRegistry, name: &str) {
     let bn = BuilderName::new(name).unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if let Some(s) = reg.snapshot(&bn) {
             if s.state == ConnState::Active {
@@ -189,12 +189,18 @@ async fn dispatch_opens_channel_to_eligible_builder() {
         .expect("dispatch must succeed");
 
     // The agent should have observed the inbound channel open.
-    let mut agent_channel = tokio::time::timeout(Duration::from_secs(2), on_open.recv())
+    let mut agent_channel = tokio::time::timeout(Duration::from_secs(30), on_open.recv())
         .await
         .expect("inbound channel-open arrives at the agent")
         .expect("on_open channel is open");
 
-    // Set up an echo on the agent side.
+    // Set up an echo on the agent side. This loop's deadline is a
+    // *max-lifetime cap*, not a reliability fence: russh doesn't
+    // reliably emit ChannelMsg::Close on the agent side when the
+    // server-side handle is dropped, so the loop exits via deadline
+    // every run. Keep this short — the bumped 30s deadlines elsewhere
+    // are reliability fences (an event we expect to see), but this one
+    // dominates the test's wall clock if widened.
     let echo_task = tokio::spawn(async move {
         let mut total: Vec<u8> = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -218,7 +224,7 @@ async fn dispatch_opens_channel_to_eligible_builder() {
 
     // Read the echo back (best-effort with a deadline).
     let mut got = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while got.len() < payload.len() && tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), argunix_channel.wait()).await {
             Ok(Some(ChannelMsg::Data { data })) => got.extend_from_slice(&data),

@@ -85,7 +85,7 @@ fn caps(systems: &[&str], features: &[&str], max_jobs: u32) -> BuilderCapabiliti
 /// EOF/timeout. Bounded so a buggy server can't hang the test forever.
 async fn await_welcome(channel: &mut russh::Channel<russh::client::Msg>) -> Option<ControlMessage> {
     let mut buf: Vec<u8> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

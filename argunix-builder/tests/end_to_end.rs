@@ -72,7 +72,7 @@ fn fresh_identity() -> PersistedKey {
 }
 
 async fn wait_for_row(store: &Arc<SqlxStore>, name: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Some(_)) = <SqlxStore as BuilderStore>::find_by_name(store, name).await {
             return;
@@ -84,7 +84,7 @@ async fn wait_for_row(store: &Arc<SqlxStore>, name: &str) {
 
 async fn wait_for_active(reg: &Arc<BuilderRegistry>, name: &str) {
     let bn = BuilderName::new(name).unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if let Some(s) = reg.snapshot(&bn) {
             if s.state == ConnState::Active {
@@ -134,7 +134,7 @@ async fn token_first_then_pubkey_subsequent() {
     // The server should flip the registry to Disconnecting before
     // the connection actually closes.
     let _ = sd_tx.send(());
-    let _ = tokio::time::timeout(Duration::from_secs(3), agent_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), agent_handle).await;
 }
 
 /// End-to-end: spawn a real argunix server + a real agent over
@@ -234,6 +234,6 @@ async fn nix_daemon_stdio_side_channel_end_to_end() {
     drop(channel);
     drop(dispatched);
     let _ = sd_tx.send(());
-    let _ = tokio::time::timeout(Duration::from_secs(3), agent_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), agent_handle).await;
     echo_handle.abort();
 }

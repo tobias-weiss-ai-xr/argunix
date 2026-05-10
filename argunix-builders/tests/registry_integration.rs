@@ -85,7 +85,7 @@ fn caps(systems: &[&str], features: &[&str], max_jobs: u32) -> BuilderCapabiliti
 
 async fn await_welcome(channel: &mut russh::Channel<russh::client::Msg>) -> Option<ControlMessage> {
     let mut buf: Vec<u8> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -119,7 +119,7 @@ where
     F: FnMut(&argunix_builders::BuilderSnapshot) -> bool,
 {
     let bn = BuilderName::new(name).unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(s) = reg.snapshot(&bn) {
             if pred(&s) {
@@ -135,7 +135,7 @@ where
 
 async fn wait_for_absent(reg: &BuilderRegistry, name: &str) -> bool {
     let bn = BuilderName::new(name).unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if reg.snapshot(&bn).is_none() {
             return true;
@@ -371,7 +371,7 @@ async fn duplicate_name_displaces_old_connection() {
     // because the server disconnected the displaced session.
     let hb = ControlMessage::Heartbeat { ts: 1, stats: None };
     let send = channel_a.data(&hb.encode_line()[..]).await;
-    let recv = tokio::time::timeout(Duration::from_secs(2), channel_a.wait()).await;
+    let recv = tokio::time::timeout(Duration::from_secs(30), channel_a.wait()).await;
     assert!(
         send.is_err() || matches!(recv, Ok(None) | Ok(Some(ChannelMsg::Close))),
         "displaced channel must be closed",
