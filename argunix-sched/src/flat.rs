@@ -7,7 +7,8 @@
 
 use crate::wfq::WfqCore;
 use crate::{
-    CompletionEffects, DerivationInfo, DispatchToken, Dispatched, ScheduleItem, ScheduleStrategy,
+    CascadedSkip, CompletionEffects, DerivationInfo, DispatchToken, Dispatched, ScheduleItem,
+    ScheduleStrategy,
 };
 use argunix_domain::{EvalId, JobId, JobStatus, RepoId};
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ use std::collections::HashMap;
 /// schedule-item-shaped fields.
 #[derive(Debug, Clone)]
 struct FlatPending {
+    repo_id: RepoId,
     eval_id: EvalId,
     head_drv: DerivationInfo,
 }
@@ -75,6 +77,7 @@ impl ScheduleStrategy for FlatStrategy {
         self.pending.insert(
             item.job_id,
             FlatPending {
+                repo_id: item.repo_id,
                 eval_id: item.eval_id,
                 head_drv: item.head_drv,
             },
@@ -117,6 +120,30 @@ impl ScheduleStrategy for FlatStrategy {
             repo_id: self.wfq.complete(job_id),
             cascaded_skips: Vec::new(),
         }
+    }
+
+    fn cancel_eval(&mut self, eval_id: EvalId) -> Vec<CascadedSkip> {
+        // FlatStrategy holds no Step graph, so cancelling an eval
+        // reduces to: remove its pending entries from WFQ, drop the
+        // metadata, return one skip per dropped Job. In-flight Jobs
+        // are left alone — the daemon's per-eval CancelToken signals
+        // them; their results arrive via complete() in due course.
+        let removed = self
+            .wfq
+            .cancel_pending(|tag| matches!(self.pending.get(tag), Some(p) if p.eval_id == eval_id));
+        let reason = format!("eval {} cancelled", eval_id.get());
+        removed
+            .into_iter()
+            .filter_map(|jid| {
+                let p = self.pending.remove(&jid)?;
+                Some(CascadedSkip {
+                    job_id: jid,
+                    eval_id: p.eval_id,
+                    repo_id: p.repo_id,
+                    reason_drv: reason.clone(),
+                })
+            })
+            .collect()
     }
 
     fn pending_count(&self) -> usize {

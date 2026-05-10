@@ -171,6 +171,28 @@ impl<T: Copy + Eq + Hash> WfqCore<T> {
         self.in_flight.remove(&tag)
     }
 
+    /// Remove every pending tag matching `predicate` without dispatching
+    /// it. Returns the removed tags for the caller to fold back into
+    /// its own state (emit skips, free metadata, etc.). In-flight tags
+    /// are not touched — they observe their own cancel signal.
+    pub(crate) fn cancel_pending<P>(&mut self, mut predicate: P) -> Vec<T>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        let mut removed = Vec::new();
+        for state in self.repos.values_mut() {
+            state.pending.retain(|(_seq, tag)| {
+                if predicate(tag) {
+                    removed.push(*tag);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        removed
+    }
+
     pub(crate) fn pending_count(&self) -> usize {
         self.repos.values().map(|s| s.pending.len()).sum()
     }

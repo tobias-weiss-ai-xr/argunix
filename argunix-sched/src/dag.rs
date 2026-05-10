@@ -421,6 +421,99 @@ impl ScheduleStrategy for DagStrategy {
         }
     }
 
+    fn cancel_eval(&mut self, eval_id: EvalId) -> Vec<CascadedSkip> {
+        // For each Job in this eval, find its head Step. Skip it (as
+        // in: mark Cancelled and cascade) only if it hasn't been
+        // dispatched yet. Steps that are already Running keep going —
+        // the per-eval CancelToken signals their build to abort, and
+        // the resulting Cancelled status flows back through complete().
+        // Internal Steps shared with another live eval also keep
+        // running; cascade only walks rdeps of *this* head, so a
+        // shared internal stays Pending/Ready/Running for whoever else
+        // wanted it.
+        let job_ids: Vec<JobId> = self
+            .job_meta
+            .iter()
+            .filter(|(_, (_, e))| *e == eval_id)
+            .map(|(jid, _)| *jid)
+            .collect();
+
+        let mut skips: Vec<CascadedSkip> = Vec::new();
+        for jid in job_ids {
+            // Find the head Step for this Job. by_drv is the source of
+            // truth — head_job links there. (Linear scan; eval sizes
+            // are bounded and this only fires on cancel.)
+            let head_drv = self
+                .by_drv
+                .iter()
+                .find(|(_, s)| s.head_job == Some(jid))
+                .map(|(d, _)| d.clone());
+            let Some(head_drv) = head_drv else {
+                // Already cleaned up (e.g. the Step terminated and was
+                // forgotten; we forget head_job links lazily). Drop
+                // the metadata and emit a skip so the daemon can
+                // close out the DB row.
+                let (repo_id, eval_id) = match self.job_meta.remove(&jid) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                skips.push(CascadedSkip {
+                    job_id: jid,
+                    eval_id,
+                    repo_id,
+                    reason_drv: format!("eval {} cancelled", eval_id.get()),
+                });
+                continue;
+            };
+
+            let (was_pending_or_ready, repo_id) = {
+                let step = self.by_drv.get_mut(&head_drv).unwrap();
+                let pending_or_ready = matches!(step.state, StepState::Pending | StepState::Ready);
+                (pending_or_ready, step.repo_id)
+            };
+
+            if was_pending_or_ready {
+                let step = self.by_drv.get_mut(&head_drv).unwrap();
+                step.state = StepState::Cancelled;
+                if let Some(tok) = step.in_flight_token.take() {
+                    // Drop the token mapping; if WFQ later pops it,
+                    // dispatch's stale-token swallow ignores it.
+                    self.token_to_drv.remove(&tok);
+                }
+                // Drop the head_job link so the cascade walk doesn't
+                // re-emit a skip for it; we emit the direct skip
+                // ourselves below.
+                step.head_job = None;
+
+                skips.push(CascadedSkip {
+                    job_id: jid,
+                    eval_id,
+                    repo_id,
+                    reason_drv: format!("eval {} cancelled", eval_id.get()),
+                });
+
+                // Cascade through rdeps. cascade_skip's own emitted
+                // skips carry reason_drv = head_drv; rewrite to the
+                // eval-cancelled message so the operator-facing log
+                // is uniform.
+                let cascade = self.cascade_skip(&head_drv);
+                let reason = format!("eval {} cancelled", eval_id.get());
+                for mut s in cascade {
+                    s.reason_drv = reason.clone();
+                    skips.push(s);
+                }
+            }
+            // Either way, the Job is no longer being tracked by the
+            // strategy (the head Step persists for its outputs but its
+            // head_job link is gone, or the Step was already Running
+            // and will route through complete()). Drop the metadata
+            // so cancel_eval is idempotent.
+            self.job_meta.remove(&jid);
+        }
+
+        skips
+    }
+
     fn pending_count(&self) -> usize {
         self.wfq.pending_count()
     }

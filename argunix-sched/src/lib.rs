@@ -138,6 +138,20 @@ pub trait ScheduleStrategy: Send {
     fn dispatch(&mut self) -> Option<Dispatched>;
     fn complete(&mut self, token: DispatchToken, status: JobStatus) -> CompletionEffects;
 
+    /// Drop every pending item belonging to `eval_id` without
+    /// dispatching it, and return one [`CascadedSkip`] per affected
+    /// head Job (so the daemon can mark DB rows + post forge checks).
+    /// In-flight items are *not* aborted here — that's the caller's
+    /// responsibility via the per-eval `CancelToken`; their results
+    /// will arrive via [`Self::complete`] in due course.
+    ///
+    /// For [`DagStrategy`], rdeps of cancelled head Steps are
+    /// cascade-skipped too, so a cancelled Job high up in the DAG
+    /// transitively skips everything underneath it. Internal Steps
+    /// that are *shared* with another still-live eval keep running —
+    /// they'll be reused by the live eval rather than wasted.
+    fn cancel_eval(&mut self, eval_id: EvalId) -> Vec<CascadedSkip>;
+
     fn pending_count(&self) -> usize;
     fn in_flight_count(&self) -> usize;
     fn pending_for(&self, repo_id: RepoId) -> usize;

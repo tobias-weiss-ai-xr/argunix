@@ -690,3 +690,183 @@ fn dag_v1_panics_on_aliased_head_drv() {
     s.enqueue(dag_item(rid(1), EvalId::new(1), jid(1), d.clone(), vec![]));
     s.enqueue(dag_item(rid(1), EvalId::new(1), jid(2), d, vec![]));
 }
+
+// ---------------------------------------------------------------------
+// cancel_eval tests
+// ---------------------------------------------------------------------
+
+#[test]
+fn flat_cancel_eval_drops_pending_and_emits_skips_for_only_that_eval() {
+    let mut s = FlatStrategy::new(None);
+    // Eval A: jobs 1, 2, 3. Eval B: jobs 10, 11.
+    for j in [1, 2, 3] {
+        s.enqueue(ScheduleItem {
+            repo_id: rid(1),
+            eval_id: EvalId::new(7),
+            job_id: jid(j),
+            head_drv: drv(&format!("/nix/store/aa-{j}.drv"), &[]),
+            closure: Vec::new(),
+        });
+    }
+    for j in [10, 11] {
+        s.enqueue(ScheduleItem {
+            repo_id: rid(1),
+            eval_id: EvalId::new(8),
+            job_id: jid(j),
+            head_drv: drv(&format!("/nix/store/bb-{j}.drv"), &[]),
+            closure: Vec::new(),
+        });
+    }
+    assert_eq!(s.pending_count(), 5);
+
+    let skips = s.cancel_eval(EvalId::new(7));
+    let mut got: Vec<JobId> = skips.iter().map(|s| s.job_id).collect();
+    got.sort_by_key(|j| j.get());
+    assert_eq!(got, vec![jid(1), jid(2), jid(3)]);
+    for sk in &skips {
+        assert_eq!(sk.eval_id, EvalId::new(7));
+        assert_eq!(sk.repo_id, rid(1));
+    }
+
+    // Only eval B's jobs remain dispatchable.
+    assert_eq!(s.pending_count(), 2);
+    let mut popped: Vec<JobId> = Vec::new();
+    while let Some(d) = s.dispatch() {
+        popped.push(d.head_job.unwrap());
+        s.complete(d.token, JobStatus::Success);
+    }
+    popped.sort_by_key(|j| j.get());
+    assert_eq!(popped, vec![jid(10), jid(11)]);
+}
+
+#[test]
+fn flat_cancel_eval_after_some_dispatched_only_drops_remaining_pending() {
+    let mut s = FlatStrategy::new(Some(1));
+    s.enqueue(ScheduleItem {
+        repo_id: rid(1),
+        eval_id: EvalId::new(7),
+        job_id: jid(1),
+        head_drv: drv("/nix/store/aa-1.drv", &[]),
+        closure: Vec::new(),
+    });
+    s.enqueue(ScheduleItem {
+        repo_id: rid(1),
+        eval_id: EvalId::new(7),
+        job_id: jid(2),
+        head_drv: drv("/nix/store/aa-2.drv", &[]),
+        closure: Vec::new(),
+    });
+    let d1 = s.dispatch().unwrap();
+    assert_eq!(d1.head_job, Some(jid(1)));
+
+    // Now cancel — job 1 is in-flight (left alone), job 2 is pending
+    // (must be dropped, must surface in skips).
+    let skips = s.cancel_eval(EvalId::new(7));
+    assert_eq!(skips.len(), 1, "only job 2 should be in the skip list");
+    assert_eq!(skips[0].job_id, jid(2));
+
+    // Job 1 still terminates normally through complete().
+    let eff = s.complete(d1.token, JobStatus::Cancelled);
+    assert_eq!(eff.repo_id, Some(rid(1)));
+}
+
+#[test]
+fn flat_cancel_eval_is_idempotent() {
+    let mut s = FlatStrategy::new(None);
+    s.enqueue(ScheduleItem {
+        repo_id: rid(1),
+        eval_id: EvalId::new(7),
+        job_id: jid(1),
+        head_drv: drv("/nix/store/x.drv", &[]),
+        closure: Vec::new(),
+    });
+    let first = s.cancel_eval(EvalId::new(7));
+    assert_eq!(first.len(), 1);
+    let second = s.cancel_eval(EvalId::new(7));
+    assert!(second.is_empty(), "second call has nothing left to skip");
+}
+
+#[test]
+fn dag_cancel_eval_skips_head_and_cascades_through_rdeps() {
+    // Eval 7: A → B → C (chain of 3 head Jobs). Cancel — all 3 must
+    // surface as skips, none must dispatch.
+    let mut s = DagStrategy::new(None);
+    let a = drv("/nix/store/aaaa.drv", &[]);
+    let b = drv("/nix/store/bbbb.drv", &["/nix/store/aaaa.drv"]);
+    let c = drv("/nix/store/cccc.drv", &["/nix/store/bbbb.drv"]);
+    s.enqueue(dag_item(rid(1), EvalId::new(7), jid(1), a.clone(), vec![]));
+    s.enqueue(dag_item(
+        rid(1),
+        EvalId::new(7),
+        jid(2),
+        b.clone(),
+        vec![a.clone()],
+    ));
+    s.enqueue(dag_item(rid(1), EvalId::new(7), jid(3), c, vec![a, b]));
+
+    let skips = s.cancel_eval(EvalId::new(7));
+    let mut got: Vec<JobId> = skips.iter().map(|s| s.job_id).collect();
+    got.sort_by_key(|j| j.get());
+    assert_eq!(got, vec![jid(1), jid(2), jid(3)]);
+
+    // No dispatches happen — A was the only ready Step and it's now
+    // Cancelled. The strategy is fully drained.
+    assert!(s.dispatch().is_none());
+}
+
+#[test]
+fn dag_cancel_eval_keeps_internal_step_for_other_live_eval() {
+    // Eval 7: head X depends on internal Z.
+    // Eval 8: head Y depends on internal Z.
+    // Z is shared — only one Step.
+    // Cancel eval 7 → X is skipped; Z stays Pending/Ready (still wanted
+    // by Y); Y eventually dispatches once Z succeeds.
+    let mut s = DagStrategy::new(None);
+    let z = drv("/nix/store/zzzz.drv", &[]);
+    let x = drv("/nix/store/xxxx.drv", &["/nix/store/zzzz.drv"]);
+    let y = drv("/nix/store/yyyy.drv", &["/nix/store/zzzz.drv"]);
+    s.enqueue(dag_item(rid(1), EvalId::new(7), jid(1), x, vec![z.clone()]));
+    s.enqueue(dag_item(rid(1), EvalId::new(8), jid(2), y, vec![z]));
+
+    // Cancel eval 7: only X surfaces as a skip.
+    let skips = s.cancel_eval(EvalId::new(7));
+    assert_eq!(skips.len(), 1);
+    assert_eq!(skips[0].job_id, jid(1));
+
+    // Z is the only ready Step; dispatch it.
+    let d_z = s.dispatch().unwrap();
+    assert_eq!(d_z.drv_path, "/nix/store/zzzz.drv");
+    assert_eq!(d_z.head_job, None, "Z is internal");
+    let _ = s.complete(d_z.token, JobStatus::Success);
+
+    // Y becomes ready (eval 8's head); X stays cancelled.
+    let next = s.dispatch().unwrap();
+    assert_eq!(next.head_job, Some(jid(2)));
+    assert!(
+        s.dispatch().is_none(),
+        "X was cancelled — no dispatch for it"
+    );
+}
+
+#[test]
+fn dag_cancel_eval_leaves_running_head_to_route_through_complete() {
+    // Eval 7: a single top-level Job. Dispatch it, then cancel. The
+    // running Step is *not* re-emitted as a skip (the daemon's
+    // CancelToken handles it, and complete() will eventually be
+    // called with Cancelled status). cancel_eval must report no skip.
+    let mut s = DagStrategy::new(None);
+    let a = drv("/nix/store/aaaa.drv", &[]);
+    s.enqueue(dag_item(rid(1), EvalId::new(7), jid(1), a, vec![]));
+    let d = s.dispatch().unwrap();
+    assert_eq!(d.head_job, Some(jid(1)));
+
+    let skips = s.cancel_eval(EvalId::new(7));
+    assert!(
+        skips.is_empty(),
+        "running head Step is not a skip target; complete() handles it",
+    );
+
+    // Simulate the daemon's CancelToken signalling the build to abort.
+    let eff = s.complete(d.token, JobStatus::Cancelled);
+    assert_eq!(eff.repo_id, Some(rid(1)));
+}
