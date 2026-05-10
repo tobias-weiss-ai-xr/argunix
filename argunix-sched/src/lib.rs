@@ -95,12 +95,32 @@ pub struct Dispatched {
 /// [`JobStatus::Failure`] (with a synthetic log explaining which dep
 /// failed) and post a failed forge check — they will *not* show up in
 /// any subsequent [`ScheduleStrategy::dispatch`] call.
+///
+/// `alias_completions` lists *additional* head Jobs that share the
+/// same drv_path as the just-completed dispatch (Nix attribute aliases
+/// — `pkgs.foo` and `pkgs.bar` both pointing to the same derivation).
+/// The strategy dispatches the head Step exactly once and returns the
+/// first head_job as the primary [`Dispatched::head_job`]; on
+/// completion, the daemon mirrors the primary's terminal status into
+/// each alias's DB row + forge check.
 #[derive(Debug, Default, Clone)]
 pub struct CompletionEffects {
     /// Repo the just-completed dispatch belonged to, if it was tracked.
     /// Mirrors the historical return value of `complete`.
     pub repo_id: Option<RepoId>,
     pub cascaded_skips: Vec<CascadedSkip>,
+    pub alias_completions: Vec<AliasCompletion>,
+}
+
+/// One head Job that aliases another (same `head_drv.drv_path`). The
+/// daemon treats these as completed with the same terminal status as
+/// the primary dispatch — the build only ran once but its result
+/// surfaces under every attribute name that pointed to the drv.
+#[derive(Debug, Clone)]
+pub struct AliasCompletion {
+    pub job_id: JobId,
+    pub eval_id: EvalId,
+    pub repo_id: RepoId,
 }
 
 /// One head Job that became unbuildable because a Step in its closure

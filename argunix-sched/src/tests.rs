@@ -679,16 +679,73 @@ fn dag_concurrency_cap_applies_across_steps() {
 }
 
 #[test]
-#[should_panic(expected = "DagStrategy V1 does not support two top-level Jobs sharing a head_drv")]
-fn dag_v1_panics_on_aliased_head_drv() {
-    // Two ScheduleItems with the same head_drv.drv_path — the V1
-    // limitation documented in dag.rs. Keeping the panic visible in
-    // tests so we can't accidentally remove it without updating the
-    // type to support multi-head.
+fn dag_aliased_head_drv_dispatches_once_emits_alias_completion() {
+    // Two ScheduleItems with the same head_drv.drv_path — Nix flakes
+    // routinely re-export the same derivation under multiple
+    // attribute paths (NixOS test re-exports, `pkgs.foo` and
+    // `pkgs.bar` aliasing each other, etc.). The Step is dispatched
+    // exactly once; the second Job surfaces via alias_completions
+    // when the primary completes, so the daemon mirrors the terminal
+    // status into both DB rows + forge checks.
     let mut s = DagStrategy::new(None);
-    let d = drv("/nix/store/same-drv.drv", &[]);
+    let d = drv("/nix/store/aliased.drv", &[]);
     s.enqueue(dag_item(rid(1), EvalId::new(1), jid(1), d.clone(), vec![]));
     s.enqueue(dag_item(rid(1), EvalId::new(1), jid(2), d, vec![]));
+
+    // Exactly one dispatch even though two Jobs were enqueued.
+    let dispatched = s.dispatch().unwrap();
+    assert_eq!(dispatched.drv_path, "/nix/store/aliased.drv");
+    assert_eq!(dispatched.head_job, Some(jid(1)));
+    assert!(s.dispatch().is_none(), "no second dispatch for the alias");
+
+    // Complete the primary; the alias surfaces via alias_completions.
+    let effects = s.complete(dispatched.token, JobStatus::Success);
+    assert_eq!(effects.alias_completions.len(), 1);
+    assert_eq!(effects.alias_completions[0].job_id, jid(2));
+    assert_eq!(effects.alias_completions[0].eval_id, EvalId::new(1));
+    assert_eq!(effects.alias_completions[0].repo_id, rid(1));
+    assert!(effects.cascaded_skips.is_empty());
+}
+
+#[test]
+fn dag_alias_with_three_jobs_sharing_one_drv() {
+    // Three-way alias: drv → {jid1, jid2, jid3}. One dispatch, two
+    // alias_completions on completion (the primary is reported via
+    // Dispatched.head_job).
+    let mut s = DagStrategy::new(None);
+    let d = drv("/nix/store/triple.drv", &[]);
+    for j in [1, 2, 3] {
+        s.enqueue(dag_item(rid(1), EvalId::new(1), jid(j), d.clone(), vec![]));
+    }
+    let dispatched = s.dispatch().unwrap();
+    assert_eq!(dispatched.head_job, Some(jid(1)));
+    let effects = s.complete(dispatched.token, JobStatus::Success);
+    let mut alias_ids: Vec<JobId> = effects.alias_completions.iter().map(|a| a.job_id).collect();
+    alias_ids.sort_by_key(|j| j.get());
+    assert_eq!(alias_ids, vec![jid(2), jid(3)]);
+}
+
+#[test]
+fn dag_alias_failure_cascades_to_all_aliased_jobs() {
+    // drv X aliased by jid1 + jid2. A separate top-level B depends
+    // on X. When X fails, cascade_skip walks B and emits a skip; the
+    // failure also flows through alias_completions for jid2 (since
+    // jid1 is the primary). Net: jid1 fails (primary), jid2 fails
+    // (alias), B is skipped.
+    let mut s = DagStrategy::new(None);
+    let x = drv("/nix/store/x.drv", &[]);
+    let b = drv("/nix/store/b.drv", &["/nix/store/x.drv"]);
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(1), x.clone(), vec![]));
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(2), x, vec![]));
+    s.enqueue(dag_item(rid(1), EvalId::new(1), jid(3), b, vec![]));
+
+    let dispatched = s.dispatch().unwrap();
+    assert_eq!(dispatched.drv_path, "/nix/store/x.drv");
+    let effects = s.complete(dispatched.token, JobStatus::Failure);
+    assert_eq!(effects.alias_completions.len(), 1);
+    assert_eq!(effects.alias_completions[0].job_id, jid(2));
+    assert_eq!(effects.cascaded_skips.len(), 1);
+    assert_eq!(effects.cascaded_skips[0].job_id, jid(3));
 }
 
 // ---------------------------------------------------------------------

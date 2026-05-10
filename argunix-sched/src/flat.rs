@@ -119,6 +119,7 @@ impl ScheduleStrategy for FlatStrategy {
         CompletionEffects {
             repo_id: self.wfq.complete(job_id),
             cascaded_skips: Vec::new(),
+            alias_completions: Vec::new(),
         }
     }
 

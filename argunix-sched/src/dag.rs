@@ -17,10 +17,6 @@
 //!
 //! ## Limitations (V1)
 //!
-//! - Two `ScheduleItem`s with the same `head_drv.drv_path` (alias /
-//!   re-export) panic on the second `enqueue`. Real-world Nix flakes
-//!   do this occasionally; we'll widen `head_jobs` to `Vec<JobId>` when
-//!   the daemon needs it.
 //! - Steps whose deps had already failed at the moment of `enqueue`
 //!   are not reactively marked `Skipped`. This matters only when one
 //!   eval's failures land before a *later* eval enqueues and shares
@@ -35,8 +31,8 @@
 
 use crate::wfq::WfqCore;
 use crate::{
-    CascadedSkip, CompletionEffects, DerivationInfo, DispatchToken, Dispatched, ScheduleItem,
-    ScheduleStrategy,
+    AliasCompletion, CascadedSkip, CompletionEffects, DerivationInfo, DispatchToken, Dispatched,
+    ScheduleItem, ScheduleStrategy,
 };
 use argunix_domain::{EvalId, JobId, JobStatus, RepoId};
 use std::collections::{HashMap, VecDeque};
@@ -103,10 +99,15 @@ struct Step {
     deps_unfinished: usize,
     /// drv paths that depend on me. Populated as edges are added.
     rdeps: Vec<String>,
-    /// Top-level Job whose `head_drv == self.drv_path`, if any. None
-    /// for internal Steps. (V1: at most one — see module-level
-    /// limitations.)
-    head_job: Option<JobId>,
+    /// Top-level Jobs whose `head_drv == self.drv_path`. Empty for
+    /// internal Steps. Multiple entries when a Nix flake exposes the
+    /// same derivation under several attribute paths
+    /// (`pkgs.foo` and `pkgs.bar` aliasing each other, NixOS test
+    /// re-exports, …): the Step is dispatched exactly once but the
+    /// terminal status is mirrored into every aliased Job's DB row
+    /// + forge check via [`AliasCompletion`] entries on
+    /// [`CompletionEffects`].
+    head_jobs: Vec<JobId>,
     /// Set when state is `Ready` or `Running`; cleared at terminal
     /// transitions. Lets `complete` look the Step back up via token
     /// without keeping a separate map (we still keep one — see
@@ -168,7 +169,7 @@ impl DagStrategy {
                 state: StepState::Pending,
                 deps_unfinished: 0,
                 rdeps: Vec::new(),
-                head_job: None,
+                head_jobs: Vec::new(),
                 in_flight_token: None,
             },
         );
@@ -242,7 +243,8 @@ impl DagStrategy {
     /// BFS the rdep closure of `from_drv`, marking each non-terminal
     /// Step as Skipped. Returns one [`CascadedSkip`] per head Job that
     /// got skipped along the way so the caller can surface them on
-    /// `CompletionEffects`.
+    /// `CompletionEffects`. A Step with multiple aliased head Jobs
+    /// emits one entry per alias.
     fn cascade_skip(&mut self, from_drv: &str) -> Vec<CascadedSkip> {
         let mut out = Vec::new();
         let initial_rdeps = self
@@ -252,7 +254,7 @@ impl DagStrategy {
             .unwrap_or_default();
         let mut queue: VecDeque<String> = VecDeque::from(initial_rdeps);
         while let Some(rdep_path) = queue.pop_front() {
-            let (head_job, further_rdeps) = {
+            let (head_jobs, further_rdeps) = {
                 let rdep = match self.by_drv.get_mut(&rdep_path) {
                     Some(s) => s,
                     None => continue,
@@ -269,9 +271,9 @@ impl DagStrategy {
                 if let Some(tok) = rdep.in_flight_token.take() {
                     self.token_to_drv.remove(&tok);
                 }
-                (rdep.head_job, rdep.rdeps.clone())
+                (rdep.head_jobs.clone(), rdep.rdeps.clone())
             };
-            if let Some(job_id) = head_job {
+            for job_id in head_jobs {
                 if let Some(&(repo_id, eval_id)) = self.job_meta.get(&job_id) {
                     out.push(CascadedSkip {
                         job_id,
@@ -327,18 +329,14 @@ impl ScheduleStrategy for DagStrategy {
             newly_inserted.push(item.head_drv.drv_path.clone());
         }
 
-        // Wire the head Step to the Job. V1 limitation: panic on the
-        // second Job that claims the same head drv (see module docs).
+        // Wire the head Step to the Job. Multiple Jobs can share a
+        // head drv (Nix flakes routinely re-export the same derivation
+        // under several attribute paths — `pkgs.foo` and `pkgs.bar`,
+        // NixOS-test re-exports, …). We dispatch the Step exactly
+        // once and surface the terminal status to every aliased Job
+        // via [`AliasCompletion`] entries on `CompletionEffects`.
         let head = self.by_drv.get_mut(&item.head_drv.drv_path).unwrap();
-        assert!(
-            head.head_job.is_none(),
-            "DagStrategy V1 does not support two top-level Jobs sharing a head_drv \
-             ({} already wanted by job {:?}; second wanter: job {})",
-            item.head_drv.drv_path,
-            head.head_job,
-            item.job_id,
-        );
-        head.head_job = Some(item.job_id);
+        head.head_jobs.push(item.job_id);
 
         self.build_edges_for(&newly_inserted, &inputs_by_drv);
         self.promote_ready_steps();
@@ -371,7 +369,9 @@ impl ScheduleStrategy for DagStrategy {
                 drv_path: step.drv_path.clone(),
                 system: step.system.clone(),
                 required_features: step.required_features.clone(),
-                head_job: step.head_job,
+                // Pick the first head Job as the primary; aliases (if
+                // any) surface on `complete` via `alias_completions`.
+                head_job: step.head_jobs.first().copied(),
             });
         }
     }
@@ -390,11 +390,15 @@ impl ScheduleStrategy for DagStrategy {
         };
 
         let new_state = StepState::from_status(status);
-        let (rdeps, succeeded) = {
+        let (rdeps, succeeded, head_jobs) = {
             let step = self.by_drv.get_mut(&drv_path).unwrap();
             step.state = new_state;
             step.in_flight_token = None;
-            (step.rdeps.clone(), new_state.is_successful_terminal())
+            (
+                step.rdeps.clone(),
+                new_state.is_successful_terminal(),
+                step.head_jobs.clone(),
+            )
         };
         let repo_id = self.wfq.complete(token);
 
@@ -415,9 +419,28 @@ impl ScheduleStrategy for DagStrategy {
             cascaded_skips = self.cascade_skip(&drv_path);
         }
 
+        // Aliases: every head Job past the primary mirrors the
+        // primary's terminal status via the daemon's alias-completion
+        // path. The primary's `head_job` is `head_jobs[0]` (matches
+        // what `dispatch` returned); the rest go in alias_completions.
+        let alias_completions: Vec<AliasCompletion> = head_jobs
+            .iter()
+            .skip(1)
+            .filter_map(|jid| {
+                self.job_meta
+                    .get(jid)
+                    .map(|&(repo_id, eval_id)| AliasCompletion {
+                        job_id: *jid,
+                        eval_id,
+                        repo_id,
+                    })
+            })
+            .collect();
+
         CompletionEffects {
             repo_id,
             cascaded_skips,
+            alias_completions,
         }
     }
 
@@ -441,12 +464,12 @@ impl ScheduleStrategy for DagStrategy {
         let mut skips: Vec<CascadedSkip> = Vec::new();
         for jid in job_ids {
             // Find the head Step for this Job. by_drv is the source of
-            // truth — head_job links there. (Linear scan; eval sizes
+            // truth — head_jobs link there. (Linear scan; eval sizes
             // are bounded and this only fires on cancel.)
             let head_drv = self
                 .by_drv
                 .iter()
-                .find(|(_, s)| s.head_job == Some(jid))
+                .find(|(_, s)| s.head_jobs.contains(&jid))
                 .map(|(d, _)| d.clone());
             let Some(head_drv) = head_drv else {
                 // Already cleaned up (e.g. the Step terminated and was
@@ -473,24 +496,37 @@ impl ScheduleStrategy for DagStrategy {
             };
 
             if was_pending_or_ready {
-                let step = self.by_drv.get_mut(&head_drv).unwrap();
-                step.state = StepState::Cancelled;
-                if let Some(tok) = step.in_flight_token.take() {
-                    // Drop the token mapping; if WFQ later pops it,
-                    // dispatch's stale-token swallow ignores it.
-                    self.token_to_drv.remove(&tok);
-                }
-                // Drop the head_job link so the cascade walk doesn't
-                // re-emit a skip for it; we emit the direct skip
-                // ourselves below.
-                step.head_job = None;
+                let cancelled_jobs: Vec<JobId> = {
+                    let step = self.by_drv.get_mut(&head_drv).unwrap();
+                    step.state = StepState::Cancelled;
+                    if let Some(tok) = step.in_flight_token.take() {
+                        // Drop the token mapping; if WFQ later pops it,
+                        // dispatch's stale-token swallow ignores it.
+                        self.token_to_drv.remove(&tok);
+                    }
+                    // Drop the head_jobs links so the cascade walk
+                    // doesn't re-emit a skip for them; we emit direct
+                    // skips ourselves below. With aliases, this Step
+                    // covers multiple Jobs (`pkgs.foo` + `pkgs.bar`
+                    // pointing to the same drv) — every one of them
+                    // gets a skip.
+                    std::mem::take(&mut step.head_jobs)
+                };
 
-                skips.push(CascadedSkip {
-                    job_id: jid,
-                    eval_id,
-                    repo_id,
-                    reason_drv: format!("eval {} cancelled", eval_id.get()),
-                });
+                let reason = format!("eval {} cancelled", eval_id.get());
+                for cjid in cancelled_jobs {
+                    let (cjid_repo, cjid_eval) = self
+                        .job_meta
+                        .get(&cjid)
+                        .copied()
+                        .unwrap_or((repo_id, eval_id));
+                    skips.push(CascadedSkip {
+                        job_id: cjid,
+                        eval_id: cjid_eval,
+                        repo_id: cjid_repo,
+                        reason_drv: reason.clone(),
+                    });
+                }
 
                 // Cascade through rdeps. cascade_skip's own emitted
                 // skips carry reason_drv = head_drv; rewrite to the

@@ -801,7 +801,7 @@ async fn run_build_phase(
         let Some(joined) = next else {
             continue;
         };
-        let (_job_id, spec, outcome, token) = match joined {
+        let (primary_job_id, spec, outcome, token) = match joined {
             Ok(t) => t,
             Err(join_err) => {
                 // A spawned task panicked or was cancelled; treat as
@@ -825,11 +825,17 @@ async fn run_build_phase(
                 JobStatus::Failure
             }
         };
-        // Tell the strategy how this Step ended. If `final_status` is
-        // a failure, DagStrategy walks the rdep closure and reports
-        // every transitively-blocked top-level Job as a CascadedSkip;
-        // we mark each affected Job's DB row + post its forge check
-        // here, since they'll never receive a Dispatched of their own.
+        // Tell the strategy how this Step ended. Effects:
+        //   - cascaded_skips: top-level Jobs that became unbuildable
+        //     because a dep terminated as failure / cancelled. We
+        //     finalise each one here since they never receive a
+        //     Dispatched.
+        //   - alias_completions: top-level Jobs that share the same
+        //     `head_drv.drv_path` as the just-completed primary
+        //     (Nix re-exports — `pkgs.foo` / `pkgs.bar` aliasing the
+        //     same drv). The build only ran once; we mirror the
+        //     primary's terminal status into every alias's DB row +
+        //     forge check.
         let effects = strategy.complete(token, final_status);
         for skip in effects.cascaded_skips {
             if let Some(skipped_spec) = specs_by_id.get(&skip.job_id) {
@@ -844,6 +850,41 @@ async fn run_build_phase(
                     collapsed_mode,
                 )
                 .await;
+            }
+        }
+        if !effects.alias_completions.is_empty() {
+            // Read the primary's row once (after build_one wrote it)
+            // to recover log_path + output_path so aliases can share
+            // them: every alias's DB row points at the same log file
+            // and output, the UI's log link works under either attr,
+            // and we don't waste disk by duplicating the log.
+            let primary_row = match <SqlxStore as JobStore>::get(&ctx.store, primary_job_id).await {
+                Ok(row) => row,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        primary = primary_job_id.get(),
+                        "failed to fetch primary row for alias mirroring",
+                    );
+                    None
+                }
+            };
+            for alias in effects.alias_completions {
+                if let Some(alias_spec) = specs_by_id.get(&alias.job_id) {
+                    handle_alias_completion(
+                        &ctx,
+                        &provider,
+                        &repo,
+                        &eval,
+                        alias_spec,
+                        alias,
+                        final_status,
+                        primary_row.as_ref(),
+                        &mut tally,
+                        collapsed_mode,
+                    )
+                    .await;
+                }
             }
         }
         tally.record(final_status);
@@ -990,6 +1031,64 @@ async fn handle_cascade_skip(
             &spec.attr_path.as_str().to_string(),
             JobStatus::Failure,
             true, // is_eval_error: surface as a skip-style description in the forge UI
+        );
+    }
+}
+
+/// Mirror the primary's terminal status into an aliased Job — same
+/// `head_drv.drv_path` re-exported under another attribute path, so
+/// the build only ran once but every aliased Job needs its own DB
+/// row finalised + forge check posted.
+///
+/// `primary_row` is the just-finalised row for the dispatched head
+/// Job (read by the caller from `JobStore::get`). When present, the
+/// alias inherits its `log_path` and `output_path` so the UI's log
+/// viewer works under either attribute name. When `None` (a DB-read
+/// hiccup), the alias is finalised with the status alone.
+#[allow(clippy::too_many_arguments)]
+async fn handle_alias_completion(
+    ctx: &WorkerContext,
+    provider: &Arc<dyn Provider>,
+    repo: &argunix_store::RepoRecord,
+    eval: &argunix_store::EvalRecord,
+    alias_spec: &argunix_eval::JobSpec,
+    alias: argunix_sched::AliasCompletion,
+    primary_status: JobStatus,
+    primary_row: Option<&argunix_store::JobRecord>,
+    tally: &mut JobTally,
+    collapsed_mode: bool,
+) {
+    let log_path = primary_row.and_then(|r| r.log_path.as_deref());
+    let output_path = primary_row.and_then(|r| r.output_path.as_deref());
+    if let Err(e) = <SqlxStore as JobStore>::finish(
+        &ctx.store,
+        alias.job_id,
+        primary_status,
+        Utc::now(),
+        log_path,
+        output_path,
+        &JobPhaseMetrics::default(),
+    )
+    .await
+    {
+        tracing::error!(
+            error = %e,
+            job_id = alias.job_id.get(),
+            "failed to finalise aliased job in DB",
+        );
+    }
+    tally.record(primary_status);
+    if !collapsed_mode {
+        post_per_job_check(
+            ctx,
+            provider,
+            &repo.forge,
+            &repo.slug,
+            &eval.sha,
+            alias.eval_id,
+            &alias_spec.attr_path.as_str().to_string(),
+            primary_status,
+            alias_spec.error.is_some(),
         );
     }
 }
