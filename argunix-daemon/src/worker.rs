@@ -137,6 +137,17 @@ pub struct WorkerContext {
     /// gated by each builder's advertised `max_jobs`. Set in
     /// `main.rs`; clamped to ≥1 at use.
     pub build_concurrency: usize,
+    /// Cross-eval dispatch scheduler. Today every eval drains its
+    /// own JoinSet locally inside `process`, so this field is
+    /// constructed but not yet read — wiring it through the dispatch
+    /// loop is the next milestone (M14). The strategy is shared
+    /// across the eval worker and (eventually) a global dispatcher
+    /// task; both lock briefly to call sync methods. `std::sync::Mutex`
+    /// matches the pattern used elsewhere in this crate
+    /// (see `dispatch_driver`'s test module) and avoids dragging
+    /// `tokio::sync::Mutex`'s `await` requirement into call sites
+    /// that don't otherwise need to be async.
+    pub scheduler: Arc<std::sync::Mutex<Box<dyn argunix_sched::ScheduleStrategy>>>,
 }
 
 /// Spawn the worker on the current tokio runtime. Returns a `JoinHandle`

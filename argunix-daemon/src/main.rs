@@ -245,6 +245,17 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // memory. `build_concurrency` is the global cap on parallel
     // in-flight builds.
     let build_concurrency: usize = 4;
+    // Cross-eval dispatch scheduler. Defaults to flat WFQ per
+    // `SchedulerKind::default()`; the build_concurrency value is the
+    // scheduler's in-flight cap (later, when the dispatcher reads from
+    // this strategy, it replaces the per-eval JoinSet semaphore in
+    // worker.rs). Constructing it here means a future config knob
+    // (`[scheduler] kind = "dag"`) drops in without touching the
+    // worker.
+    let scheduler = std::sync::Arc::new(std::sync::Mutex::new(argunix_sched::build(
+        argunix_sched::SchedulerKind::default(),
+        Some(build_concurrency),
+    )));
     let worker_ctx = worker::WorkerContext {
         current: current.clone(),
         store: store.clone(),
@@ -262,6 +273,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         nix_store_bin: args.nix_store_bin.clone(),
         nix_bin: args.nix_bin.clone(),
         build_concurrency,
+        scheduler: scheduler.clone(),
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
 

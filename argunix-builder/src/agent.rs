@@ -504,8 +504,29 @@ async fn handle_build(
         }
     };
 
-    let log_truncated = stderr_task.await.unwrap_or(false);
-    let mut output_paths = stdout_task.await.unwrap_or_default();
+    // On the abort path we MUST NOT await the stdout/stderr pump tasks.
+    // `child.start_kill()` sends SIGKILL to the immediate child only;
+    // any grandchildren the child forked (a shell's `sleep`, a build
+    // wrapper's nested process, …) inherit and keep the pipe
+    // write-ends, so the tasks' `read()` calls would block on EOF
+    // until those grandchildren exit naturally. We saw this hang for
+    // 30+ seconds under cargo-tests sandbox load. Discarding the
+    // task results is fine: log chunks already streamed up to the
+    // moment of abort are in `out_tx`'s backlog, and output_paths
+    // are empty on non-success below regardless. Aborting the tasks
+    // drops the read-ends of the pipes; the orphaned grandchildren's
+    // writes go to a closed pipe (no impact on the daemon, and the
+    // grandchildren reap themselves when they finish).
+    let (log_truncated, mut output_paths) = if aborted {
+        stderr_task.abort();
+        stdout_task.abort();
+        (false, Vec::<String>::new())
+    } else {
+        (
+            stderr_task.await.unwrap_or(false),
+            stdout_task.await.unwrap_or_default(),
+        )
+    };
 
     // When the agent owns the gcroot, `nix-store --realise --add-root
     // <path>` prints the symlink path on stdout, not the underlying
@@ -1218,12 +1239,7 @@ exit 0
                 }
             }
         };
-        // Generous timeout: under cargo-tests' parallel workspace load
-        // in the nix sandbox, fork+exec latency for the fake nix-store
-        // can spike well past a few seconds. The actual abort path
-        // resolves in microseconds when CPU is available; we only need
-        // headroom for scheduling jitter.
-        tokio::time::timeout(Duration::from_secs(30), started_seen)
+        tokio::time::timeout(Duration::from_secs(5), started_seen)
             .await
             .expect("BuildStarted must arrive promptly");
 
@@ -1243,7 +1259,7 @@ exit 0
                 }
             }
         };
-        let status = tokio::time::timeout(Duration::from_secs(30), collect)
+        let status = tokio::time::timeout(Duration::from_secs(5), collect)
             .await
             .expect("BuildFinished must follow Abort within seconds")
             .expect("stream did not end before BuildFinished");
