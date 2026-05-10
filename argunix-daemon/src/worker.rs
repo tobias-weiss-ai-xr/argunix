@@ -23,6 +23,7 @@ use argunix_builders::{
 };
 use argunix_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
 use argunix_forge::{CheckPost, CheckState, ForgeError, Provider};
+use argunix_sched::ScheduleStrategy;
 use argunix_store::{EvalStore, JobPhaseMetrics, JobStore, RepoStore, SqlxStore};
 use argunix_web::{CancelRegistry, ConfigSnapshot, PauseRegistry, eval_target_url, job_target_url};
 use chrono::Utc;
@@ -441,6 +442,45 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         persisted.push((spec, job_id));
     }
 
+    // Walk the dependency closures of every top-level Job's drv so the
+    // DagStrategy in `run_build_phase` can gate Job B on Job A when B
+    // transitively depends on A. This is the answer to the original
+    // duplicate-work question: if A and B are both top-level and B
+    // needs A's output, the gating ensures A finishes before B's
+    // builder is asked to realise B (and either substitutes A from
+    // the post-build cache or — when both land on the same builder —
+    // reuses A's local store entry).
+    //
+    // Walk failures degrade to no-gating: an empty `ClosureWalk`
+    // means every Step's `head_drv.input_drvs` is empty, so the
+    // strategy treats every Job as immediately Ready and we get the
+    // pre-refactor behaviour. We log loudly but don't fail the eval —
+    // the underlying nix issue (nix-command not enabled, drv path
+    // ungettable, …) shouldn't kill the build phase.
+    let head_drv_paths: Vec<&str> = persisted
+        .iter()
+        .filter_map(|(s, _)| s.drv_path.as_deref())
+        .collect();
+    let walk = match argunix_eval::walk_closures(&head_drv_paths, ctx.eval_timeout).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                head_count = head_drv_paths.len(),
+                "closure walk failed; build phase falls back to no-gating",
+            );
+            argunix_eval::ClosureWalk {
+                heads: head_drv_paths.iter().map(|s| s.to_string()).collect(),
+                derivations: std::collections::HashMap::new(),
+            }
+        }
+    };
+    tracing::info!(
+        top_level_jobs = persisted.len(),
+        derivations_in_walk = walk.derivations.len(),
+        "closure walk done",
+    );
+
     // Replace the initial "evaluating…" overall check (posted at
     // webhook time) with a "building N jobs" pending update.
     // Without this, the GitHub /
@@ -505,6 +545,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             eval,
             provider,
             persisted,
+            walk,
             total,
             collapsed_mode,
             caches,
@@ -536,6 +577,7 @@ async fn run_build_phase(
     eval: argunix_store::EvalRecord,
     provider: Arc<dyn Provider>,
     persisted: Vec<(argunix_eval::JobSpec, JobId)>,
+    walk: argunix_eval::ClosureWalk,
     total: usize,
     collapsed_mode: bool,
     caches: Vec<argunix_build::CacheRef>,
@@ -553,6 +595,76 @@ async fn run_build_phase(
     let summary_debounce = std::time::Duration::from_secs(2);
     let mut last_summary_post: Option<std::time::Instant> = None;
 
+    // Build a per-eval DagStrategy gated on top-level→top-level deps.
+    // For each top-level Job's drv, we look at its transitive closure
+    // (from `walk`) and pick out the OTHER top-level Jobs in this same
+    // eval that appear in it. Those become the Step's `input_drvs`.
+    // Internal Steps (drvs in the closure that aren't top-level Jobs)
+    // are treated as external — DagStrategy ignores them and the
+    // builder substitutes them as today. Effect: B waits until A
+    // succeeds before its dispatch fires, so two builders can't
+    // independently rebuild A in parallel for B.
+    //
+    // Strategy `cap = None`: the global semaphore (`ctx.global_build_sem`)
+    // is the canonical cap, shared across evals. The strategy itself
+    // doesn't enforce a cap.
+    let head_paths: std::collections::HashSet<String> = persisted
+        .iter()
+        .filter_map(|(s, _)| s.drv_path.clone())
+        .collect();
+    let specs_by_id: std::collections::HashMap<JobId, argunix_eval::JobSpec> =
+        persisted.iter().map(|(s, j)| (*j, s.clone())).collect();
+    let mut strategy = argunix_sched::DagStrategy::new(None);
+    strategy.set_weight(repo.id, 1);
+    // Jobs without a drv_path (eval-error jobs) were already finalised
+    // in persist_job; we still need to record their tally + post their
+    // check so the eval's overall summary is correct. We process them
+    // upfront, before the dispatch loop, so the rolling collapsed-mode
+    // summary already reflects the eval-time failures.
+    for (spec, _job_id) in &persisted {
+        if spec.drv_path.is_some() {
+            continue;
+        }
+        tally.record(JobStatus::Failure);
+        if !collapsed_mode {
+            post_per_job_check(
+                &ctx,
+                &provider,
+                &repo.forge,
+                &repo.slug,
+                &eval.sha,
+                eval_id,
+                &spec.attr_path.as_str().to_string(),
+                JobStatus::Failure,
+                spec.error.is_some(),
+            );
+        }
+    }
+    for (spec, job_id) in &persisted {
+        let Some(drv_path) = spec.drv_path.clone() else {
+            continue;
+        };
+        let toplevel_deps: Vec<String> = walk
+            .closure_for(&drv_path)
+            .into_iter()
+            .filter(|d| head_paths.contains(&d.drv_path))
+            .map(|d| d.drv_path)
+            .collect();
+        strategy.enqueue(argunix_sched::ScheduleItem {
+            repo_id: repo.id,
+            eval_id,
+            job_id: *job_id,
+            head_drv: argunix_domain::DerivationInfo {
+                drv_path,
+                system: spec.system.clone(),
+                required_features: spec.required_system_features.clone(),
+                input_drvs: toplevel_deps,
+            },
+            closure: Vec::new(),
+        });
+    }
+    drop(persisted); // ownership now lives in `specs_by_id` + `strategy`.
+
     // Parallelise the build loop. Up to `ctx.build_concurrency`
     // derivations build in parallel *across the whole daemon* (see
     // `WorkerContext::global_build_sem`); per-builder capacity is
@@ -563,24 +675,34 @@ async fn run_build_phase(
     // snapshot, so over-cap dispatches don't deadlock — they go
     // through nix's own scheduler instead.
     let global_sem = ctx.global_build_sem.clone();
-    let mut set: tokio::task::JoinSet<(JobId, argunix_eval::JobSpec, anyhow::Result<JobStatus>)> =
-        tokio::task::JoinSet::new();
-    let mut work_iter = persisted.into_iter();
-    let mut work_drained = false;
+    type BuildResult = (
+        JobId,
+        argunix_eval::JobSpec,
+        anyhow::Result<JobStatus>,
+        argunix_sched::DispatchToken,
+    );
+    let mut set: tokio::task::JoinSet<BuildResult> = tokio::task::JoinSet::new();
 
     'outer: loop {
-        // Spawn while we have permits and still have jobs to dispatch.
-        if !work_drained && !cancel.is_cancelled() {
+        // Spawn while we have permits and the strategy has Ready Steps.
+        if !cancel.is_cancelled() {
             loop {
                 let permit = match global_sem.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => break, // No global permits free.
                 };
-                let Some((spec, job_id)) = work_iter.next() else {
+                let Some(d) = strategy.dispatch() else {
                     drop(permit);
-                    work_drained = true;
                     break;
                 };
+                let job_id = d
+                    .head_job
+                    .expect("DagStrategy with empty closure dispatches only head Steps");
+                let spec = specs_by_id
+                    .get(&job_id)
+                    .expect("spec present for every enqueued job_id")
+                    .clone();
+                let token = d.token;
                 let ctx_c = ctx.clone();
                 let cancel_c = cancel.clone();
                 let caches_c = caches.clone();
@@ -597,13 +719,13 @@ async fn run_build_phase(
                     )
                     .instrument(span)
                     .await;
-                    (job_id, spec, res)
+                    (job_id, spec, res, token)
                 });
             }
         }
 
-        // Termination: nothing in flight and nothing left to dispatch.
-        if work_drained && set.is_empty() {
+        // Termination: in-flight set empty AND strategy fully drained.
+        if set.is_empty() && strategy.pending_count() == 0 {
             break 'outer;
         }
         // Cancel arrived but nothing in flight either — fall through
@@ -634,12 +756,37 @@ async fn run_build_phase(
                     remaining_done = tally.success + tally.cached + tally.failure,
                     "evaluation cancelled mid-build-loop; awaiting graceful shutdown of in-flight builds",
                 );
+                // Drop the strategy's still-pending Steps for this
+                // eval. The returned skips are jobs that were waiting
+                // on a dep that won't fire now; the daemon writes
+                // their DB rows + posts forge checks via the same
+                // cascade-skip path used for failure-driven cascades.
+                let skips = strategy.cancel_eval(eval_id);
+                for skip in skips {
+                    if let Some(skipped_spec) = specs_by_id.get(&skip.job_id) {
+                        handle_cascade_skip(
+                            &ctx,
+                            &provider,
+                            &repo,
+                            &eval,
+                            skipped_spec,
+                            skip,
+                            &mut tally,
+                            collapsed_mode,
+                        )
+                        .await;
+                    }
+                }
                 // Drain naturally — each in-flight build observes
                 // the cancel token through its own future and
                 // returns `JobStatus::Cancelled` after Abort + drain.
                 // The per-build wall-clock timeout bounds how long
                 // a wedged agent can keep us here.
-                while set.join_next().await.is_some() {}
+                while let Some(joined) = set.join_next().await {
+                    if let Ok((_, _, _, token)) = joined {
+                        let _ = strategy.complete(token, JobStatus::Cancelled);
+                    }
+                }
                 <SqlxStore as EvalStore>::finish(
                     &ctx.store,
                     eval_id,
@@ -654,12 +801,18 @@ async fn run_build_phase(
         let Some(joined) = next else {
             continue;
         };
-        let (_job_id, spec, outcome) = match joined {
+        let (_job_id, spec, outcome, token) = match joined {
             Ok(t) => t,
             Err(join_err) => {
                 // A spawned task panicked or was cancelled; treat as
                 // a pipeline error so the overall eval still finishes
-                // with a meaningful tally.
+                // with a meaningful tally. We can't reach the strategy
+                // to call `complete` for the lost token (we don't have
+                // it), but the strategy's pending_count was already
+                // decremented when dispatch handed it out, so the
+                // termination check still works — it just leaves a
+                // dangling in_flight slot until the strategy is
+                // dropped at end-of-function.
                 tracing::error!(error = %join_err, "build task panicked");
                 tally.record(JobStatus::Failure);
                 continue;
@@ -672,6 +825,27 @@ async fn run_build_phase(
                 JobStatus::Failure
             }
         };
+        // Tell the strategy how this Step ended. If `final_status` is
+        // a failure, DagStrategy walks the rdep closure and reports
+        // every transitively-blocked top-level Job as a CascadedSkip;
+        // we mark each affected Job's DB row + post its forge check
+        // here, since they'll never receive a Dispatched of their own.
+        let effects = strategy.complete(token, final_status);
+        for skip in effects.cascaded_skips {
+            if let Some(skipped_spec) = specs_by_id.get(&skip.job_id) {
+                handle_cascade_skip(
+                    &ctx,
+                    &provider,
+                    &repo,
+                    &eval,
+                    skipped_spec,
+                    skip,
+                    &mut tally,
+                    collapsed_mode,
+                )
+                .await;
+            }
+        }
         tally.record(final_status);
         if collapsed_mode {
             // Debounce. Only post a summary update if 2s elapsed
@@ -743,6 +917,81 @@ async fn run_build_phase(
         tracing::warn!(error = %e, dir = %work_dir.display(), "failed to clean workdir");
     }
     Ok(())
+}
+
+/// Handle a top-level Job that became unbuildable because a Step in
+/// its closure terminated as failure / cancelled (DagStrategy emits
+/// these via `CompletionEffects::cascaded_skips`). The skipped Job
+/// never receives a `Dispatched`, so the dispatch loop won't write
+/// its DB row or post its forge check via the normal
+/// completion path — this helper does it instead.
+#[allow(clippy::too_many_arguments)]
+async fn handle_cascade_skip(
+    ctx: &WorkerContext,
+    provider: &Arc<dyn Provider>,
+    repo: &argunix_store::RepoRecord,
+    eval: &argunix_store::EvalRecord,
+    spec: &argunix_eval::JobSpec,
+    skip: argunix_sched::CascadedSkip,
+    tally: &mut JobTally,
+    collapsed_mode: bool,
+) {
+    // Synthetic log so the UI's log viewer has something to show. The
+    // operator clicking through to a Skipped job sees *why*: which
+    // upstream drv took it down. Mirror the eval-error log path
+    // convention (see `persist_job`) so the UI's
+    // `log_path` lookup hits the same way.
+    let log_path = ctx
+        .log_dir
+        .join(skip.repo_id.get().to_string())
+        .join(skip.eval_id.get().to_string())
+        .join(format!("{}.log.zst", skip.job_id.get()));
+    let body = format!(
+        "argunix: skipped because a dependency failed.\n\
+         attribute: {}\n\
+         dependency drv: {}\n",
+        spec.attr_path.as_str(),
+        skip.reason_drv,
+    );
+    if let Err(e) = argunix_build::write_zstd_log(&log_path, body.into_bytes()).await {
+        tracing::warn!(
+            error = %e,
+            attr = %spec.attr_path,
+            "failed to write cascade-skip log",
+        );
+    }
+    let log_path_str = log_path.to_string_lossy().into_owned();
+    if let Err(e) = <SqlxStore as JobStore>::finish(
+        &ctx.store,
+        skip.job_id,
+        JobStatus::Failure,
+        Utc::now(),
+        Some(&log_path_str),
+        None,
+        &JobPhaseMetrics::default(),
+    )
+    .await
+    {
+        tracing::error!(
+            error = %e,
+            job_id = skip.job_id.get(),
+            "failed to finalise cascade-skipped job in DB",
+        );
+    }
+    tally.record(JobStatus::Failure);
+    if !collapsed_mode {
+        post_per_job_check(
+            ctx,
+            provider,
+            &repo.forge,
+            &repo.slug,
+            &eval.sha,
+            skip.eval_id,
+            &spec.attr_path.as_str().to_string(),
+            JobStatus::Failure,
+            true, // is_eval_error: surface as a skip-style description in the forge UI
+        );
+    }
 }
 
 /// In-progress description for the rolling collapsed check. GitHub
