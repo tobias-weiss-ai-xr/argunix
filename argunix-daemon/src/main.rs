@@ -251,6 +251,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // pool of `build_concurrency` permits.
     let global_build_sem =
         std::sync::Arc::new(tokio::sync::Semaphore::new(build_concurrency.max(1)));
+    // Tracks the detached build-phase tasks `process` spawns so the
+    // shutdown sequence can wait for them rather than letting the
+    // runtime tear them down mid-`nix copy`.
+    let build_tasks = std::sync::Arc::new(worker::BuildTaskTracker::new());
     // Cross-eval dispatch scheduler. Defaults to flat WFQ per
     // `SchedulerKind::default()`; the build_concurrency value is the
     // scheduler's in-flight cap (later, when the dispatcher reads from
@@ -280,6 +284,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         nix_bin: args.nix_bin.clone(),
         build_concurrency,
         global_build_sem: global_build_sem.clone(),
+        build_tasks: build_tasks.clone(),
         scheduler: scheduler.clone(),
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
@@ -470,10 +475,36 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // can leave half-finished log entries. 30 s gives an in-flight
     // `nix-store --realise` a fair chance to wrap up; longer than
     // that and the operator wanted a hard restart anyway.
-    match tokio::time::timeout(Duration::from_secs(30), worker_handle).await {
-        Ok(_) => tracing::info!("graceful shutdown complete"),
+    //
+    // Two phases:
+    //   1. The eval worker itself drains (its rx side closes when the
+    //      last sender Arc drops above). With my spawn-and-return
+    //      refactor in `worker::process`, this is fast — the worker
+    //      doesn't await build phases anymore.
+    //   2. The detached build-phase tasks (registered with
+    //      `build_tasks`) drain. This is where the real wall-clock
+    //      goes, since these are the `nix copy` / `nix-store --realise`
+    //      pipelines.
+    let drain_deadline = Duration::from_secs(30);
+    let drain_start = std::time::Instant::now();
+    match tokio::time::timeout(drain_deadline, worker_handle).await {
+        Ok(_) => tracing::info!("eval worker drained"),
+        Err(_) => tracing::warn!("eval worker did not drain within 30s"),
+    }
+    let remaining = drain_deadline.saturating_sub(drain_start.elapsed());
+    let in_flight = build_tasks.in_flight();
+    if in_flight > 0 {
+        tracing::info!(
+            in_flight,
+            remaining_secs = remaining.as_secs(),
+            "waiting for in-flight build phases to finish",
+        );
+    }
+    match tokio::time::timeout(remaining, build_tasks.wait_idle()).await {
+        Ok(()) => tracing::info!("graceful shutdown complete"),
         Err(_) => tracing::warn!(
-            "worker did not drain within 30s; exiting and letting systemd reap any in-flight build"
+            in_flight = build_tasks.in_flight(),
+            "build phases did not drain within 30s; exiting and letting systemd reap any in-flight build"
         ),
     }
     Ok(())

@@ -54,6 +54,10 @@ use tokio::task::JoinSet;
 /// On cancel, the driver stops dispatching new work but waits for
 /// every in-flight build to resolve before returning, so caller-side
 /// state stays consistent.
+// Not yet wired into worker.rs's dispatch loop — that wiring is the
+// next milestone. The driver's tests below exercise it via the trait
+// directly so the integration point doesn't have to wait.
+#[allow(dead_code)]
 pub async fn drive<F, Fut>(
     strategy: &mut dyn ScheduleStrategy,
     spawn: F,

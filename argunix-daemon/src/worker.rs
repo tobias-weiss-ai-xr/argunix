@@ -149,6 +149,13 @@ pub struct WorkerContext {
     /// the daemon-side resources (`nix copy` proxy sockets, log
     /// streamers, file descriptors).
     pub global_build_sem: Arc<tokio::sync::Semaphore>,
+    /// Counter of detached build-phase tasks `process` spawned. The
+    /// daemon's shutdown sequence awaits this so SIGTERM doesn't
+    /// drop in-flight `nix copy` and `nix-store --realise` mid-stream.
+    /// Without this tracker, the eval worker drains immediately after
+    /// my spawn-and-return refactor — but the actual build tasks
+    /// would die when the runtime tears down.
+    pub build_tasks: Arc<BuildTaskTracker>,
     /// Cross-eval dispatch scheduler. Today every eval drains its
     /// own JoinSet locally inside `process`, so this field is
     /// constructed but not yet read — wiring it through the dispatch
@@ -161,6 +168,71 @@ pub struct WorkerContext {
     /// that don't otherwise need to be async.
     #[allow(dead_code)]
     pub scheduler: Arc<std::sync::Mutex<Box<dyn argunix_sched::ScheduleStrategy>>>,
+}
+
+/// Counter + Notify the daemon uses to wait for all detached build
+/// phase tasks before exiting. Same shape as `CancelToken`'s
+/// `flag + notify` pair: cheap, no allocation per spawn, no Mutex
+/// held across await.
+#[derive(Default)]
+pub struct BuildTaskTracker {
+    in_flight: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl BuildTaskTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Spawn `fut` on the current tokio runtime and register it with
+    /// the tracker. The spawned task decrements the counter and wakes
+    /// any waiter on its return path, so a panic before `await`
+    /// completion would still leave the counter accurate (Drop on the
+    /// helper guard).
+    pub fn spawn<F>(self: &Arc<Self>, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let tracker = self.clone();
+        tokio::spawn(async move {
+            // RAII guard so a panic still decrements + notifies.
+            struct Decrement(Arc<BuildTaskTracker>);
+            impl Drop for Decrement {
+                fn drop(&mut self) {
+                    self.0
+                        .in_flight
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    self.0.notify.notify_waiters();
+                }
+            }
+            let _g = Decrement(tracker);
+            fut.await;
+        });
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolve once the in-flight count drops to zero. The notify-then-
+    /// recheck dance handles the race where every task finishes
+    /// between our load and our `notified` registration.
+    pub async fn wait_idle(&self) {
+        loop {
+            if self.in_flight() == 0 {
+                return;
+            }
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            if self.in_flight() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Spawn the worker on the current tokio runtime. Returns a `JoinHandle`
@@ -425,7 +497,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     // the task end.
     let ctx_owned = ctx.clone();
     let store_owned = ctx.store.clone();
-    tokio::spawn(async move {
+    ctx.build_tasks.spawn(async move {
         if let Err(e) = run_build_phase(
             ctx_owned,
             eval_id,
