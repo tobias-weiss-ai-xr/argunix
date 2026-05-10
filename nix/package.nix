@@ -30,6 +30,20 @@ let
     # added by the wrapper derivation below.
   };
 
+  # `cargo test --workspace` as its own derivation. We don't enable
+  # `doCheck` on the binary build above because that would slow every
+  # `nix build .#argunix` by however long the test suite takes; running
+  # tests as a separate `nix flake check` entry keeps the build/test
+  # split honest. Surfaced via passthru so flake.nix can wire it into
+  # `checks.<system>` without duplicating the fileset filter.
+  tests = naersk.buildPackage {
+    name = "argunix-cargo-tests";
+    inherit src;
+    mode = "test";
+    release = false;
+    cargoTestOptions = x: x ++ [ "--workspace" ];
+  };
+
   static =
     runCommand "argunix-static"
       {
@@ -54,7 +68,7 @@ in
 runCommand "argunix"
   {
     inherit (rust) version;
-    passthru = { inherit rust static; };
+    passthru = { inherit rust static tests; };
     meta.mainProgram = "argunix";
   }
   ''
