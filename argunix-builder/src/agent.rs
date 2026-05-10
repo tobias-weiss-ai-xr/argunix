@@ -1218,7 +1218,12 @@ exit 0
                 }
             }
         };
-        tokio::time::timeout(Duration::from_secs(5), started_seen)
+        // Generous timeout: under cargo-tests' parallel workspace load
+        // in the nix sandbox, fork+exec latency for the fake nix-store
+        // can spike well past a few seconds. The actual abort path
+        // resolves in microseconds when CPU is available; we only need
+        // headroom for scheduling jitter.
+        tokio::time::timeout(Duration::from_secs(30), started_seen)
             .await
             .expect("BuildStarted must arrive promptly");
 
@@ -1238,7 +1243,7 @@ exit 0
                 }
             }
         };
-        let status = tokio::time::timeout(Duration::from_secs(5), collect)
+        let status = tokio::time::timeout(Duration::from_secs(30), collect)
             .await
             .expect("BuildFinished must follow Abort within seconds")
             .expect("stream did not end before BuildFinished");
