@@ -133,10 +133,19 @@ pub struct WorkerContext {
     /// Tests inject a fake; in production `"nix"` on PATH.
     pub nix_bin: PathBuf,
     /// Maximum number of derivations to build in parallel across the
-    /// whole evaluation. Per-builder concurrency is additionally
+    /// whole *daemon*. Per-builder concurrency is additionally
     /// gated by each builder's advertised `max_jobs`. Set in
     /// `main.rs`; clamped to ≥1 at use.
     pub build_concurrency: usize,
+    /// Single semaphore the build phase acquires permits from before
+    /// spawning a per-derivation task. Lifted out of the per-eval loop
+    /// so the cap is global: two concurrent evals share one pool of
+    /// `build_concurrency` permits instead of each getting their own.
+    /// Without this, the user-visible "global" cap is actually
+    /// `build_concurrency × concurrent_evals`, which would overcommit
+    /// the daemon-side resources (`nix copy` proxy sockets, log
+    /// streamers, file descriptors).
+    pub global_build_sem: Arc<tokio::sync::Semaphore>,
     /// Cross-eval dispatch scheduler. Today every eval drains its
     /// own JoinSet locally inside `process`, so this field is
     /// constructed but not yet read — wiring it through the dispatch
@@ -468,15 +477,16 @@ async fn run_build_phase(
     let summary_debounce = std::time::Duration::from_secs(2);
     let mut last_summary_post: Option<std::time::Instant> = None;
 
-    // Parallelise the per-eval build loop. Up to
-    // `ctx.build_concurrency` derivations build in parallel; per-builder
-    // capacity is gated separately by each builder's `max_jobs` (read
+    // Parallelise the build loop. Up to `ctx.build_concurrency`
+    // derivations build in parallel *across the whole daemon* (see
+    // `WorkerContext::global_build_sem`); per-builder capacity is
+    // gated separately by each builder's advertised `max_jobs` (read
     // inside `pick_builder_for_spec` via `BuilderRegistry::eligible`).
     // When the pool is saturated, `pick_builder_for_spec` returns None
     // and `build_one` falls back to a multi-builder `--builders`
     // snapshot, so over-cap dispatches don't deadlock — they go
     // through nix's own scheduler instead.
-    let global_sem = Arc::new(tokio::sync::Semaphore::new(ctx.build_concurrency.max(1)));
+    let global_sem = ctx.global_build_sem.clone();
     let mut set: tokio::task::JoinSet<(JobId, argunix_eval::JobSpec, anyhow::Result<JobStatus>)> =
         tokio::task::JoinSet::new();
     let mut work_iter = persisted.into_iter();

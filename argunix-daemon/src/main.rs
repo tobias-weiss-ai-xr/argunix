@@ -245,6 +245,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // memory. `build_concurrency` is the global cap on parallel
     // in-flight builds.
     let build_concurrency: usize = 4;
+    // Single global build cap shared across all in-flight evals. With
+    // build dispatch now spawned per-eval (see `worker::process`),
+    // this prevents two concurrent evals from each getting their own
+    // pool of `build_concurrency` permits.
+    let global_build_sem =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(build_concurrency.max(1)));
     // Cross-eval dispatch scheduler. Defaults to flat WFQ per
     // `SchedulerKind::default()`; the build_concurrency value is the
     // scheduler's in-flight cap (later, when the dispatcher reads from
@@ -273,6 +279,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         nix_store_bin: args.nix_store_bin.clone(),
         nix_bin: args.nix_bin.clone(),
         build_concurrency,
+        global_build_sem: global_build_sem.clone(),
         scheduler: scheduler.clone(),
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
