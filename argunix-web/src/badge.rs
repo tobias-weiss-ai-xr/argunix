@@ -490,12 +490,8 @@ mod tests {
         // Repo with no default-branch metadata yet: snippet falls
         // back to the bare URL. The endpoint resolves both forms to
         // the same any-branch behaviour at request time.
-        let snippet = markdown_snippet(
-            "https://argunix.example.com/",
-            "github",
-            "owner/repo",
-            None,
-        );
+        let snippet =
+            markdown_snippet("https://argunix.example.com/", "github", "owner/repo", None);
         assert_eq!(
             snippet,
             "[![argunix](https://argunix.example.com/badge/github/owner/repo.svg)](https://argunix.example.com/r/github/owner/repo)"

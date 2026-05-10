@@ -58,11 +58,15 @@ let
       *)
         # Bare flake URL: this is a Select call. Distinguish on the
         # --select function body.
+        # The runner wraps each Select output in
+        #   f: builtins.mapAttrs (_: c: <value_expr>) (f.outputs.<name> or {})
+        # so the value_expr appears *before* the output name in the
+        # function body — patterns are ordered accordingly.
         case "$select_fn" in
-          *"f.outputs.nixosConfigurations"*"config.system.build.toplevel"*)
+          *"config.system.build.toplevel"*"f.outputs.nixosConfigurations"*)
             echo '{"attr":"laptop","drvPath":"/nix/store/ffff-nixos-laptop.drv","system":"x86_64-linux"}'
             ;;
-          *"f.outputs.homeConfigurations"*"activationPackage"*)
+          *"activationPackage"*"f.outputs.homeConfigurations"*)
             echo '{"attr":"alice","drvPath":"/nix/store/gggg-home-alice.drv","system":"x86_64-linux"}'
             ;;
           *)

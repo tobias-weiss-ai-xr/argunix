@@ -337,6 +337,7 @@ name = "argunix-sched"
 version = "0.0.1"
 dependencies = [
  "argunix-domain",
+ "serde",
  "tracing",
 ]
 
