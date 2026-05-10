@@ -135,7 +135,10 @@ pub struct WorkerContext {
     /// Maximum number of derivations to build in parallel across the
     /// whole *daemon*. Per-builder concurrency is additionally
     /// gated by each builder's advertised `max_jobs`. Set in
-    /// `main.rs`; clamped to ≥1 at use.
+    /// `main.rs`; clamped to ≥1 at use. The actual gating is done
+    /// by `global_build_sem` (this scalar is the configured cap,
+    /// kept around for future diagnostics / control queries).
+    #[allow(dead_code)]
     pub build_concurrency: usize,
     /// Single semaphore the build phase acquires permits from before
     /// spawning a per-derivation task. Lifted out of the per-eval loop
@@ -156,6 +159,7 @@ pub struct WorkerContext {
     /// (see `dispatch_driver`'s test module) and avoids dragging
     /// `tokio::sync::Mutex`'s `await` requirement into call sites
     /// that don't otherwise need to be async.
+    #[allow(dead_code)]
     pub scheduler: Arc<std::sync::Mutex<Box<dyn argunix_sched::ScheduleStrategy>>>,
 }
 
