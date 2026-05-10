@@ -199,8 +199,8 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     // [docs/concepts/cancel-on-push.md] for the broader cancellation
     // model.
     let cancel = ctx.cancellations.register(eval_id);
-    let _guard = CancelGuard {
-        registry: &ctx.cancellations,
+    let cancel_guard = CancelGuard {
+        registry: ctx.cancellations.clone(),
         eval_id,
     };
 
@@ -223,10 +223,13 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     let repo = <SqlxStore as RepoStore>::get(&ctx.store, eval.repo_id)
         .await?
         .ok_or_else(|| anyhow!("repo row {} disappeared", eval.repo_id.get()))?;
+    // Clone the Arc out so the spawned build task can take ownership;
+    // the eval task no longer needs to borrow from `snap` past return.
     let provider = snap
         .providers
         .get(&repo.forge)
-        .ok_or_else(|| anyhow!("no provider for forge `{}`", repo.forge))?;
+        .ok_or_else(|| anyhow!("no provider for forge `{}`", repo.forge))?
+        .clone();
 
     <SqlxStore as EvalStore>::start(&ctx.store, eval_id, Utc::now(), EvalStatus::Evaluating)
         .await?;
@@ -289,7 +292,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             let detail = summarise_for_check(&e.to_string(), 130);
             post_overall_check(
                 ctx,
-                provider,
+                &provider,
                 &repo.forge,
                 &repo.slug,
                 &eval.sha,
@@ -362,7 +365,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     // this; here we just ensure there's at least one transition.
     post_overall_check(
         ctx,
-        provider,
+        &provider,
         &repo.forge,
         &repo.slug,
         &eval.sha,
@@ -380,7 +383,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         for (spec, _) in &persisted {
             post_per_job_check_pending(
                 ctx,
-                provider,
+                &provider,
                 &repo.forge,
                 &repo.slug,
                 &eval.sha,
@@ -389,6 +392,77 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             );
         }
     }
+
+    // Build phase runs as a background task. The eval task (this
+    // function's caller) returns immediately and pulls the next
+    // EvalId off the channel — so eval N+1's clone+eval starts
+    // concurrently with eval N's still-running builds, which is the
+    // user-visible point of this whole refactor.
+    //
+    // Cancel ownership transfers into the spawned task via
+    // `cancel_guard`: that's how cancel-on-push can still find this
+    // eval's CancelToken in the registry mid-build, and how the
+    // registry entry gets dropped exactly when the build phase
+    // terminates (Drop on the guard, regardless of error path).
+    //
+    // Errors inside the build phase used to bubble up via process()'s
+    // Result, where the outer `worker::spawn` trap recorded them in
+    // `evaluations.failure_reason`. With detached spawning that
+    // pathway is gone, so we replicate the trap inline before letting
+    // the task end.
+    let ctx_owned = ctx.clone();
+    let store_owned = ctx.store.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_build_phase(
+            ctx_owned,
+            eval_id,
+            repo,
+            eval,
+            provider,
+            persisted,
+            total,
+            collapsed_mode,
+            caches,
+            cancel,
+            work_dir,
+            cancel_guard,
+        )
+        .await
+        {
+            let chained = format!("{e:#}");
+            tracing::error!(error = %chained, "build phase failed");
+            let _ = <SqlxStore as EvalStore>::fail_with_reason(
+                &store_owned,
+                eval_id,
+                &chained,
+                Utc::now(),
+            )
+            .await;
+        }
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_build_phase(
+    ctx: WorkerContext,
+    eval_id: EvalId,
+    repo: argunix_store::RepoRecord,
+    eval: argunix_store::EvalRecord,
+    provider: Arc<dyn Provider>,
+    persisted: Vec<(argunix_eval::JobSpec, JobId)>,
+    total: usize,
+    collapsed_mode: bool,
+    caches: Vec<argunix_build::CacheRef>,
+    cancel: argunix_web::CancelToken,
+    work_dir: PathBuf,
+    // Owns the cancel-token deregister responsibility. Drops at the
+    // end of this function, *after* the dispatch loop terminates and
+    // the final overall check is posted, so cancel-on-push can find
+    // the eval throughout its build phase.
+    cancel_guard: CancelGuard,
+) -> anyhow::Result<()> {
+    let _cancel_guard = cancel_guard;
 
     let mut tally = JobTally::default();
     let summary_debounce = std::time::Duration::from_secs(2);
@@ -525,8 +599,8 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             if elapsed_ok {
                 let desc = collapsed_progress(&tally, total);
                 post_overall_check(
-                    ctx,
-                    provider,
+                    &ctx,
+                    &provider,
                     &repo.forge,
                     &repo.slug,
                     &eval.sha,
@@ -538,8 +612,8 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             }
         } else {
             post_per_job_check(
-                ctx,
-                provider,
+                &ctx,
+                &provider,
                 &repo.forge,
                 &repo.slug,
                 &eval.sha,
@@ -569,8 +643,8 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         tally.success, tally.cached, tally.failure,
     );
     post_overall_check(
-        ctx,
-        provider,
+        &ctx,
+        &provider,
         &repo.forge,
         &repo.slug,
         &eval.sha,
@@ -1724,13 +1798,17 @@ async fn run_git_with_optional_cwd(
 
 /// RAII handle that deregisters the cancellation token on `Drop` so the
 /// registry doesn't leak entries when `process()` returns from any of
-/// its many error paths.
-struct CancelGuard<'a> {
-    registry: &'a CancelRegistry,
+/// its many error paths. Arc-based so the same guard can be moved into
+/// a spawned task — the build phase (which runs detached from the
+/// eval task) is responsible for deregistering its own cancel token
+/// when it terminates, so cancel-on-push can still find the eval
+/// mid-build.
+struct CancelGuard {
+    registry: Arc<CancelRegistry>,
     eval_id: EvalId,
 }
 
-impl Drop for CancelGuard<'_> {
+impl Drop for CancelGuard {
     fn drop(&mut self) {
         self.registry.deregister(self.eval_id);
     }
