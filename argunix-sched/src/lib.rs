@@ -30,6 +30,9 @@ mod tests;
 pub use dag::DagStrategy;
 pub use flat::FlatStrategy;
 pub use wfq::DEFAULT_WEIGHT;
+// Re-exported for backward compat with consumers that import the type
+// from this crate. The canonical location is `argunix_domain`.
+pub use argunix_domain::DerivationInfo;
 
 use argunix_domain::{EvalId, JobId, JobStatus, RepoId};
 
@@ -42,24 +45,6 @@ use argunix_domain::{EvalId, JobId, JobStatus, RepoId};
 /// instances or daemon restarts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DispatchToken(pub u64);
-
-/// Information about one derivation, sufficient to dispatch a build of
-/// it on a remote builder.
-///
-/// `input_drvs` is the *direct* input derivations of `drv_path`. The
-/// strategy uses it to build a Step graph; for [`DagStrategy`] the
-/// caller is expected to provide the full transitive closure (head
-/// drv + every reachable input) on the [`ScheduleItem`] so the graph
-/// is complete. Drvs whose `input_drvs` reference paths not present in
-/// the supplied closure are treated as external (already substituted
-/// or fetched at build time) and not gated on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivationInfo {
-    pub drv_path: String,
-    pub system: Option<String>,
-    pub required_features: Vec<String>,
-    pub input_drvs: Vec<String>,
-}
 
 /// One unit of work handed to a strategy. Strategies cherry-pick the
 /// fields they care about; ones they ignore are noise to them.

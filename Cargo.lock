@@ -275,6 +275,7 @@ dependencies = [
  "argunix-domain",
  "argunix-eval",
  "argunix-forge",
+ "argunix-sched",
  "argunix-store",
  "argunix-web",
  "axum",

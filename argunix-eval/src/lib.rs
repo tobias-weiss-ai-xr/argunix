@@ -19,10 +19,12 @@
 //! request caps each subprocess. Memory limits are enforced by
 //! systemd in production; we only apply timeouts here.
 
+mod closure;
 mod jobspec;
 mod runner;
 mod systems;
 
+pub use closure::{ClosureError, ClosureWalk, parse as parse_closure_walk, walk_closures};
 pub use jobspec::{JobSpec, ParseError, RawJob, parse_lines};
 pub use runner::{EvalError, EvalRequest, FlakeOutput, FragmentKind, evaluate};
 pub use systems::detect_local_systems;

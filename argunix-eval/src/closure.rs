@@ -61,7 +61,10 @@ pub enum ClosureError {
     #[error("parsing nix derivation show output: {0}")]
     Parse(#[from] serde_json::Error),
     #[error("unsupported nix derivation show schema version {version} (supported: {supported:?})")]
-    UnsupportedVersion { version: u64, supported: &'static [u64] },
+    UnsupportedVersion {
+        version: u64,
+        supported: &'static [u64],
+    },
 }
 
 /// Result of walking one or more head derivations' transitive closures.

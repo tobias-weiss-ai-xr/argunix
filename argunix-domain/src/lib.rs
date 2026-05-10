@@ -2,6 +2,7 @@
 
 mod attr_path;
 mod builder;
+mod derivation;
 mod forge_kind;
 mod ids;
 mod sha;
@@ -12,6 +13,7 @@ pub use attr_path::AttrPath;
 pub use builder::{
     BuilderCapabilities, BuilderName, BuilderNameError, BuilderPubkey, BuilderPubkeyError,
 };
+pub use derivation::DerivationInfo;
 pub use forge_kind::ForgeKind;
 pub use ids::{BuilderId, EvalId, JobId, RepoId};
 pub use sha::{Sha, ShaError};

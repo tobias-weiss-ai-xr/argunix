@@ -1,4 +1,5 @@
 mod control;
+mod dispatch_driver;
 mod gc;
 mod worker;
 
