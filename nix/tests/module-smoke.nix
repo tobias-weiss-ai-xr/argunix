@@ -7,8 +7,8 @@
 #
 # Verifies:
 #   - The module evaluates and the systemd unit starts.
-#   - LoadCredential exposes the forge token under $CREDENTIALS_DIRECTORY
-#     and the daemon accepts it. (Webhook secrets are now argunix-managed,
+#   - The daemon reads the forge token from a direct path the static
+#     `argunix` user can access. (Webhook secrets are now argunix-managed,
 #     stored in sqlite — no operator file involved.)
 #   - Port 8080 listens and /healthz returns "ok".
 #   - The argunix user is in nix.settings.trusted-users.
@@ -31,15 +31,12 @@ in
       services.argunix = {
         enable = true;
         listen = "127.0.0.1:8080";
-        credentials = {
-          gh-token = "${githubToken}";
-        };
         settings = {
           external_url = "https://argunix.example.com";
           forges.gh = {
             kind = "github";
             web_url = "https://github.com";
-            token_path = "$CREDENTIALS_DIRECTORY/gh-token";
+            token_path = "${githubToken}";
             # Empty repos {} — without it the auto-install pass would
             # try to reach api.github.com from within the test VM.
             # Keep it empty so this test stays purely about module

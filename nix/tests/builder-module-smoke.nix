@@ -9,8 +9,8 @@
 #   - The systemd unit evaluates and starts.
 #   - The user exists and is in `nix.settings.trusted-users`.
 #   - The agent's persistent identity is generated under StateDir.
-#   - LoadCredential exposes the enrollment token under
-#     $CREDENTIALS_DIRECTORY (and the agent doesn't crash on it).
+#   - The agent reads the enrollment token straight from the host
+#     path (and doesn't crash on it).
 #   - The agent logs `capabilities discovered` (proves
 #     `nix show-config --json` succeeded inside the sandbox).
 { pkgs, ... }:
@@ -61,8 +61,8 @@ in
     )
 
     # Agent reached the dial loop and is logging connect-or-backoff
-    # events — proves the enrollment-token credential was loaded and
-    # the binary is past startup.
+    # events — proves the enrollment token was read and the binary is
+    # past startup.
     machine.wait_until_succeeds(
         "journalctl -u argunix-builder.service --no-pager | grep -q 'agent starting'",
         timeout=20,

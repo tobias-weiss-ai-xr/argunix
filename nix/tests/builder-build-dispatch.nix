@@ -52,20 +52,16 @@ in
     services.argunix = {
       enable = true;
       listen = "127.0.0.1:8080";
-      credentials = {
-        gh-token = "${githubToken}";
-        builder-enrollment-token = "${enrollmentToken}";
-      };
       settings = {
         external_url = "https://argunix.example.com";
         builder_enrollment = {
           listen = "[::]:2222";
-          token_path = "$CREDENTIALS_DIRECTORY/builder-enrollment-token";
+          token_path = "${enrollmentToken}";
         };
         forges.gh = {
           kind = "github";
           web_url = "https://github.com";
-          token_path = "$CREDENTIALS_DIRECTORY/gh-token";
+          token_path = "${githubToken}";
           repos = { };
         };
       };

@@ -100,8 +100,9 @@ in
         can wipe the file and unset this option — the agent keeps
         running on pubkey auth.
 
-        Loaded into the unit via `LoadCredential=`, so the actual
-        contents are never on disk inside the unit's namespace.
+        Read directly by the agent, which runs as the static
+        `argunix-builder` user. The file must be readable by that
+        user (e.g. an agenix secret with `owner = "argunix-builder"`).
       '';
     };
 
@@ -178,7 +179,7 @@ in
           ]
           ++ lib.optionals (cfg.enrollmentTokenFile != null) [
             "--enrollment-token-path"
-            "%d/enrollment-token"
+            (toString cfg.enrollmentTokenFile)
           ]
         );
         Restart = "on-failure";
@@ -191,10 +192,6 @@ in
         StateDirectoryMode = "0700";
         WorkingDirectory = cfg.stateDir;
         RuntimeDirectory = "argunix-builder";
-
-        LoadCredential = lib.optional (
-          cfg.enrollmentTokenFile != null
-        ) "enrollment-token:${toString cfg.enrollmentTokenFile}";
 
         NoNewPrivileges = true;
         ProtectSystem = "strict";

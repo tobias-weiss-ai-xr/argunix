@@ -50,24 +50,17 @@ in
   services.argunix = {
     enable = true;
     listen = "127.0.0.1:8080";
-    credentials = {
-      gh-token = "/var/lib/argunix-credentials/gh-token";
-      gl-token = "/var/lib/argunix-credentials/gl-token";
-      fj-token = "/var/lib/argunix-credentials/fj-token";
-      opencode-token = "/var/lib/argunix-credentials/opencode-token";
-      builder-enrollment-token = "/var/lib/argunix-credentials/builder-enrollment-token";
-    };
     settings = {
       external_url = "https://${fqdn}";
       builder_enrollment = {
         listen = "[::]:45678";
-        token_path = "$CREDENTIALS_DIRECTORY/builder-enrollment-token";
+        token_path = "/var/lib/argunix-credentials/builder-enrollment-token";
       };
       forges = {
         github = {
           kind = "github";
           web_url = "https://github.com";
-          token_path = "$CREDENTIALS_DIRECTORY/gh-token";
+          token_path = "/var/lib/argunix-credentials/gh-token";
           repos = {
             "applicative-systems/mkdocs-flake" = { };
             "applicative-systems/nixos-appliance-ota-update" = { };
@@ -81,7 +74,7 @@ in
         gitlab = {
           kind = "gitlab";
           web_url = "https://gitlab.com";
-          token_path = "$CREDENTIALS_DIRECTORY/gl-token";
+          token_path = "/var/lib/argunix-credentials/gl-token";
           repos = {
             "jonge/pprintpp" = {
               watched_branches = [ "master" ];
@@ -91,7 +84,7 @@ in
         codeberg = {
           kind = "forgejo";
           web_url = "https://codeberg.org";
-          token_path = "$CREDENTIALS_DIRECTORY/fj-token";
+          token_path = "/var/lib/argunix-credentials/fj-token";
           repos = {
             "tfc/pprintpp" = {
               watched_branches = [ "master" ];
@@ -102,7 +95,7 @@ in
         opencode = {
           kind = "gitlab";
           web_url = "https://gitlab.opencode.de";
-          token_path = "$CREDENTIALS_DIRECTORY/opencode-token";
+          token_path = "/var/lib/argunix-credentials/opencode-token";
           repos = {
             "oci-community/images/applicative-systems/example-build-and-attest" = { };
           };
