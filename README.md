@@ -188,7 +188,7 @@ head -c 32 /dev/urandom | base64 \
 }
 ```
 
-**2. On the builder host**, place the *same* token at a path the
+**2. On the builder host**, place the _same_ token at a path the
 `argunix-builder` user can read, then enable the builder module:
 
 ```nix
@@ -237,18 +237,18 @@ fastest way to know what to expect:
 
 **Different:**
 
-| | Hydra | argunix |
-| --- | --- | --- |
-| State store | PostgreSQL | SQLite |
-| Implementation | Perl + Rust queue runner | Rust workspace (single binary family) |
-| Project model | Operator-managed projects/jobsets, poll-based git inputs | Forge-webhook-driven; one entry per repo in YAML |
-| Eval target | `hydraJobs` attribute | flake `packages` / `checks` / `devShells` / `nixosConfigurations` |
-| Dispatch granularity | Per-`.drv` (full closure exploded into Steps) | Per top-level Job, with [top-level → top-level DAG gating](docs/concepts/scheduling.md) |
-| Internal-closure dedup | Yes, global via the Step map | Deferred to substituter / post-build cache |
-| Forge integration | Plugin to post statuses; PR support via separate setup | GitHub / GitLab / Forgejo first-class; auto-installs webhooks; [PR allowlist + permission gate](docs/concepts/allowlist.md) built in |
-| Configuration | DB-backed; web admin UI to create projects/jobsets | Declarative YAML / NixOS module; no admin UI for project setup |
-| Cancel-on-new-push | No | [Yes](docs/concepts/cancel-on-push.md) |
-| Many-job UX on the forge | One check per build | [Collapsed rolling check past a threshold](docs/concepts/collapsed-checks.md) |
+|                          | Hydra                                                    | argunix                                                                                                                              |
+| ------------------------ | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| State store              | PostgreSQL                                               | SQLite                                                                                                                               |
+| Implementation           | Perl + Rust queue runner                                 | Rust workspace (single binary family)                                                                                                |
+| Project model            | Operator-managed projects/jobsets, poll-based git inputs | Forge-webhook-driven; one entry per repo in YAML                                                                                     |
+| Eval target              | `hydraJobs` attribute                                    | flake `packages` / `checks` / `devShells` / `nixosConfigurations`                                                                    |
+| Dispatch granularity     | Per-`.drv` (full closure exploded into Steps)            | Per top-level Job, with [top-level → top-level DAG gating](docs/concepts/scheduling.md)                                              |
+| Internal-closure dedup   | Yes, global via the Step map                             | Deferred to substituter / post-build cache                                                                                           |
+| Forge integration        | Plugin to post statuses; PR support via separate setup   | GitHub / GitLab / Forgejo first-class; auto-installs webhooks; [PR allowlist + permission gate](docs/concepts/allowlist.md) built in |
+| Configuration            | DB-backed; web admin UI to create projects/jobsets       | Declarative YAML / NixOS module; no admin UI for project setup                                                                       |
+| Cancel-on-new-push       | No                                                       | [Yes](docs/concepts/cancel-on-push.md)                                                                                               |
+| Many-job UX on the forge | One check per build                                      | [Collapsed rolling check past a threshold](docs/concepts/collapsed-checks.md)                                                        |
 
 The headline trade is **dispatch granularity**. Hydra explodes every
 top-level build into per-`.drv` Steps and dedups them globally; this
@@ -270,19 +270,19 @@ good trade; for "we are nixpkgs," Hydra is still the right tool.
 
 **Different:**
 
-| | Botanix | argunix |
-| --- | --- | --- |
-| Builder transport | gRPC (tonic) coordinator ↔ worker | Closure transfer over SSH (russh) from coordinator to enrolled builders + local trusted-user dispatch |
-| Builder enrollment | Worker registers via HTTP, receives a token | Builder enrolls via a token + listen socket on the builder host; see [`nix/builder-module.nix`](nix/builder-module.nix) |
-| Configuration surface | Environment variables | YAML / NixOS module options |
-| Eval target | `hydraJobs` | flake `packages` / `checks` / `devShells` / `nixosConfigurations` |
-| Forges out of the box | Forgejo (primary), GitHub / Gitea / Gerrit modules | GitHub + GHES, GitLab.com + self-hosted, Forgejo / Gitea / Codeberg |
-| State store | SQLite (via sea-orm) | SQLite (via sqlx) |
-| PR trust model | n/a | [Forge-permission check + static allowlist](docs/concepts/allowlist.md) |
-| Auth failure handling | n/a | [Forge pause on `401`](docs/concepts/forge-pause.md) |
-| Webhook duplicates | n/a | [Coalesced by `(repo, sha)`](docs/concepts/webhook-coalescing.md) |
-| Many-job UX | One check per build | [Collapsed rolling check past a threshold](docs/concepts/collapsed-checks.md) |
-| License | EUPL-1.2 | GPL-3.0-or-later |
+|                       | Botanix                                            | argunix                                                                                                                 |
+| --------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Builder transport     | gRPC (tonic) coordinator ↔ worker                 | Closure transfer over SSH (russh) from coordinator to enrolled builders + local trusted-user dispatch                   |
+| Builder enrollment    | Worker registers via HTTP, receives a token        | Builder enrolls via a token + listen socket on the builder host; see [`nix/builder-module.nix`](nix/builder-module.nix) |
+| Configuration surface | Environment variables                              | YAML / NixOS module options                                                                                             |
+| Eval target           | `hydraJobs`                                        | flake `packages` / `checks` / `devShells` / `nixosConfigurations`                                                       |
+| Forges out of the box | Forgejo (primary), GitHub / Gitea / Gerrit modules | GitHub + GHES, GitLab.com + self-hosted, Forgejo / Gitea / Codeberg                                                     |
+| State store           | SQLite (via sea-orm)                               | SQLite (via sqlx)                                                                                                       |
+| PR trust model        | n/a                                                | [Forge-permission check + static allowlist](docs/concepts/allowlist.md)                                                 |
+| Auth failure handling | n/a                                                | [Forge pause on `401`](docs/concepts/forge-pause.md)                                                                    |
+| Webhook duplicates    | n/a                                                | [Coalesced by `(repo, sha)`](docs/concepts/webhook-coalescing.md)                                                       |
+| Many-job UX           | One check per build                                | [Collapsed rolling check past a threshold](docs/concepts/collapsed-checks.md)                                           |
+| License               | EUPL-1.2                                           | GPL-3.0-or-later                                                                                                        |
 
 The headline difference is **operational shape**. Botanix is a
 coordinator-with-workers system you configure via env vars and stand

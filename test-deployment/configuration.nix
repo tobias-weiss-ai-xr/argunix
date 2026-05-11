@@ -87,7 +87,9 @@ in
           token_path = "/var/lib/argunix-credentials/fj-token";
           repos = {
             "tfc/argunix" = { };
-            "tfc/pprintpp" = { watched_branches = [ "master" ]; };
+            "tfc/pprintpp" = {
+              watched_branches = [ "master" ];
+            };
             "tfc/tulonix" = { };
           };
         };
