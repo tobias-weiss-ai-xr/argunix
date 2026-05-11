@@ -1465,6 +1465,30 @@ async fn build_one(
         return Ok(JobStatus::Failure);
     };
 
+    // `is_cached` is set by `nix-eval-jobs --check-cache-status` when
+    // the derivation's outputs are already valid locally or fetchable
+    // from a configured substituter. This catches the case the HTTP
+    // `check_cache` probe below misses: an output the coordinator built
+    // in a previous eval (e.g. a PR that has now been merged into main
+    // re-evaluating to the same drv). Short-circuit before any builder
+    // dispatch — the outputs are right there in /nix/store.
+    if spec.is_cached {
+        if let Some(output) = spec.primary_output() {
+            tracing::info!(job_id = job_id.get(), output = %output, "local store hit");
+            <SqlxStore as JobStore>::finish(
+                &ctx.store,
+                job_id,
+                JobStatus::Cached,
+                Utc::now(),
+                None,
+                Some(output),
+                &JobPhaseMetrics::default(),
+            )
+            .await?;
+            return Ok(JobStatus::Cached);
+        }
+    }
+
     if let Some(output) = spec.primary_output() {
         match argunix_build::check_cache(output, caches, Duration::from_secs(30)).await {
             Ok(argunix_build::CacheCheckResult::Hit { cache_url }) => {

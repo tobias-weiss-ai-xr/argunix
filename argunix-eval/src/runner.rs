@@ -191,7 +191,15 @@ async fn run_one(
     cmd.args(["--extra-experimental-features", "nix-command flakes"])
         .arg("--flake")
         .arg(&flake_uri)
-        .arg("--meta");
+        .arg("--meta")
+        // Have nix-eval-jobs mark `isCached: true` on any attribute
+        // whose outputs are already valid in the local store or
+        // available from a configured substituter. Without this, an
+        // eval that's identical to a recently-completed one (e.g. main
+        // re-evaluating the same content as a just-merged PR) would
+        // re-dispatch every job to a builder even though the outputs
+        // are already present.
+        .arg("--check-cache-status");
     if let Some(expr) = select {
         cmd.arg("--select").arg(expr);
     }
@@ -417,6 +425,10 @@ exit 0
         assert!(
             !pkgs.iter().any(|a| *a == "--select"),
             "PerSystem call must NOT pass --select; got {pkgs:?}",
+        );
+        assert!(
+            pkgs.iter().any(|a| *a == "--check-cache-status"),
+            "expected --check-cache-status in per-system argv, got {pkgs:?}",
         );
 
         // Second call: Select on `nixosConfigurations`. Bare flake URL
