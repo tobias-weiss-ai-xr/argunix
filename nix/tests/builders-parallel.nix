@@ -1,0 +1,589 @@
+# NixOS test: a coordinator and TWO dynamic-pool builders, each with
+# `max-jobs = parallelJobs`. Two webhook-driven evaluations land on the
+# coordinator; each produces `parallelJobs` derivations. The daemon
+# spawns each eval's build phase as a detached task that shares the
+# global `build_concurrency` semaphore, so the build phases of the
+# two evals run concurrently. We assert that at some moment both
+# builders carry `parallelJobs` in-flight builds simultaneously —
+# i.e. all 2*parallelJobs derivations build in parallel across the pool.
+#
+# Concurrency knobs in play:
+#   - per-builder `max-jobs`     (set via nix.settings.max-jobs)
+#   - daemon `build_concurrency` (hardcoded 4 in argunix-daemon/src/main.rs)
+# With `parallelJobs = 2`, two builders × 2 = 4 slots ↔ daemon cap of 4.
+# Raising `parallelJobs` past 2 saturates the daemon cap; the assertion
+# would still pass for one builder reaching parallelJobs but the
+# "simultaneously on both" claim only holds while total ≤ 4.
+{ pkgs, ... }:
+
+let
+  # Test knobs. `parallelJobs` is the per-builder `max-jobs` and the
+  # derivations-per-eval count; `sleepSecs` is how long each build
+  # spins inside `bash -c "sleep N; …"` so the polling loop has a
+  # comfortable window to observe both builders saturated.
+  parallelJobs = 2;
+  sleepSecs = 30;
+
+  enrollmentToken = pkgs.writeText "argunix-builder-enrollment-token" "tok";
+  githubToken = pkgs.writeText "argunix-test-github-token" "ghtok";
+
+  attrNames = builtins.genList (i: "j${toString i}") (2 * parallelJobs);
+
+  # A representative test deriv used only to compute the *input
+  # closure* (stdenv + coreutils + bash + …) that both VMs need
+  # pre-staged. The concrete drvs are minted at runtime inside the
+  # coord VM via `nix-instantiate` so the test stays robust against
+  # cross-system hash differences between flake-eval and VM contexts.
+  representative =
+    pkgs.runCommand "argunix-parallel-rep"
+      {
+        requiredSystemFeatures = [ "argunix-test" ];
+      }
+      ''
+        sleep 0
+        echo rep > $out
+      '';
+
+  # Nix expression file the coord VM evaluates per attr. Importing
+  # `pkgs.path` (staged via `additionalPaths`) means the runtime
+  # `runCommand` matches what we used for `representative.inputDerivation`,
+  # so the input closure pre-staged on both VMs covers every concrete
+  # job. `''$out'' escapes to `$out` (shell), `''${}'` escapes Nix
+  # interpolation.
+  derivExpr = pkgs.writeText "argunix-parallel-deriv.nix" ''
+    { name, sleepSecs }:
+    let
+      pkgs = import ${pkgs.path} { };
+      env = {
+        requiredSystemFeatures = [ "argunix-test" ];
+      };
+    in
+    pkgs.runCommand "argunix-parallel-${"$"}{name}" env '''
+      sleep ${"$"}{sleepSecs}
+      echo "built-${"$"}{name}" > ${"$"}out
+    '''
+  '';
+
+  # Stub forge: GETs return [], POST /hooks returns {id:1,config:{}}.
+  # Listens on a fixed port so the daemon can talk to it on startup
+  # (ensure_webhooks). Persists the per-repo webhook secret to sqlite,
+  # which we read back to sign our test payloads.
+  fakeForgePort = 7777;
+  fakeForgeScript = pkgs.writeText "argunix-fake-forge.py" ''
+    import http.server, json
+    PORT = ${toString fakeForgePort}
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"[]")
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"id": 1, "config": {}}).encode())
+        def log_message(self, *_a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", PORT), H)
+    srv.serve_forever()
+  '';
+
+  # Fake git: emit a trivial flake.nix into the dest of `git clone`
+  # and no-op for `git -C <dst> …` subcommands. The flake itself
+  # doesn't have to evaluate anything real — the *only* tool reading
+  # it is our fake `nix-eval-jobs`, which emits a hard-coded JSON
+  # for the `#packages.x86_64-linux` fragment.
+  fakeFlakeStub = pkgs.writeText "fake-flake.nix" ''
+    { description = "argunix-parallel-stub"; outputs = { self }: { }; }
+  '';
+  fakeGit = pkgs.writeShellScriptBin "git" ''
+    set -eu
+    if [ "$1" = "-C" ]; then
+      exit 0
+    fi
+    case "$1" in
+      clone)
+        dst=""
+        for a in "$@"; do dst="$a"; done
+        ${pkgs.coreutils}/bin/mkdir -p "$dst"
+        ${pkgs.coreutils}/bin/cp ${fakeFlakeStub} "$dst/flake.nix"
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+  '';
+
+  # Fake nix-eval-jobs. Each invocation that targets the
+  # `packages.x86_64-linux` fragment consumes one slot of
+  # `/var/lib/argunix/.fake-jobs.txt` and emits the corresponding
+  # jobs lines. All other fragments (`checks`, `devShells`, …) emit
+  # nothing (eval-success with zero jobs).
+  #
+  # The counter is per `packages.x86_64-linux` call only — `process()`
+  # runs the eval phase serially, so increments are race-free: eval 1
+  # consumes block 0, eval 2 consumes block 1.
+  fakeNixEvalJobs = pkgs.writeShellScriptBin "nix-eval-jobs" ''
+    set -eu
+    flake=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --flake) flake="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    case "$flake" in
+      *"#packages.x86_64-linux"*) : ;;
+      *) exit 0 ;;
+    esac
+
+    DATA=/var/lib/argunix
+    counter_file="$DATA/.fake-counter"
+    jobs_file="$DATA/.fake-jobs.txt"
+    counter=0
+    if [ -s "$counter_file" ]; then
+      read -r counter < "$counter_file"
+    fi
+    next=$((counter + 1))
+    printf '%s\n' "$next" > "$counter_file"
+
+    block=${toString parallelJobs}
+    start=$((counter * block + 1))
+    end=$((start + block - 1))
+    ${pkgs.gawk}/bin/awk -v s="$start" -v e="$end" 'NR>=s && NR<=e { print }' "$jobs_file"
+  '';
+
+in
+{
+  name = "argunix-builders-parallel";
+
+  nodes.coord =
+    { pkgs, ... }:
+    {
+      imports = [ ../module.nix ];
+
+      services.argunix = {
+        enable = true;
+        listen = "127.0.0.1:8080";
+        settings = {
+          external_url = "http://127.0.0.1:8080";
+          builder_enrollment = {
+            listen = "[::]:2222";
+            token_path = "${enrollmentToken}";
+          };
+          forges.gh = {
+            kind = "github";
+            web_url = "http://127.0.0.1:${toString fakeForgePort}";
+            token_path = "${githubToken}";
+            repos = {
+              # Two watched branches so the two test pushes both land
+              # as evaluations (default policy drops pushes to
+              # unwatched branches — see argunix-web/src/policy.rs).
+              "myorg/myrepo" = {
+                watched_branches = [
+                  "main"
+                  "feat"
+                ];
+              };
+            };
+          };
+        };
+      };
+
+      # Order matters: the daemon's `ensure_webhooks` pass runs at
+      # startup and persists the per-repo secret to sqlite *if and
+      # only if* the forge POST succeeds. The fake forge must be
+      # listening before argunix.service starts, otherwise the test's
+      # signed webhook is rejected with 503 (WebhookNotProvisioned).
+      systemd.services.fake-forge = {
+        description = "argunix test fake forge";
+        wantedBy = [ "multi-user.target" ];
+        before = [ "argunix.service" ];
+        serviceConfig = {
+          ExecStart = "${pkgs.python3}/bin/python3 ${fakeForgeScript}";
+          Restart = "on-failure";
+          RestartSec = 1;
+        };
+      };
+      systemd.services.argunix = {
+        after = [ "fake-forge.service" ];
+        requires = [ "fake-forge.service" ];
+      };
+
+      # Prepend the fake nix-eval-jobs + fake git so the daemon's
+      # subprocesses hit our stubs before the real binaries. The
+      # rest of the module's `path` (real nix, socat) is preserved
+      # because mkBefore merges into the existing list.
+      systemd.services.argunix.path = pkgs.lib.mkBefore [
+        fakeNixEvalJobs
+        fakeGit
+      ];
+
+      environment.systemPackages = [
+        pkgs.argunix
+        pkgs.curl
+        pkgs.jq
+        pkgs.openssl
+        pkgs.sqlite
+      ];
+
+      # Coordinator must NOT advertise `argunix-test`: the runtime
+      # `nix derivation show --recursive` and `nix copy` are fine, but
+      # we want any actual realisation of these derivations to route
+      # through the dispatch pool, not the coord's local nix-daemon.
+      nix.settings.system-features = [
+        "kvm"
+        "nixos-test"
+        "benchmark"
+        "big-parallel"
+      ];
+
+      virtualisation.memorySize = 1536;
+      virtualisation.writableStore = true;
+      virtualisation.additionalPaths = [
+        pkgs.path
+        representative.inputDerivation
+      ];
+    };
+
+  nodes.builder1 =
+    { pkgs, ... }:
+    {
+      imports = [ ../builder-module.nix ];
+
+      services.argunix-builder = {
+        enable = true;
+        argunixHost = "coord";
+        argunixPort = 2222;
+        enrollmentTokenFile = "${enrollmentToken}";
+        name = "b1";
+      };
+
+      nix.settings = {
+        system-features = [
+          "kvm"
+          "nixos-test"
+          "benchmark"
+          "big-parallel"
+          "argunix-test"
+        ];
+        # The agent's `nix show-config --json` reports this verbatim
+        # to the coord in its `hello`; the coord stores it as
+        # `BuilderCapabilities.max_jobs` and gates dispatch on
+        # `in_flight < max_jobs` (see argunix-builders/src/registry.rs).
+        max-jobs = parallelJobs;
+      };
+
+      virtualisation.memorySize = 1536;
+      virtualisation.writableStore = true;
+      virtualisation.additionalPaths = [
+        pkgs.path
+        representative.inputDerivation
+      ];
+    };
+
+  nodes.builder2 =
+    { pkgs, ... }:
+    {
+      imports = [ ../builder-module.nix ];
+
+      services.argunix-builder = {
+        enable = true;
+        argunixHost = "coord";
+        argunixPort = 2222;
+        enrollmentTokenFile = "${enrollmentToken}";
+        name = "b2";
+      };
+
+      nix.settings = {
+        system-features = [
+          "kvm"
+          "nixos-test"
+          "benchmark"
+          "big-parallel"
+          "argunix-test"
+        ];
+        max-jobs = parallelJobs;
+      };
+
+      virtualisation.memorySize = 1536;
+      virtualisation.writableStore = true;
+      virtualisation.additionalPaths = [
+        pkgs.path
+        representative.inputDerivation
+      ];
+    };
+
+  testScript = ''
+    import json
+    import shlex
+    import time
+
+    attrs = ${builtins.toJSON attrNames}
+    parallel_jobs = ${toString parallelJobs}
+    sleep_secs = ${toString sleepSecs}
+    expected_jobs = len(attrs)
+
+    start_all()
+    coord.wait_for_unit("fake-forge.service", timeout=60)
+    coord.wait_for_unit("argunix.service", timeout=60)
+    coord.wait_for_open_port(8080, timeout=60)
+    coord.wait_for_open_port(2222, timeout=60)
+    coord.wait_for_open_port(${toString fakeForgePort}, timeout=60)
+    builder1.wait_for_unit("argunix-builder.service", timeout=60)
+    builder2.wait_for_unit("argunix-builder.service", timeout=60)
+
+    # Both builders must enrol and advertise the gating system feature
+    # plus the right max_jobs before we proceed.
+    def builders_json():
+        raw = coord.succeed(
+            "argunixctl --socket /run/argunix/control.sock builders list --json"
+        )
+        return json.loads(raw)
+
+    def all_ready():
+        bs = builders_json()
+        names = {b["name"]: b for b in bs}
+        if set(names) != {"b1", "b2"}:
+            return False
+        for b in bs:
+            if not b.get("connected"):
+                return False
+            if "argunix-test" not in b.get("features", []):
+                return False
+            if b.get("max_jobs") != parallel_jobs:
+                return False
+        return True
+
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not all_ready():
+        time.sleep(0.5)
+    assert all_ready(), f"builders not ready: {builders_json()!r}"
+
+    # Mint one .drv per attr inside the coord VM. The drvs share
+    # everything-but-the-name, so each is a unique store path and the
+    # daemon has to actually build all of them (nothing is cached).
+    drv_paths = {}
+    out_paths = {}
+    for name in attrs:
+        raw = coord.succeed(
+            f"nix-instantiate --argstr name {name} --argstr sleepSecs {sleep_secs}"
+            f" ${derivExpr}"
+        ).strip()
+        # nix-instantiate prints `<drv>` or `<drv>!out` with --add-root,
+        # but plain invocation just prints the drv path.
+        drv = raw.splitlines()[0].strip()
+        assert drv.endswith(".drv"), f"unexpected nix-instantiate output for {name}: {raw!r}"
+        drv_paths[name] = drv
+        out = coord.succeed(f"nix-store -q --outputs {drv}").strip()
+        assert out.startswith("/nix/store/"), f"unexpected output path for {name}: {out!r}"
+        out_paths[name] = out
+
+    # Stage the fake nix-eval-jobs's job list. Order: eval 1 gets the
+    # first `parallel_jobs` attrs, eval 2 gets the rest. We write all
+    # jobs upfront so the fake script's counter selects the right
+    # block on each invocation.
+    lines = []
+    for name in attrs:
+        rec = {
+            "attr": name,
+            "drvPath": drv_paths[name],
+            "system": "x86_64-linux",
+            "outputs": {"out": out_paths[name]},
+            "requiredSystemFeatures": ["argunix-test"],
+        }
+        lines.append(json.dumps(rec))
+    coord.succeed(
+        "install -o argunix -g argunix -m 0644 /dev/null /var/lib/argunix/.fake-jobs.txt"
+    )
+    for line in lines:
+        coord.succeed(
+            f"printf '%s\\n' {shlex.quote(line)}"
+            " >> /var/lib/argunix/.fake-jobs.txt"
+        )
+    coord.succeed(
+        "install -o argunix -g argunix -m 0644 /dev/null /var/lib/argunix/.fake-counter"
+    )
+
+    # Read back the per-repo webhook secret the daemon's ensure_webhooks
+    # pass persisted (one for forge=`gh`, slug=`myorg/myrepo`).
+    secret_hex = coord.succeed(
+        "sqlite3 /var/lib/argunix/db.sqlite"
+        " \"SELECT hex(webhook_secret) FROM repos WHERE forge='gh' AND slug='myorg/myrepo';\""
+    ).strip()
+    assert secret_hex, "no webhook secret in db — ensure_webhooks didn't run?"
+
+    def post_webhook(branch, sha):
+        body = json.dumps({
+            "ref": f"refs/heads/{branch}",
+            "after": sha,
+            "repository": {"full_name": "myorg/myrepo"},
+            "pusher": {"name": "alice"},
+        })
+        q_body = shlex.quote(body)
+        sig = coord.succeed(
+            f"printf %s {q_body}"
+            f" | openssl dgst -sha256 -mac HMAC -macopt hexkey:{secret_hex}"
+            " | awk '{print \"sha256=\" $2}'"
+        ).strip()
+        code = coord.succeed(
+            f"curl -s -o /tmp/resp -w '%{{http_code}}'"
+            " -X POST http://127.0.0.1:8080/webhook/github"
+            " -H 'Content-Type: application/json'"
+            " -H 'X-GitHub-Event: push'"
+            f" -H 'X-Hub-Signature-256: {sig}'"
+            f" -d {q_body}"
+        ).strip()
+        assert code == "202", f"webhook for {branch} not accepted: HTTP {code}"
+
+    # Two distinct branches so cancel-on-push doesn't supersede eval 1
+    # when eval 2 arrives (branch_key drives the cancel match — see
+    # argunix-web/src/cancel.rs).
+    post_webhook("main", "1111111111111111111111111111111111111111")
+    post_webhook("feat", "2222222222222222222222222222222222222222")
+
+    # Poll the control socket and remember the peak in-flight per
+    # builder, plus whether we ever saw BOTH builders at full capacity
+    # simultaneously. Run until all expected jobs reach a terminal
+    # status in sqlite.
+    #
+    # Floor is `sleep_secs` once both builders are saturated; in
+    # practice nix copy + closure walks add several seconds per build.
+    # We bound the wait tightly so a wedged dispatch path fails fast
+    # rather than burning the test driver's wall clock — and print a
+    # diagnostic snapshot every few seconds so an interactive run
+    # shows what's actually happening between webhook and completion.
+    peak = {"b1": 0, "b2": 0}
+    saw_both_saturated = False
+    overall_deadline = time.monotonic() + sleep_secs + 120
+    last_diag = 0.0
+
+    def jobs_status_snapshot():
+        return coord.succeed(
+            "sqlite3 /var/lib/argunix/db.sqlite"
+            " 'SELECT status, COUNT(*) FROM jobs GROUP BY status;'"
+        ).strip()
+
+    def evals_status_snapshot():
+        return coord.succeed(
+            "sqlite3 /var/lib/argunix/db.sqlite"
+            " 'SELECT id, status FROM evaluations ORDER BY id;'"
+        ).strip()
+
+    def jobs_done_count():
+        n = coord.succeed(
+            "sqlite3 /var/lib/argunix/db.sqlite"
+            " \"SELECT COUNT(*) FROM jobs WHERE status IN"
+            " ('success','failure','cancelled','interrupted');\""
+        ).strip()
+        return int(n)
+
+    def dump_failure_context(reason):
+        print(f"--- failure context: {reason} ---")
+        print(f"evals: {evals_status_snapshot()!r}")
+        print(f"jobs:  {jobs_status_snapshot()!r}")
+        print(f"peak:  {peak!r}")
+        print("--- coord journal tail ---")
+        print(coord.succeed("journalctl -u argunix.service --no-pager -n 120"))
+        print("--- builder1 journal tail ---")
+        print(builder1.succeed("journalctl -u argunix-builder.service --no-pager -n 60"))
+        print("--- builder2 journal tail ---")
+        print(builder2.succeed("journalctl -u argunix-builder.service --no-pager -n 60"))
+
+    done = 0
+    while time.monotonic() < overall_deadline:
+        bs = builders_json()
+        by_name = {b["name"]: b for b in bs}
+        b1 = by_name.get("b1", {}).get("in_flight", 0)
+        b2 = by_name.get("b2", {}).get("in_flight", 0)
+        peak["b1"] = max(peak["b1"], b1)
+        peak["b2"] = max(peak["b2"], b2)
+        if b1 >= parallel_jobs and b2 >= parallel_jobs:
+            saw_both_saturated = True
+        done = jobs_done_count()
+        now = time.monotonic()
+        if now - last_diag >= 10:
+            last_diag = now
+            print(
+                f"[poll t={now:.0f}s] in_flight b1={b1} b2={b2} done={done}/{expected_jobs}"
+                f" evals={evals_status_snapshot()!r}"
+            )
+        if done >= expected_jobs:
+            break
+        time.sleep(1)
+
+    if done < expected_jobs:
+        dump_failure_context(f"only {done}/{expected_jobs} jobs reached a terminal status before deadline")
+        raise AssertionError(
+            f"jobs did not finish in time: done={done}/{expected_jobs}, peak={peak!r}"
+        )
+
+    # Make sure both evaluations finished cleanly.
+    final = coord.succeed(
+        "sqlite3 /var/lib/argunix/db.sqlite"
+        " '.headers on'"
+        " 'SELECT id, status, trigger, git_ref FROM evaluations ORDER BY id;'"
+    )
+    print("--- evaluations ---")
+    print(final)
+    eval_statuses = coord.succeed(
+        "sqlite3 /var/lib/argunix/db.sqlite"
+        " 'SELECT status FROM evaluations ORDER BY id;'"
+    ).split()
+    if eval_statuses != ["done", "done"]:
+        dump_failure_context(f"unexpected eval statuses: {eval_statuses!r}")
+        raise AssertionError(f"unexpected eval statuses: {eval_statuses!r}")
+
+    rows = coord.succeed(
+        "sqlite3 /var/lib/argunix/db.sqlite"
+        " '.headers on'"
+        " 'SELECT id, eval_id, attr_path, status FROM jobs ORDER BY id;'"
+    )
+    print("--- jobs ---")
+    print(rows)
+    job_statuses = coord.succeed(
+        "sqlite3 /var/lib/argunix/db.sqlite"
+        " 'SELECT status FROM jobs;'"
+    ).split()
+    assert all(s == "success" for s in job_statuses), (
+        f"some jobs did not succeed: {job_statuses!r}"
+    )
+    assert len(job_statuses) == expected_jobs, (
+        f"expected {expected_jobs} jobs, got {len(job_statuses)}"
+    )
+
+    # Verify each derivation's output landed back in the coord store
+    # (the closure-pull path). Each must contain its attr-specific text.
+    for name in attrs:
+        contents = coord.succeed(f"cat {out_paths[name]}").strip()
+        assert contents == f"built-{name}", (
+            f"deriv {name} produced unexpected output {contents!r}"
+        )
+
+    # The headline assertion: at some sampled moment, both builders
+    # were carrying their full `max_jobs` of in-flight builds — i.e.
+    # all 2*parallel_jobs derivations were realising in parallel
+    # across the pool.
+    if not saw_both_saturated:
+        dump_failure_context(f"never observed both builders saturated simultaneously; peak={peak!r}")
+        raise AssertionError(
+            f"never observed both builders saturated simultaneously; peak={peak!r}"
+        )
+
+    print("")
+    print("=" * 64)
+    print("argunix builders-parallel summary")
+    print("=" * 64)
+    print(f"parallel_jobs (per builder max-jobs):  {parallel_jobs}")
+    print(f"sleep per build (s):                   {sleep_secs}")
+    print(f"derivations total:                     {expected_jobs}")
+    print("evaluations:                           2 (branches main, feat)")
+    print(f"peak in-flight per builder:            b1={peak['b1']} b2={peak['b2']}")
+    print(f"both builders ever saturated at once:  {saw_both_saturated}")
+    print("=" * 64)
+  '';
+}
