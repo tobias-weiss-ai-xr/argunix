@@ -276,7 +276,11 @@ impl Provider for GithubProvider {
         slug: &Slug,
         target_url: &str,
         secret: &[u8],
+        _secret_is_fresh: bool,
     ) -> Result<HookId, ForgeError> {
+        // GitHub's hook PATCH endpoint reliably rewrites `config.secret`,
+        // so we ignore `secret_is_fresh` — the normal update path
+        // already converges sqlite and the forge after a DB wipe.
         // GET existing hooks; find one whose `config.url` matches.
         let list_url = format!("{}/repos/{}/hooks", self.api_url, slug.as_str());
         let list_resp = self

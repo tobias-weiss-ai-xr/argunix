@@ -253,6 +253,7 @@ mod tests {
             _: &Slug,
             _: &str,
             _: &[u8],
+            _: bool,
         ) -> Result<argunix_forge::HookId, ForgeError> {
             unreachable!("policy never installs webhooks");
         }

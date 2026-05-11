@@ -284,6 +284,7 @@ impl Provider for ForgejoProvider {
         slug: &Slug,
         target_url: &str,
         secret: &[u8],
+        secret_is_fresh: bool,
     ) -> Result<HookId, ForgeError> {
         // Gitea/Forgejo: shape mirrors GitHub's REST surface.
         let list_url = format!("{}/repos/{}/hooks", self.api_url, slug.as_str());
@@ -343,18 +344,43 @@ impl Provider for ForgejoProvider {
         // Known Forgejo limitation: PATCHing an existing hook does NOT
         // update `config.secret` reliably (validated against Codeberg's
         // current Forgejo). The other fields (events, url,
-        // content_type) update fine. If you regenerate the secret in
-        // argunix's sqlite, you must also delete the hook in the
-        // Forgejo UI so the next auto-install pass POSTs a fresh one
-        // with the new secret. (TODO: detect "hook_id stored but
-        // sqlite was just wiped" via a new `Provider::ensure_webhook`
-        // arg taking the prior hook_id, and force delete+POST.)
+        // content_type) update fine. So when argunix's sqlite just
+        // generated the secret (typically a wiped DB), any pre-existing
+        // hook is signing with a key we no longer have — DELETE it
+        // first and POST a fresh one so the forge and sqlite agree.
+        // When sqlite already had the secret, PATCH is fine: secrets
+        // match by construction and only the metadata might drift.
+        if let (true, Some(h)) = (secret_is_fresh, &existing) {
+            let delete_url = format!("{}/repos/{}/hooks/{}", self.api_url, slug.as_str(), h.id);
+            let del_resp = self
+                .client
+                .delete(&delete_url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(AUTHORIZATION, format!("token {}", self.token))
+                .send()
+                .await?;
+            let del_status = del_resp.status();
+            if del_status.as_u16() == 401 {
+                return Err(ForgeError::Unauthorised);
+            }
+            // 404 is fine — someone deleted it in the UI between our
+            // GET and DELETE; the POST below installs the new one.
+            if !del_status.is_success() && del_status.as_u16() != 404 {
+                let body = del_resp.text().await.unwrap_or_default();
+                return Err(ForgeError::Api {
+                    status: del_status.as_u16(),
+                    url: delete_url,
+                    body,
+                });
+            }
+        }
         let (method, url) = match &existing {
-            Some(h) => (
+            Some(h) if !secret_is_fresh => (
                 reqwest::Method::PATCH,
                 format!("{}/repos/{}/hooks/{}", self.api_url, slug.as_str(), h.id),
             ),
-            None => (reqwest::Method::POST, list_url.clone()),
+            _ => (reqwest::Method::POST, list_url.clone()),
         };
         let resp = self
             .client
