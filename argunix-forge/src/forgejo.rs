@@ -284,7 +284,6 @@ impl Provider for ForgejoProvider {
         slug: &Slug,
         target_url: &str,
         secret: &[u8],
-        secret_is_fresh: bool,
     ) -> Result<HookId, ForgeError> {
         // Gitea/Forgejo: shape mirrors GitHub's REST surface.
         let list_url = format!("{}/repos/{}/hooks", self.api_url, slug.as_str());
@@ -343,14 +342,18 @@ impl Provider for ForgejoProvider {
 
         // Known Forgejo limitation: PATCHing an existing hook does NOT
         // update `config.secret` reliably (validated against Codeberg's
-        // current Forgejo). The other fields (events, url,
-        // content_type) update fine. So when argunix's sqlite just
-        // generated the secret (typically a wiped DB), any pre-existing
-        // hook is signing with a key we no longer have — DELETE it
-        // first and POST a fresh one so the forge and sqlite agree.
-        // When sqlite already had the secret, PATCH is fine: secrets
-        // match by construction and only the metadata might drift.
-        if let (true, Some(h)) = (secret_is_fresh, &existing) {
+        // current Forgejo). Since the secret on the forge is opaque to
+        // us — we can never verify whether it still matches sqlite —
+        // the only way auto-install can guarantee convergence is to
+        // DELETE any existing hook with this URL and POST a fresh one
+        // every pass. Other fields (events, url, content_type) come
+        // along for free. The cost is one extra API call per repo per
+        // boot/reload and a rotation of the forge-side hook id, both
+        // acceptable for a CI deployment. The brief window between
+        // DELETE and POST risks dropping a webhook delivery; since
+        // auto-install only runs on boot/reload (rare events) and
+        // pushes are equally rare, the practical exposure is small.
+        if let Some(h) = &existing {
             let delete_url = format!("{}/repos/{}/hooks/{}", self.api_url, slug.as_str(), h.id);
             let del_resp = self
                 .client
@@ -375,16 +378,9 @@ impl Provider for ForgejoProvider {
                 });
             }
         }
-        let (method, url) = match &existing {
-            Some(h) if !secret_is_fresh => (
-                reqwest::Method::PATCH,
-                format!("{}/repos/{}/hooks/{}", self.api_url, slug.as_str(), h.id),
-            ),
-            _ => (reqwest::Method::POST, list_url.clone()),
-        };
         let resp = self
             .client
-            .request(method, &url)
+            .post(&list_url)
             .header(USER_AGENT, &self.user_agent)
             .header(ACCEPT, "application/json")
             .header(AUTHORIZATION, format!("token {}", self.token))
@@ -399,7 +395,7 @@ impl Provider for ForgejoProvider {
             let body = resp.text().await.unwrap_or_default();
             return Err(ForgeError::Api {
                 status: status.as_u16(),
-                url,
+                url: list_url,
                 body,
             });
         }

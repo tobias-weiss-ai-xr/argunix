@@ -86,21 +86,17 @@ async fn ensure_one(
     // the secret in its string-form throughout. The providers send
     // `std::str::from_utf8(secret)` directly as the string secret in
     // their API payload; no hex re-encoding.
-    // `secret_is_fresh` lets the provider know whether sqlite agrees
-    // with whatever the forge already has installed: if we just made up
-    // a new secret, any pre-existing hook on the forge is signing with
-    // a stale key and must be recreated rather than patched.
-    let (secret, secret_is_fresh) = match store.get_webhook_secret(&repo.forge, &repo.slug).await? {
-        Some(s) if !s.is_empty() => (s, false),
+    let secret = match store.get_webhook_secret(&repo.forge, &repo.slug).await? {
+        Some(s) if !s.is_empty() => s,
         _ => {
             let mut raw = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut raw);
-            (hex::encode(raw).into_bytes(), true)
+            hex::encode(raw).into_bytes()
         }
     };
 
     let hook_id = provider
-        .ensure_webhook(&repo.slug, &target_url, &secret, secret_is_fresh)
+        .ensure_webhook(&repo.slug, &target_url, &secret)
         .await?;
 
     store.set_webhook(repo_id, &secret, &hook_id.0).await?;

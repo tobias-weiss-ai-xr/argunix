@@ -341,11 +341,7 @@ impl Provider for GitlabProvider {
         slug: &Slug,
         target_url: &str,
         secret: &[u8],
-        _secret_is_fresh: bool,
     ) -> Result<HookId, ForgeError> {
-        // GitLab's hook PUT endpoint reliably rewrites the `token`
-        // field, so we ignore `secret_is_fresh` — the normal update
-        // path already converges sqlite and the forge after a DB wipe.
         let project = Self::project_path(slug);
         let list_url = format!("{}/projects/{}/hooks", self.api_url, project);
         let list_resp = self

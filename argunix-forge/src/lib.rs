@@ -101,24 +101,16 @@ pub trait Provider: Send + Sync {
 
     /// Idempotently ensure a webhook exists at `slug` pointing at
     /// `target_url` with secret `secret`. Implementations look up an
-    /// existing webhook by URL match, PATCH it if found, POST a new
-    /// one otherwise. Returns the forge-side hook id (caller stores
-    /// it for future updates).
-    ///
-    /// `secret_is_fresh` signals that argunix just generated this
-    /// secret (sqlite had nothing — typically a wiped DB). On forges
-    /// where the update endpoint cannot reliably rewrite an existing
-    /// hook's secret (notably Forgejo / Gitea, validated against
-    /// Codeberg), the implementation must DELETE the stale hook
-    /// before POSTing a new one so the forge's HMAC key matches
-    /// sqlite. Providers whose update endpoint reliably rewrites the
-    /// secret (GitHub, GitLab) may ignore this flag.
+    /// existing webhook by URL match and either update it in-place
+    /// or replace it; on forges whose update endpoint cannot rewrite
+    /// the secret (Forgejo / Gitea, validated against Codeberg) the
+    /// only way to converge is DELETE+POST. Returns the forge-side
+    /// hook id (caller stores it for future updates).
     async fn ensure_webhook(
         &self,
         slug: &Slug,
         target_url: &str,
         secret: &[u8],
-        secret_is_fresh: bool,
     ) -> Result<HookId, ForgeError>;
 
     /// Build a clone URL for `slug` that includes whatever auth this
