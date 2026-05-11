@@ -192,12 +192,18 @@ fn pick_eval<'a>(
         tail == branch
     };
 
-    // Prefer terminal evals (the user wants the latest *result*, not a
-    // mid-flight pending state) — fall back to in-flight only when no
-    // terminal eval matches the filter yet.
+    // Prefer terminal evals so the badge stays stable across pushes —
+    // Done / EvaluationFailed are the "real" results a reader cares
+    // about and we don't want the badge to flip to yellow on every
+    // push. Cancelled is *not* a real result though: a cancellation
+    // followed by a fresh build should show the new build's pending
+    // state, not stay stuck on grey. So the preferred-terminal pass
+    // skips Cancelled and the bare-match fallback picks it up only
+    // when it's the most recent thing matching at all (preserving
+    // "cancelled" for repos where no rebuild has landed yet).
     evals
         .iter()
-        .find(|e| matches(e) && e.status.is_terminal())
+        .find(|e| matches(e) && e.status.is_terminal() && e.status != EvalStatus::Cancelled)
         .or_else(|| evals.iter().find(|e| matches(e)))
 }
 
@@ -381,6 +387,29 @@ mod tests {
         ];
         let picked = pick_eval(&evals, None).unwrap();
         assert_eq!(picked.id.get(), 2);
+    }
+
+    #[test]
+    fn pick_eval_cancelled_does_not_mask_in_flight() {
+        // A cancelled previous run must not keep the badge grey while
+        // a fresh build is in flight — the rebuild is the state the
+        // operator cares about.
+        let evals = vec![
+            record(2, EvalStatus::Building, "main"),
+            record(1, EvalStatus::Cancelled, "main"),
+        ];
+        let picked = pick_eval(&evals, None).unwrap();
+        assert_eq!(picked.id.get(), 2);
+    }
+
+    #[test]
+    fn pick_eval_cancelled_still_shown_when_newest_overall() {
+        // No rebuild yet: the badge should still surface the
+        // cancellation rather than "unknown".
+        let evals = vec![record(1, EvalStatus::Cancelled, "main")];
+        let picked = pick_eval(&evals, None).unwrap();
+        assert_eq!(picked.id.get(), 1);
+        assert_eq!(picked.status, EvalStatus::Cancelled);
     }
 
     #[test]
