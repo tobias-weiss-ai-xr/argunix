@@ -190,10 +190,55 @@ impl BuilderRegistry {
         // Drop any stats from a previous incarnation so the UI doesn't
         // show a window that ends before this connection started.
         self.stats.lock().unwrap().remove(&name);
+        // If we displaced a prior connection, its in-flight builds are
+        // gone with the agent (a reconnecting builder has no memory of
+        // them). Drop the lifecycle senders so workers waiting on
+        // `recv()` see the channel close and exit their drain loop with
+        // "builder disconnected mid-build" instead of wedging until the
+        // per-job wall-clock timeout fires. The prior handler's `Drop`
+        // can't do this from `remove_if_matches` because the new
+        // connection's id no longer matches.
+        if prior.is_some() {
+            let drained = self.drain_in_flight_for(&name);
+            if !drained.is_empty() {
+                tracing::warn!(
+                    builder = %name,
+                    build_ids = ?drained,
+                    "displaced builder had in-flight builds; closed lifecycle channels so workers fail them",
+                );
+            }
+        }
         prior.map(|p| DisplacedConnection {
             name,
             session: p.session,
         })
+    }
+
+    /// Drop all per-build lifecycle senders and live-phase entries for
+    /// `name`. Workers blocked on the corresponding `mpsc::Receiver`
+    /// observe the channel close on their next poll. Returns the
+    /// build_ids whose senders were dropped (for logging).
+    fn drain_in_flight_for(&self, name: &BuilderName) -> Vec<i64> {
+        let mut drained = Vec::new();
+        {
+            let mut builds = self.in_flight_builds.lock().unwrap();
+            // Collect keys first to avoid mutating while iterating.
+            let keys: Vec<(BuilderName, i64)> =
+                builds.keys().filter(|(n, _)| n == name).cloned().collect();
+            for k in keys {
+                drained.push(k.1);
+                builds.remove(&k);
+            }
+        }
+        {
+            let mut phases = self.phases.lock().unwrap();
+            let keys: Vec<(BuilderName, i64)> =
+                phases.keys().filter(|(n, _)| n == name).cloned().collect();
+            for k in keys {
+                phases.remove(&k);
+            }
+        }
+        drained
     }
 
     pub fn mark_disconnecting(&self, name: &BuilderName) {
@@ -216,6 +261,18 @@ impl BuilderRegistry {
             map.remove(name);
             self.in_flight.lock().unwrap().remove(name);
             self.stats.lock().unwrap().remove(name);
+            // Release inner-mutex before we touch in_flight_builds /
+            // phases — the drain helper takes those locks itself, and
+            // we don't want to hold three at once.
+            drop(map);
+            let drained = self.drain_in_flight_for(name);
+            if !drained.is_empty() {
+                tracing::warn!(
+                    builder = %name,
+                    build_ids = ?drained,
+                    "builder disconnected with in-flight builds; closed lifecycle channels so workers fail them",
+                );
+            }
         }
     }
 
@@ -512,6 +569,90 @@ mod tests {
             .snapshot(&name)
             .expect("second registration still present");
         assert_eq!(snap.builder_id.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn disconnect_drops_in_flight_lifecycle_senders() {
+        // The wedge bug: a worker waiting on the lifecycle receiver
+        // must observe channel-close (recv() -> None) when the builder
+        // disconnects, instead of blocking until its wall-clock timeout.
+        let reg = BuilderRegistry::new();
+        let name = BuilderName::new("eu").unwrap();
+        let first = conn(&reg, 1, caps(&["x86_64-linux"], &["kvm"], 4));
+        let conn_id = first.connection_id;
+        let _ = reg.register(name.clone(), first);
+
+        let mut rx_a = reg.register_in_flight_build(name.clone(), 100);
+        let mut rx_b = reg.register_in_flight_build(name.clone(), 101);
+        reg.set_phase(&name, 100, BuildPhase::Build);
+        reg.set_phase(&name, 101, BuildPhase::Pull);
+
+        // Simulate plain disconnect via the same code path
+        // `ConnectionHandler::drop` uses.
+        reg.remove_if_matches(&name, conn_id);
+
+        // Both receivers must now close.
+        assert!(
+            rx_a.recv().await.is_none(),
+            "receiver A should observe close"
+        );
+        assert!(
+            rx_b.recv().await.is_none(),
+            "receiver B should observe close"
+        );
+        // Phases are wiped so the UI doesn't keep showing a phase for
+        // a dead build.
+        assert!(reg.phase_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn takeover_drops_prior_in_flight_lifecycle_senders() {
+        // Reconnect path: the displaced agent's in-flight builds are
+        // gone with it. The new agent will dispatch fresh builds; the
+        // old senders MUST be dropped so the old workers wake up and
+        // fail their jobs, freeing capacity.
+        let reg = BuilderRegistry::new();
+        let name = BuilderName::new("eu").unwrap();
+        let _ = reg.register(name.clone(), conn(&reg, 1, caps(&["x86_64-linux"], &[], 1)));
+        let mut rx_old = reg.register_in_flight_build(name.clone(), 100);
+        reg.set_phase(&name, 100, BuildPhase::Build);
+
+        // Reconnect — second `register` displaces the first.
+        let _ = reg.register(name.clone(), conn(&reg, 1, caps(&["x86_64-linux"], &[], 1)));
+
+        assert!(
+            rx_old.recv().await.is_none(),
+            "prior incarnation's lifecycle receiver should observe close on takeover",
+        );
+        assert!(reg.phase_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_only_drains_the_named_builder() {
+        // Other builders' in-flight lifecycle channels must keep working.
+        let reg = BuilderRegistry::new();
+        let dead = BuilderName::new("dead").unwrap();
+        let alive = BuilderName::new("alive").unwrap();
+        let dead_conn = conn(&reg, 1, caps(&["x86_64-linux"], &[], 1));
+        let dead_conn_id = dead_conn.connection_id;
+        let _ = reg.register(dead.clone(), dead_conn);
+        let _ = reg.register(
+            alive.clone(),
+            conn(&reg, 2, caps(&["x86_64-linux"], &[], 1)),
+        );
+        let mut rx_dead = reg.register_in_flight_build(dead.clone(), 100);
+        let tx_alive_present_before =
+            reg.forward_build_event(&alive, 200, BuildLifecycle::Started { pid: Some(1) });
+        // No registered receiver for build 200 yet.
+        assert!(!tx_alive_present_before);
+        let _rx_alive = reg.register_in_flight_build(alive.clone(), 200);
+
+        reg.remove_if_matches(&dead, dead_conn_id);
+
+        assert!(rx_dead.recv().await.is_none());
+        // The alive builder's sender must still be live: forward_build_event
+        // succeeds (returns true) because the receiver is registered.
+        assert!(reg.forward_build_event(&alive, 200, BuildLifecycle::Started { pid: Some(2) }));
     }
 
     #[test]
