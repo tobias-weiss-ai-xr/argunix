@@ -17,6 +17,7 @@ use russh::ChannelMsg;
 use russh::client::{self, Handle, Handler, Msg as ClientMsg, Session as ClientSession};
 use russh::keys::ssh_key::{self, PrivateKey};
 use russh::keys::{Algorithm, PrivateKeyWithHashAlg};
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -167,13 +168,44 @@ async fn serve_one_connection(
         .map_err(|e| AgentError::IdentityKey(e.to_string()))?;
     let key = Arc::new(key);
 
-    let client_cfg = Arc::new(client::Config::default());
+    // SSH-layer keepalive: russh sends a global request every 30s when
+    // nothing has been received and tears the session down after
+    // `keepalive_max` (3) unanswered ones — so a wedged peer is
+    // surfaced as a transport error within ~2 minutes regardless of
+    // what the kernel TCP stack thinks.
+    let client_cfg = Arc::new(client::Config {
+        keepalive_interval: Some(Duration::from_secs(30)),
+        keepalive_max: 3,
+        ..client::Config::default()
+    });
     let handler = AgentClient {
         nix_daemon_socket: Arc::new(cfg.nix_daemon_socket.clone()),
         argunix_host_key_path: cfg.argunix_host_key_path.clone(),
         close_signals: Arc::new(StdMutex::new(HashMap::new())),
     };
-    let mut session = client::connect(client_cfg, cfg.argunix, handler)
+
+    // TCP keepalive on the underlying socket: catches the
+    // suspend/resume "half-open" case where the laptop wakes up on a
+    // different network and the original 4-tuple is no longer
+    // reachable. Without SO_KEEPALIVE the kernel never probes an idle
+    // socket, so a connection can sit wedged for the duration of
+    // `tcp_retries2` (~15min) — or indefinitely if the heartbeat
+    // payload is too small to fill the send buffer and trigger
+    // retransmits. 30s idle + 10s × 3 probes ⇒ dead in ~60s.
+    let tcp = tokio::net::TcpStream::connect(cfg.argunix)
+        .await
+        .map_err(|e| AgentError::Connect {
+            addr: cfg.argunix,
+            source: russh::Error::IO(e),
+        })?;
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    if let Err(e) = SockRef::from(&tcp).set_tcp_keepalive(&keepalive) {
+        tracing::warn!(error = %e, "set_tcp_keepalive() failed; suspend/resume detection may be slow");
+    }
+    let mut session = client::connect_stream(client_cfg, tcp, handler)
         .await
         .map_err(|source| AgentError::Connect {
             addr: cfg.argunix,
