@@ -96,9 +96,10 @@ in
         Path on the host to a file containing the shared
         builder-enrollment token. Used only on first contact (or
         after `argunixctl builders revoke`); subsequent connects use
-        the persistent pubkey. Once argunix has the row, the operator
-        can wipe the file and unset this option — the agent keeps
-        running on pubkey auth.
+        the persistent pubkey. Once argunix has the row, the file
+        can be wiped — the agent treats a missing file as
+        "pubkey-only" and keeps running, so leaving this option set
+        across re-deploys is fine.
 
         Read directly by the agent, which runs as the static
         `argunix-builder` user. The file must be readable by that

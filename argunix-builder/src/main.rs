@@ -97,13 +97,27 @@ async fn main() -> Result<()> {
     // Read the enrollment token if a path was provided. Once argunix's
     // TOFU row is in place, the operator removes the file (or the
     // `enrollment_token_path` line) and pubkey auth takes over.
+    //
+    // A *missing* file when the path is configured is treated the same
+    // as "no path configured": fall through to pubkey-only. This is the
+    // common operator workflow — wipe the secret after first enrolment
+    // without also editing the systemd unit. Other errors (permission
+    // denied, IO trouble) are still surfaced.
     let enrollment_token = match cli.enrollment_token_path.as_ref() {
-        Some(path) => {
-            let bytes = tokio::fs::read(path)
-                .await
-                .with_context(|| format!("reading enrollment token at {}", path.display()))?;
-            Some(Arc::new(strip_trailing_newlines(bytes)))
-        }
+        Some(path) => match tokio::fs::read(path).await {
+            Ok(bytes) => Some(Arc::new(strip_trailing_newlines(bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    path = %path.display(),
+                    "enrollment token file not found; proceeding with pubkey auth only",
+                );
+                None
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("reading enrollment token at {}", path.display())));
+            }
+        },
         None => None,
     };
 
