@@ -348,11 +348,24 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Place nix-eval-jobs' indirect GC roots inside the per-eval
+    // work_dir. work_dir is removed at the end of `run_build_phase`
+    // (after every job in this eval has reached a terminal state), so
+    // the eval-time drv roots naturally release at that point —
+    // successful jobs already hold their own output gcroots by then
+    // (which pin the drv via nix's default `gc-keep-derivations`),
+    // failed/cancelled jobs have nothing to keep. Without these roots
+    // the system nix-gc can reclaim a queued job's drv before the
+    // worker's `nix copy --to` runs, which then fails with "no
+    // substituter that can build it" — the drv is CI-internal and
+    // can't be re-fetched from any cache.
+    let eval_drv_roots = work_dir.join(".eval-drvs");
     let request = argunix_eval::EvalRequest {
         source_path: work_dir.clone(),
         systems: ctx.systems.clone(),
         outputs: argunix_eval::default_flake_outputs(),
         timeout: ctx.eval_timeout,
+        gc_roots_dir: Some(eval_drv_roots),
     };
     let jobs = tokio::select! {
         biased;

@@ -77,6 +77,16 @@ pub struct EvalRequest {
     pub outputs: Vec<FlakeOutput>,
     /// Wall-clock cap on each `nix-eval-jobs` subprocess.
     pub timeout: Duration,
+    /// Directory where `nix-eval-jobs` registers indirect GC roots
+    /// for every instantiated `.drv`. Without this, the drvs land in
+    /// `/nix/store` unrooted and the system's automatic nix-gc can
+    /// reclaim them before the worker pushes them to a builder,
+    /// surfacing as `nix copy --to` failing with "no substituter
+    /// that can build it". Callers should point this at a per-eval
+    /// path that they remove when the eval's build phase finishes;
+    /// removing the dir drops the indirect roots and lets the drvs
+    /// fall back to normal GC eligibility.
+    pub gc_roots_dir: Option<PathBuf>,
 }
 
 impl EvalRequest {
@@ -86,6 +96,7 @@ impl EvalRequest {
             systems,
             outputs: crate::default_flake_outputs(),
             timeout: Duration::from_secs(600),
+            gc_roots_dir: None,
         }
     }
 }
@@ -115,6 +126,15 @@ pub async fn evaluate(request: &EvalRequest) -> Result<Vec<JobSpec>, EvalError> 
         &request.outputs
     };
 
+    // `nix-eval-jobs --gc-roots-dir` expects the directory to exist.
+    // Create it once up-front so each fragment can register roots into
+    // it without racing on a parallel `mkdir`.
+    if let Some(dir) = &request.gc_roots_dir {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(EvalError::Io)?;
+    }
+
     let mut jobs = Vec::new();
     for output in outputs {
         match &output.kind {
@@ -127,6 +147,7 @@ pub async fn evaluate(request: &EvalRequest) -> Result<Vec<JobSpec>, EvalError> 
                         &fragment,
                         None,
                         request.timeout,
+                        request.gc_roots_dir.as_deref(),
                     )
                     .await?;
                     jobs.append(&mut produced);
@@ -150,6 +171,7 @@ pub async fn evaluate(request: &EvalRequest) -> Result<Vec<JobSpec>, EvalError> 
                     &output.name,
                     Some(select_fn.as_str()),
                     request.timeout,
+                    request.gc_roots_dir.as_deref(),
                 )
                 .await?;
                 jobs.append(&mut produced);
@@ -175,6 +197,7 @@ async fn run_one(
     attr_prefix: &str,
     select: Option<&str>,
     wall_clock: Duration,
+    gc_roots_dir: Option<&Path>,
 ) -> Result<Vec<JobSpec>, EvalError> {
     let flake_uri = match fragment_suffix {
         Some(suffix) => format!("{}#{suffix}", source.display()),
@@ -202,6 +225,12 @@ async fn run_one(
         .arg("--check-cache-status");
     if let Some(expr) = select {
         cmd.arg("--select").arg(expr);
+    }
+    // Pin the freshly-instantiated `.drv` files in the local store
+    // until the caller is ready to drop the roots. See `EvalRequest::
+    // gc_roots_dir`.
+    if let Some(dir) = gc_roots_dir {
+        cmd.arg("--gc-roots-dir").arg(dir);
     }
     let mut child = cmd
         .stdin(Stdio::null())
@@ -367,6 +396,11 @@ exit 0
         // we add more PATH-mutating tests. Right now there is exactly one.
         unsafe { std::env::set_var("PATH", &new_path) };
 
+        // Set gc_roots_dir so the assertions below can also check that
+        // --gc-roots-dir is forwarded for both fragment kinds (the GC
+        // race fix relies on the drvs being rooted on *every*
+        // nix-eval-jobs invocation, not just the per-system one).
+        let roots = src.path().join("eval-drvs");
         let request = EvalRequest {
             source_path: src.path().to_path_buf(),
             systems: vec!["x86_64-linux".into()],
@@ -383,6 +417,7 @@ exit 0
                 },
             ],
             timeout: Duration::from_secs(10),
+            gc_roots_dir: Some(roots.clone()),
         };
         let result = evaluate(&request).await;
 
@@ -453,6 +488,28 @@ exit 0
         assert!(
             !nixos_flake_uri.contains('#'),
             "Select call must use a bare flake URI (no `#fragment`), got `{nixos_flake_uri}`",
+        );
+
+        // Both invocations must carry `--gc-roots-dir <roots>` so the
+        // freshly-instantiated drvs are pinned for as long as the
+        // caller keeps the directory alive — see EvalRequest::gc_roots_dir.
+        let roots_str = roots.to_string_lossy().into_owned();
+        for (label, call) in [("per-system", pkgs), ("select", nixos)] {
+            let idx = call
+                .iter()
+                .position(|a| *a == "--gc-roots-dir")
+                .unwrap_or_else(|| {
+                    panic!("{label} invocation missing --gc-roots-dir; argv={call:?}")
+                });
+            assert_eq!(
+                call.get(idx + 1).copied(),
+                Some(roots_str.as_str()),
+                "{label} --gc-roots-dir argument should be the path we passed in EvalRequest; argv={call:?}",
+            );
+        }
+        assert!(
+            roots.exists(),
+            "evaluate() should create the gc-roots-dir before invoking nix-eval-jobs",
         );
     }
 

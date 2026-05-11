@@ -574,6 +574,9 @@ async fn eval(args: EvalArgs) -> anyhow::Result<()> {
         systems: systems.clone(),
         outputs: argunix_eval::default_flake_outputs(),
         timeout: Duration::from_secs(args.timeout_seconds),
+        // Offline `argunix eval` just prints jobs as JSON — no
+        // subsequent push/build, so we don't need to pin the drvs.
+        gc_roots_dir: None,
     };
     tracing::info!(src = %request.source_path.display(), ?systems, "starting offline evaluation");
     let jobs = argunix_eval::evaluate(&request)
@@ -645,6 +648,11 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
         systems: systems.clone(),
         outputs: argunix_eval::default_flake_outputs(),
         timeout: Duration::from_secs(args.eval_timeout_seconds),
+        // Offline `argunix build` runs eval + build back-to-back in the
+        // same process; the drvs land in the local store and are
+        // realised immediately, so the GC race the worker hits doesn't
+        // apply here.
+        gc_roots_dir: None,
     };
     let jobs = match argunix_eval::evaluate(&eval_request).await {
         Ok(j) => j,
