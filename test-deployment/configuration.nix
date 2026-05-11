@@ -86,9 +86,8 @@ in
           web_url = "https://codeberg.org";
           token_path = "/var/lib/argunix-credentials/fj-token";
           repos = {
-            "tfc/pprintpp" = {
-              watched_branches = [ "master" ];
-            };
+            "tfc/argunix" = { };
+            "tfc/pprintpp" = { watched_branches = [ "master" ]; };
             "tfc/tulonix" = { };
           };
         };
