@@ -13,7 +13,7 @@
 #                                  set below to 2 * parallelJobs)
 # Both are tied to `parallelJobs` so the "all builders saturated"
 # assertion is a function of one knob.
-{ pkgs, ... }:
+{ ... }:
 
 let
   # Test knobs. `parallelJobs` is the per-builder `max-jobs` and the
@@ -23,138 +23,153 @@ let
   parallelJobs = 4;
   sleepSecs = 30;
 
-  enrollmentToken = pkgs.writeText "argunix-builder-enrollment-token" "tok";
-  githubToken = pkgs.writeText "argunix-test-github-token" "ghtok";
-
   attrNames = builtins.genList (i: "j${toString i}") (2 * parallelJobs);
 
-  # A representative test deriv used only to compute the *input
-  # closure* (stdenv + coreutils + bash + …) that both VMs need
-  # pre-staged. The concrete drvs are minted at runtime inside the
-  # coord VM via `nix-instantiate` so the test stays robust against
-  # cross-system hash differences between flake-eval and VM contexts.
-  representative =
-    pkgs.runCommand "argunix-parallel-rep"
-      {
-        requiredSystemFeatures = [ "argunix-test" ];
-      }
-      ''
-        sleep 0
-        echo rep > $out
-      '';
-
-  # Nix expression file the coord VM evaluates per attr. Importing
-  # `pkgs.path` (staged via `additionalPaths`) means the runtime
-  # `runCommand` matches what we used for `representative.inputDerivation`,
-  # so the input closure pre-staged on both VMs covers every concrete
-  # job. `''$out'' escapes to `$out` (shell), `''${}'` escapes Nix
-  # interpolation.
-  derivExpr = pkgs.writeText "argunix-parallel-deriv.nix" ''
-    { name, sleepSecs }:
-    let
-      pkgs = import ${pkgs.path} { };
-      env = {
-        requiredSystemFeatures = [ "argunix-test" ];
-      };
-    in
-    pkgs.runCommand "argunix-parallel-${"$"}{name}" env '''
-      sleep ${"$"}{sleepSecs}
-      echo "built-${"$"}{name}" > ${"$"}out
-    '''
-  '';
-
-  # Stub forge: GETs return [], POST /hooks returns {id:1,config:{}}.
-  # Listens on a fixed port so the daemon can talk to it on startup
-  # (ensure_webhooks). Persists the per-repo webhook secret to sqlite,
-  # which we read back to sign our test payloads.
+  # Stub forge listening port — referenced by both the systemd unit
+  # text on the coord and by the daemon's `web_url`, so it has to live
+  # at the top level (pure data, no pkgs dependency).
   fakeForgePort = 7777;
-  fakeForgeScript = pkgs.writeText "argunix-fake-forge.py" ''
-    import http.server, json
-    PORT = ${toString fakeForgePort}
-    class H(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b"[]")
-        def do_POST(self):
-            length = int(self.headers.get("Content-Length", 0))
-            self.rfile.read(length)
-            self.send_response(201)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"id": 1, "config": {}}).encode())
-        def log_message(self, *_a):
-            pass
-    srv = http.server.HTTPServer(("127.0.0.1", PORT), H)
-    srv.serve_forever()
-  '';
 
-  # Fake git: emit a trivial flake.nix into the dest of `git clone`
-  # and no-op for `git -C <dst> …` subcommands. The flake itself
-  # doesn't have to evaluate anything real — the *only* tool reading
-  # it is our fake `nix-eval-jobs`, which emits a hard-coded JSON
-  # for the `#packages.x86_64-linux` fragment.
-  fakeFlakeStub = pkgs.writeText "fake-flake.nix" ''
-    { description = "argunix-parallel-stub"; outputs = { self }: { }; }
-  '';
-  fakeGit = pkgs.writeShellScriptBin "git" ''
-    set -eu
-    if [ "$1" = "-C" ]; then
-      exit 0
-    fi
-    case "$1" in
-      clone)
-        dst=""
-        for a in "$@"; do dst="$a"; done
-        ${pkgs.coreutils}/bin/mkdir -p "$dst"
-        ${pkgs.coreutils}/bin/cp ${fakeFlakeStub} "$dst/flake.nix"
-        exit 0
-        ;;
-      *)
-        exit 0
-        ;;
-    esac
-  '';
+  # Every helper that builds something Nix-derivable goes through this
+  # factory so each VM gets its stubs built against its OWN pkgs. The
+  # outer `pkgs` of a NixOS test is the test driver's (host) pkgs; if
+  # the host architecture differs from a VM's (e.g. cross-arch test
+  # runs), references to `pkgs.coreutils`, `pkgs.gawk`, and the stdenv
+  # under `pkgs.runCommand` would otherwise embed host binaries that
+  # can't execute on the guest. Calling this from inside each node's
+  # module function — where `pkgs` IS that node's pkgs — keeps every
+  # arch-sensitive store-path reference local to the VM consuming it.
+  mkStubs = pkgs: rec {
+    enrollmentToken = pkgs.writeText "argunix-builder-enrollment-token" "tok";
+    githubToken = pkgs.writeText "argunix-test-github-token" "ghtok";
 
-  # Fake nix-eval-jobs. Each invocation that targets the
-  # `packages.x86_64-linux` fragment consumes one slot of
-  # `/var/lib/argunix/.fake-jobs.txt` and emits the corresponding
-  # jobs lines. All other fragments (`checks`, `devShells`, …) emit
-  # nothing (eval-success with zero jobs).
-  #
-  # The counter is per `packages.x86_64-linux` call only — `process()`
-  # runs the eval phase serially, so increments are race-free: eval 1
-  # consumes block 0, eval 2 consumes block 1.
-  fakeNixEvalJobs = pkgs.writeShellScriptBin "nix-eval-jobs" ''
-    set -eu
-    flake=""
-    while [ $# -gt 0 ]; do
+    # A representative test deriv used only to compute the *input
+    # closure* (stdenv + coreutils + bash + …) that the VM needs
+    # pre-staged. The concrete drvs are minted at runtime inside the
+    # coord VM via `nix-instantiate` so the test stays robust against
+    # cross-system hash differences between flake-eval and VM contexts.
+    representative =
+      pkgs.runCommand "argunix-parallel-rep"
+        {
+          requiredSystemFeatures = [ "argunix-test" ];
+        }
+        ''
+          sleep 0
+          echo rep > $out
+        '';
+
+    # Nix expression file the coord VM evaluates per attr. Importing
+    # `pkgs.path` (staged via `additionalPaths`) means the runtime
+    # `runCommand` matches what we used for `representative.inputDerivation`,
+    # so the input closure pre-staged on the coord covers every concrete
+    # job. `''$out'' escapes to `$out` (shell), `''${}'` escapes Nix
+    # interpolation.
+    derivExpr = pkgs.writeText "argunix-parallel-deriv.nix" ''
+      { name, sleepSecs }:
+      let
+        pkgs = import ${pkgs.path} { };
+        env = {
+          requiredSystemFeatures = [ "argunix-test" ];
+        };
+      in
+      pkgs.runCommand "argunix-parallel-${"$"}{name}" env '''
+        sleep ${"$"}{sleepSecs}
+        echo "built-${"$"}{name}" > ${"$"}out
+      '''
+    '';
+
+    # Stub forge: GETs return [], POST /hooks returns {id:1,config:{}}.
+    # Listens on a fixed port so the daemon can talk to it on startup
+    # (ensure_webhooks). Persists the per-repo webhook secret to sqlite,
+    # which we read back to sign our test payloads.
+    fakeForgeScript = pkgs.writeText "argunix-fake-forge.py" ''
+      import http.server, json
+      PORT = ${toString fakeForgePort}
+      class H(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              self.send_response(200)
+              self.send_header("Content-Type", "application/json")
+              self.end_headers()
+              self.wfile.write(b"[]")
+          def do_POST(self):
+              length = int(self.headers.get("Content-Length", 0))
+              self.rfile.read(length)
+              self.send_response(201)
+              self.send_header("Content-Type", "application/json")
+              self.end_headers()
+              self.wfile.write(json.dumps({"id": 1, "config": {}}).encode())
+          def log_message(self, *_a):
+              pass
+      srv = http.server.HTTPServer(("127.0.0.1", PORT), H)
+      srv.serve_forever()
+    '';
+
+    # Fake git: emit a trivial flake.nix into the dest of `git clone`
+    # and no-op for `git -C <dst> …` subcommands. The flake itself
+    # doesn't have to evaluate anything real — the *only* tool reading
+    # it is our fake `nix-eval-jobs`, which emits a hard-coded JSON
+    # for the `#packages.x86_64-linux` fragment.
+    fakeFlakeStub = pkgs.writeText "fake-flake.nix" ''
+      { description = "argunix-parallel-stub"; outputs = { self }: { }; }
+    '';
+    fakeGit = pkgs.writeShellScriptBin "git" ''
+      set -eu
+      if [ "$1" = "-C" ]; then
+        exit 0
+      fi
       case "$1" in
-        --flake) flake="$2"; shift 2 ;;
-        *) shift ;;
+        clone)
+          dst=""
+          for a in "$@"; do dst="$a"; done
+          ${pkgs.coreutils}/bin/mkdir -p "$dst"
+          ${pkgs.coreutils}/bin/cp ${fakeFlakeStub} "$dst/flake.nix"
+          exit 0
+          ;;
+        *)
+          exit 0
+          ;;
       esac
-    done
-    case "$flake" in
-      *"#packages.x86_64-linux"*) : ;;
-      *) exit 0 ;;
-    esac
+    '';
 
-    DATA=/var/lib/argunix
-    counter_file="$DATA/.fake-counter"
-    jobs_file="$DATA/.fake-jobs.txt"
-    counter=0
-    if [ -s "$counter_file" ]; then
-      read -r counter < "$counter_file"
-    fi
-    next=$((counter + 1))
-    printf '%s\n' "$next" > "$counter_file"
+    # Fake nix-eval-jobs. Each invocation that targets the
+    # `packages.x86_64-linux` fragment consumes one slot of
+    # `/var/lib/argunix/.fake-jobs.txt` and emits the corresponding
+    # jobs lines. All other fragments (`checks`, `devShells`, …) emit
+    # nothing (eval-success with zero jobs).
+    #
+    # The counter is per `packages.x86_64-linux` call only — `process()`
+    # runs the eval phase serially, so increments are race-free: eval 1
+    # consumes block 0, eval 2 consumes block 1.
+    fakeNixEvalJobs = pkgs.writeShellScriptBin "nix-eval-jobs" ''
+      set -eu
+      flake=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --flake) flake="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      case "$flake" in
+        *"#packages.x86_64-linux"*) : ;;
+        *) exit 0 ;;
+      esac
 
-    block=${toString parallelJobs}
-    start=$((counter * block + 1))
-    end=$((start + block - 1))
-    ${pkgs.gawk}/bin/awk -v s="$start" -v e="$end" 'NR>=s && NR<=e { print }' "$jobs_file"
-  '';
+      DATA=/var/lib/argunix
+      counter_file="$DATA/.fake-counter"
+      jobs_file="$DATA/.fake-jobs.txt"
+      counter=0
+      if [ -s "$counter_file" ]; then
+        read -r counter < "$counter_file"
+      fi
+      next=$((counter + 1))
+      printf '%s\n' "$next" > "$counter_file"
+
+      block=${toString parallelJobs}
+      start=$((counter * block + 1))
+      end=$((start + block - 1))
+      ${pkgs.gawk}/bin/awk -v s="$start" -v e="$end" 'NR>=s && NR<=e { print }' "$jobs_file"
+    '';
+  };
 
 in
 {
@@ -162,6 +177,9 @@ in
 
   nodes.coord =
     { pkgs, ... }:
+    let
+      stubs = mkStubs pkgs;
+    in
     {
       imports = [ ../module.nix ];
 
@@ -176,12 +194,12 @@ in
           schedule.build_concurrency = 2 * parallelJobs;
           builder_enrollment = {
             listen = "[::]:2222";
-            token_path = "${enrollmentToken}";
+            token_path = "${stubs.enrollmentToken}";
           };
           forges.gh = {
             kind = "github";
             web_url = "http://127.0.0.1:${toString fakeForgePort}";
-            token_path = "${githubToken}";
+            token_path = "${stubs.githubToken}";
             repos = {
               # Two watched branches so the two test pushes both land
               # as evaluations (default policy drops pushes to
@@ -207,7 +225,7 @@ in
         wantedBy = [ "multi-user.target" ];
         before = [ "argunix.service" ];
         serviceConfig = {
-          ExecStart = "${pkgs.python3}/bin/python3 ${fakeForgeScript}";
+          ExecStart = "${pkgs.python3}/bin/python3 ${stubs.fakeForgeScript}";
           Restart = "on-failure";
           RestartSec = 1;
         };
@@ -222,8 +240,8 @@ in
       # rest of the module's `path` (real nix, socat) is preserved
       # because mkBefore merges into the existing list.
       systemd.services.argunix.path = pkgs.lib.mkBefore [
-        fakeNixEvalJobs
-        fakeGit
+        stubs.fakeNixEvalJobs
+        stubs.fakeGit
       ];
 
       environment.systemPackages = [
@@ -247,14 +265,25 @@ in
 
       virtualisation.memorySize = 1536;
       virtualisation.writableStore = true;
+      # `derivExpr` is staged here so the testScript's
+      # `nix-instantiate ${stubs.derivExpr}` finds the file in the
+      # coord's store. Built with the coord's own pkgs so the
+      # `${pkgs.path}` reference inside its body resolves to the same
+      # nixpkgs source the runtime `pkgs.runCommand` is going to call
+      # against (system-features come from the env, but the input
+      # closure must match the pre-staged `representative.inputDerivation`).
       virtualisation.additionalPaths = [
         pkgs.path
-        representative.inputDerivation
+        stubs.representative.inputDerivation
+        stubs.derivExpr
       ];
     };
 
   nodes.builder1 =
     { pkgs, ... }:
+    let
+      stubs = mkStubs pkgs;
+    in
     {
       imports = [ ../builder-module.nix ];
 
@@ -262,7 +291,7 @@ in
         enable = true;
         argunixHost = "coord";
         argunixPort = 2222;
-        enrollmentTokenFile = "${enrollmentToken}";
+        enrollmentTokenFile = "${stubs.enrollmentToken}";
         name = "b1";
       };
 
@@ -285,12 +314,15 @@ in
       virtualisation.writableStore = true;
       virtualisation.additionalPaths = [
         pkgs.path
-        representative.inputDerivation
+        stubs.representative.inputDerivation
       ];
     };
 
   nodes.builder2 =
     { pkgs, ... }:
+    let
+      stubs = mkStubs pkgs;
+    in
     {
       imports = [ ../builder-module.nix ];
 
@@ -298,7 +330,7 @@ in
         enable = true;
         argunixHost = "coord";
         argunixPort = 2222;
-        enrollmentTokenFile = "${enrollmentToken}";
+        enrollmentTokenFile = "${stubs.enrollmentToken}";
         name = "b2";
       };
 
@@ -317,11 +349,22 @@ in
       virtualisation.writableStore = true;
       virtualisation.additionalPaths = [
         pkgs.path
-        representative.inputDerivation
+        stubs.representative.inputDerivation
       ];
     };
 
-  testScript = ''
+  testScript =
+    { nodes, ... }:
+    let
+      # Rebuild against the coord's own pkgs so the `${...derivExpr}`
+      # path interpolated below matches the one the coord staged via
+      # `additionalPaths`. `mkStubs` is pure, so this yields the same
+      # store path as the coord-side instantiation when the coord's
+      # pkgs matches the host's (default), and a *correctly-arch'd*
+      # path when it doesn't.
+      coordStubs = mkStubs nodes.coord.nixpkgs.pkgs;
+    in
+    ''
     import json
     import shlex
     import time
@@ -375,7 +418,7 @@ in
     for name in attrs:
         raw = coord.succeed(
             f"nix-instantiate --argstr name {name} --argstr sleepSecs {sleep_secs}"
-            f" ${derivExpr}"
+            f" ${coordStubs.derivExpr}"
         ).strip()
         # nix-instantiate prints `<drv>` or `<drv>!out` with --add-root,
         # but plain invocation just prints the drv path.
