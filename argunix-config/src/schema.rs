@@ -113,6 +113,14 @@ pub struct Schedule {
     /// [docs/concepts/webhook-coalescing.md].
     #[serde(default = "default_webhook_coalesce_seconds")]
     pub webhook_coalesce_seconds: u32,
+    /// Global cap on derivations being built concurrently across the
+    /// whole daemon. Bounds parallel `nix copy` proxies, log capture
+    /// tasks, and `nix-store --realise` invocations dispatched through
+    /// the builder pool. Per-builder concurrency is additionally
+    /// gated by each builder's advertised `max_jobs`. Clamped to ≥1
+    /// at use.
+    #[serde(default = "default_build_concurrency")]
+    pub build_concurrency: u32,
 }
 
 fn default_collapsed_threshold() -> u32 {
@@ -123,11 +131,16 @@ fn default_webhook_coalesce_seconds() -> u32 {
     5
 }
 
+fn default_build_concurrency() -> u32 {
+    4
+}
+
 impl Default for Schedule {
     fn default() -> Self {
         Self {
             collapsed_check_threshold: default_collapsed_threshold(),
             webhook_coalesce_seconds: default_webhook_coalesce_seconds(),
+            build_concurrency: default_build_concurrency(),
         }
     }
 }
@@ -539,6 +552,7 @@ forges:
         let c = parse(&minimal_yaml());
         assert_eq!(c.listen, "127.0.0.1:8080");
         assert_eq!(c.schedule.collapsed_check_threshold, 100);
+        assert_eq!(c.schedule.build_concurrency, 4);
         assert!(!c.dry_run);
         assert_eq!(c.repos.len(), 1);
         assert_eq!(c.repos[0].forge, "github-myorg");

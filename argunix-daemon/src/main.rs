@@ -243,8 +243,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Closure transfer is `nix copy` over a tunneled
     // `nix-daemon --stdio`, which streams per-file with bounded
     // memory. `build_concurrency` is the global cap on parallel
-    // in-flight builds.
-    let build_concurrency: usize = 4;
+    // in-flight builds. Operators tune this via the YAML
+    // `schedule.build_concurrency` key (default 4).
+    let build_concurrency: usize = current
+        .load()
+        .config
+        .schedule
+        .build_concurrency as usize;
     // Single global build cap shared across all in-flight evals. With
     // build dispatch now spawned per-eval (see `worker::process`),
     // this prevents two concurrent evals from each getting their own

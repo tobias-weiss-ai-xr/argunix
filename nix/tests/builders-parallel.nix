@@ -9,11 +9,10 @@
 #
 # Concurrency knobs in play:
 #   - per-builder `max-jobs`     (set via nix.settings.max-jobs)
-#   - daemon `build_concurrency` (hardcoded 4 in argunix-daemon/src/main.rs)
-# With `parallelJobs = 2`, two builders × 2 = 4 slots ↔ daemon cap of 4.
-# Raising `parallelJobs` past 2 saturates the daemon cap; the assertion
-# would still pass for one builder reaching parallelJobs but the
-# "simultaneously on both" claim only holds while total ≤ 4.
+#   - daemon `build_concurrency` (settings.schedule.build_concurrency,
+#                                  set below to 2 * parallelJobs)
+# Both are tied to `parallelJobs` so the "all builders saturated"
+# assertion is a function of one knob.
 { pkgs, ... }:
 
 let
@@ -21,7 +20,7 @@ let
   # derivations-per-eval count; `sleepSecs` is how long each build
   # spins inside `bash -c "sleep N; …"` so the polling loop has a
   # comfortable window to observe both builders saturated.
-  parallelJobs = 2;
+  parallelJobs = 4;
   sleepSecs = 30;
 
   enrollmentToken = pkgs.writeText "argunix-builder-enrollment-token" "tok";
@@ -171,6 +170,10 @@ in
         listen = "127.0.0.1:8080";
         settings = {
           external_url = "http://127.0.0.1:8080";
+          # The whole point of this test: two builders should be able
+          # to run `parallelJobs` derivations each at the same time, so
+          # the daemon's global cap must be at least 2*parallelJobs.
+          schedule.build_concurrency = 2 * parallelJobs;
           builder_enrollment = {
             listen = "[::]:2222";
             token_path = "${enrollmentToken}";
