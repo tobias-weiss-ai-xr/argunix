@@ -6,131 +6,103 @@
 //! agnostic helpers like [`crate::dispatch_inbound`] can drive it
 //! without knowing about russh.
 //!
-//! Why a single function (not a `split_channel` returning two
-//! halves): russh's `Channel` is owned and methods take `&mut self`,
-//! so we can't easily split it across two threads without locking.
-//! Instead, [`with_channel_io`] runs a pump task that owns the
-//! channel and ferries bytes through a `tokio::io::duplex` pipe —
-//! the user supplies a closure that receives the `AsyncRead`/Write
-//! end and returns when its work is done. The pump shuts down when
-//! the closure resolves or the channel reports EOF/close.
+//! The two directions are pumped by **separate tasks** joined at the
+//! parent level. Multiplexing them via `tokio::select!` with `.await`
+//! calls inside the arms deadlocks under back-pressure: when one
+//! direction is awaiting (e.g. `pump_writer.write_all` blocked
+//! because the user's reader is slow), the other arm is not polled,
+//! so the response stream that would unblock the first direction
+//! cannot drain. The classic nix-daemon-protocol pattern (request →
+//! response) hits this every time the response queue fills.
 
 use russh::client::Msg as ClientMsg;
 use russh::server::Msg as ServerMsg;
-use russh::{Channel, ChannelId, ChannelMsg};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use russh::{Channel, ChannelId, ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::oneshot;
 
-/// Internal pump-loop that owns the russh channel and ferries bytes
-/// in both directions through `pump_side`. Generic over the channel
-/// "side" type so the same loop drives both the agent-side
-/// `Channel<ClientMsg>` (server-pushed) and the daemon-side
-/// `Channel<ServerMsg>` (client-opened).
-///
-/// `close_rx`, when supplied, is an out-of-band signal that the
-/// channel has been closed by the peer. Required on the agent side:
-/// for *server-pushed* channels, russh delivers `CHANNEL_EOF` and
-/// `CHANNEL_CLOSE` only via the `Handler::channel_eof/close`
-/// callbacks — never through `Channel::wait()` — so without this
-/// signal the pump would spin forever after a clean close. Optional
-/// on the daemon side, where `wait()` does see Eof/Close.
-async fn run_pump<S>(
-    mut channel: Channel<S>,
-    mut pump_side: DuplexStream,
-    close_rx: Option<oneshot::Receiver<()>>,
-) -> Channel<S>
-where
-    S: ChannelSide,
-{
-    let mut buf = vec![0u8; 16 * 1024];
-    let mut close_rx = close_rx;
-    // Track each direction independently. We tear down the pump
-    // only when BOTH halves are done: the user has stopped writing
-    // outbound (its writer was dropped — `pump_side.read()` returned
-    // `Ok(0)`) AND the peer has signalled inbound EOF (either via
-    // `channel.wait()` returning Eof/Close, or via the out-of-band
-    // `close_rx` callback path on agent-side server-pushed
-    // channels).
-    //
-    // Critical for bidirectional protocols like the
-    // `NixDaemonStdio` tunnel: when the daemon EOFs after writing
-    // its request, the agent's `nix-daemon --stdio` is still
-    // producing response bytes. Tearing down on inbound EOF would
-    // drop those bytes before they reach the channel.
-    let mut user_writer_done = false;
-    let mut inbound_done = false;
+/// Inbound pump: russh channel → `pump_writer` (which the user reads
+/// via the other end of the duplex). Runs until the peer signals
+/// EOF/close either inline (via `channel.wait()` returning Eof/Close)
+/// or out-of-band (via `close_rx`, used on agent-side server-pushed
+/// channels — russh delivers their EOF/Close only through the
+/// Handler callback path).
+async fn run_pump_inbound(
+    mut read_half: ChannelReadHalf,
+    mut pump_writer: WriteHalf<DuplexStream>,
+    mut close_rx: Option<oneshot::Receiver<()>>,
+) {
     loop {
-        if user_writer_done && inbound_done {
-            break;
-        }
         tokio::select! {
-            // Channel → pump_side (user reads via `read()` end).
-            ev = channel.wait(), if !inbound_done => match ev {
+            ev = read_half.wait() => match ev {
                 Some(ChannelMsg::Data { data }) => {
-                    if pump_side.write_all(&data).await.is_err() {
-                        // User-side reader gone — keep pumping
-                        // outbound but stop trying to write inbound.
-                        inbound_done = true;
+                    if pump_writer.write_all(&data).await.is_err() {
+                        return;
                     }
                 }
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    let _ = pump_side.shutdown().await;
-                    inbound_done = true;
+                    let _ = pump_writer.shutdown().await;
+                    return;
                 }
                 Some(_) => continue,
             },
-            // pump_side → channel (user writes via `write()` end).
-            r = pump_side.read(&mut buf), if !user_writer_done => match r {
-                Ok(0) => {
-                    let _ = channel.eof().await;
-                    user_writer_done = true;
-                }
-                Ok(n) => {
-                    if channel.data(&buf[..n]).await.is_err() {
-                        // Channel write failed — stop trying.
-                        user_writer_done = true;
-                    }
-                }
-                Err(_) => {
-                    user_writer_done = true;
-                }
-            },
-            // Agent-side out-of-band EOF/Close from Handler.
-            // `wait_close` sets the slot to None after firing so
-            // the branch can never re-fire.
-            //
-            // Russh delivers `CHANNEL_EOF` via a separate callback
-            // path from the channel mpsc, so `channel.wait()` may
-            // still have queued `Data` events that haven't been
-            // pumped yet. Drain them with a short polling timeout
-            // before signalling EOF to the user — otherwise the
-            // closing peer's last bytes get dropped and the
-            // user-side subprocess (e.g. `nix-daemon --stdio`)
-            // sees a truncated stream.
-            _ = wait_close(&mut close_rx), if !inbound_done => {
+            _ = wait_close(&mut close_rx) => {
+                // Russh delivers `CHANNEL_EOF` via a separate callback
+                // path from the channel mpsc, so the receiver may
+                // still have queued `Data` events that haven't been
+                // pumped yet. Drain them with a short polling timeout
+                // before signalling EOF to the user — otherwise the
+                // closing peer's last bytes get dropped and the
+                // user-side subprocess (e.g. `nix-daemon --stdio`)
+                // sees a truncated stream.
                 loop {
                     match tokio::time::timeout(
-                        std::time::Duration::from_millis(50),
-                        channel.wait(),
+                        Duration::from_millis(50),
+                        read_half.wait(),
                     ).await {
                         Ok(Some(ChannelMsg::Data { data })) => {
-                            if pump_side.write_all(&data).await.is_err() {
-                                break;
+                            if pump_writer.write_all(&data).await.is_err() {
+                                return;
                             }
                         }
                         _ => break,
                     }
                 }
-                let _ = pump_side.shutdown().await;
-                inbound_done = true;
-                // Do NOT break: outbound pump must keep running
-                // until the user closure drops its writer (which
-                // for the nix-daemon tunnel means the subprocess
-                // has finished emitting response bytes and exited).
+                let _ = pump_writer.shutdown().await;
+                return;
             }
         }
     }
-    channel
+}
+
+/// Outbound pump: `pump_reader` (which the user writes via the other
+/// end of the duplex) → russh channel `data` frames. Runs until the
+/// user drops its writer (`pump_reader.read` returns 0), at which
+/// point we send `CHANNEL_EOF` so the peer knows we're done writing.
+/// `close()` is the caller's responsibility — see [`with_channel_io`].
+async fn run_pump_outbound<S>(
+    mut pump_reader: ReadHalf<DuplexStream>,
+    write_half: Arc<ChannelWriteHalf<S>>,
+) where
+    S: ChannelSide,
+{
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match pump_reader.read(&mut buf).await {
+            Ok(0) => {
+                let _ = write_half.eof().await;
+                return;
+            }
+            Ok(n) => {
+                if write_half.data(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 async fn wait_close(slot: &mut Option<oneshot::Receiver<()>>) {
@@ -159,10 +131,11 @@ impl ChannelSide for ServerMsg {}
 /// Returns whatever `f` returns; the channel is closed cleanly when
 /// `f` resolves (or earlier if the channel goes away).
 ///
-/// The pump task and `f` run concurrently via `tokio::join!`, so
-/// `f` can both read from and write to the channel without
-/// deadlocking even when the russh channel uses internal flow
-/// control.
+/// The inbound pump, outbound pump, and `f` run concurrently via
+/// `tokio::join!`, each as an independent future on the same task.
+/// This is what allows `f` to do bidirectional I/O without dead-
+/// locking on back-pressure: a stall in one direction can no longer
+/// starve the other.
 ///
 /// `close_rx` is required on the agent side (server-pushed
 /// channels — russh hides EOF/Close from `wait()` and delivers them
@@ -181,11 +154,19 @@ where
     // 64K duplex buffer — sized to absorb a typical russh channel
     // window without backpressuring the pump on every Data event.
     let (user_side, pump_side) = tokio::io::duplex(64 * 1024);
+    let (pump_reader, pump_writer) = tokio::io::split(pump_side);
+    let (read_half, write_half) = channel.split();
+    let write_half = Arc::new(write_half);
+
     let user_fut = f(user_side);
-    let (channel, result) = tokio::join!(run_pump(channel, pump_side, close_rx), user_fut);
+    let inbound = run_pump_inbound(read_half, pump_writer, close_rx);
+    let outbound = run_pump_outbound::<S>(pump_reader, write_half.clone());
+
+    let (_, _, result) = tokio::join!(inbound, outbound, user_fut);
+
     // After f resolves, ensure the russh channel is fully closed.
     // Best-effort — if the peer already closed it, this is a no-op.
-    let _ = channel.eof().await;
-    let _ = channel.close().await;
+    let _ = write_half.eof().await;
+    let _ = write_half.close().await;
     result
 }
