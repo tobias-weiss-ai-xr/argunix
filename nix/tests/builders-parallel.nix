@@ -232,6 +232,10 @@ in
 {
   name = "argunix-builders-parallel";
 
+  defaults = {
+    networking.dhcpcd.enable = false;
+  };
+
   nodes.coord =
     { pkgs, lib, ... }:
     let

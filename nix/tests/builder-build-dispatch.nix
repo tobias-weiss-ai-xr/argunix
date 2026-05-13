@@ -46,6 +46,10 @@ in
 {
   name = "argunix-builder-build-dispatch";
 
+  defaults = {
+    networking.dhcpcd.enable = false;
+  };
+
   nodes.argunix = {
     imports = [ ../module.nix ];
 

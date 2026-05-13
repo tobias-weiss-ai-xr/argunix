@@ -167,6 +167,10 @@ in
 {
   name = "argunix-crash-recovery";
 
+  defaults = {
+    networking.dhcpcd.enable = false;
+  };
+
   nodes.machine =
     { lib, ... }:
     {

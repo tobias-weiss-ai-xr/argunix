@@ -94,6 +94,10 @@ in
 {
   name = "argunix-builder-stream-large";
 
+  defaults = {
+    networking.dhcpcd.enable = false;
+  };
+
   nodes.argunix =
     { pkgs, ... }:
     {

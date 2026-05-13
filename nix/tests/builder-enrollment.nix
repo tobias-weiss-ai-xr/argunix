@@ -15,6 +15,10 @@ in
 {
   name = "argunix-builder-enrollment";
 
+  defaults = {
+    networking.dhcpcd.enable = false;
+  };
+
   nodes.argunix = {
     imports = [ ../module.nix ];
 

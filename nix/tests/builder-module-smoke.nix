@@ -21,6 +21,10 @@ in
 {
   name = "argunix-builder-module-smoke";
 
+  defaults = {
+    networking.dhcpcd.enable = false;
+  };
+
   nodes.machine = {
     imports = [ ../builder-module.nix ];
 
