@@ -551,6 +551,17 @@ impl EvalStore for SqlxStore {
         Ok(rows.into_iter().map(EvalId::new).collect())
     }
 
+    async fn list_building_ids(&self) -> Result<Vec<EvalId>, StoreError> {
+        let rows = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM evaluations
+             WHERE status = 'building'
+             ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(EvalId::new).collect())
+    }
+
     async fn list_by_status(
         &self,
         status: EvalStatus,
@@ -793,6 +804,20 @@ impl JobStore for SqlxStore {
             .bind(JobStatus::Running.as_str())
             .execute(&self.pool)
             .await?;
+        Ok(r.rows_affected())
+    }
+
+    async fn requeue_interrupted_for_eval(&self, eval_id: EvalId) -> Result<u64, StoreError> {
+        let r = sqlx::query(
+            "UPDATE jobs
+             SET status = ?1, started_at = NULL, builder_id = NULL
+             WHERE eval_id = ?2 AND status = ?3",
+        )
+        .bind(JobStatus::Queued.as_str())
+        .bind(eval_id.get())
+        .bind(JobStatus::Interrupted.as_str())
+        .execute(&self.pool)
+        .await?;
         Ok(r.rows_affected())
     }
 
@@ -1245,8 +1270,92 @@ mod tests {
              have existing job rows that re-running process() would \
              duplicate",
         );
+        // `list_building_ids` is the resume-path companion: only the
+        // mid-build eval comes back, since the worker can pick that
+        // up via its skip-eval-phase resume branch.
+        let building_ids = <SqlxStore as EvalStore>::list_building_ids(&s)
+            .await
+            .unwrap();
+        assert_eq!(building_ids, vec![building]);
         // Sanity-check we set up the fixtures right.
-        let _ = (evaluating, building, done, failed, cancelled);
+        let _ = (evaluating, done, failed, cancelled);
+    }
+
+    #[tokio::test]
+    async fn requeue_interrupted_for_eval_only_touches_interrupted_jobs() {
+        let s = store().await;
+        let repo_id = <SqlxStore as RepoStore>::upsert(&s, "github", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        let eval_id = <SqlxStore as EvalStore>::create(
+            &s,
+            NewEvaluation {
+                repo_id,
+                trigger: "push".to_string(),
+                git_ref: "refs/heads/main".to_string(),
+                sha: Sha::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                pr_number: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mk = |attr: &str| NewJob {
+            eval_id,
+            attr_path: AttrPath::new(attr),
+            drv_path: Some(format!("/nix/store/xxx-{attr}.drv")),
+            system: "x86_64-linux".to_string(),
+        };
+        let interrupted = <SqlxStore as JobStore>::create(&s, mk("a")).await.unwrap();
+        let queued = <SqlxStore as JobStore>::create(&s, mk("b")).await.unwrap();
+        let success = <SqlxStore as JobStore>::create(&s, mk("c")).await.unwrap();
+
+        // Drive `interrupted` through Running → Interrupted (simulating
+        // the boot-time `mark_running_interrupted` pass).
+        <SqlxStore as JobStore>::start(&s, interrupted, Utc::now())
+            .await
+            .unwrap();
+        let flipped = <SqlxStore as JobStore>::mark_running_interrupted(&s)
+            .await
+            .unwrap();
+        assert_eq!(flipped, 1);
+        // Finish `success` so we can confirm it's left alone.
+        <SqlxStore as JobStore>::finish(
+            &s,
+            success,
+            JobStatus::Success,
+            Utc::now(),
+            None,
+            None,
+            &crate::records::JobPhaseMetrics::default(),
+        )
+        .await
+        .unwrap();
+
+        let n = <SqlxStore as JobStore>::requeue_interrupted_for_eval(&s, eval_id)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "only the single Interrupted row should be flipped");
+
+        let after = <SqlxStore as JobStore>::get(&s, interrupted)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, JobStatus::Queued);
+        assert!(
+            after.started_at.is_none(),
+            "started_at should be cleared so the resumed dispatch can re-stamp it",
+        );
+
+        let q = <SqlxStore as JobStore>::get(&s, queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.status, JobStatus::Queued, "untouched");
+        let ok = <SqlxStore as JobStore>::get(&s, success)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok.status, JobStatus::Success, "terminal job not touched");
     }
 
     #[tokio::test]

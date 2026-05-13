@@ -163,13 +163,16 @@ pub trait EvalStore: Send + Sync {
     /// landed, row created, but the worker hasn't picked it up yet.
     /// Used at daemon startup to redrive evals the previous instance
     /// died before processing.
-    ///
-    /// Deliberately excludes `Evaluating`/`Building` evals: jobs
-    /// already exist for those, and re-running `process()` would
-    /// re-execute `nix-eval-jobs` and persist a *second* row per
-    /// attr_path (no upsert today). Per-job redrive for
-    /// in-flight evals is a separate, larger change.
     async fn list_queued_ids(&self) -> Result<Vec<EvalId>, StoreError>;
+
+    /// IDs of evaluations that were mid-build when the previous daemon
+    /// instance died — i.e. `status = 'building'`. Their jobs are
+    /// already persisted, so the worker can skip the clone / eval /
+    /// persist phases and pick up the build loop from where it
+    /// stopped. Companion to `JobStore::requeue_interrupted_for_eval`
+    /// which flips this eval's `Interrupted` jobs back to `Queued` so
+    /// the resumed worker actually retries them.
+    async fn list_building_ids(&self) -> Result<Vec<EvalId>, StoreError>;
     /// Up to `limit` evaluations whose row sits in `status`, joined
     /// with their repo for UI display. Ordering: oldest started first
     /// (so a stale `Evaluating` row from a crashed worker floats to
@@ -253,6 +256,15 @@ pub trait JobStore: Send + Sync {
     /// — boot-time interruption is argunix's fault, not the builder's, and
     /// shouldn't push the job toward the per-job retry cap.
     async fn mark_running_interrupted(&self) -> Result<u64, StoreError>;
+
+    /// Crash-recovery companion to `mark_running_interrupted`. Flips
+    /// every `Interrupted` job belonging to `eval_id` back to `Queued`
+    /// and clears its `started_at` so a resumed worker can dispatch it
+    /// from scratch. Returns the number of rows updated. Like
+    /// `mark_running_interrupted`, does NOT touch `interrupt_count`
+    /// — the prior interruption was the daemon dying, not the job
+    /// itself misbehaving.
+    async fn requeue_interrupted_for_eval(&self, eval_id: EvalId) -> Result<u64, StoreError>;
 
     /// Record dispatch of `id` to `builder_id` and stamp `started_at`.
     /// Sets status to `Running` and writes the builder for anti-affinity

@@ -317,93 +317,126 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow!("no provider for forge `{}`", repo.forge))?
         .clone();
 
-    <SqlxStore as EvalStore>::start(&ctx.store, eval_id, Utc::now(), EvalStatus::Evaluating)
-        .await?;
-
+    // Crash-recovery: an eval already in `Building` was mid-build
+    // when the previous daemon died. Jobs are persisted; skip
+    // clone + nix-eval-jobs + persist and pick up the build phase
+    // with whatever the DB still holds. `main.rs` requeued any
+    // `Interrupted` jobs back to `Queued` before redispatching, so
+    // every still-pending job is in `Queued` when we get here.
+    let is_resume = eval.status == EvalStatus::Building;
     let work_dir = ctx.work_dir.join(eval_id.get().to_string());
-    if work_dir.exists() {
-        tokio::fs::remove_dir_all(&work_dir)
-            .await
-            .with_context(|| format!("clearing stale workdir {}", work_dir.display()))?;
-    }
 
-    let clone_url = provider.clone_url(&repo.slug);
-    let clone_fut = clone_repo(&clone_url, &eval.sha, &work_dir, ctx.clone_timeout);
-    tokio::select! {
-        biased;
-        r = clone_fut => r.with_context(|| format!("cloning {} at {}", repo.slug, eval.sha))?,
-        _ = cancel.cancelled() => {
-            tracing::info!("evaluation cancelled during clone");
-            <SqlxStore as EvalStore>::finish(
-                &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
-            ).await?;
-            return Ok(());
-        }
-    };
-
-    if cancel.is_cancelled() {
-        tracing::info!("evaluation cancelled before eval phase");
-        <SqlxStore as EvalStore>::finish(&ctx.store, eval_id, EvalStatus::Cancelled, Utc::now())
+    let persisted: Vec<(argunix_eval::JobSpec, JobId)> = if is_resume {
+        tracing::info!("resuming building evaluation; skipping clone/eval phase");
+        load_jobs_for_resume(&ctx.store, eval_id).await?
+    } else {
+        <SqlxStore as EvalStore>::start(&ctx.store, eval_id, Utc::now(), EvalStatus::Evaluating)
             .await?;
-        return Ok(());
-    }
 
-    // Place nix-eval-jobs' indirect GC roots inside the per-eval
-    // work_dir. work_dir is removed at the end of `run_build_phase`
-    // (after every job in this eval has reached a terminal state), so
-    // the eval-time drv roots naturally release at that point —
-    // successful jobs already hold their own output gcroots by then
-    // (which pin the drv via nix's default `gc-keep-derivations`),
-    // failed/cancelled jobs have nothing to keep. Without these roots
-    // the system nix-gc can reclaim a queued job's drv before the
-    // worker's `nix copy --to` runs, which then fails with "no
-    // substituter that can build it" — the drv is CI-internal and
-    // can't be re-fetched from any cache.
-    let eval_drv_roots = work_dir.join(".eval-drvs");
-    let request = argunix_eval::EvalRequest {
-        source_path: work_dir.clone(),
-        systems: ctx.systems.clone(),
-        outputs: argunix_eval::default_flake_outputs(),
-        timeout: ctx.eval_timeout,
-        gc_roots_dir: Some(eval_drv_roots),
-    };
-    let jobs = tokio::select! {
-        biased;
-        res = argunix_eval::evaluate(&request) => res,
-        _ = cancel.cancelled() => {
-            tracing::info!("evaluation cancelled during nix-eval-jobs");
+        if work_dir.exists() {
+            tokio::fs::remove_dir_all(&work_dir)
+                .await
+                .with_context(|| format!("clearing stale workdir {}", work_dir.display()))?;
+        }
+
+        let clone_url = provider.clone_url(&repo.slug);
+        let clone_fut = clone_repo(&clone_url, &eval.sha, &work_dir, ctx.clone_timeout);
+        tokio::select! {
+            biased;
+            r = clone_fut => r.with_context(|| format!("cloning {} at {}", repo.slug, eval.sha))?,
+            _ = cancel.cancelled() => {
+                tracing::info!("evaluation cancelled during clone");
+                <SqlxStore as EvalStore>::finish(
+                    &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
+                ).await?;
+                return Ok(());
+            }
+        };
+
+        if cancel.is_cancelled() {
+            tracing::info!("evaluation cancelled before eval phase");
             <SqlxStore as EvalStore>::finish(
-                &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
-            ).await?;
+                &ctx.store,
+                eval_id,
+                EvalStatus::Cancelled,
+                Utc::now(),
+            )
+            .await?;
             return Ok(());
         }
-    };
-    let jobs = match jobs {
-        Ok(jobs) => jobs,
-        Err(e) => {
-            // Surface eval-time failure as a single failed forge
-            // check. Github's status `description` field is capped at
-            // 140 chars, so we truncate the (often multi-line)
-            // nix-eval-jobs error before posting. The eval row's
-            // status + `failure_reason` are written by the worker's
-            // outer error trap (see `spawn_worker`) using the full
-            // chained error, so the UI gets the unsummarised text.
-            let detail = summarise_for_check(&e.to_string(), 130);
-            post_overall_check(
-                ctx,
-                &provider,
-                &repo.forge,
-                &repo.slug,
-                &eval.sha,
-                eval_id,
-                CheckState::Failure,
-                &format!("evaluation failed: {detail}"),
-            );
-            return Err(anyhow::Error::from(e).context("evaluation failed"));
+
+        // Place nix-eval-jobs' indirect GC roots inside the per-eval
+        // work_dir. work_dir is removed at the end of `run_build_phase`
+        // (after every job in this eval has reached a terminal state), so
+        // the eval-time drv roots naturally release at that point —
+        // successful jobs already hold their own output gcroots by then
+        // (which pin the drv via nix's default `gc-keep-derivations`),
+        // failed/cancelled jobs have nothing to keep. Without these roots
+        // the system nix-gc can reclaim a queued job's drv before the
+        // worker's `nix copy --to` runs, which then fails with "no
+        // substituter that can build it" — the drv is CI-internal and
+        // can't be re-fetched from any cache.
+        let eval_drv_roots = work_dir.join(".eval-drvs");
+        let request = argunix_eval::EvalRequest {
+            source_path: work_dir.clone(),
+            systems: ctx.systems.clone(),
+            outputs: argunix_eval::default_flake_outputs(),
+            timeout: ctx.eval_timeout,
+            gc_roots_dir: Some(eval_drv_roots),
+        };
+        let jobs = tokio::select! {
+            biased;
+            res = argunix_eval::evaluate(&request) => res,
+            _ = cancel.cancelled() => {
+                tracing::info!("evaluation cancelled during nix-eval-jobs");
+                <SqlxStore as EvalStore>::finish(
+                    &ctx.store, eval_id, EvalStatus::Cancelled, Utc::now()
+                ).await?;
+                return Ok(());
+            }
+        };
+        let jobs = match jobs {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                // Surface eval-time failure as a single failed forge
+                // check. Github's status `description` field is capped at
+                // 140 chars, so we truncate the (often multi-line)
+                // nix-eval-jobs error before posting. The eval row's
+                // status + `failure_reason` are written by the worker's
+                // outer error trap (see `spawn_worker`) using the full
+                // chained error, so the UI gets the unsummarised text.
+                let detail = summarise_for_check(&e.to_string(), 130);
+                post_overall_check(
+                    ctx,
+                    &provider,
+                    &repo.forge,
+                    &repo.slug,
+                    &eval.sha,
+                    eval_id,
+                    CheckState::Failure,
+                    &format!("evaluation failed: {detail}"),
+                );
+                return Err(anyhow::Error::from(e).context("evaluation failed"));
+            }
+        };
+        <SqlxStore as EvalStore>::mark_building(&ctx.store, eval_id, Utc::now()).await?;
+        tracing::info!(count = jobs.len(), "evaluation finished");
+
+        // Persist every job spec to the DB *before* starting the build
+        // loop. Without this, the read-only UI's job table grows row by
+        // row as the worker iterates, and a user looking at an in-flight
+        // evaluation can't tell whether the rows currently shown are the
+        // final list or whether more are still to come. With upfront
+        // persistence, the table reflects the final shape as soon as the
+        // eval transitions to `Building`, and the eval's status field is
+        // the single source of truth for "is anything still pending?".
+        let mut persisted: Vec<(argunix_eval::JobSpec, JobId)> = Vec::with_capacity(jobs.len());
+        for spec in jobs {
+            let job_id = persist_job(&ctx.store, &ctx.log_dir, repo.id, eval_id, &spec).await?;
+            persisted.push((spec, job_id));
         }
+        persisted
     };
-    <SqlxStore as EvalStore>::mark_building(&ctx.store, eval_id, Utc::now()).await?;
-    tracing::info!(count = jobs.len(), "evaluation finished");
 
     let caches: Vec<argunix_build::CacheRef> = snap
         .config
@@ -431,7 +464,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     let threshold = repo_cfg
         .and_then(|r| r.collapsed_check_threshold)
         .unwrap_or(snap.config.schedule.collapsed_check_threshold);
-    let total = jobs.len();
+    let total = persisted.len();
     let collapsed_mode = total as u32 > threshold;
     if collapsed_mode {
         tracing::info!(
@@ -439,20 +472,6 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             threshold,
             "collapsed check mode active; per-job statuses suppressed",
         );
-    }
-
-    // Persist every job spec to the DB *before* starting the build
-    // loop. Without this, the read-only UI's job table grows row by
-    // row as the worker iterates, and a user looking at an in-flight
-    // evaluation can't tell whether the rows currently shown are the
-    // final list or whether more are still to come. With upfront
-    // persistence, the table reflects the final shape as soon as the
-    // eval transitions to `Building`, and the eval's status field is
-    // the single source of truth for "is anything still pending?".
-    let mut persisted: Vec<(argunix_eval::JobSpec, JobId)> = Vec::with_capacity(jobs.len());
-    for spec in jobs {
-        let job_id = persist_job(&ctx.store, &ctx.log_dir, repo.id, eval_id, &spec).await?;
-        persisted.push((spec, job_id));
     }
 
     // Walk the dependency closures of every top-level Job's drv so the
@@ -516,8 +535,12 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     // matrix of `argunix: <attr>` rows on the commit page immediately,
     // each in the "queued" state, rather than rows blinking into
     // existence one by one as builds finish. Skipped in collapsed
-    // mode where per-job checks are entirely suppressed.
-    if !collapsed_mode {
+    // mode where per-job checks are entirely suppressed. Also skipped
+    // on resume — the previous instance already posted them, and the
+    // jobs left to run are a subset of the original set, so re-posting
+    // "pending" for the already-finished ones would be a regression on
+    // the forge UI.
+    if !collapsed_mode && !is_resume {
         for (spec, _) in &persisted {
             post_per_job_check_pending(
                 ctx,
@@ -967,8 +990,13 @@ async fn run_build_phase(
         &description,
     );
 
-    if let Err(e) = tokio::fs::remove_dir_all(&work_dir).await {
-        tracing::warn!(error = %e, dir = %work_dir.display(), "failed to clean workdir");
+    // On crash-resume the workdir may not exist (the previous instance
+    // already removed it, or never created it). The existence guard
+    // keeps the cleanup quiet in that case.
+    if work_dir.exists() {
+        if let Err(e) = tokio::fs::remove_dir_all(&work_dir).await {
+            tracing::warn!(error = %e, dir = %work_dir.display(), "failed to clean workdir");
+        }
     }
     Ok(())
 }
@@ -1374,6 +1402,50 @@ fn spawn_post_check(
             }
         }
     });
+}
+
+/// Reconstruct the worker's `Vec<(JobSpec, JobId)>` from the DB rows
+/// for an evaluation that was already `Building` on the previous
+/// daemon instance. Only jobs still in `Queued` are returned — any
+/// terminal job (success/failure/cached/cancelled) from before the
+/// crash is left alone. `Interrupted` jobs are expected to have been
+/// flipped back to `Queued` by `main.rs`'s resume pass before this is
+/// reached.
+///
+/// The reconstructed `JobSpec` loses the original `outputs` map and
+/// `required_system_features` — those weren't persisted to the jobs
+/// table. The consequence: the resumed build will miss the cache-skip
+/// shortcut (no `primary_output` to query a binary cache for) and
+/// won't see required-feature pre-flight. Both are acceptable on
+/// crash recovery: cache-miss costs a re-build (correct result, just
+/// slower), and a feature mismatch surfaces as a normal nix build
+/// failure rather than a fast-fail.
+async fn load_jobs_for_resume(
+    store: &SqlxStore,
+    eval_id: EvalId,
+) -> anyhow::Result<Vec<(argunix_eval::JobSpec, JobId)>> {
+    use argunix_domain::AttrPath;
+    let rows = <SqlxStore as JobStore>::list_by_eval(store, eval_id)
+        .await
+        .with_context(|| format!("loading jobs for resumed eval {}", eval_id.get()))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.status != JobStatus::Queued {
+            continue;
+        }
+        let spec = argunix_eval::JobSpec {
+            attr_path: AttrPath::new(row.attr_path.as_str().to_string()),
+            drv_path: row.drv_path.clone(),
+            system: Some(row.system.clone()),
+            error: None,
+            outputs: std::collections::BTreeMap::new(),
+            meta: serde_json::Value::Null,
+            is_cached: false,
+            required_system_features: Vec::new(),
+        };
+        out.push((spec, row.id));
+    }
+    Ok(out)
 }
 
 async fn persist_job(

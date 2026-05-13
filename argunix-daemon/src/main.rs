@@ -291,12 +291,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let worker_handle = worker::spawn(worker_ctx, rx);
 
     // Redrive `Queued` evaluations the previous instance never
-    // started processing. We deliberately do NOT redrive
-    // `Evaluating`/`Building` evals here: jobs already exist for
-    // those, and re-running `process()` would re-execute
-    // `nix-eval-jobs` and `persist_job` for every spec, duplicating
-    // every job row for the eval. Per-job redispatch for in-flight
-    // evals is a separate, larger change.
+    // started processing.
     match <argunix_store::SqlxStore as EvalStore>::list_queued_ids(&store).await {
         Ok(ids) if !ids.is_empty() => {
             tracing::info!(
@@ -311,6 +306,49 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "could not list queued evaluations at startup"),
+    }
+
+    // Resume `Building` evaluations that were mid-build when the
+    // previous daemon instance died. Their jobs are already persisted
+    // — the just-completed `mark_running_interrupted` pass flipped any
+    // jobs that were `Running` to `Interrupted`. We requeue those
+    // `Interrupted` jobs back to `Queued` and hand the eval to the
+    // worker, which detects the already-`Building` state and skips
+    // the clone/eval/persist phase.
+    match <argunix_store::SqlxStore as EvalStore>::list_building_ids(&store).await {
+        Ok(ids) if !ids.is_empty() => {
+            tracing::info!(
+                count = ids.len(),
+                "resuming building evaluations from prior run"
+            );
+            for id in ids {
+                match <argunix_store::SqlxStore as JobStore>::requeue_interrupted_for_eval(
+                    &store, id,
+                )
+                .await
+                {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::info!(
+                                eval_id = id.get(),
+                                requeued = n,
+                                "requeued interrupted jobs for resumed eval"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        eval_id = id.get(),
+                        "failed to requeue interrupted jobs",
+                    ),
+                }
+                if let Err(e) = tx.send(id) {
+                    tracing::warn!(error = %e, "failed to enqueue eval for resume");
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "could not list building evaluations at startup"),
     }
 
     let listen = args
