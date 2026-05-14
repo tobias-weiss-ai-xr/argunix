@@ -216,6 +216,70 @@ To retire a builder, run `argunixctl builders revoke <name>` on
 the argunix host; the agent's pubkey is invalidated and it falls
 back to needing a fresh enrollment token to re-join.
 
+### 5. (Optional) Publish builds to a binary cache
+
+argunix can sign and push every successful build's output closure
+to one or more binary caches, so the team substitutes from them
+instead of rebuilding locally. The push fires on the coordinator
+right after the output is pulled back from the builder, so a
+multi-builder deployment only needs the signing key + storage
+credentials in one place — see
+[docs/concepts/cache-push.md](docs/concepts/cache-push.md).
+
+**1. Generate a signing key** and drop the secret half where the
+`argunix` user can read it:
+
+```sh
+nix --extra-experimental-features 'nix-command' \
+  key generate-secret --key-name ci.example.com \
+  | install -m 0400 -o argunix -g argunix /dev/stdin \
+    /var/lib/argunix-credentials/cache/secret
+nix --extra-experimental-features 'nix-command' \
+  key convert-secret-to-public \
+  < /var/lib/argunix-credentials/cache/secret \
+  > /var/lib/argunix-credentials/cache/public
+```
+
+The contents of `…/cache/public` is what users put in their
+`nix.settings.trusted-public-keys`.
+
+**2. Point argunix at the cache.** For an S3-compatible backend
+(real S3, Garage, MinIO, …), the push URL is the write endpoint;
+`public_url` is the URL users will read from (typically a CDN or
+the public gateway). Symmetric backends (cachix, attic, plain
+`file://`) leave `public_url` unset.
+
+```nix
+{
+  services.argunix.settings.binary_caches = [
+    {
+      push_url = "s3://my-cache?endpoint=https://s3.example.com&region=eu-central-1";
+      public_url = "https://cache.example.com";
+      signing_key_path = "/var/lib/argunix-credentials/cache/secret";
+    }
+  ];
+
+  # AWS-style credentials reach `nix copy --to s3://…` via the
+  # daemon's environment. The file is a standard credentials INI
+  # block (`[default]\naws_access_key_id=…\naws_secret_access_key=…`).
+  systemd.services.argunix.serviceConfig.EnvironmentFile =
+    "/var/lib/argunix-credentials/cache/s3-credentials";
+}
+```
+
+After `nixos-rebuild switch`, the next successful build pushes
+its closure to the cache. Push failures are logged and the job
+stays `Success` — argunix never fails a build because a cache
+hiccupped.
+
+**3. Have users read from the cache.** Drop these two lines into
+the team's `nix.conf` (or its NixOS equivalent):
+
+```
+substituters = https://cache.example.com https://cache.nixos.org
+trusted-public-keys = ci.example.com:<contents-of-cache/public> cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+```
+
 ## For Hydra and Botanix users
 
 argunix occupies the same problem space as
