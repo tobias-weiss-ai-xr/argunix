@@ -34,6 +34,9 @@
 { pkgs, ... }:
 
 let
+  argunixPort = 8080;
+  fakeForgePort = 8081;
+
   githubToken = pkgs.writeText "argunix-crash-recovery-token" "tok";
 
   # Persistent across reboot, owned by `argunix`, *outside* the
@@ -158,11 +161,12 @@ let
             self.wfile.write(json.dumps(payload).encode())
         def log_message(self, *_a):
             pass
-    srv = http.server.HTTPServer(("127.0.0.1", 8081), H)
-    print("fake-forge listening on 127.0.0.1:8081", flush=True)
+    srv = http.server.HTTPServer(("127.0.0.1", ${toString fakeForgePort}), H)
+    print("fake-forge listening on 127.0.0.1:${toString fakeForgePort}", flush=True)
     sys.stdout.flush()
     srv.serve_forever()
   '';
+
 in
 {
   name = "argunix-crash-recovery";
@@ -172,18 +176,18 @@ in
   };
 
   nodes.machine =
-    { lib, ... }:
+    { pkgs, lib, ... }:
     {
       imports = [ ../module.nix ];
 
       services.argunix = {
         enable = true;
-        listen = "127.0.0.1:8080";
+        listen = "127.0.0.1:${toString argunixPort}";
         settings = {
           external_url = "https://argunix.example.com";
           forges.gh = {
             kind = "github";
-            web_url = "http://127.0.0.1:8081";
+            web_url = "http://127.0.0.1:${toString fakeForgePort}";
             token_path = "${githubToken}";
             repos."myorg/myrepo" = { };
           };
@@ -227,7 +231,7 @@ in
         wantedBy = [ "multi-user.target" ];
         before = [ "argunix.service" ];
         serviceConfig = {
-          ExecStart = "${pkgs.python3}/bin/python3 ${fakeForgePy}";
+          ExecStart = "${lib.getExe pkgs.python3} ${fakeForgePy}";
           Restart = "on-failure";
           RestartSec = 1;
         };
@@ -246,8 +250,8 @@ in
     machine.start()
     machine.wait_for_unit("fake-forge.service")
     machine.wait_for_unit("argunix.service")
-    machine.wait_for_open_port(8080)
-    machine.wait_for_open_port(8081)
+    machine.wait_for_open_port(${toString argunixPort})
+    machine.wait_for_open_port(${toString fakeForgePort})
 
     db = "/var/lib/argunix/db.sqlite"
 
@@ -274,7 +278,7 @@ in
 
     code = machine.succeed(
         "curl -s -o /tmp/resp -w '%{http_code}'"
-        " -X POST http://127.0.0.1:8080/webhook/github"
+        " -X POST http://127.0.0.1:${toString argunixPort}/webhook/github"
         " -H 'Content-Type: application/json'"
         " -H 'X-GitHub-Event: push'"
         f" -H 'X-Hub-Signature-256: {sig}'"
@@ -312,7 +316,7 @@ in
     machine.start()
     machine.wait_for_unit("fake-forge.service")
     machine.wait_for_unit("argunix.service")
-    machine.wait_for_open_port(8080)
+    machine.wait_for_open_port(${toString argunixPort})
 
     # After reboot the daemon's startup runs `mark_running_interrupted`
     # (Running → Interrupted), then the resume pass flips that job
