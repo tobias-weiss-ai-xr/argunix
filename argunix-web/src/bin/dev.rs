@@ -59,6 +59,24 @@ forges:
     repos:
       ops/infra:
         watched_branches: [main]
+# Three cache entries so /caches renders all the interesting cells:
+#   - asymmetric S3 + CDN (full snippets)
+#   - symmetric cachix-style (full snippets, public_url == push_url)
+#   - file:// with no public_url (the "incomplete" hint path).
+# `signing_key_path` points at /dev/null because the dev binary never
+# actually runs `nix copy`; the field is only on disk to satisfy
+# `validate_secrets_exist`, which the dev binary doesn't call anyway.
+binary_caches:
+  - push_url: s3://argunix-cache?endpoint=https://s3.example.com&region=eu-central-1
+    public_url: https://cache.example.com
+    public_key: argunix-example.com:abcdefGHIJklMNOpqrstUVWXYZ0123456789abcdefGHIJk=
+    signing_key_path: /dev/null
+  - push_url: https://argunix.cachix.org
+    public_url: https://argunix.cachix.org
+    public_key: argunix.cachix.org-1:ZZZZ1234567890abcdefGHIJklMNOpqrstUVWXYZ0123abc=
+    signing_key_path: /dev/null
+  - push_url: file:///srv/argunix-local-cache
+    signing_key_path: /dev/null
 "#;
 
 #[tokio::main]
@@ -141,6 +159,8 @@ async fn main() -> anyhow::Result<()> {
     println!("argunix dev UI listening on http://{local}/");
     println!("    /            – cluster status (htmx-polled)");
     println!("    /repos       – repos overview");
+    println!("    /hosts       – coordinator + builders");
+    println!("    /caches      – binary caches + substituter snippets");
     println!("    /r/gh/argunix/argunix");
     println!("    /r/gh/acme/widgets");
     println!("    /r/fj/ops/infra");

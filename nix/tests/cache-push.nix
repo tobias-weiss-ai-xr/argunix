@@ -104,28 +104,34 @@ let
     EOF
   '';
 
-  testConfig = (pkgs.formats.yaml { }).generate "argunix-test.yaml" {
-    external_url = "https://argunix.example.com";
-    forges.gh = {
-      kind = "github";
-      web_url = "https://github.com";
-      token_path = "${githubToken}";
-      repos."myorg/myrepo" = { };
-    };
-    binary_caches = [
-      # Asymmetric S3 cache.
-      {
-        push_url = s3CachePushUrl;
-        public_url = s3CachePublicUrl;
-        signing_key_path = "${signingKeys}/secret";
-      }
-      # Symmetric local file cache — no `public_url`.
-      {
-        push_url = localCacheUrl;
-        signing_key_path = "${signingKeys}/secret";
-      }
-    ];
-  };
+  # The public key is generated inside `signingKeys` at build time,
+  # so we splice its contents into the YAML at build time too —
+  # `pkgs.formats.yaml.generate` would need the literal string at
+  # Nix-eval time, which is too early.
+  testConfig = pkgs.runCommand "argunix-test.yaml" { } ''
+    pub=$(cat ${signingKeys}/public)
+    cat > $out <<EOF
+    external_url: https://argunix.example.com
+    forges:
+      gh:
+        kind: github
+        web_url: https://github.com
+        token_path: ${githubToken}
+        repos:
+          myorg/myrepo: {}
+    binary_caches:
+      # Asymmetric S3 cache. `public_url` + `public_key` together
+      # unlock the copy-pasteable substituter snippets on /caches.
+      - push_url: ${s3CachePushUrl}
+        public_url: ${s3CachePublicUrl}
+        public_key: $pub
+        signing_key_path: ${signingKeys}/secret
+      # Symmetric local file cache — no `public_url`. The /caches
+      # page renders this as "incomplete" with a hint.
+      - push_url: ${localCacheUrl}
+        signing_key_path: ${signingKeys}/secret
+    EOF
+  '';
 in
 {
   name = "argunix-cache-push";
@@ -245,6 +251,51 @@ in
     )
     machine.succeed(
         "grep -q 'push_url: ${localCacheUrl}' ${testConfig}"
+    )
+
+    # The /caches page is user-facing: only fully-configured
+    # caches (public_url + public_key) appear in the main list,
+    # with the three substituter snippets. Push-only entries are
+    # hidden from the consumer view and surface as a single
+    # operator note at the bottom.
+    caches_html = machine.succeed(
+        "curl -fsS http://127.0.0.1:${toString argunixPort}/caches"
+    )
+    pubkey = machine.succeed("cat ${signingKeys}/public").strip()
+    print(f"trusted-public-key: {pubkey}")
+    assert "${s3CachePublicUrl}" in caches_html, (
+        f"expected s3 public_url to appear on /caches, got: {caches_html[:500]!r}"
+    )
+    assert pubkey in caches_html, (
+        f"expected public_key {pubkey!r} on /caches"
+    )
+    assert "extra-substituters" in caches_html, (
+        "expected substituter snippets in the rendered /caches HTML"
+    )
+    assert "nixConfig" in caches_html, (
+        "expected the flake nixConfig snippet on /caches"
+    )
+    assert "nix.settings" in caches_html, (
+        "expected the NixOS nix.settings snippet on /caches"
+    )
+
+    # Privacy regression guard: push URLs (potentially carrying
+    # credentials or pointing at private endpoints) must NEVER
+    # render on the user-facing /caches page.
+    assert "${s3CachePushUrl}" not in caches_html, (
+        "push_url must not appear on /caches — that's an "
+        "operator-internal endpoint"
+    )
+    assert "${localCacheUrl}" not in caches_html, (
+        "push_url must not appear on /caches — that's an "
+        "operator-internal endpoint"
+    )
+
+    # The file:// entry has no public_url → it must be hidden
+    # from the user list and surface only via the operator
+    # summary line.
+    assert "configured for push but not for public consumption" in caches_html, (
+        "expected operator summary line for the push-only cache"
     )
 
     # Drive a real eval+build+push through the single-shot CLI.

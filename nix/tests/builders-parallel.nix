@@ -531,15 +531,19 @@ in
       #
       # Floor is `sleep_secs` once both builders are saturated; in
       # practice nix copy + closure walks add several seconds per build.
-      # We bound the wait tightly so a wedged dispatch path fails fast
-      # rather than burning the test driver's wall clock — and print a
-      # diagnostic snapshot every few seconds so an interactive run
-      # shows what's actually happening between webhook and completion.
+      # The deadline budget is split across two pessimistic-but-plausible
+      # waves of `sleep_secs` each plus a generous base for VM startup,
+      # dispatch routing, and closure transfer under load. Picked
+      # large enough that a heavily-loaded test host doesn't flake
+      # (observed wall clock under nominal conditions is ~40s; we've
+      # seen 150s+ on busy CI machines) yet still tight enough that
+      # a genuinely wedged dispatch path surfaces within a few minutes
+      # rather than burning the full test-driver wall clock.
       peak = {"b1": 0, "b2": 0}
       saw_both_saturated = False
       done = 0
       with subtest("poll until all jobs reach a terminal status"):
-          overall_deadline = time.monotonic() + sleep_secs + 120
+          overall_deadline = time.monotonic() + 4 * sleep_secs + 120
           last_diag = 0.0
           while time.monotonic() < overall_deadline:
               bs = builders_json()

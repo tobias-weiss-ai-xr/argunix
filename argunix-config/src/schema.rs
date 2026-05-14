@@ -324,17 +324,22 @@ impl ForgeConfig {
 /// Symmetric backends (cachix, file://, attic) leave `public_url`
 /// unset.
 ///
-/// Argunix doesn't currently *use* `public_url` for any subprocess
-/// — system-wide `nix.settings.substituters` already handles read /
-/// substitution on the host, so the field is here for the
-/// upcoming UI / `argunixctl cache snippet` surfaces, not for the
-/// push pipeline.
+/// Argunix doesn't *use* `public_url` or `public_key` for any
+/// subprocess — system-wide `nix.settings.substituters` handles
+/// read / substitution on the host. Both fields exist so the
+/// `/caches` page can render copy-pasteable snippets (flake
+/// `nixConfig`, NixOS `nix.settings`, plain `nix.conf`) without
+/// reading the signing key file at request time. The operator
+/// derives `public_key` once via
+/// `nix key convert-secret-to-public < secret`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BinaryCache {
     pub push_url: String,
     #[serde(default)]
     pub public_url: Option<String>,
+    #[serde(default)]
+    pub public_key: Option<String>,
     pub signing_key_path: SecretFile,
 }
 

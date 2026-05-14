@@ -10,6 +10,7 @@ from those caches instead of rebuilding locally.
 binary_caches:
   - push_url: s3://my-cache?endpoint=https://s3.example.com&region=eu-central-1
     public_url: https://cache.example.com # optional, see below
+    public_key: ci.example.com:abc123… # optional, paired with public_url
     signing_key_path: /var/lib/argunix-credentials/cache/secret
   - push_url: file:///srv/argunix-cache
     signing_key_path: /var/lib/argunix-credentials/cache/secret
@@ -20,10 +21,14 @@ binary_caches:
   `file://`, `https://<name>.cachix.org`, attic's store URI, …
 - **`public_url`** is the URL users put in their `nix.conf`.
   Asymmetric backends (S3 push + CDN read) have it; symmetric
-  ones (cachix, attic, file://) leave it unset. Today it's
-  informational only — surfaced in the UI / `argunixctl cache`
-  snippet, not consumed by the push pipeline.
-- **`signing_key_path`** is a nix-format secret key (the kind
+  ones (cachix, attic, file://) leave it unset.
+- **`public_key`** is the verbatim `<name>:<base64>` public-key
+  line users add to `trusted-public-keys`. Derive it once via
+  `nix key convert-secret-to-public < signing-key > public`; both
+  fields together let the `/caches` page render copy-pasteable
+  substituter snippets without argunix ever reading the secret
+  file at request time.
+- **`signing_key_path`** is the nix-format secret key (the kind
   `nix key generate-secret` produces). The path is handed to
   `nix copy` via the `secret-key=` query param so the upload is
   signed at write time; clients reject the substitution unless
@@ -129,6 +134,18 @@ eval-time `is_cached` flag from
 [`nix-eval-jobs --check-cache-status`](https://github.com/nix-community/nix-eval-jobs)
 already consults the host's substituters and short-circuits
 already-cached jobs before any builder dispatch.
+
+## The /caches page
+
+When `public_url` and `public_key` are both set on an entry, the
+`/caches` page renders three copy-pasteable substituter snippets
+per cache: one for a flake's `nixConfig`, one for a NixOS module,
+one for a plain `nix.conf`. Send users the URL and they pick the
+form that matches where they consume the flake.
+
+Entries missing `public_url` or `public_key` still appear (so an
+operator sees what's configured) but are tagged "incomplete" with
+a hint on which field to set.
 
 ## Where it lives
 

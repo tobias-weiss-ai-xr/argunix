@@ -48,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .route("/_/status", get(ui::status_fragment))
         .route("/repos", get(ui::index))
         .route("/hosts", get(ui::hosts))
+        .route("/caches", get(ui::caches))
         .route("/healthz", get(healthz))
         .route("/r/{forge}/{*tail}", get(ui::dispatch_repo))
         .route("/badge/{forge}/{*tail}", get(badge::handle))

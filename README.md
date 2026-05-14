@@ -246,7 +246,9 @@ The contents of `…/cache/public` is what users put in their
 **2. Point argunix at the cache.** For an S3-compatible backend
 (real S3, Garage, MinIO, …), the push URL is the write endpoint;
 `public_url` is the URL users will read from (typically a CDN or
-the public gateway). Symmetric backends (cachix, attic, plain
+the public gateway). `public_key` is what you generated in step 1
+— argunix never reads the secret half at request time, so this
+must be set explicitly. Symmetric backends (cachix, attic, plain
 `file://`) leave `public_url` unset.
 
 ```nix
@@ -255,6 +257,7 @@ the public gateway). Symmetric backends (cachix, attic, plain
     {
       push_url = "s3://my-cache?endpoint=https://s3.example.com&region=eu-central-1";
       public_url = "https://cache.example.com";
+      public_key = "ci.example.com:<contents-of-cache/public>";
       signing_key_path = "/var/lib/argunix-credentials/cache/secret";
     }
   ];
@@ -272,13 +275,12 @@ its closure to the cache. Push failures are logged and the job
 stays `Success` — argunix never fails a build because a cache
 hiccupped.
 
-**3. Have users read from the cache.** Drop these two lines into
-the team's `nix.conf` (or its NixOS equivalent):
-
-```
-substituters = https://cache.example.com https://cache.nixos.org
-trusted-public-keys = ci.example.com:<contents-of-cache/public> cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
-```
+**3. Hand users the substituter snippet.** Once `public_url` and
+`public_key` are set, the argunix instance renders ready-to-paste
+snippets at `https://<your-deploy>/caches` — one for adding the
+cache to a flake's `nixConfig`, one for a NixOS module, and one
+for a plain `nix.conf` on macOS / generic Linux / WSL. Send users
+the URL or the snippet they need.
 
 ## For Hydra and Botanix users
 

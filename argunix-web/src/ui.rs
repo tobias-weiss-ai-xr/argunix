@@ -516,6 +516,90 @@ pub async fn hosts(State(state): State<AppState>) -> Result<Html<String>, UiErro
     })?))
 }
 
+#[derive(Template)]
+#[template(path = "caches.html")]
+struct CachesTemplate {
+    /// `base.html` reads this to drive the header logo's spin
+    /// animation. The cache page has no notion of "cluster busy",
+    /// so always false — the spinner stays quiet on this page even
+    /// when builds are running. The status / hosts pages remain the
+    /// place to look for live activity.
+    cluster_active: bool,
+    /// Caches users can actually consume — every entry has
+    /// `public_url` + `public_key`, so each carries pre-rendered
+    /// snippets the template drops verbatim into copy buttons.
+    public_caches: Vec<PublicCacheRow>,
+    /// How many entries argunix pushes to that *cannot* be
+    /// advertised to users yet (missing `public_url` or
+    /// `public_key`). Rendered as a single operator-facing
+    /// reminder line at the bottom, with no per-cache detail —
+    /// this page is for users, not for diagnosing the YAML.
+    incomplete_count: usize,
+}
+
+/// User-facing view of one fully-configured cache. `push_url` is
+/// deliberately absent — that's an operator-internal endpoint
+/// (often carrying credentials or pointing at a private S3 host)
+/// and has no business on a page consumers might forward links to.
+struct PublicCacheRow {
+    public_url: String,
+    public_key: String,
+    /// `nixConfig` block to paste at the top of a `flake.nix`.
+    flake_snippet: String,
+    /// `nix.settings` block for a NixOS module.
+    nixos_snippet: String,
+    /// Plain `nix.conf` lines for non-NixOS hosts
+    /// (`~/.config/nix/nix.conf` or `/etc/nix/nix.conf`).
+    nix_conf_snippet: String,
+}
+
+/// `GET /caches` — list configured binary caches with copy-pasteable
+/// substituter snippets so end-users can opt into the cache from a
+/// flake, a NixOS config, or a plain `nix.conf`. Entries that lack
+/// the public-side fields needed to render those snippets are
+/// hidden from the main list and summarised as a count at the
+/// bottom for the operator's eyes only.
+pub async fn caches(State(state): State<AppState>) -> Result<Html<String>, UiError> {
+    let snap = state.current.load_full();
+    let mut public_caches = Vec::new();
+    let mut incomplete_count = 0usize;
+    for c in &snap.config.binary_caches {
+        match (c.public_url.as_deref(), c.public_key.as_deref()) {
+            (Some(url), Some(key)) => {
+                public_caches.push(PublicCacheRow {
+                    public_url: url.to_string(),
+                    public_key: key.to_string(),
+                    flake_snippet: render_flake_snippet(url, key),
+                    nixos_snippet: render_nixos_snippet(url, key),
+                    nix_conf_snippet: render_nix_conf_snippet(url, key),
+                });
+            }
+            _ => incomplete_count += 1,
+        }
+    }
+    Ok(Html(render(&CachesTemplate {
+        cluster_active: false,
+        public_caches,
+        incomplete_count,
+    })?))
+}
+
+fn render_flake_snippet(public_url: &str, public_key: &str) -> String {
+    format!(
+        "{{\n  nixConfig = {{\n    extra-substituters = [ \"{public_url}\" ];\n    extra-trusted-public-keys = [ \"{public_key}\" ];\n  }};\n\n  # ... rest of your flake ...\n}}"
+    )
+}
+
+fn render_nixos_snippet(public_url: &str, public_key: &str) -> String {
+    format!(
+        "{{\n  nix.settings = {{\n    extra-substituters = [ \"{public_url}\" ];\n    extra-trusted-public-keys = [ \"{public_key}\" ];\n  }};\n}}"
+    )
+}
+
+fn render_nix_conf_snippet(public_url: &str, public_key: &str) -> String {
+    format!("extra-substituters = {public_url}\nextra-trusted-public-keys = {public_key}")
+}
+
 fn build_coordinator_row(state: &AppState) -> CoordinatorRow {
     let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())

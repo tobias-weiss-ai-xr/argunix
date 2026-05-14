@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block title %}cache — argunix{% endblock %}
+{% block content %}
+<div class="flex items-baseline justify-between mb-4 flex-wrap gap-2">
+  <h1 class="text-2xl font-semibold">Cache</h1>
+  <p class="text-sm text-muted">
+    {{ public_caches.len() }} available
+  </p>
+</div>
+
+{% if public_caches.is_empty() %}
+<p class="text-muted">
+  No public caches are advertised by this argunix instance yet.
+  Ask the operator to set <code class="text-xs font-mono">public_url</code>
+  and <code class="text-xs font-mono">public_key</code> on a
+  <code class="text-xs font-mono">binary_caches</code> entry.
+</p>
+{% else %}
+<p class="text-sm text-muted mb-6">
+  Builds produced by this argunix instance are signed and uploaded
+  to the caches below. Add them to your nix configuration to
+  substitute the artifacts instead of rebuilding from source —
+  pick the snippet that matches where you consume the flake.
+</p>
+
+<div class="flex flex-col gap-6">
+  {% for c in public_caches %}
+  <article class="rounded border border-border bg-surface p-4 flex flex-col gap-4">
+    <header class="flex flex-col gap-1">
+      <h2 class="text-base font-semibold break-all">{{ c.public_url }}</h2>
+      <div class="text-xs text-muted truncate" title="{{ c.public_key }}">
+        public-key: <code class="font-mono text-fg">{{ c.public_key }}</code>
+      </div>
+    </header>
+
+    <section class="flex flex-col gap-2">
+      <div class="flex items-baseline justify-between gap-2 flex-wrap">
+        <h3 class="text-sm font-semibold">Flake — paste into your <code class="font-mono">flake.nix</code></h3>
+        <button
+          type="button"
+          class="px-3 py-1 rounded border border-border text-xs hover:border-link"
+          data-copy-target="snippet-flake-{{ loop.index }}"
+        >copy</button>
+      </div>
+      <p class="text-xs text-muted">
+        Anyone running <code class="font-mono">nix build</code> /
+        <code class="font-mono">nix develop</code> against your flake
+        gets the cache offered automatically (subject to the user
+        accepting <code class="font-mono">nixConfig</code>).
+      </p>
+      <pre
+        id="snippet-flake-{{ loop.index }}"
+        class="font-mono text-xs whitespace-pre-wrap break-all px-3 py-2 rounded border border-border bg-bg text-fg overflow-x-auto"
+      >{{ c.flake_snippet }}</pre>
+    </section>
+
+    <section class="flex flex-col gap-2">
+      <div class="flex items-baseline justify-between gap-2 flex-wrap">
+        <h3 class="text-sm font-semibold">NixOS — drop into any module</h3>
+        <button
+          type="button"
+          class="px-3 py-1 rounded border border-border text-xs hover:border-link"
+          data-copy-target="snippet-nixos-{{ loop.index }}"
+        >copy</button>
+      </div>
+      <p class="text-xs text-muted">
+        Applies system-wide on <code class="font-mono">nixos-rebuild switch</code>.
+        Persists across nix invocations and across users.
+      </p>
+      <pre
+        id="snippet-nixos-{{ loop.index }}"
+        class="font-mono text-xs whitespace-pre-wrap break-all px-3 py-2 rounded border border-border bg-bg text-fg overflow-x-auto"
+      >{{ c.nixos_snippet }}</pre>
+    </section>
+
+    <section class="flex flex-col gap-2">
+      <div class="flex items-baseline justify-between gap-2 flex-wrap">
+        <h3 class="text-sm font-semibold">Non-NixOS — <code class="font-mono">~/.config/nix/nix.conf</code> (or <code class="font-mono">/etc/nix/nix.conf</code>)</h3>
+        <button
+          type="button"
+          class="px-3 py-1 rounded border border-border text-xs hover:border-link"
+          data-copy-target="snippet-conf-{{ loop.index }}"
+        >copy</button>
+      </div>
+      <p class="text-xs text-muted">
+        For any host with nix installed: macOS, generic Linux, WSL.
+        Append these lines.
+      </p>
+      <pre
+        id="snippet-conf-{{ loop.index }}"
+        class="font-mono text-xs whitespace-pre-wrap break-all px-3 py-2 rounded border border-border bg-bg text-fg overflow-x-auto"
+      >{{ c.nix_conf_snippet }}</pre>
+    </section>
+  </article>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if incomplete_count > 0 %}
+<aside class="mt-8 text-xs text-muted border-t border-border pt-3">
+  Operator note: {{ incomplete_count }}
+  {% if incomplete_count == 1 %}cache is{% else %}caches are{% endif %}
+  configured for push but not for public consumption — set
+  <code class="font-mono">public_url</code> and
+  <code class="font-mono">public_key</code> on those
+  <code class="font-mono">binary_caches</code> entries to advertise
+  them here.
+</aside>
+{% endif %}
+
+<script>
+  (() => {
+    const buttons = document.querySelectorAll('button[data-copy-target]');
+    if (!buttons.length) return;
+    buttons.forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const target = document.getElementById(btn.dataset.copyTarget);
+        if (!target) return;
+        const text = target.textContent || '';
+        const restore = () => {
+          const original = btn.dataset.originalText || 'copy';
+          btn.textContent = original;
+        };
+        if (!btn.dataset.originalText) btn.dataset.originalText = btn.textContent;
+        try {
+          await navigator.clipboard.writeText(text);
+          btn.textContent = 'copied';
+          setTimeout(restore, 1200);
+        } catch (_) {
+          {# Fallback: select the text + execCommand for older browsers
+             / http origins where the async clipboard API is gated. #}
+          const range = document.createRange();
+          range.selectNodeContents(target);
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+          try {
+            document.execCommand('copy');
+            btn.textContent = 'copied';
+            setTimeout(restore, 1200);
+          } catch (_) { /* give up */ }
+        }
+      });
+    });
+  })();
+</script>
+{% endblock %}
