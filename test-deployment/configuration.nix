@@ -45,6 +45,7 @@ in
 
   users.users.root.openssh.authorizedKeys.keys = [
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6Z4dj1RU+44lXXW1Dw6TW4cLtV/4+qJRO7vFOmyC6C tfc@ai"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL7I8SFIFoKEBJEPEEUp14PuwA1Z+olKcL3OKlaxI//6 tfc@framejonge"
   ];
 
   services.argunix = {
