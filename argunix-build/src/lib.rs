@@ -18,9 +18,11 @@
 mod cache;
 mod gc_root;
 mod log_capture;
+mod push;
 mod runner;
 
 pub use cache::{CacheCheckResult, CacheRef, check_cache};
 pub use gc_root::{add_gc_root, gc_root_path};
 pub use log_capture::{LogCaptureLimit, write_zstd_log};
+pub use push::{PushCache, PushError, push_to_caches};
 pub use runner::{BuildError, BuildOutcome, BuildRequest, BuildStatus, run_build};

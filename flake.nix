@@ -130,6 +130,7 @@
             builder-build-dispatch = pkgs.testers.runNixOSTest ./nix/tests/builder-build-dispatch.nix;
             builder-stream-large = pkgs.testers.runNixOSTest ./nix/tests/builder-stream-large.nix;
             builders-parallel = pkgs.testers.runNixOSTest ./nix/tests/builders-parallel.nix;
+            cache-push = pkgs.testers.runNixOSTest ./nix/tests/cache-push.nix;
             crash-recovery = pkgs.testers.runNixOSTest ./nix/tests/crash-recovery.nix;
           };
         };

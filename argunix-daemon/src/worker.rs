@@ -447,6 +447,16 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             substitute: c.substitute,
         })
         .collect();
+    let push_caches: Vec<argunix_build::PushCache> = snap
+        .config
+        .binary_caches
+        .iter()
+        .filter(|c| c.push)
+        .map(|c| argunix_build::PushCache {
+            url: c.url.clone(),
+            signing_key_path: c.signing_key_path.path().to_path_buf(),
+        })
+        .collect();
 
     // Above the threshold we collapse per-job checks into a single
     // rolling `argunix: evaluation` status whose description is
@@ -585,6 +595,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             total,
             collapsed_mode,
             caches,
+            push_caches,
             cancel,
             work_dir,
             cancel_guard,
@@ -617,6 +628,7 @@ async fn run_build_phase(
     total: usize,
     collapsed_mode: bool,
     caches: Vec<argunix_build::CacheRef>,
+    push_caches: Vec<argunix_build::PushCache>,
     cancel: argunix_web::CancelToken,
     work_dir: PathBuf,
     // Owns the cancel-token deregister responsibility. Drops at the
@@ -742,6 +754,7 @@ async fn run_build_phase(
                 let ctx_c = ctx.clone();
                 let cancel_c = cancel.clone();
                 let caches_c = caches.clone();
+                let push_caches_c = push_caches.clone();
                 let repo_id = repo.id;
                 let span = info_span!(
                     "job",
@@ -751,7 +764,14 @@ async fn run_build_phase(
                 set.spawn(async move {
                     let _permit = permit; // released on drop
                     let res = build_one(
-                        &ctx_c, repo_id, eval_id, job_id, &spec, &caches_c, &cancel_c,
+                        &ctx_c,
+                        repo_id,
+                        eval_id,
+                        job_id,
+                        &spec,
+                        &caches_c,
+                        &push_caches_c,
+                        &cancel_c,
                     )
                     .instrument(span)
                     .await;
@@ -1534,6 +1554,7 @@ fn format_eval_error_log(attr_path: &str, error: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn build_one(
     ctx: &WorkerContext,
     repo_id: RepoId,
@@ -1541,6 +1562,7 @@ async fn build_one(
     job_id: JobId,
     spec: &argunix_eval::JobSpec,
     caches: &[argunix_build::CacheRef],
+    push_caches: &[argunix_build::PushCache],
     cancel: &argunix_web::CancelToken,
 ) -> anyhow::Result<JobStatus> {
     if spec.error.is_some() {
@@ -1763,6 +1785,26 @@ async fn build_one(
                 .first()
                 .cloned()
                 .or_else(|| spec.primary_output().map(String::from));
+
+            // Best-effort publish to every push-enabled cache. A flaky
+            // cache logs but doesn't fail the job — the build is still
+            // a success locally; only the publish degraded.
+            if !push_caches.is_empty() && !outcome.output_paths.is_empty() {
+                let errs = argunix_build::push_to_caches(
+                    &outcome.output_paths,
+                    push_caches,
+                    Duration::from_secs(300),
+                )
+                .await;
+                for e in errs {
+                    tracing::warn!(
+                        job_id = job_id.get(),
+                        error = %e,
+                        "cache push failed; job stays success, output not published",
+                    );
+                }
+            }
+
             <SqlxStore as JobStore>::finish(
                 &ctx.store,
                 job_id,

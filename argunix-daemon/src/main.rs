@@ -726,6 +726,15 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
             substitute: c.substitute,
         })
         .collect();
+    let push_caches: Vec<argunix_build::PushCache> = config
+        .binary_caches
+        .iter()
+        .filter(|c| c.push)
+        .map(|c| argunix_build::PushCache {
+            url: c.url.clone(),
+            signing_key_path: c.signing_key_path.path().to_path_buf(),
+        })
+        .collect();
 
     let log_base = args
         .log_dir
@@ -738,6 +747,7 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
 
     let build_timeout = Duration::from_secs(args.build_timeout_seconds);
     let cache_timeout = Duration::from_secs(30);
+    let push_timeout = Duration::from_secs(300);
 
     let mut summary = Summary::default();
     for spec in jobs {
@@ -749,7 +759,9 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
             job_id,
             &spec,
             &caches,
+            &push_caches,
             cache_timeout,
+            push_timeout,
             build_timeout,
             &log_base,
             &gc_root_base,
@@ -818,7 +830,9 @@ async fn build_one_job(
     job_id: JobId,
     spec: &argunix_eval::JobSpec,
     caches: &[argunix_build::CacheRef],
+    push_caches: &[argunix_build::PushCache],
     cache_timeout: Duration,
+    push_timeout: Duration,
     build_timeout: Duration,
     log_base: &Path,
     gc_root_base: &Path,
@@ -895,6 +909,22 @@ async fn build_one_job(
                 .first()
                 .cloned()
                 .or_else(|| spec.primary_output().map(String::from));
+
+            // Best-effort publish to every push-enabled cache. A flaky
+            // cache logs but doesn't fail the job — the build is still
+            // a success locally; only the publish degraded.
+            if !push_caches.is_empty() && !outcome.output_paths.is_empty() {
+                let errs =
+                    argunix_build::push_to_caches(&outcome.output_paths, push_caches, push_timeout)
+                        .await;
+                for e in errs {
+                    tracing::warn!(
+                        job_id = job_id.get(),
+                        error = %e,
+                        "cache push failed; job stays success, output not published",
+                    );
+                }
+            }
 
             <argunix_store::SqlxStore as JobStore>::finish(
                 store,
