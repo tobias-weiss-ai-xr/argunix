@@ -1,11 +1,13 @@
 {
   modulesPath,
   pkgs,
+  lib,
   ...
 }:
 
 let
   fqdn = "argunix.nix-consulting.net";
+  cacheUrl = "s3://test-cache?endpoint=nbg1.your-objectstorage.com&region=nbg1&addressing-style=virtual";
 in
 {
   imports = [
@@ -138,4 +140,26 @@ in
     jq
     sqlite
   ];
+
+  nix.settings = {
+    substituters = [
+      "https://cache.nixos.org"
+      cacheUrl
+    ];
+    trusted-public-keys = [
+      "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+      "test-cache:vUfGsNg1GFZRW1wHSFsjcklY2fpzGkPntpdOoW3mhTA="
+    ];
+    secret-key-files = [ "/var/lib/argunix-credentials/cache/test-cache-priv.key" ];
+    post-build-hook = pkgs.writeShellScript "upload-to-test-cache" ''
+      set -eu
+      set -f
+      export IFS=' '
+      exec ${lib.getExe pkgs.nix} --extra-experimental-features 'nix-command flakes' copy --to '${cacheUrl}' $OUT_PATHS
+    '';
+  };
+
+  systemd.services.nix-daemon.environment = {
+    AWS_SHARED_CREDENTIALS_FILE = "/var/lib/argunix-credentials/s3-credentials";
+  };
 }
