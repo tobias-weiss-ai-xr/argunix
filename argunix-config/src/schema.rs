@@ -313,15 +313,29 @@ impl ForgeConfig {
     }
 }
 
+/// A binary cache argunix should publish successful build outputs to.
+///
+/// `push_url` is the nix store URI argunix hands to `nix copy --to`
+/// (`s3://bucket?endpoint=…`, `file:///var/cache/argunix`,
+/// `https://<name>.cachix.org`, …). It's typically *not* what
+/// downstream users put in their `nix.conf` — that's `public_url`,
+/// which is operator-facing documentation for asymmetric backends
+/// (push to a private S3 endpoint, advertise a CDN'd HTTPS URL).
+/// Symmetric backends (cachix, file://, attic) leave `public_url`
+/// unset.
+///
+/// Argunix doesn't currently *use* `public_url` for any subprocess
+/// — system-wide `nix.settings.substituters` already handles read /
+/// substitution on the host, so the field is here for the
+/// upcoming UI / `argunixctl cache snippet` surfaces, not for the
+/// push pipeline.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BinaryCache {
-    pub url: String,
+    pub push_url: String,
+    #[serde(default)]
+    pub public_url: Option<String>,
     pub signing_key_path: SecretFile,
-    #[serde(default)]
-    pub push: bool,
-    #[serde(default)]
-    pub substitute: bool,
 }
 
 /// Runtime model of a configured repo. Built from [`WireRepo`] +

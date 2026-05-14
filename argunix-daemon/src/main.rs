@@ -718,20 +718,11 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
     <argunix_store::SqlxStore as EvalStore>::mark_building(&store, eval_id, Utc::now()).await?;
     tracing::info!(count = jobs.len(), "evaluation finished");
 
-    let caches: Vec<argunix_build::CacheRef> = config
-        .binary_caches
-        .iter()
-        .map(|c| argunix_build::CacheRef {
-            url: c.url.clone(),
-            substitute: c.substitute,
-        })
-        .collect();
     let push_caches: Vec<argunix_build::PushCache> = config
         .binary_caches
         .iter()
-        .filter(|c| c.push)
         .map(|c| argunix_build::PushCache {
-            url: c.url.clone(),
+            url: c.push_url.clone(),
             signing_key_path: c.signing_key_path.path().to_path_buf(),
         })
         .collect();
@@ -746,7 +737,6 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("/nix/var/nix/gcroots/per-user/argunix"));
 
     let build_timeout = Duration::from_secs(args.build_timeout_seconds);
-    let cache_timeout = Duration::from_secs(30);
     let push_timeout = Duration::from_secs(300);
 
     let mut summary = Summary::default();
@@ -758,9 +748,7 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
             eval_id,
             job_id,
             &spec,
-            &caches,
             &push_caches,
-            cache_timeout,
             push_timeout,
             build_timeout,
             &log_base,
@@ -829,9 +817,7 @@ async fn build_one_job(
     eval_id: EvalId,
     job_id: JobId,
     spec: &argunix_eval::JobSpec,
-    caches: &[argunix_build::CacheRef],
     push_caches: &[argunix_build::PushCache],
-    cache_timeout: Duration,
     push_timeout: Duration,
     build_timeout: Duration,
     log_base: &Path,
@@ -847,30 +833,26 @@ async fn build_one_job(
         return Ok(JobStatus::Failure);
     };
 
-    if let Some(output) = spec.primary_output() {
-        match argunix_build::check_cache(output, caches, cache_timeout).await {
-            Ok(argunix_build::CacheCheckResult::Hit { cache_url }) => {
-                tracing::info!(
-                    job_id = job_id.get(),
-                    cache = %cache_url,
-                    "cache hit; marking job cached without building",
-                );
-                <argunix_store::SqlxStore as JobStore>::finish(
-                    store,
-                    job_id,
-                    JobStatus::Cached,
-                    Utc::now(),
-                    None,
-                    Some(output),
-                    &JobPhaseMetrics::default(),
-                )
-                .await?;
-                return Ok(JobStatus::Cached);
-            }
-            Ok(argunix_build::CacheCheckResult::Miss) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "cache check failed; falling through to build");
-            }
+    // `is_cached` is set by `nix-eval-jobs --check-cache-status` when
+    // the output is already in the local store or fetchable from a
+    // configured system-wide substituter. Short-circuit before any
+    // build runs — mirrors the worker's behaviour. Argunix doesn't
+    // keep its own cache probe any more; system-wide nix.settings is
+    // the single source of truth for "is this path cached".
+    if spec.is_cached {
+        if let Some(output) = spec.primary_output() {
+            tracing::info!(job_id = job_id.get(), output = %output, "local store hit");
+            <argunix_store::SqlxStore as JobStore>::finish(
+                store,
+                job_id,
+                JobStatus::Cached,
+                Utc::now(),
+                None,
+                Some(output),
+                &JobPhaseMetrics::default(),
+            )
+            .await?;
+            return Ok(JobStatus::Cached);
         }
     }
 

@@ -27,7 +27,13 @@ let
     done
     case "$flake" in
       *"#packages.x86_64-linux"*)
-        echo '{"attr":"cached","drvPath":"/nix/store/cccc-cached.drv","system":"x86_64-linux","outputs":{"out":"/nix/store/cccc-cached"}}'
+        # `isCached: true` is how `nix-eval-jobs --check-cache-status`
+        # signals "output is already reachable via local store or a
+        # system-wide substituter". Argunix short-circuits on it and
+        # marks the job `Cached` without dispatching a build. The
+        # other two derivations omit the field (defaults to false)
+        # and exercise the real build path.
+        echo '{"attr":"cached","drvPath":"/nix/store/cccc-cached.drv","system":"x86_64-linux","outputs":{"out":"/nix/store/cccc-cached"},"isCached":true}'
         echo '{"attr":"succeed","drvPath":"/nix/store/dddd-succeed.drv","system":"x86_64-linux","outputs":{"out":"/nix/store/dddd-succeed"}}'
         echo '{"attr":"fail","drvPath":"/nix/store/eeee-fail.drv","system":"x86_64-linux","outputs":{"out":"/nix/store/eeee-fail"}}'
         ;;
@@ -98,33 +104,18 @@ let
 
   fakeNix = writeShellScriptBin "nix" ''
     set -eu
-    # Only `nix path-info --store <url> <path>` is invoked by argunix
-    # in the single-shot build pipeline.
-    case "$1" in
-      path-info)
-        shift
-        store=""
-        path=""
-        while [ $# -gt 0 ]; do
-          case "$1" in
-            --store) store="$2"; shift 2 ;;
-            *) path="$1"; shift ;;
-          esac
-        done
-        case "$path" in
-          /nix/store/cccc-cached) exit 0 ;;
-          *) exit 1 ;;
-        esac
-        ;;
-      *)
-        echo "fake nix: unsupported subcommand $1" >&2
-        exit 2
-        ;;
-    esac
+    # The single-shot build pipeline shells out to `nix` only for the
+    # post-build `nix copy --to <cache>` step. The test's
+    # `binary_caches` list is empty (no push targets), so no `nix
+    # copy` ever runs and this stub stays cold. We keep the stub
+    # present anyway so an accidental wiring regression that adds a
+    # `nix` invocation fails loudly instead of inheriting the
+    # sandbox's real nix and going off-script.
+    echo "fake nix: unexpected invocation: $*" >&2
+    exit 2
   '';
 
   token = writeText "argunix-test-github-token" "tok-value";
-  signingKey = writeText "argunix-test-cache-signing-key" "fake-key";
 
   config = writers.writeYAML "argunix.yaml" {
     external_url = "https://argunix.example.com";
@@ -136,14 +127,10 @@ let
         "myorg/myrepo" = { };
       };
     };
-    binary_caches = [
-      {
-        url = "https://cache.example.com";
-        signing_key_path = "${signingKey}";
-        push = false;
-        substitute = true;
-      }
-    ];
+    # No `binary_caches` here — system-wide `nix.settings.substituters`
+    # owns reads, and we have nothing to push to in a sandbox test.
+    # The `cached` derivation gets marked `Cached` via the
+    # `isCached: true` flag in the fake nix-eval-jobs output.
   };
 
   fixtureFlake = runCommand "argunix-build-fixture-flake" { } ''

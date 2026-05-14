@@ -1,20 +1,27 @@
-# End-to-end test of the post-build cache push, against a real
-# self-hosted S3-compatible cache (Garage) rather than a
-# file://-based stand-in.
+# End-to-end test of the post-build cache push, covering both shapes
+# of `BinaryCache` config:
 #
-# A real NixOS VM with real nix + real nix-eval-jobs, real Garage,
+#   1. Asymmetric — `push_url` and `public_url` differ. Realistic for
+#      S3-class backends where argunix writes via the API endpoint
+#      and users read from a CDN or a separate S3-web gateway. We
+#      use Garage on the same VM to play both roles.
+#
+#   2. Symmetric — no `public_url` set, so the same URL is the one
+#      operators advertise. Mirrors cachix / attic / a plain
+#      file:// cache.
+#
+# A real NixOS VM with real nix + real nix-eval-jobs + real Garage,
 # driven through `argunix build` (the single-shot CLI). The build
 # runs locally — no builder enrolment, no forge calls — and the push
-# step writes the output closure to an `s3://` bucket served by
-# Garage on the same VM. We assert:
+# step writes the output closure to *both* configured caches. We
+# assert per cache:
 #
-#   - the bucket contains at least one `*.narinfo` and a NAR
-#     payload after the push,
-#   - `nix path-info --store s3://…` resolves the output (proving
-#     the narinfo is well-formed, references valid, signature
-#     verifies against the configured public key),
-#   - the build output content is what we asked for (sanity check
-#     that argunix ran the real build, not a stub).
+#   - the cache backend received the narinfo + NAR payload,
+#   - `nix path-info --store <url>` resolves the output (proving the
+#     narinfo is well-formed, references valid, signature verifies
+#     against the configured public key),
+#   - `nix store verify` succeeds (signature actually present, not
+#     just well-formed).
 #
 # `services.argunix.enable = true` exercises the module's wiring of
 # `binary_caches` + signing key path through to the YAML the daemon
@@ -32,7 +39,19 @@ let
   s3Region = "garage";
   s3ApiEndpoint = "http://127.0.0.1:3900";
 
-  cacheUrl = "s3://${s3Bucket}?endpoint=${s3ApiEndpoint}&region=${s3Region}";
+  # Asymmetric cache: argunix pushes via `s3://` to the Garage API,
+  # users would read via a CDN / Garage's s3_web gateway. We pick a
+  # synthetic `public_url` to demonstrate the field — it's
+  # informational only at this stage (argunix doesn't fan out reads
+  # to it).
+  s3CachePushUrl = "s3://${s3Bucket}?endpoint=${s3ApiEndpoint}&region=${s3Region}";
+  s3CachePublicUrl = "https://cache.example.com";
+
+  # Symmetric cache: write and read on the same URL. file:// is the
+  # simplest representative — cachix / attic / harmonia would look
+  # the same in config (single URL, no public_url).
+  localCacheDir = "/var/cache/argunix-local";
+  localCacheUrl = "file://${localCacheDir}";
 
   githubToken = pkgs.writeText "argunix-test-github-token" "tok";
 
@@ -40,7 +59,9 @@ let
   # --generate-binary-cache-key` won't run in a build sandbox
   # (it touches /nix/var/nix/profiles); `nix key …` is the pure
   # crypto path. We hand the secret to argunix and use the public
-  # side to verify signed narinfo from the testScript.
+  # side to verify signed narinfo from the testScript. Both caches
+  # share one key — common in practice when an operator owns both
+  # backends.
   signingKeys =
     pkgs.runCommand "argunix-test-cache-keys"
       {
@@ -92,11 +113,16 @@ let
       repos."myorg/myrepo" = { };
     };
     binary_caches = [
+      # Asymmetric S3 cache.
       {
-        url = cacheUrl;
+        push_url = s3CachePushUrl;
+        public_url = s3CachePublicUrl;
         signing_key_path = "${signingKeys}/secret";
-        push = true;
-        substitute = false;
+      }
+      # Symmetric local file cache — no `public_url`.
+      {
+        push_url = localCacheUrl;
+        signing_key_path = "${signingKeys}/secret";
       }
     ];
   };
@@ -140,6 +166,14 @@ in
           };
         };
       };
+
+      # Symmetric file:// cache target — argunix's push step writes
+      # `<hash>.narinfo` + `nar/<hash>.nar.xz` here. Owned by the
+      # argunix user so the testScript invocation as that user can
+      # write.
+      systemd.tmpfiles.rules = [
+        "d ${localCacheDir} 0755 argunix argunix - -"
+      ];
 
       environment.systemPackages = [
         pkgs.argunix
@@ -201,9 +235,16 @@ in
     )
 
     # Confirm the module wired the cache config through to the
-    # daemon's YAML.
+    # daemon's YAML — both shapes (asymmetric + symmetric) must
+    # land in the same `binary_caches` list.
     machine.succeed(
-        "grep -q 's3://${s3Bucket}' ${testConfig}"
+        "grep -q 'push_url: s3://${s3Bucket}' ${testConfig}"
+    )
+    machine.succeed(
+        "grep -q 'public_url: ${s3CachePublicUrl}' ${testConfig}"
+    )
+    machine.succeed(
+        "grep -q 'push_url: ${localCacheUrl}' ${testConfig}"
     )
 
     # Drive a real eval+build+push through the single-shot CLI.
@@ -211,6 +252,8 @@ in
     # invoke it: same uid, same nix-daemon trust level. AWS
     # credentials reach `nix copy` via the env — that's how the
     # nix S3 store reads them, identical to a real S3 deployment.
+    # The file:// cache needs no credentials; argunix-build's push
+    # iterates over every configured cache and writes to each.
     machine.succeed(
         "install -d -o argunix -g argunix /var/lib/argunix-test"
     )
@@ -249,10 +292,15 @@ in
         f"unexpected output contents: {contents!r}"
     )
 
+    pubkey = machine.succeed("cat ${signingKeys}/public").strip()
+    print(f"trusted-public-key: {pubkey}")
+
+    # ---- Asymmetric cache assertions: S3 (Garage) ----
+    #
     # The bucket must hold at least one narinfo object and a NAR
-    # payload. `garage bucket list` reports object counts and
-    # sizes; a non-zero count proves the push reached durable
-    # storage on the remote.
+    # payload. `garage bucket info` reports object counts; a
+    # non-zero count proves the push reached durable storage on
+    # the remote.
     bucket_info = machine.succeed("garage bucket info ${s3Bucket}")
     print("--- garage bucket info ---")
     print(bucket_info)
@@ -260,37 +308,61 @@ in
         match_or_fail(r"Objects:\s*(\d+)", bucket_info, "object count")
     )
     assert object_count > 0, (
-        f"expected at least one object in the bucket, got {object_count}"
+        f"expected at least one object in the s3 bucket, got {object_count}"
     )
 
-    # `nix path-info --store s3://…` is the closest thing to "is
-    # the cache able to serve this path" — it parses the narinfo,
-    # verifies the references, and checks the signature against
-    # trusted-public-keys. We add the public key so the signature
-    # check goes through the same path a real-world substituter
-    # does.
-    pubkey = machine.succeed("cat ${signingKeys}/public").strip()
-    print(f"trusted-public-key: {pubkey}")
+    # `nix path-info --store s3://…` parses the narinfo, verifies
+    # the references, and checks the signature against
+    # trusted-public-keys — the same path a substituter takes.
     machine.succeed(
         f"AWS_ACCESS_KEY_ID={key_id}"
         f" AWS_SECRET_ACCESS_KEY={secret_key}"
         " nix --extra-experimental-features nix-command"
         f" path-info --extra-trusted-public-keys '{pubkey}'"
-        f" --store '${cacheUrl}' {out_path}"
+        f" --store '${s3CachePushUrl}' {out_path}"
     )
-
-    # And the narinfo must actually be signed by our key — not
-    # just well-formed. `nix store verify --store <cache>` exits
-    # non-zero if signatures are missing or untrusted; this
-    # guards against a regression where we drop the `secret-key=`
-    # query param and cache the path unsigned.
     machine.succeed(
         f"AWS_ACCESS_KEY_ID={key_id}"
         f" AWS_SECRET_ACCESS_KEY={secret_key}"
         " nix --extra-experimental-features nix-command"
         " store verify"
         f" --extra-trusted-public-keys '{pubkey}'"
-        f" --store '${cacheUrl}' {out_path}"
+        f" --store '${s3CachePushUrl}' {out_path}"
+    )
+
+    # ---- Symmetric cache assertions: file:// ----
+    #
+    # The cache dir must hold narinfo + NAR. `nix copy --to
+    # file:///…` writes both atomically per push; a populated
+    # narinfo without its NAR would be a regression in our
+    # subprocess wiring.
+    print("--- ${localCacheDir} ---")
+    print(machine.succeed("ls -la ${localCacheDir}"))
+    print(machine.succeed("ls -la ${localCacheDir}/nar"))
+
+    narinfo_count = int(machine.succeed(
+        "find ${localCacheDir} -maxdepth 1 -name '*.narinfo' | wc -l"
+    ).strip())
+    assert narinfo_count > 0, (
+        f"expected at least one narinfo in the file:// cache, got {narinfo_count}"
+    )
+    nar_count = int(machine.succeed(
+        "find ${localCacheDir}/nar -name '*.nar*' | wc -l"
+    ).strip())
+    assert nar_count > 0, (
+        f"expected at least one NAR payload in the file:// cache, got {nar_count}"
+    )
+
+    machine.succeed(
+        "nix --extra-experimental-features nix-command"
+        f" path-info --extra-trusted-public-keys '{pubkey}'"
+        f" --store '${localCacheUrl}' {out_path}"
+    )
+    machine.succeed(
+        "nix --extra-experimental-features nix-command"
+        " store verify"
+        f" --extra-trusted-public-keys '{pubkey}'"
+        f" --store '${localCacheUrl}' {out_path}"
     )
   '';
 }

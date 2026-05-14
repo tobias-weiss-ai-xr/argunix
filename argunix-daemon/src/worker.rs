@@ -438,22 +438,12 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         persisted
     };
 
-    let caches: Vec<argunix_build::CacheRef> = snap
-        .config
-        .binary_caches
-        .iter()
-        .map(|c| argunix_build::CacheRef {
-            url: c.url.clone(),
-            substitute: c.substitute,
-        })
-        .collect();
     let push_caches: Vec<argunix_build::PushCache> = snap
         .config
         .binary_caches
         .iter()
-        .filter(|c| c.push)
         .map(|c| argunix_build::PushCache {
-            url: c.url.clone(),
+            url: c.push_url.clone(),
             signing_key_path: c.signing_key_path.path().to_path_buf(),
         })
         .collect();
@@ -594,7 +584,6 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             walk,
             total,
             collapsed_mode,
-            caches,
             push_caches,
             cancel,
             work_dir,
@@ -627,7 +616,6 @@ async fn run_build_phase(
     walk: argunix_eval::ClosureWalk,
     total: usize,
     collapsed_mode: bool,
-    caches: Vec<argunix_build::CacheRef>,
     push_caches: Vec<argunix_build::PushCache>,
     cancel: argunix_web::CancelToken,
     work_dir: PathBuf,
@@ -753,7 +741,6 @@ async fn run_build_phase(
                 let token = d.token;
                 let ctx_c = ctx.clone();
                 let cancel_c = cancel.clone();
-                let caches_c = caches.clone();
                 let push_caches_c = push_caches.clone();
                 let repo_id = repo.id;
                 let span = info_span!(
@@ -769,7 +756,6 @@ async fn run_build_phase(
                         eval_id,
                         job_id,
                         &spec,
-                        &caches_c,
                         &push_caches_c,
                         &cancel_c,
                     )
@@ -1561,7 +1547,6 @@ async fn build_one(
     eval_id: EvalId,
     job_id: JobId,
     spec: &argunix_eval::JobSpec,
-    caches: &[argunix_build::CacheRef],
     push_caches: &[argunix_build::PushCache],
     cancel: &argunix_web::CancelToken,
 ) -> anyhow::Result<JobStatus> {
@@ -1573,12 +1558,11 @@ async fn build_one(
     };
 
     // `is_cached` is set by `nix-eval-jobs --check-cache-status` when
-    // the derivation's outputs are already valid locally or fetchable
-    // from a configured substituter. This catches the case the HTTP
-    // `check_cache` probe below misses: an output the coordinator built
-    // in a previous eval (e.g. a PR that has now been merged into main
-    // re-evaluating to the same drv). Short-circuit before any builder
-    // dispatch — the outputs are right there in /nix/store.
+    // the output is already valid locally or fetchable from a
+    // configured system-wide substituter. Short-circuit before any
+    // builder dispatch — argunix no longer keeps its own pre-build
+    // cache probe; `nix.settings.substituters` on the host is the
+    // single source of truth.
     if spec.is_cached {
         if let Some(output) = spec.primary_output() {
             tracing::info!(job_id = job_id.get(), output = %output, "local store hit");
@@ -1593,27 +1577,6 @@ async fn build_one(
             )
             .await?;
             return Ok(JobStatus::Cached);
-        }
-    }
-
-    if let Some(output) = spec.primary_output() {
-        match argunix_build::check_cache(output, caches, Duration::from_secs(30)).await {
-            Ok(argunix_build::CacheCheckResult::Hit { cache_url }) => {
-                tracing::info!(job_id = job_id.get(), cache = %cache_url, "cache hit");
-                <SqlxStore as JobStore>::finish(
-                    &ctx.store,
-                    job_id,
-                    JobStatus::Cached,
-                    Utc::now(),
-                    None,
-                    Some(output),
-                    &JobPhaseMetrics::default(),
-                )
-                .await?;
-                return Ok(JobStatus::Cached);
-            }
-            Ok(argunix_build::CacheCheckResult::Miss) => {}
-            Err(e) => tracing::warn!(error = %e, "cache check failed; falling through to build"),
         }
     }
 
