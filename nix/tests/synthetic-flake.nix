@@ -24,27 +24,30 @@ let
 
   githubToken = pkgs.writeText "argunix-synth-test-token" "tok";
 
-  # ed25519 binary-cache key pair. nix-serve signs narinfo on demand
-  # with the secret half; we hand the public half to argunix's
-  # `binary_caches[*].public_key` so it lands in the synthetic flake's
-  # `nixConfig.extra-trusted-public-keys` for the client.
-  signingKeys =
-    pkgs.runCommand "argunix-synth-test-cache-keys"
-      {
-        nativeBuildInputs = [ pkgs.nix ];
-      }
-      ''
-        mkdir -p $out
-        export HOME=$TMPDIR
-        nix --extra-experimental-features 'nix-command' \
-          key generate-secret --key-name argunix-synth-test > "$out/secret"
-        nix --extra-experimental-features 'nix-command' \
-          key convert-secret-to-public < "$out/secret" > "$out/public"
-      '';
-
-  # `nix key convert-secret-to-public` emits the key with a trailing
-  # newline; argunix's YAML wants the bare key string.
-  publicKey = lib.removeSuffix "\n" (builtins.readFile "${signingKeys}/public");
+  # ed25519 binary-cache key pair, hardcoded.
+  #
+  # We do *not* generate the keypair at build time (e.g. via `nix key
+  # generate-secret` inside `runCommand`) because that derivation is
+  # non-deterministic: every fresh build produces a different secret
+  # at the same input-addressed store path. In single-machine setups
+  # the path is built once and consistently reused — but in CI / on
+  # multi-host build farms, the eval-time `builtins.readFile` of the
+  # public half and the VM-image read of the secret half can end up
+  # backed by *different* materialisations of the same path (e.g. one
+  # built locally, one fetched from a substituter that stored the
+  # previous run's bytes). The result is that nix-serve signs with
+  # key A and the client trusts key B → "lacks a signature by a
+  # trusted key", deterministically, in CI only.
+  #
+  # The test isn't validating keygen — only that signed narinfo round-
+  # trips through `fetchClosure { inputAddressed = true; }`. A bundled
+  # keypair is therefore the right shape: deterministic, identical
+  # across hosts, and the secret half is harmless to publish (it
+  # signs nothing outside this throwaway test fixture).
+  publicKey = "argunix-synth-test:NRr7uNjeT5Sf6V1ddpJHVcidw4DVFkkDOP+O4IfVSBM=";
+  secretKeyFile = pkgs.writeText "argunix-synth-test-secret" ''
+    argunix-synth-test:jdieG84Do93GiLF/O+Vb1gAjtt405xJcS37kjJTnEf01Gvu42N5PlJ/pXV12kkdVyJ3DgNUWSQM4/47gh9VIEw==
+  '';
 
   cacheUrl = "http://argunix:${toString cacheHttpPort}";
 in
@@ -82,7 +85,7 @@ in
               push_url = "file:///var/cache/argunix-unused";
               public_url = cacheUrl;
               public_key = publicKey;
-              signing_key_path = "${signingKeys}/secret";
+              signing_key_path = "${secretKeyFile}";
             }
           ];
         };
@@ -95,7 +98,7 @@ in
         enable = true;
         port = cacheHttpPort;
         bindAddress = "0.0.0.0";
-        secretKeyFile = "${signingKeys}/secret";
+        secretKeyFile = "${secretKeyFile}";
       };
 
       networking.firewall.allowedTCPPorts = [
