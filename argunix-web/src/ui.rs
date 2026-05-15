@@ -976,7 +976,17 @@ async fn collect_status_view(state: &AppState) -> Result<StatusView, UiError> {
 
     let now = chrono::Utc::now();
     let builders_view = collect_builders(&roster, &live, current_jobs_by_builder, now);
-    let builders = builders_view.rows;
+    // The index strip only shows what's *currently doing work*. Offline
+    // / revoked rows belong on `/hosts` (where the "configured but
+    // offline" section lives) — surfacing them on the landing page
+    // would dilute the "what is the cluster doing right now" question
+    // the rest of this view answers. The `X / Y` counter still
+    // reflects total roster size via `builders_online` / `_known`.
+    let builders: Vec<BuilderRow> = builders_view
+        .rows
+        .into_iter()
+        .filter(|b| b.is_online)
+        .collect();
     let builders_online = builders_view.online;
 
     // Pull `LIMIT + 1` so we can tell whether the queue extends past the
