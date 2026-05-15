@@ -327,7 +327,7 @@ impl ForgeConfig {
 /// Argunix doesn't *use* `public_url` or `public_key` for any
 /// subprocess — system-wide `nix.settings.substituters` handles
 /// read / substitution on the host. Both fields exist so the
-/// `/caches` page can render copy-pasteable snippets (flake
+/// `/cache` page can render copy-pasteable snippets (flake
 /// `nixConfig`, NixOS `nix.settings`, plain `nix.conf`) without
 /// reading the signing key file at request time. The operator
 /// derives `public_key` once via

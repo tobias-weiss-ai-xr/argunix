@@ -25,7 +25,7 @@ binary_caches:
 - **`public_key`** is the verbatim `<name>:<base64>` public-key
   line users add to `trusted-public-keys`. Derive it once via
   `nix key convert-secret-to-public < signing-key > public`; both
-  fields together let the `/caches` page render copy-pasteable
+  fields together let the `/cache` page render copy-pasteable
   substituter snippets without argunix ever reading the secret
   file at request time.
 - **`signing_key_path`** is the nix-format secret key (the kind
@@ -135,10 +135,10 @@ eval-time `is_cached` flag from
 already consults the host's substituters and short-circuits
 already-cached jobs before any builder dispatch.
 
-## The /caches page
+## The /cache page
 
 When `public_url` and `public_key` are both set on an entry, the
-`/caches` page renders three copy-pasteable substituter snippets
+`/cache` page renders three copy-pasteable substituter snippets
 per cache: one for a flake's `nixConfig`, one for a NixOS module,
 one for a plain `nix.conf`. Send users the URL and they pick the
 form that matches where they consume the flake.

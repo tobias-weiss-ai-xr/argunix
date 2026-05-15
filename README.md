@@ -277,7 +277,7 @@ hiccupped.
 
 **3. Hand users the substituter snippet.** Once `public_url` and
 `public_key` are set, the argunix instance renders ready-to-paste
-snippets at `https://<your-deploy>/caches` — one for adding the
+snippets at `https://<your-deploy>/cache` — one for adding the
 cache to a flake's `nixConfig`, one for a NixOS module, and one
 for a plain `nix.conf` on macOS / generic Linux / WSL. Send users
 the URL or the snippet they need.

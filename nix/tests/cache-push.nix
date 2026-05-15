@@ -121,12 +121,12 @@ let
           myorg/myrepo: {}
     binary_caches:
       # Asymmetric S3 cache. `public_url` + `public_key` together
-      # unlock the copy-pasteable substituter snippets on /caches.
+      # unlock the copy-pasteable substituter snippets on /cache.
       - push_url: ${s3CachePushUrl}
         public_url: ${s3CachePublicUrl}
         public_key: $pub
         signing_key_path: ${signingKeys}/secret
-      # Symmetric local file cache — no `public_url`. The /caches
+      # Symmetric local file cache — no `public_url`. The /cache
       # page renders this as "incomplete" with a hint.
       - push_url: ${localCacheUrl}
         signing_key_path: ${signingKeys}/secret
