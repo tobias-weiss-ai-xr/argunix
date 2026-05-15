@@ -267,6 +267,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         argunix_sched::SchedulerKind::default(),
         Some(build_concurrency),
     )));
+    // Registry blob/manifest pool. Fixed location for the prototype:
+    // `./registry-state` next to the sqlite db. The web router and the
+    // worker share the same Arc.
+    let registry_state = std::sync::Arc::new(argunix_registry::RegistryState::new(
+        std::path::PathBuf::from("./registry-state"),
+    ));
+    if let Err(e) = registry_state.ensure_dirs().await {
+        tracing::warn!(error = %e, "failed to create registry state dirs at startup");
+    }
     let worker_ctx = worker::WorkerContext {
         current: current.clone(),
         store: store.clone(),
@@ -287,6 +296,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         global_build_sem: global_build_sem.clone(),
         build_tasks: build_tasks.clone(),
         scheduler: scheduler.clone(),
+        registry_state: registry_state.clone(),
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
 
@@ -395,7 +405,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         coordinator_versions,
     };
     let app_state = std::sync::Arc::new(inner);
-    let router = argunix_web::router(app_state.clone());
+    let registry_router = argunix_registry::router(argunix_registry::api::RegistryApi {
+        state: registry_state.clone(),
+        store: store.clone(),
+    });
+    let router = argunix_web::router(app_state.clone()).merge(registry_router);
 
     // Spawn the control-socket server. Bound to the path from CLI
     // args (default `/run/argunix/control.sock`). Runs as a background
@@ -739,11 +753,21 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
     let build_timeout = Duration::from_secs(args.build_timeout_seconds);
     let push_timeout = Duration::from_secs(300);
 
+    // Single-shot mode shares the registry-state convention with the
+    // long-running daemon: `./registry-state` next to the sqlite db.
+    let registry_state = std::sync::Arc::new(argunix_registry::RegistryState::new(
+        std::path::PathBuf::from("./registry-state"),
+    ));
+    if let Err(e) = registry_state.ensure_dirs().await {
+        tracing::warn!(error = %e, "failed to create registry state dirs");
+    }
+
     let mut summary = Summary::default();
     for spec in jobs {
         let job_id = persist_job(&store, eval_id, &spec).await?;
         let outcome = build_one_job(
             &store,
+            &registry_state,
             repo_id,
             eval_id,
             job_id,
@@ -822,6 +846,7 @@ async fn persist_job(
 #[allow(clippy::too_many_arguments)]
 async fn build_one_job(
     store: &argunix_store::SqlxStore,
+    registry_state: &Arc<argunix_registry::RegistryState>,
     repo_id: RepoId,
     eval_id: EvalId,
     job_id: JobId,
@@ -927,6 +952,20 @@ async fn build_one_job(
                 &JobPhaseMetrics::default(),
             )
             .await?;
+
+            if spec.is_docker_image {
+                try_publish_docker_image_cli(
+                    store,
+                    registry_state,
+                    repo_id,
+                    eval_id,
+                    job_id,
+                    spec,
+                    primary_output.as_deref(),
+                )
+                .await;
+            }
+
             Ok(JobStatus::Success)
         }
         argunix_build::BuildStatus::Failure => {
@@ -942,6 +981,66 @@ async fn build_one_job(
             .await?;
             Ok(JobStatus::Failure)
         }
+    }
+}
+
+/// Single-shot CLI variant of the worker's docker-image publish. Same
+/// best-effort policy: any failure is logged at `warn` and the job
+/// stays `Success`.
+async fn try_publish_docker_image_cli(
+    store: &argunix_store::SqlxStore,
+    state: &Arc<argunix_registry::RegistryState>,
+    repo_id: RepoId,
+    eval_id: EvalId,
+    job_id: JobId,
+    spec: &argunix_eval::JobSpec,
+    output_path: Option<&str>,
+) {
+    let repo = match <argunix_store::SqlxStore as RepoStore>::get(store, repo_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(repo_id = repo_id.get(), "registry: repo row missing");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "registry: repo lookup failed");
+            return;
+        }
+    };
+    let eval = match <argunix_store::SqlxStore as EvalStore>::get(store, eval_id).await {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            tracing::warn!(eval_id = eval_id.get(), "registry: eval row missing");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "registry: eval lookup failed");
+            return;
+        }
+    };
+    let attr_leaf = argunix_registry::publish::attr_leaf(spec.attr_path.as_str());
+    let system = spec.system.as_deref().unwrap_or("unknown");
+    let req = argunix_registry::publish::PublishRequest {
+        state,
+        store,
+        repo_id,
+        eval_id,
+        job_id,
+        forge: &repo.forge,
+        repo_slug: repo.slug.as_str(),
+        attr_leaf: &attr_leaf,
+        system,
+        git_ref: &eval.git_ref,
+        sha: &eval.sha,
+        output_path,
+    };
+    if let Err(e) = argunix_registry::publish(req).await {
+        tracing::warn!(
+            job_id = job_id.get(),
+            attr = %spec.attr_path,
+            error = %e,
+            "docker registry publish failed; job stays success",
+        );
     }
 }
 

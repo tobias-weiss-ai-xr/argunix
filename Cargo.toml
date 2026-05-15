@@ -7,6 +7,7 @@ members = [
   "argunix-forge",
   "argunix-eval",
   "argunix-build",
+  "argunix-registry",
   "argunix-sched",
   "argunix-web",
   "argunix-control",
@@ -25,6 +26,7 @@ license = "GPL-3.0-or-later"
 argunix-domain = { path = "argunix-domain" }
 argunix-config = { path = "argunix-config" }
 argunix-store = { path = "argunix-store" }
+argunix-registry = { path = "argunix-registry" }
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

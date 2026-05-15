@@ -48,6 +48,10 @@ pub struct JobSpec {
     /// `requiredSystemFeatures` from the .drv (e.g. `["cuda"]`,
     /// `["uid-range"]`). Empty when the derivation didn't declare any.
     pub required_system_features: Vec<String>,
+    /// True when `meta.docker-image == true`. Marks the build output as
+    /// a `dockerTools.{buildImage,buildLayeredImage}` tarball that the
+    /// argunix registry should pick up after a successful build.
+    pub is_docker_image: bool,
 }
 
 impl JobSpec {
@@ -59,6 +63,12 @@ impl JobSpec {
             .or_else(|| self.outputs.values().next())
             .map(String::as_str)
     }
+}
+
+fn meta_docker_image(meta: &serde_json::Value) -> bool {
+    meta.get("docker-image")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +95,7 @@ pub fn parse_lines(prefix: &str, body: &str) -> Result<Vec<JobSpec>, ParseError>
             line: idx + 1,
             source: e,
         })?;
+        let is_docker_image = meta_docker_image(&raw.meta);
         out.push(JobSpec {
             attr_path: AttrPath::new(if raw.attr.is_empty() {
                 prefix.to_string()
@@ -98,6 +109,7 @@ pub fn parse_lines(prefix: &str, body: &str) -> Result<Vec<JobSpec>, ParseError>
             meta: raw.meta,
             is_cached: raw.is_cached,
             required_system_features: raw.required_system_features,
+            is_docker_image,
         });
     }
     Ok(out)
@@ -201,6 +213,20 @@ mod tests {
         let body = r#"{"attr":"x","drvPath":"/nix/store/x.drv","system":"x86_64-linux"}"#;
         let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
         assert!(jobs[0].required_system_features.is_empty());
+    }
+
+    #[test]
+    fn detects_docker_image_meta() {
+        let body = r#"{"attr":"img","drvPath":"/nix/store/x.drv","system":"x86_64-linux","meta":{"docker-image":true}}"#;
+        let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
+        assert!(jobs[0].is_docker_image);
+    }
+
+    #[test]
+    fn missing_docker_image_meta_is_false() {
+        let body = r#"{"attr":"x","drvPath":"/nix/store/x.drv","system":"x86_64-linux","meta":{"description":"hi"}}"#;
+        let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
+        assert!(!jobs[0].is_docker_image);
     }
 
     #[test]

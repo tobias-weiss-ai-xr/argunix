@@ -1,10 +1,10 @@
 use crate::records::{
-    BuilderRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord, JobRecord, JobWithContext,
-    NewBuilder, NewEvaluation, NewJob, RepoRecord,
+    BuilderRecord, DockerImageRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord, JobRecord,
+    JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob, RepoRecord,
 };
 use crate::traits::{
-    BuilderStore, EvalStore, ForgeStatusStore, InterruptOutcome, JobStore, MAX_INTERRUPTIONS,
-    RepoStore, StoreError,
+    BuilderStore, DockerImageStore, EvalStore, ForgeStatusStore, InterruptOutcome, JobStore,
+    MAX_INTERRUPTIONS, RepoStore, StoreError,
 };
 use argunix_domain::{
     AttrPath, BuilderCapabilities, BuilderId, BuilderName, BuilderNameError, BuilderPubkey,
@@ -1139,6 +1139,144 @@ impl ForgeStatusStore for SqlxStore {
             handle,
             last_posted_at,
         }))
+    }
+}
+
+fn map_docker_image(row: &SqliteRow) -> Result<DockerImageRecord, StoreError> {
+    let repo_id: i64 = row.try_get("repo_id")?;
+    let eval_id: i64 = row.try_get("eval_id")?;
+    let job_id: i64 = row.try_get("job_id")?;
+    let image_name: String = row.try_get("image_name")?;
+    let system: String = row.try_get("system")?;
+    let git_ref: String = row.try_get("git_ref")?;
+    let sha: String = row.try_get("sha")?;
+    let manifest_digest: String = row.try_get("manifest_digest")?;
+    let manifest_path: String = row.try_get("manifest_path")?;
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+    Ok(DockerImageRecord {
+        repo_id: RepoId::new(repo_id),
+        eval_id: EvalId::new(eval_id),
+        job_id: JobId::new(job_id),
+        image_name,
+        system,
+        git_ref,
+        sha: to_sha(job_id, sha)?,
+        manifest_digest,
+        manifest_path,
+        created_at,
+    })
+}
+
+#[async_trait]
+impl DockerImageStore for SqlxStore {
+    async fn create(&self, new: NewDockerImage) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO docker_images
+                (repo_id, eval_id, job_id, image_name, system, git_ref, sha,
+                 manifest_digest, manifest_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(new.repo_id.get())
+        .bind(new.eval_id.get())
+        .bind(new.job_id.get())
+        .bind(&new.image_name)
+        .bind(&new.system)
+        .bind(&new.git_ref)
+        .bind(new.sha.as_str())
+        .bind(&new.manifest_digest)
+        .bind(&new.manifest_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn latest_for_branch(
+        &self,
+        image_name: &str,
+        system: &str,
+        git_ref: &str,
+    ) -> Result<Option<DockerImageRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT repo_id, eval_id, job_id, image_name, system, git_ref, sha,
+                    manifest_digest, manifest_path, created_at
+             FROM docker_images
+             WHERE image_name = ?1 AND system = ?2 AND git_ref = ?3
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(image_name)
+        .bind(system)
+        .bind(git_ref)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| map_docker_image(&r)).transpose()
+    }
+
+    async fn latest_per_system_for_branch(
+        &self,
+        image_name: &str,
+        git_ref: &str,
+    ) -> Result<Vec<DockerImageRecord>, StoreError> {
+        // SQLite doesn't have DISTINCT ON; emulate with a correlated subquery
+        // picking the max id per system. id is monotonically increasing so
+        // ordering by id DESC matches "latest insert".
+        let rows = sqlx::query(
+            "SELECT repo_id, eval_id, job_id, image_name, system, git_ref, sha,
+                    manifest_digest, manifest_path, created_at
+             FROM docker_images d
+             WHERE image_name = ?1 AND git_ref = ?2
+               AND id = (
+                 SELECT MAX(id) FROM docker_images
+                 WHERE image_name = d.image_name
+                   AND git_ref    = d.git_ref
+                   AND system     = d.system
+               )
+             ORDER BY system",
+        )
+        .bind(image_name)
+        .bind(git_ref)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_docker_image).collect()
+    }
+
+    async fn rows_by_sha_prefix(
+        &self,
+        image_name: &str,
+        sha_prefix: &str,
+    ) -> Result<Vec<DockerImageRecord>, StoreError> {
+        let pattern = format!("{sha_prefix}%");
+        let rows = sqlx::query(
+            "SELECT repo_id, eval_id, job_id, image_name, system, git_ref, sha,
+                    manifest_digest, manifest_path, created_at
+             FROM docker_images
+             WHERE image_name = ?1 AND sha LIKE ?2
+             ORDER BY system, created_at DESC",
+        )
+        .bind(image_name)
+        .bind(pattern)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_docker_image).collect()
+    }
+
+    async fn by_manifest_digest(
+        &self,
+        image_name: &str,
+        manifest_digest: &str,
+    ) -> Result<Option<DockerImageRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT repo_id, eval_id, job_id, image_name, system, git_ref, sha,
+                    manifest_digest, manifest_path, created_at
+             FROM docker_images
+             WHERE image_name = ?1 AND manifest_digest = ?2
+             LIMIT 1",
+        )
+        .bind(image_name)
+        .bind(manifest_digest)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| map_docker_image(&r)).transpose()
     }
 }
 

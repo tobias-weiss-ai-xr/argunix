@@ -169,6 +169,10 @@ pub struct WorkerContext {
     /// that don't otherwise need to be async.
     #[allow(dead_code)]
     pub scheduler: Arc<std::sync::Mutex<Box<dyn argunix_sched::ScheduleStrategy>>>,
+    /// Where converted docker-image blobs and per-build manifests
+    /// live. The HTTP `/v2/...` registry surface reads from the same
+    /// path, so daemon and web server must agree.
+    pub registry_state: Arc<argunix_registry::RegistryState>,
 }
 
 /// Counter + Notify the daemon uses to wait for all detached build
@@ -1448,6 +1452,7 @@ async fn load_jobs_for_resume(
             meta: serde_json::Value::Null,
             is_cached: false,
             required_system_features: Vec::new(),
+            is_docker_image: false,
         };
         out.push((spec, row.id));
     }
@@ -1780,6 +1785,17 @@ async fn build_one(
             )
             .await?;
 
+            // Two post-success side-effects, both independent and
+            // both best-effort (failure of either keeps the job
+            // status as Success):
+            //   1. cache push: fans the output closure out to every
+            //      configured `binary_caches` entry in a detached
+            //      task so we don't hold the build loop while a
+            //      slow cache writes. Wall-clock lands on the job
+            //      row via `record_cache_push_ms`.
+            //   2. docker registry publish: when the attribute is a
+            //      `dockerTools` image, copy it into the embedded
+            //      registry so users can `docker pull` by tag.
             if !push_caches.is_empty() && !outcome.output_paths.is_empty() {
                 let output_paths = outcome.output_paths.clone();
                 let caches: Vec<argunix_build::PushCache> = push_caches.to_vec();
@@ -1817,6 +1833,18 @@ async fn build_one(
                     .in_current_span(),
                 );
             }
+            if spec.is_docker_image {
+                try_publish_docker_image(
+                    &ctx.store,
+                    &ctx.registry_state,
+                    repo_id,
+                    eval_id,
+                    job_id,
+                    spec,
+                    primary.as_deref(),
+                )
+                .await;
+            }
 
             Ok(JobStatus::Success)
         }
@@ -1833,6 +1861,67 @@ async fn build_one(
             .await?;
             Ok(JobStatus::Failure)
         }
+    }
+}
+
+/// Best-effort docker registry publish. Any error is logged at `warn`
+/// — the build is already a success, so registry-publish failure must
+/// not flip the job's terminal status. Mirrors `binary_caches` push
+/// failure policy.
+async fn try_publish_docker_image(
+    store: &SqlxStore,
+    state: &Arc<argunix_registry::RegistryState>,
+    repo_id: RepoId,
+    eval_id: EvalId,
+    job_id: JobId,
+    spec: &argunix_eval::JobSpec,
+    output_path: Option<&str>,
+) {
+    let repo = match <SqlxStore as argunix_store::RepoStore>::get(store, repo_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(repo_id = repo_id.get(), "registry: repo row missing");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "registry: repo lookup failed");
+            return;
+        }
+    };
+    let eval = match <SqlxStore as argunix_store::EvalStore>::get(store, eval_id).await {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            tracing::warn!(eval_id = eval_id.get(), "registry: eval row missing");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "registry: eval lookup failed");
+            return;
+        }
+    };
+    let attr_leaf = argunix_registry::publish::attr_leaf(spec.attr_path.as_str());
+    let system = spec.system.as_deref().unwrap_or("unknown");
+    let req = argunix_registry::publish::PublishRequest {
+        state,
+        store,
+        repo_id,
+        eval_id,
+        job_id,
+        forge: &repo.forge,
+        repo_slug: repo.slug.as_str(),
+        attr_leaf: &attr_leaf,
+        system,
+        git_ref: &eval.git_ref,
+        sha: &eval.sha,
+        output_path,
+    };
+    if let Err(e) = argunix_registry::publish(req).await {
+        tracing::warn!(
+            job_id = job_id.get(),
+            attr = %spec.attr_path,
+            error = %e,
+            "docker registry publish failed; job stays success",
+        );
     }
 }
 
@@ -2444,6 +2533,7 @@ mod tests {
             meta: serde_json::Value::Null,
             is_cached: false,
             required_system_features: required.iter().map(|s| s.to_string()).collect(),
+            is_docker_image: false,
         }
     }
 

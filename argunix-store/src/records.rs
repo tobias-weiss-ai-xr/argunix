@@ -207,3 +207,40 @@ pub struct BuilderRecord {
     pub last_seen: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
+
+/// Fields supplied when registering a converted docker image. Inserted
+/// after a successful build of an attribute flagged with
+/// `meta.docker-image == true` and a successful skopeo conversion of
+/// the docker-archive tarball into the registry blob pool.
+#[derive(Debug, Clone)]
+pub struct NewDockerImage {
+    pub repo_id: RepoId,
+    pub eval_id: EvalId,
+    pub job_id: JobId,
+    /// Forge-prefixed image name without the host (`<forge>/<owner>/<repo>/<attr>`).
+    pub image_name: String,
+    /// Nix system tuple (`x86_64-linux`, `aarch64-linux`).
+    pub system: String,
+    pub git_ref: String,
+    pub sha: Sha,
+    /// `sha256:<hex>` of the converted manifest.json bytes.
+    pub manifest_digest: String,
+    /// Absolute path to the on-disk manifest.json in the registry pool.
+    pub manifest_path: String,
+}
+
+/// One row of `docker_images`. Returned by registry lookups so the
+/// HTTP layer can serve manifests / blobs from disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerImageRecord {
+    pub repo_id: RepoId,
+    pub eval_id: EvalId,
+    pub job_id: JobId,
+    pub image_name: String,
+    pub system: String,
+    pub git_ref: String,
+    pub sha: Sha,
+    pub manifest_digest: String,
+    pub manifest_path: String,
+    pub created_at: DateTime<Utc>,
+}

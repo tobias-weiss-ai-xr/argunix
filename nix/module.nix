@@ -174,6 +174,12 @@ in
         # our russh-tunneled proxy socket.
         # see `closure_xfer::nix_copy_over_pool`.
         pkgs.socat
+        # Converts `dockerTools.{buildImage,buildLayeredImage}`
+        # docker-archive tarballs into the OCI/distribution layout
+        # served by the `/v2/...` registry surface. Invoked from
+        # `argunix-registry::convert` after each docker-image build's
+        # `BuildStatus::Success`.
+        pkgs.skopeo
       ];
 
       serviceConfig = {

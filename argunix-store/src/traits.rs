@@ -1,6 +1,6 @@
 use crate::records::{
-    BuilderRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord, JobPhaseMetrics, JobRecord,
-    JobWithContext, NewBuilder, NewEvaluation, NewJob, RepoRecord,
+    BuilderRecord, DockerImageRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord, JobPhaseMetrics,
+    JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob, RepoRecord,
 };
 use argunix_domain::{
     BuilderId, BuilderPubkey, EvalId, EvalStatus, JobId, JobStatus, RepoId, Slug,
@@ -362,6 +362,52 @@ pub trait BuilderStore: Send + Sync {
     /// All builders, oldest enrollment first. Includes revoked rows so
     /// `argunixctl builders` can show them.
     async fn list_all(&self) -> Result<Vec<BuilderRecord>, StoreError>;
+}
+
+#[async_trait]
+pub trait DockerImageStore: Send + Sync {
+    /// Insert a converted docker image. Called by the worker after a
+    /// successful build of an attribute flagged with
+    /// `meta.docker-image == true` and a successful skopeo conversion
+    /// to OCI blobs in the registry pool.
+    async fn create(&self, new: NewDockerImage) -> Result<(), StoreError>;
+
+    /// Most recent row matching `(image_name, system, git_ref)`. Drives
+    /// the registry's tag → manifest resolution: callers fan out across
+    /// `system` to assemble a multi-arch OCI image index, then return
+    /// the per-system child manifest by digest.
+    async fn latest_for_branch(
+        &self,
+        image_name: &str,
+        system: &str,
+        git_ref: &str,
+    ) -> Result<Option<DockerImageRecord>, StoreError>;
+
+    /// All systems for which we have a build of `image_name` on `git_ref`,
+    /// each represented by its most recent row. Used to assemble the OCI
+    /// image index served at `/v2/<image_name>/manifests/<branch>`.
+    async fn latest_per_system_for_branch(
+        &self,
+        image_name: &str,
+        git_ref: &str,
+    ) -> Result<Vec<DockerImageRecord>, StoreError>;
+
+    /// Per-system rows for an exact sha. Used by `:sha-<short>` tag
+    /// resolution after the caller resolves the short prefix to a full
+    /// sha (or via `LIKE 'short%'` directly).
+    async fn rows_by_sha_prefix(
+        &self,
+        image_name: &str,
+        sha_prefix: &str,
+    ) -> Result<Vec<DockerImageRecord>, StoreError>;
+
+    /// Single row by manifest digest — used to serve manifest-by-digest
+    /// requests (`/v2/<name>/manifests/sha256:<hex>`).
+    async fn by_manifest_digest(
+        &self,
+        image_name: &str,
+        manifest_digest: &str,
+    ) -> Result<Option<DockerImageRecord>, StoreError>;
 }
 
 #[async_trait]

@@ -16,6 +16,7 @@ argunix-control = { path = "../argunix-control" }
 argunix-domain = { workspace = true }
 argunix-eval = { path = "../argunix-eval" }
 argunix-forge = { path = "../argunix-forge" }
+argunix-registry = { workspace = true }
 argunix-sched = { path = "../argunix-sched" }
 argunix-store = { workspace = true }
 argunix-web = { path = "../argunix-web" }

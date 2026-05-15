@@ -276,6 +276,7 @@ dependencies = [
  "argunix-domain",
  "argunix-eval",
  "argunix-forge",
+ "argunix-registry",
  "argunix-sched",
  "argunix-store",
  "argunix-web",
@@ -332,6 +333,27 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "argunix-registry"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "argunix-domain",
+ "argunix-store",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
