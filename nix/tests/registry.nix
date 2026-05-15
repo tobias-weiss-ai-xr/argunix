@@ -104,20 +104,26 @@ in
         };
       };
 
-      # Real docker daemon for the pull+run side. Argunix serves over
-      # plain HTTP, so the daemon must accept the registry as
-      # insecure (no TLS, no auth).
-      virtualisation.docker = {
+      # We use podman (daemonless) instead of docker for the
+      # pull+run side. Docker's daemon holds a ~150 MiB resident
+      # set + heap permanently, and that — plus argunix + nix's
+      # build sandbox — was crossing a SIGKILL threshold during
+      # the inner fixture-image build in CI ("builder failed due
+      # to signal 9"). Podman has the same OCI-distribution
+      # semantics for the assertions we care about (pull a real
+      # image, run it, capture stdout) without persistent daemon
+      # overhead. `registries.insecure` lets it accept the plain-
+      # HTTP registry argunix serves.
+      virtualisation.containers = {
         enable = true;
-        daemon.settings = {
-          insecure-registries = [ registryHost ];
-        };
+        registries.insecure = [ registryHost ];
       };
 
       environment.systemPackages = [
         pkgs.argunix
         pkgs.nix-eval-jobs
         pkgs.skopeo
+        pkgs.podman
         # For decompressing per-job build logs (`*.log.zst`) when the
         # test needs to print them on failure.
         pkgs.zstd
@@ -129,17 +135,21 @@ in
 
       virtualisation = {
         # dockerTools layers + docker daemon image cache + nix store
-        # for the fixture closure leave the default 1 GiB tight.
-        memorySize = 4096;
+        # for the fixture closure + argunix's own resident set leave
+        # the default 1 GiB tight. 4 GiB also tipped over in CI
+        # (host running multiple VM tests in parallel under tighter
+        # cgroup pressure than a workstation), surfacing as SIGKILL
+        # on the inner `cp` build. 8 GiB gives comfortable headroom
+        # — bigger than strictly necessary on idle hardware but the
+        # test's wall-clock is dominated by the VM boot, not RAM.
+        memorySize = 8192;
         diskSize = 8 * 1024;
         writableStore = true;
         # Default `writableStoreUseTmpfs = true` puts the writable
         # overlay on RAM. The fixture build's $out + nix's eval
         # heap + argunix daemon + docker daemon collectively
-        # overflow that, and the inner build gets OOM-killed
-        # (SIGKILL on the builder, surfacing as "builder failed
-        # due to signal 9"). Push both the store overlay and the
-        # build-sandbox /tmp to the disk-backed image instead.
+        # overflow that even at the bumped memory size — keep the
+        # store overlay and build-sandbox /tmp disk-backed.
         writableStoreUseTmpfs = false;
       };
       boot.tmp.useTmpfs = false;
@@ -171,7 +181,6 @@ in
     machine.start()
     machine.wait_for_unit("argunix.service")
     machine.wait_for_open_port(${toString argunixPort})
-    machine.wait_for_unit("docker.service")
 
     # Pull the rendered YAML path from the running systemd unit so
     # the `argunix build` CLI invocation below reuses the module's
@@ -365,10 +374,10 @@ in
     assert '"linux"' in manifest, f"expected linux platform in index: {manifest!r}"
     assert '"amd64"' in manifest, f"expected amd64 platform in index: {manifest!r}"
 
-    # Cross-check the second hop ourselves before docker takes it:
+    # Cross-check the second hop ourselves before the client takes it:
     # the index references each per-arch manifest by digest. If our
     # own /manifests/sha256:... endpoint doesn't return that
-    # manifest, docker pull won't either. Collect everything into a
+    # manifest, podman pull won't either. Collect everything into a
     # single string so the assertion message carries the full
     # picture even when the test driver elides intermediate prints.
     import json as _json2
@@ -390,14 +399,17 @@ in
         print(probe2)
         digest_probes += f"\n  GET /manifests/{digest} -> rc={rc}\n{probe2}\n"
 
-    # Real docker pull: walks the index, picks the matching child
+    # Real podman pull: walks the index, picks the matching child
     # manifest by platform, and downloads each blob via /v2/.../blobs/.
+    # Podman is daemonless — pull and run happen as ordinary user-space
+    # processes — so it doesn't keep a persistent resident set around
+    # while we're driving the eval+build above.
     rc, pull_out = machine.execute(
-        "docker pull ${registryHost}/gh/myorg/myrepo/hello-image:main 2>&1"
+        "podman pull ${registryHost}/gh/myorg/myrepo/hello-image:main 2>&1"
     )
     assert rc == 0, (
-        f"docker pull failed (rc={rc})\n"
-        f"docker output:\n{pull_out}\n"
+        f"podman pull failed (rc={rc})\n"
+        f"podman output:\n{pull_out}\n"
         f"index returned by /manifests/main:\n{manifest}\n"
         f"docker_images:\n{docker_images_dump}\n"
         f"per-digest probes:{digest_probes}"
@@ -407,9 +419,9 @@ in
     # in the dockerTools fixture echoes a known string; that round
     # trip is the load-bearing assertion.
     run_out = machine.succeed(
-        "docker run --rm ${registryHost}/gh/myorg/myrepo/hello-image:main"
+        "podman run --rm ${registryHost}/gh/myorg/myrepo/hello-image:main"
     ).strip()
-    print(f"docker run output: {run_out!r}")
+    print(f"podman run output: {run_out!r}")
     assert run_out == "hello-from-argunix-registry", (
         f"unexpected container output: {run_out!r}"
     )
