@@ -149,6 +149,17 @@ pub trait EvalStore: Send + Sync {
         repo_id: RepoId,
         limit: u32,
     ) -> Result<Vec<EvalRecord>, StoreError>;
+
+    /// Most-recent `Done` evaluation on `git_ref` for `repo_id`, or
+    /// `None` if the repo has never had a successful eval on that ref.
+    /// `git_ref` must match exactly (e.g. `refs/heads/main`); the
+    /// synthetic-flake `/ref/<branch>` and bare-slug endpoints use
+    /// this to map a mutable URL to the latest immutable eval.
+    async fn latest_done_for_ref(
+        &self,
+        repo_id: RepoId,
+        git_ref: &str,
+    ) -> Result<Option<EvalRecord>, StoreError>;
     /// All non-terminal evaluations (queued / evaluating / building) for
     /// `repo_id` whose `git_ref` *starts with* `branch_key_prefix`. Used by
     /// cancel-on-new-push: a fresh push on a branch finds all

@@ -258,6 +258,12 @@ struct RepoTemplate {
     /// button on the page writes this to the clipboard.
     badge_markdown: String,
     evals: Vec<EvalRow>,
+    /// `nix run` snippet for the synthetic-flake endpoint at the
+    /// bare-slug (latest-on-default-branch) URL. `None` when this
+    /// instance has no usable public cache configured. Shown on the
+    /// repo page so users can copy it into a terminal without
+    /// drilling into a specific eval.
+    nix_run_snippet: Option<String>,
 }
 
 struct EvalRow {
@@ -324,6 +330,11 @@ struct EvalTemplate {
     /// Forge-side link to the commit. Empty when no forge URL can be
     /// built.
     commit_link: String,
+    /// `nix run` snippet for `<external_url>/flake/<forge>/<slug>/eval/<id>`.
+    /// `None` when no public cache is configured, or this eval has zero
+    /// green jobs (the synthetic-flake endpoint would 404 — surface that
+    /// here by hiding the snippet rather than showing a broken command).
+    nix_run_snippet: Option<String>,
 }
 
 struct JobRow {
@@ -371,6 +382,11 @@ struct JobTemplate {
     /// "—". The whole block is suppressed in the template when no
     /// phase has data, so jobs built locally stay clean.
     phase_metrics: PhaseMetricsRow,
+    /// Concrete `nix run` snippet pinned to this exact attr — e.g.
+    /// `nix run … /flake/<forge>/<slug>/eval/<id>#<leaf>`. `None` for
+    /// non-green jobs (nothing to expose), or instances with no
+    /// public cache configured.
+    nix_run_snippet: Option<String>,
 }
 
 #[derive(Default)]
@@ -607,6 +623,37 @@ fn render_nixos_snippet(public_url: &str, public_key: &str) -> String {
 
 fn render_nix_conf_snippet(public_url: &str, public_key: &str) -> String {
     format!("extra-substituters = {public_url}\nextra-trusted-public-keys = {public_key}")
+}
+
+/// Build the `nix run` shell snippet that hits the synthetic-flake
+/// endpoint at the given selector tail (e.g. `""` for default branch,
+/// `/eval/42` for an eval pin). Returns `None` when the instance has
+/// no usable public cache (the synthetic-flake handler itself 409s in
+/// that case, so showing a snippet that always fails would be a lie).
+///
+/// `attr` is what goes after the `#` — pass `"<attr>"` literally as a
+/// placeholder on pages that don't know which attribute the user
+/// wants, or the concrete leaf name on the job page.
+fn synthetic_flake_run_snippet(
+    state: &AppState,
+    forge: &str,
+    slug: &str,
+    selector_tail: &str,
+    attr: &str,
+) -> Option<String> {
+    let snap = state.current.load_full();
+    let has_public_cache = snap
+        .config
+        .binary_caches
+        .iter()
+        .any(|c| c.public_url.is_some() && c.public_key.is_some());
+    if !has_public_cache {
+        return None;
+    }
+    let base = snap.config.external_url.trim_end_matches('/');
+    Some(format!(
+        "nix run --accept-flake-config {base}/flake/{forge}/{slug}{selector_tail}#{attr}"
+    ))
 }
 
 fn build_coordinator_row(state: &AppState) -> CoordinatorRow {
@@ -1264,6 +1311,7 @@ async fn repo_page(
         crate::badge::badge_url(external_url, &forge, slug.as_str(), snippet_branch_ref);
     let badge_markdown =
         crate::badge::markdown_snippet(external_url, &forge, slug.as_str(), snippet_branch_ref);
+    let nix_run_snippet = synthetic_flake_run_snippet(&state, &forge, slug.as_str(), "", "<attr>");
     let html = render(&RepoTemplate {
         cluster_active,
         forge,
@@ -1274,6 +1322,7 @@ async fn repo_page(
         badge_url,
         badge_markdown,
         evals,
+        nix_run_snippet,
     })?;
     Ok(Html(html).into_response())
 }
@@ -1332,7 +1381,7 @@ async fn eval_page(
 
     let job_heading = job_heading_for(&eval.status, jobs.len());
     let empty_jobs_msg = empty_jobs_msg_for(&eval.status);
-    let job_rows = jobs
+    let job_rows: Vec<JobRow> = jobs
         .into_iter()
         .map(|j| JobRow {
             attr_path: j.attr_path.to_string(),
@@ -1359,6 +1408,26 @@ async fn eval_page(
         eval.sha.as_str(),
     );
 
+    // Only show the snippet if there's something to run — `jobs` is
+    // moved into `job_rows` above, but we still know via `eval.status`
+    // whether the eval reached `Done` (precondition for any successful
+    // job to exist). `job_rows` carries the per-job status labels so
+    // we re-check there to avoid false-positives when only failed jobs
+    // exist.
+    let has_green_job = job_rows
+        .iter()
+        .any(|j| j.status == "success" || j.status == "cached");
+    let nix_run_snippet = if has_green_job {
+        synthetic_flake_run_snippet(
+            &state,
+            &forge,
+            slug.as_str(),
+            &format!("/eval/{}", eval_id.get()),
+            "<attr>",
+        )
+    } else {
+        None
+    };
     let cluster_active = cluster_is_active(&state).await?;
     let html = render(&EvalTemplate {
         cluster_active,
@@ -1383,6 +1452,7 @@ async fn eval_page(
         repo_url,
         ref_link,
         commit_link,
+        nix_run_snippet,
     })?;
     Ok(Html(html).into_response())
 }
@@ -1426,6 +1496,32 @@ async fn job_page(
         None
     };
 
+    // Only a green job has an attr the synthetic flake exposes. For
+    // failed/cancelled jobs the synthetic-flake endpoint silently
+    // omits the attr (its `nix run` would just fail "missing
+    // attribute"), so we hide the snippet rather than show one that
+    // doesn't work.
+    let nix_run_snippet = if job.status.is_success() {
+        // The leaf attr is what shows up under `apps.<sys>.<here>` /
+        // `packages.<sys>.<here>` in the synthetic flake — same
+        // last-segment slicing as `synthetic_flake::leaf_attr`.
+        let leaf = job
+            .attr_path
+            .as_str()
+            .rsplit('.')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(job.attr_path.as_str());
+        synthetic_flake_run_snippet(
+            &state,
+            &forge,
+            slug.as_str(),
+            &format!("/eval/{}", eval_id.get()),
+            leaf,
+        )
+    } else {
+        None
+    };
     let cluster_active = cluster_is_active(&state).await?;
     let html = render(&JobTemplate {
         cluster_active,
@@ -1444,6 +1540,7 @@ async fn job_page(
         has_log: job.log_path.is_some(),
         live_builder,
         phase_metrics,
+        nix_run_snippet,
     })?;
     Ok(Html(html).into_response())
 }

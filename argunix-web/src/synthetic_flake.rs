@@ -62,9 +62,18 @@ impl IntoResponse for SyntheticFlakeError {
     }
 }
 
-/// `GET /flake/{forge}/{*tail}` — `tail` looks like `<slug>/eval/<id>`.
-/// Multi-segment slugs (gitlab subgroups) are tolerated because the
-/// `/eval/` marker uniquely separates slug from selector.
+/// `GET /flake/{forge}/{*tail}` — `tail` is one of:
+///
+/// - `<slug>/eval/<id>`        immutable, exact eval
+/// - `<slug>/ref/<branch>`     mutable, latest green eval on `<branch>`
+/// - `<slug>`                  mutable, latest green eval on the repo's
+///                             default branch (forge-supplied; 404 if
+///                             argunix hasn't seen a webhook for the
+///                             repo yet and so doesn't know which
+///                             branch counts as default).
+///
+/// Multi-segment slugs (GitLab subgroups) are tolerated because the
+/// `/eval/`, `/ref/` markers uniquely separate slug from selector.
 pub async fn serve(
     AxumPath((forge, tail)): AxumPath<(String, String)>,
     State(state): State<AppState>,
@@ -85,10 +94,36 @@ pub async fn serve(
         .await?
         .ok_or(SyntheticFlakeError::NotFound)?;
 
-    let eval = EvalStore::get(&state.store, parsed.eval_id)
-        .await?
-        .filter(|e| e.repo_id == repo.id)
-        .ok_or(SyntheticFlakeError::NotFound)?;
+    let (eval, mutable) = match parsed.selector {
+        Selector::EvalId(id) => {
+            let e = EvalStore::get(&state.store, id)
+                .await?
+                .filter(|e| e.repo_id == repo.id)
+                .ok_or(SyntheticFlakeError::NotFound)?;
+            (e, false)
+        }
+        Selector::LatestOnRef(branch) => {
+            let git_ref = normalize_branch_to_git_ref(branch);
+            let e = EvalStore::latest_done_for_ref(&state.store, repo.id, &git_ref)
+                .await?
+                .ok_or(SyntheticFlakeError::NotFound)?;
+            (e, true)
+        }
+        Selector::LatestDefault => {
+            // No `default_branch` means no webhook has populated the
+            // repo metadata yet — we genuinely don't know which branch
+            // to point at. 404 is more honest than guessing `main`.
+            let default_branch = repo
+                .default_branch
+                .as_deref()
+                .ok_or(SyntheticFlakeError::NotFound)?;
+            let git_ref = normalize_branch_to_git_ref(default_branch);
+            let e = EvalStore::latest_done_for_ref(&state.store, repo.id, &git_ref)
+                .await?
+                .ok_or(SyntheticFlakeError::NotFound)?;
+            (e, true)
+        }
+    };
 
     let jobs = JobStore::list_by_eval(&state.store, eval.id).await?;
     let entries = jobs
@@ -112,40 +147,94 @@ pub async fn serve(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-tar"),
     );
-    // `/eval/<id>` is content-addressed (the eval is immutable: same
-    // sha, same green jobs forever — failed jobs that get retried
-    // create new evals, not mutations). Tell nix it can cache forever.
+    // `/eval/<id>` is content-addressed (same sha, same green jobs
+    // forever — failed jobs that get retried create new evals, not
+    // mutations), so tell nix it can cache forever. The mutable forms
+    // (`/ref/<branch>` and bare slug) need shorter TTL because their
+    // resolution changes when a new eval lands.
+    let cache_control = if mutable {
+        "public, max-age=60"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
     h.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
+        HeaderValue::from_static(cache_control),
     );
     Ok(resp)
+}
+
+/// Map a forge-supplied branch name (`main`, `master`, …) to the full
+/// git-ref form stored on `evaluations.git_ref`. Pass-through when the
+/// caller already gave us a `refs/`-prefixed value (so the `/ref/`
+/// endpoint accepts both `main` and `refs/heads/main`).
+fn normalize_branch_to_git_ref(branch: &str) -> String {
+    if branch.starts_with("refs/") {
+        branch.to_string()
+    } else {
+        format!("refs/heads/{branch}")
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedTail<'a> {
     slug: &'a str,
-    eval_id: EvalId,
+    selector: Selector<'a>,
 }
 
-/// Split `<slug>/eval/<id>` into (slug, id). The slug can contain
-/// slashes; we split on the *last* `/eval/` boundary so a repo named
-/// `eval` doesn't break parsing.
+#[derive(Debug, PartialEq, Eq)]
+enum Selector<'a> {
+    /// `/eval/<id>` — immutable, exact eval row.
+    EvalId(EvalId),
+    /// `/ref/<branch>` — mutable, latest green eval on that branch.
+    LatestOnRef(&'a str),
+    /// bare slug — mutable, latest green eval on the repo's default
+    /// branch as reported by its forge webhooks.
+    LatestDefault,
+}
+
+/// Parse the tail of `/flake/<forge>/<tail>` into slug + selector.
+/// Markers are checked most-specific-first so a slug that happens to
+/// contain `ref` or `eval` doesn't confuse the parser. `rfind` against
+/// each marker handles the (unlikely) case where the slug itself
+/// contains `/eval/` or `/ref/`.
 fn parse_tail(tail: &str) -> Option<ParsedTail<'_>> {
     let tail = tail.trim_end_matches('/');
-    let marker = tail.rfind("/eval/")?;
-    let slug = &tail[..marker];
-    if slug.is_empty() {
+    if tail.is_empty() {
         return None;
     }
-    let id_str = &tail[marker + "/eval/".len()..];
-    if id_str.is_empty() || id_str.contains('/') {
-        return None;
+    if let Some(marker) = tail.rfind("/eval/") {
+        let slug = &tail[..marker];
+        if slug.is_empty() {
+            return None;
+        }
+        let id_str = &tail[marker + "/eval/".len()..];
+        if id_str.is_empty() || id_str.contains('/') {
+            return None;
+        }
+        let eval_id: i64 = id_str.parse().ok()?;
+        return Some(ParsedTail {
+            slug,
+            selector: Selector::EvalId(EvalId::new(eval_id)),
+        });
     }
-    let eval_id: i64 = id_str.parse().ok()?;
+    if let Some(marker) = tail.rfind("/ref/") {
+        let slug = &tail[..marker];
+        if slug.is_empty() {
+            return None;
+        }
+        let branch = &tail[marker + "/ref/".len()..];
+        if branch.is_empty() {
+            return None;
+        }
+        return Some(ParsedTail {
+            slug,
+            selector: Selector::LatestOnRef(branch),
+        });
+    }
     Some(ParsedTail {
-        slug,
-        eval_id: EvalId::new(eval_id),
+        slug: tail,
+        selector: Selector::LatestDefault,
     })
 }
 
@@ -394,27 +483,82 @@ mod tests {
     fn parses_eval_tail() {
         let p = parse_tail("owner/repo/eval/42").unwrap();
         assert_eq!(p.slug, "owner/repo");
-        assert_eq!(p.eval_id, EvalId::new(42));
+        assert_eq!(p.selector, Selector::EvalId(EvalId::new(42)));
     }
 
     #[test]
     fn parses_subgroup_slug() {
         let p = parse_tail("group/sub/proj/eval/7").unwrap();
         assert_eq!(p.slug, "group/sub/proj");
-        assert_eq!(p.eval_id, EvalId::new(7));
+        assert_eq!(p.selector, Selector::EvalId(EvalId::new(7)));
     }
 
     #[test]
-    fn rejects_missing_eval_marker() {
-        assert!(parse_tail("owner/repo").is_none());
-        assert!(parse_tail("owner/repo/").is_none());
+    fn parses_ref_tail() {
+        let p = parse_tail("owner/repo/ref/main").unwrap();
+        assert_eq!(p.slug, "owner/repo");
+        assert_eq!(p.selector, Selector::LatestOnRef("main"));
     }
 
     #[test]
-    fn rejects_trailing_garbage() {
-        // `<id>/something` (e.g. a job sub-path) shouldn't accidentally
-        // parse — the synthetic-flake endpoint only takes a bare eval id.
+    fn parses_ref_with_slashes() {
+        // Branch names can contain slashes (`feature/foo`), and so can
+        // multi-segment slugs (GitLab subgroups). `rfind` of `/ref/`
+        // pins the boundary at the last occurrence — the more common
+        // case being a branch name on a non-subgroup slug.
+        let p = parse_tail("owner/repo/ref/feature/foo").unwrap();
+        assert_eq!(p.slug, "owner/repo");
+        assert_eq!(p.selector, Selector::LatestOnRef("feature/foo"));
+    }
+
+    #[test]
+    fn bare_slug_is_latest_default() {
+        // No marker → mutable "latest on default branch".
+        let p = parse_tail("owner/repo").unwrap();
+        assert_eq!(p.slug, "owner/repo");
+        assert_eq!(p.selector, Selector::LatestDefault);
+    }
+
+    #[test]
+    fn bare_subgroup_slug_is_latest_default() {
+        let p = parse_tail("group/sub/proj").unwrap();
+        assert_eq!(p.slug, "group/sub/proj");
+        assert_eq!(p.selector, Selector::LatestDefault);
+    }
+
+    #[test]
+    fn empty_tail_rejected() {
+        assert!(parse_tail("").is_none());
+        assert!(parse_tail("/").is_none());
+    }
+
+    #[test]
+    fn rejects_trailing_garbage_after_eval_id() {
+        // `<id>/something` (e.g. a job sub-path) is unambiguously a
+        // malformed eval URL — once `/eval/` is anchored as the
+        // marker, the id-suffix must not contain another `/`. We
+        // reject hard here rather than falling through to a
+        // LatestDefault interpretation, because the user clearly
+        // meant `/eval/<id>` and an opaque 404 on a bogus slug is
+        // worse than a clear "not found" on the eval URL.
         assert!(parse_tail("owner/repo/eval/42/job/foo").is_none());
+    }
+
+    #[test]
+    fn normalizes_branch_to_git_ref() {
+        // The forge gives us bare branch names (`main`); we store
+        // git refs (`refs/heads/main`). Both forms work on the
+        // `/ref/<…>` URL.
+        assert_eq!(normalize_branch_to_git_ref("main"), "refs/heads/main");
+        assert_eq!(
+            normalize_branch_to_git_ref("refs/heads/main"),
+            "refs/heads/main",
+        );
+        // Slash-bearing branch (`feature/foo`).
+        assert_eq!(
+            normalize_branch_to_git_ref("feature/foo"),
+            "refs/heads/feature/foo",
+        );
     }
 
     #[test]

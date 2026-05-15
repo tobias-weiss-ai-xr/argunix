@@ -14,3 +14,35 @@
   class="h-10 w-10{% if cluster_active %} argunix-spin{% endif %} dark:invert"
 />
 {%- endmacro %}
+
+{# Copy-pasteable `nix run` snippet for the synthetic-flake feature.
+   Used on the repo, eval, and job pages — `id` must be unique per
+   page, `command` is the literal shell line. `note` is rendered as
+   trailing helper text and may be empty. The matching copy button
+   is handled by the global `data-copy-target` listener in base.html. #}
+{% macro nix_run_snippet(id, command, note) -%}
+<section class="mb-6 rounded border border-border bg-surface p-3">
+  <div class="flex items-baseline justify-between gap-2 mb-2 flex-wrap">
+    <h2 class="text-sm font-semibold">Run from cache</h2>
+    <button
+      type="button"
+      class="px-3 py-1 rounded border border-border text-xs hover:border-link"
+      data-copy-target="{{ id }}"
+    >copy</button>
+  </div>
+  <pre
+    id="{{ id }}"
+    class="font-mono text-xs whitespace-pre-wrap break-all px-3 py-2 rounded border border-border bg-bg text-fg overflow-x-auto"
+  >{{ command }}</pre>
+  {% if !note.is_empty() %}
+  <p class="text-xs text-muted mt-2">{{ note|safe }}</p>
+  {% endif %}
+  <p class="text-xs text-muted mt-2">
+    Requires this argunix's cache in
+    <code class="font-mono">trusted-substituters</code> +
+    <code class="font-mono">trusted-public-keys</code> — see
+    <a class="text-link hover:underline" href="/cache">/cache</a> for
+    the one-time setup snippet.
+  </p>
+</section>
+{%- endmacro %}

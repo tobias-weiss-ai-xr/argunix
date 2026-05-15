@@ -1,4 +1,6 @@
-{% extends "base.html" %} {% block title %}{{ forge }}/{{ slug }} — argunix{% endblock %} {% block content %}
+{% extends "base.html" %}
+{%- import "_macros.html" as m -%}
+{% block title %}{{ forge }}/{{ slug }} — argunix{% endblock %} {% block content %}
 <h1 class="text-2xl font-semibold mb-1">
   {% if let Some(n) = name %}{{ n }}{% else %}{{ forge }} / {{ slug }}{% endif %}
 </h1>
@@ -25,15 +27,24 @@
       readonly
       value="{{ badge_markdown }}"
       class="flex-1 min-w-0 font-mono text-xs px-2 py-1 rounded border border-border bg-bg text-fg"
-      data-badge-snippet
+      id="badge-snippet"
     />
     <button
       type="button"
       class="px-3 py-1 rounded border border-border text-sm hover:border-link"
-      data-copy-target="data-badge-snippet"
+      data-copy-target="badge-snippet"
     >copy</button>
   </div>
 </section>
+
+{% if let Some(snippet) = nix_run_snippet %}
+{% call m::nix_run_snippet(
+  "snippet-repo-run",
+  snippet,
+  "Replace <code class=\"font-mono\">&lt;attr&gt;</code> with a package name from the latest successful eval (see jobs in any green eval below). This URL tracks the default branch."
+) %}
+{% endif %}
+
 {% if evals.is_empty() %}
 <p class="text-muted">No evaluations yet.</p>
 {% else %}
@@ -83,26 +94,6 @@
 </div>
 {% endif %}
 
-<script>
-  (() => {
-    const btn = document.querySelector('button[data-copy-target="data-badge-snippet"]');
-    const input = document.querySelector('input[data-badge-snippet]');
-    if (!btn || !input) return;
-    btn.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(input.value);
-        const original = btn.textContent;
-        btn.textContent = 'copied';
-        setTimeout(() => { btn.textContent = original; }, 1200);
-      } catch (_) {
-        {# Fallback for environments without the async clipboard API
-           (older Safari, http:// origins). select() + execCommand still
-           works in those cases and degrades silently if both fail. #}
-        input.focus();
-        input.select();
-        try { document.execCommand('copy'); } catch (_) { /* give up */ }
-      }
-    });
-  })();
-</script>
+{# Copy buttons are wired by the global `data-copy-target` listener
+   in `base.html`. No per-page script needed. #}
 {% endblock %}

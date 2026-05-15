@@ -529,6 +529,25 @@ impl EvalStore for SqlxStore {
         rows.iter().map(map_eval).collect()
     }
 
+    async fn latest_done_for_ref(
+        &self,
+        repo_id: RepoId,
+        git_ref: &str,
+    ) -> Result<Option<EvalRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, repo_id, trigger, git_ref, sha, started_at, finished_at, status, pr_number, building_started_at, failure_reason
+             FROM evaluations
+             WHERE repo_id = ?1 AND git_ref = ?2 AND status = 'done'
+             ORDER BY id DESC
+             LIMIT 1",
+        )
+        .bind(repo_id.get())
+        .bind(git_ref)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(map_eval).transpose()
+    }
+
     async fn list_active_by_branch_key(
         &self,
         repo_id: RepoId,

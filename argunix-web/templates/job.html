@@ -1,4 +1,6 @@
-{% extends "base.html" %} {% block title %}{{ attr_path }} — argunix{% endblock %} {% block content %}
+{% extends "base.html" %}
+{%- import "_macros.html" as m -%}
+{% block title %}{{ attr_path }} — argunix{% endblock %} {% block content %}
 <h1 class="text-2xl font-semibold font-mono mb-2">{{ attr_path }}</h1>
 <p class="mb-4">
   <a
@@ -30,6 +32,14 @@
   <dd class="font-mono">{{ b }}</dd>
   {% endif %}
 </dl>
+
+{% if let Some(snippet) = nix_run_snippet %}
+{% call m::nix_run_snippet(
+  "snippet-job-run",
+  snippet,
+  ""
+) %}
+{% endif %}
 
 {% if let Some(builder_name) = live_builder %}
 <section class="mb-6" id="live-stats" data-builder="{{ builder_name }}">

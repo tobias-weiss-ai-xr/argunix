@@ -32,5 +32,46 @@
     <footer class="max-w-5xl mx-auto px-4 py-4 text-xs text-muted">
       argunix CI
     </footer>
+    <script>
+      {# Global copy-target listener. Any element with `data-copy-target="<id>"`
+         on it copies the matching element's text to the clipboard on click.
+         Reads `.value` for inputs/textareas, falls back to `.textContent` for
+         <pre> + everything else. Event-delegated so it works for snippets
+         added dynamically and pages that don't include their own script. #}
+      document.addEventListener('click', async (ev) => {
+        const btn = ev.target.closest('button[data-copy-target]');
+        if (!btn) return;
+        const target = document.getElementById(btn.dataset.copyTarget);
+        if (!target) return;
+        const text = ('value' in target && target.value)
+          || target.textContent
+          || '';
+        if (!btn.dataset.originalText) {
+          btn.dataset.originalText = btn.textContent;
+        }
+        const restore = () => { btn.textContent = btn.dataset.originalText; };
+        try {
+          await navigator.clipboard.writeText(text);
+          btn.textContent = 'copied';
+          setTimeout(restore, 1200);
+        } catch (_) {
+          {# Fallback for older browsers / http:// origins where the
+             async clipboard API is gated: select + execCommand. #}
+          try {
+            if (target.select) target.select();
+            else {
+              const range = document.createRange();
+              range.selectNodeContents(target);
+              const sel = window.getSelection();
+              sel.removeAllRanges();
+              sel.addRange(range);
+            }
+            document.execCommand('copy');
+            btn.textContent = 'copied';
+            setTimeout(restore, 1200);
+          } catch (_) { /* give up */ }
+        }
+      });
+    </script>
   </body>
 </html>
