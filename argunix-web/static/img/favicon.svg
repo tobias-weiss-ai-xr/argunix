@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 209 209">
+  <title>argunix</title>
+  <style>
+    .ink { fill: #0f172a; stroke: #0f172a; }
+    .hole { fill: #ffffff; stroke: none; }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #f1f5f9; stroke: #f1f5f9; }
+      .hole { fill: #0f172a; stroke: none; }
+    }
+  </style>
+  <g transform="translate(45.698577,0)">
+    <g transform="rotate(60,102.82411,59.250478)">
+      <line class="ink" x1="120" y1="120" x2="120" y2="84" stroke-width="4" stroke-linecap="round" fill="none" />
+      <circle class="ink" cx="120" cy="70" r="15" />
+      <circle class="hole" cx="120" cy="70" r="7" />
+      <circle class="ink" cx="120" cy="70.349998" r="4.5" />
+      <circle class="hole" cx="116.85" cy="66.849998" r="2.0250001" />
+    </g>
+    <g transform="rotate(120,93.875177,94.583493)">
+      <line class="ink" x1="120" y1="120" x2="120" y2="84" stroke-width="4" stroke-linecap="round" fill="none" />
+      <circle class="ink" cx="120" cy="70" r="15" />
+      <circle class="hole" cx="120" cy="70" r="7" />
+      <circle class="ink" cx="120" cy="70.349998" r="4.5" />
+      <circle class="hole" cx="116.85" cy="66.849998" r="2.0250001" />
+    </g>
+    <g transform="rotate(180,89.400712,112.25)">
+      <line class="ink" x1="120" y1="120" x2="120" y2="84" stroke-width="4" stroke-linecap="round" fill="none" />
+      <circle class="ink" cx="120" cy="70" r="15" />
+      <circle class="hole" cx="120" cy="70" r="7" />
+      <circle class="ink" cx="120" cy="70.349998" r="4.5" />
+      <circle class="hole" cx="116.85" cy="66.849998" r="2.0250001" />
+    </g>
+    <g transform="rotate(-120,84.926247,129.91651)">
+      <line class="ink" x1="120" y1="120" x2="120" y2="84" stroke-width="4" stroke-linecap="round" fill="none" />
+      <circle class="ink" cx="120" cy="70" r="15" />
+      <circle class="hole" cx="120" cy="70" r="7" />
+      <circle class="ink" cx="120" cy="70.349998" r="4.5" />
+      <circle class="hole" cx="116.85" cy="66.849998" r="2.0250001" />
+    </g>
+    <g transform="rotate(-60,75.977318,165.24952)">
+      <line class="ink" x1="120" y1="120" x2="120" y2="84" stroke-width="4" stroke-linecap="round" fill="none" />
+      <circle class="ink" cx="120" cy="70" r="15" />
+      <circle class="hole" cx="120" cy="70" r="7" />
+      <circle class="ink" cx="120" cy="70.349998" r="4.5" />
+      <circle class="hole" cx="116.85" cy="66.849998" r="2.0250001" />
+    </g>
+    <g>
+      <line class="ink" x1="58.801422" y1="104.5" x2="58.801422" y2="64.5" stroke-width="8" stroke-linecap="round" fill="none" />
+      <circle class="ink" cx="58.801422" cy="34.5" r="34" />
+      <circle class="hole" cx="58.801422" cy="34.5" r="18" />
+      <circle class="ink" cx="58.801422" cy="35.400002" r="11" />
+      <circle class="hole" cx="51.101425" cy="26.799999" r="4.9499998" />
+    </g>
+    <circle class="ink" cx="58.801422" cy="104.5" r="10" />
+  </g>
+</svg>

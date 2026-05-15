@@ -15,6 +15,8 @@ let
       || file.hasExt "css"
       || file.hasExt "html"
       || file.hasExt "svg"
+      || file.hasExt "ico"
+      || file.hasExt "png"
       || file.hasExt "js"
       || file.hasExt "LICENSE"
       || file.name == "Cargo.toml"
