@@ -77,18 +77,6 @@ let
   '';
 
   githubToken = pkgs.writeText "argunix-test-github-token" "tok";
-
-  testConfig = pkgs.writers.writeYAML "argunix-test.yaml" {
-    external_url = "https://argunix.example.com";
-    forges.gh = {
-      kind = "github";
-      web_url = "https://github.com";
-      token_path = "${githubToken}";
-      repos = {
-        "myorg/myrepo" = { };
-      };
-    };
-  };
 in
 {
   name = "argunix-registry";
@@ -105,7 +93,15 @@ in
       services.argunix = {
         enable = true;
         listen = "127.0.0.1:${toString argunixPort}";
-        configFile = testConfig;
+        settings = {
+          external_url = "https://argunix.example.com";
+          forges.gh = {
+            kind = "github";
+            web_url = "https://github.com";
+            token_path = "${githubToken}";
+            repos."myorg/myrepo" = { };
+          };
+        };
       };
 
       # Real docker daemon for the pull+run side. Argunix serves over
@@ -170,10 +166,23 @@ in
     };
 
   testScript = ''
+    import re
+
     machine.start()
     machine.wait_for_unit("argunix.service")
     machine.wait_for_open_port(${toString argunixPort})
     machine.wait_for_unit("docker.service")
+
+    # Pull the rendered YAML path from the running systemd unit so
+    # the `argunix build` CLI invocation below reuses the module's
+    # generated config file — no test-side YAML to maintain.
+    exec_start = machine.succeed(
+        "systemctl show argunix -p ExecStart --value"
+    )
+    m = re.search(r"--config\s+(\S+)", exec_start)
+    assert m, f"could not parse daemon config path from: {exec_start!r}"
+    config_path = m.group(1)
+    print(f"argunix config: {config_path}")
 
     # Drive the build with the daemon stopped so a single sqlite
     # writer at a time is touching /var/lib/argunix/db.sqlite. The
@@ -200,7 +209,7 @@ in
     out = machine.succeed(
         "cd /var/lib/argunix && sudo -u argunix"
         " argunix build"
-        " --config ${testConfig}"
+        f" --config {config_path}"
         " --src ${fixtureFlake}"
         " --slug myorg/myrepo"
         " --forge gh"

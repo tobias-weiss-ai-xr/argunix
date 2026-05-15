@@ -30,7 +30,7 @@
 # keeps the test free of forge tokens and webhook simulation while
 # still going through the same `argunix-build::push_to_caches`
 # code path the service uses.
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
 
 let
   argunixPort = 8080;
@@ -105,33 +105,10 @@ let
   '';
 
   # The public key is generated inside `signingKeys` at build time,
-  # so we splice its contents into the YAML at build time too —
-  # `pkgs.formats.yaml.generate` would need the literal string at
-  # Nix-eval time, which is too early.
-  testConfig = pkgs.runCommand "argunix-test.yaml" { } ''
-    pub=$(cat ${signingKeys}/public)
-    cat > $out <<EOF
-    external_url: https://argunix.example.com
-    forges:
-      gh:
-        kind: github
-        web_url: https://github.com
-        token_path: ${githubToken}
-        repos:
-          myorg/myrepo: {}
-    binary_caches:
-      # Asymmetric S3 cache. `public_url` + `public_key` together
-      # unlock the copy-pasteable substituter snippets on /cache.
-      - push_url: ${s3CachePushUrl}
-        public_url: ${s3CachePublicUrl}
-        public_key: $pub
-        signing_key_path: ${signingKeys}/secret
-      # Symmetric local file cache — no `public_url`. The /cache
-      # page renders this as "incomplete" with a hint.
-      - push_url: ${localCacheUrl}
-        signing_key_path: ${signingKeys}/secret
-    EOF
-  '';
+  # so we read it back via IFD — one extra realisation at flake-eval
+  # time, fine for a test, and lets us hand the bare string to the
+  # NixOS module's `settings` option.
+  publicKey = lib.removeSuffix "\n" (builtins.readFile "${signingKeys}/public");
 in
 {
   name = "argunix-cache-push";
@@ -148,7 +125,31 @@ in
       services.argunix = {
         enable = true;
         listen = "127.0.0.1:${toString argunixPort}";
-        configFile = testConfig;
+        settings = {
+          external_url = "https://argunix.example.com";
+          forges.gh = {
+            kind = "github";
+            web_url = "https://github.com";
+            token_path = "${githubToken}";
+            repos."myorg/myrepo" = { };
+          };
+          binary_caches = [
+            # Asymmetric S3 cache. `public_url` + `public_key` together
+            # unlock the copy-pasteable substituter snippets on /cache.
+            {
+              push_url = s3CachePushUrl;
+              public_url = s3CachePublicUrl;
+              public_key = publicKey;
+              signing_key_path = "${signingKeys}/secret";
+            }
+            # Symmetric local file cache — no `public_url`. The /cache
+            # page renders this as "incomplete" with a hint.
+            {
+              push_url = localCacheUrl;
+              signing_key_path = "${signingKeys}/secret";
+            }
+          ];
+        };
       };
 
       # Self-hosted S3-compatible cache backend. The same VM hosts
@@ -207,6 +208,18 @@ in
     machine.wait_for_unit("argunix.service")
     machine.wait_for_open_port(${toString argunixPort})
 
+    # Pull the rendered YAML path from the running systemd unit so
+    # neither the grep checks below nor the `argunix build` invocation
+    # later need a separate test-side YAML — the module's generated
+    # file is the single source of truth.
+    exec_start = machine.succeed(
+        "systemctl show argunix -p ExecStart --value"
+    )
+    config_path = match_or_fail(
+        r"--config\s+(\S+)", exec_start, "daemon config path"
+    )
+    print(f"argunix config: {config_path}")
+
     # Garage takes a moment to bind its rpc + s3-api ports after
     # the systemd unit becomes "active"; wait until the s3-api
     # socket is actually answering.
@@ -244,13 +257,13 @@ in
     # daemon's YAML — both shapes (asymmetric + symmetric) must
     # land in the same `binary_caches` list.
     machine.succeed(
-        "grep -q 'push_url: s3://${s3Bucket}' ${testConfig}"
+        f"grep -q 'push_url: s3://${s3Bucket}' {config_path}"
     )
     machine.succeed(
-        "grep -q 'public_url: ${s3CachePublicUrl}' ${testConfig}"
+        f"grep -q 'public_url: ${s3CachePublicUrl}' {config_path}"
     )
     machine.succeed(
-        "grep -q 'push_url: ${localCacheUrl}' ${testConfig}"
+        f"grep -q 'push_url: ${localCacheUrl}' {config_path}"
     )
 
     # The /cache page is user-facing: only fully-configured
@@ -313,7 +326,7 @@ in
         f" AWS_ACCESS_KEY_ID={key_id}"
         f" AWS_SECRET_ACCESS_KEY={secret_key}"
         " argunix build"
-        " --config ${testConfig}"
+        f" --config {config_path}"
         " --src ${fixtureFlake}"
         " --slug myorg/myrepo"
         " --forge gh"
