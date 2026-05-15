@@ -35,7 +35,7 @@
 
     <section class="flex flex-col gap-2">
       <div class="flex items-baseline justify-between gap-2 flex-wrap">
-        <h3 class="text-sm font-semibold">Flake — paste into your <code class="font-mono">flake.nix</code></h3>
+        <h3 class="text-sm font-semibold">Flake: Paste into your <code class="font-mono">flake.nix</code></h3>
         <button
           type="button"
           class="px-3 py-1 rounded border border-border text-xs hover:border-link"
@@ -43,7 +43,7 @@
         >copy</button>
       </div>
       <p class="text-xs text-muted">
-        Anyone running <code class="font-mono">nix build</code> /
+        Configure your flakes to suggest the cache to users. Anyone running <code class="font-mono">nix build</code> /
         <code class="font-mono">nix develop</code> against your flake
         gets the cache offered automatically (subject to the user
         accepting <code class="font-mono">nixConfig</code>).
@@ -56,7 +56,7 @@
 
     <section class="flex flex-col gap-2">
       <div class="flex items-baseline justify-between gap-2 flex-wrap">
-        <h3 class="text-sm font-semibold">NixOS — drop into any module</h3>
+        <h3 class="text-sm font-semibold">NixOS: Drop into any module</h3>
         <button
           type="button"
           class="px-3 py-1 rounded border border-border text-xs hover:border-link"
@@ -64,8 +64,7 @@
         >copy</button>
       </div>
       <p class="text-xs text-muted">
-        Applies system-wide on <code class="font-mono">nixos-rebuild switch</code>.
-        Persists across nix invocations and across users.
+        Configure your NixOS system to use the cache for all nix invocations and all users.
       </p>
       <pre
         id="snippet-nixos-{{ loop.index }}"
@@ -75,7 +74,7 @@
 
     <section class="flex flex-col gap-2">
       <div class="flex items-baseline justify-between gap-2 flex-wrap">
-        <h3 class="text-sm font-semibold">Non-NixOS — <code class="font-mono">~/.config/nix/nix.conf</code> (or <code class="font-mono">/etc/nix/nix.conf</code>)</h3>
+        <h3 class="text-sm font-semibold">Non-NixOS: <code class="font-mono">~/.config/nix/nix.conf</code> or <code class="font-mono">/etc/nix/nix.conf</code></h3>
         <button
           type="button"
           class="px-3 py-1 rounded border border-border text-xs hover:border-link"

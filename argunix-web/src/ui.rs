@@ -553,7 +553,7 @@ struct PublicCacheRow {
     nix_conf_snippet: String,
 }
 
-/// `GET /caches` — list configured binary caches with copy-pasteable
+/// `GET /cache` — list configured binary caches with copy-pasteable
 /// substituter snippets so end-users can opt into the cache from a
 /// flake, a NixOS config, or a plain `nix.conf`. Entries that lack
 /// the public-side fields needed to render those snippets are

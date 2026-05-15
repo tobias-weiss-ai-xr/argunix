@@ -59,7 +59,7 @@ forges:
     repos:
       ops/infra:
         watched_branches: [main]
-# Three cache entries so /caches renders all the interesting cells:
+# Three cache entries so /cache renders all the interesting cells:
 #   - asymmetric S3 + CDN (full snippets)
 #   - symmetric cachix-style (full snippets, public_url == push_url)
 #   - file:// with no public_url (the "incomplete" hint path).
@@ -160,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
     println!("    /            – cluster status (htmx-polled)");
     println!("    /repos       – repos overview");
     println!("    /hosts       – coordinator + builders");
-    println!("    /caches      – binary caches + substituter snippets");
+    println!("    /cache       – binary caches + substituter snippets");
     println!("    /r/gh/argunix/argunix");
     println!("    /r/gh/acme/widgets");
     println!("    /r/fj/ops/infra");
