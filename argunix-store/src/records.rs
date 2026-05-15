@@ -127,6 +127,14 @@ pub struct JobPhaseMetrics {
     pub pull_bytes: Option<u64>,
     /// Wall-clock of the entire `nix copy --from` invocation.
     pub pull_ms: Option<u64>,
+    /// Wall-clock of the post-success `nix copy --to <binary_cache>`
+    /// publish, summed across every configured cache. Written by a
+    /// detached background task that fires after `finish` — so the
+    /// value lands on the row a few seconds to several minutes after
+    /// `finished_at`. `None` for jobs with no `binary_caches`
+    /// configured, for failures (no push attempted), and for any job
+    /// where the daemon was shut down mid-push.
+    pub cache_push_ms: Option<u64>,
 }
 
 /// A job row joined with its evaluation and repo. Used by the status

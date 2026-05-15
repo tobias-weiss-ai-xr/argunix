@@ -868,6 +868,7 @@ fn default_phase_metrics() -> JobPhaseMetrics {
         build_ms: Some(85_400),
         pull_bytes: Some(523_876_544),
         pull_ms: Some(7_120),
+        cache_push_ms: Some(161_500),
     }
 }
 

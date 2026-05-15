@@ -253,41 +253,41 @@ in
         "grep -q 'push_url: ${localCacheUrl}' ${testConfig}"
     )
 
-    # The /caches page is user-facing: only fully-configured
+    # The /cache page is user-facing: only fully-configured
     # caches (public_url + public_key) appear in the main list,
     # with the three substituter snippets. Push-only entries are
     # hidden from the consumer view and surface as a single
     # operator note at the bottom.
     caches_html = machine.succeed(
-        "curl -fsS http://127.0.0.1:${toString argunixPort}/caches"
+        "curl -fsS http://127.0.0.1:${toString argunixPort}/cache"
     )
     pubkey = machine.succeed("cat ${signingKeys}/public").strip()
     print(f"trusted-public-key: {pubkey}")
     assert "${s3CachePublicUrl}" in caches_html, (
-        f"expected s3 public_url to appear on /caches, got: {caches_html[:500]!r}"
+        f"expected s3 public_url to appear on /cache, got: {caches_html[:500]!r}"
     )
     assert pubkey in caches_html, (
-        f"expected public_key {pubkey!r} on /caches"
+        f"expected public_key {pubkey!r} on /cache"
     )
     assert "extra-substituters" in caches_html, (
-        "expected substituter snippets in the rendered /caches HTML"
+        "expected substituter snippets in the rendered /cache HTML"
     )
     assert "nixConfig" in caches_html, (
-        "expected the flake nixConfig snippet on /caches"
+        "expected the flake nixConfig snippet on /cache"
     )
     assert "nix.settings" in caches_html, (
-        "expected the NixOS nix.settings snippet on /caches"
+        "expected the NixOS nix.settings snippet on /cache"
     )
 
     # Privacy regression guard: push URLs (potentially carrying
     # credentials or pointing at private endpoints) must NEVER
-    # render on the user-facing /caches page.
+    # render on the user-facing /cache page.
     assert "${s3CachePushUrl}" not in caches_html, (
-        "push_url must not appear on /caches — that's an "
+        "push_url must not appear on /cache — that's an "
         "operator-internal endpoint"
     )
     assert "${localCacheUrl}" not in caches_html, (
-        "push_url must not appear on /caches — that's an "
+        "push_url must not appear on /cache — that's an "
         "operator-internal endpoint"
     )
 

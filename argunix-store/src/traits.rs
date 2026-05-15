@@ -276,6 +276,14 @@ pub trait JobStore: Send + Sync {
         started_at: DateTime<Utc>,
     ) -> Result<(), StoreError>;
 
+    /// Late-binding update for the post-`finish` cache-push duration.
+    /// The publish runs in a detached background task (see
+    /// `argunix-daemon::worker`), so its wall-clock isn't known when
+    /// `finish` writes the row. Called by that task once `nix copy
+    /// --to` has settled across every configured cache. No-op if the
+    /// row was already gone (operator-deleted, retention pass, etc.).
+    async fn record_cache_push_ms(&self, id: JobId, cache_push_ms: u64) -> Result<(), StoreError>;
+
     /// Transport-failure recovery for the dynamic builder pool. Under
     /// a single transaction: increment `interrupt_count`; if the new
     /// count is ≤ `MAX_INTERRUPTIONS`, flip status to `Interrupted`;

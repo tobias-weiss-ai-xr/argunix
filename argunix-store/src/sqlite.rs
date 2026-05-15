@@ -173,6 +173,7 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
     let build_ms: Option<i64> = row.try_get("build_ms")?;
     let pull_bytes: Option<i64> = row.try_get("pull_bytes")?;
     let pull_ms: Option<i64> = row.try_get("pull_ms")?;
+    let cache_push_ms: Option<i64> = row.try_get("cache_push_ms")?;
     let to_u64 = |v: Option<i64>| v.map(|n| n.max(0) as u64);
     Ok(JobRecord {
         id: JobId::new(id),
@@ -194,6 +195,7 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
             to_u64(build_ms),
             to_u64(pull_bytes),
             to_u64(pull_ms),
+            to_u64(cache_push_ms),
         ),
     })
 }
@@ -204,6 +206,7 @@ fn argunix_store_records_phase_metrics(
     build_ms: Option<u64>,
     pull_bytes: Option<u64>,
     pull_ms: Option<u64>,
+    cache_push_ms: Option<u64>,
 ) -> crate::records::JobPhaseMetrics {
     crate::records::JobPhaseMetrics {
         push_bytes,
@@ -211,6 +214,7 @@ fn argunix_store_records_phase_metrics(
         build_ms,
         pull_bytes,
         pull_ms,
+        cache_push_ms,
     }
 }
 
@@ -681,7 +685,8 @@ impl JobStore for SqlxStore {
         let row = sqlx::query(
             "SELECT id, eval_id, attr_path, drv_path, system, started_at, finished_at,
                     status, log_path, output_path, builder_id, interrupt_count, failure_reason,
-                    push_bytes, push_ms, build_ms, pull_bytes, pull_ms
+                    push_bytes, push_ms, build_ms, pull_bytes, pull_ms,
+                    cache_push_ms
              FROM jobs WHERE id = ?1",
         )
         .bind(id.get())
@@ -694,7 +699,8 @@ impl JobStore for SqlxStore {
         let rows = sqlx::query(
             "SELECT id, eval_id, attr_path, drv_path, system, started_at, finished_at,
                     status, log_path, output_path, builder_id, interrupt_count, failure_reason,
-                    push_bytes, push_ms, build_ms, pull_bytes, pull_ms
+                    push_bytes, push_ms, build_ms, pull_bytes, pull_ms,
+                    cache_push_ms
              FROM jobs WHERE eval_id = ?1 ORDER BY id",
         )
         .bind(eval_id.get())
@@ -709,6 +715,7 @@ impl JobStore for SqlxStore {
                     j.started_at, j.finished_at, j.status, j.log_path, j.output_path,
                     j.builder_id, j.interrupt_count, j.failure_reason,
                     j.push_bytes, j.push_ms, j.build_ms, j.pull_bytes, j.pull_ms,
+                    j.cache_push_ms,
                     r.forge AS r_forge, r.slug AS r_slug,
                     e.git_ref AS e_git_ref, e.sha AS e_sha
              FROM jobs j
@@ -728,6 +735,7 @@ impl JobStore for SqlxStore {
                     j.started_at, j.finished_at, j.status, j.log_path, j.output_path,
                     j.builder_id, j.interrupt_count, j.failure_reason,
                     j.push_bytes, j.push_ms, j.build_ms, j.pull_bytes, j.pull_ms,
+                    j.cache_push_ms,
                     r.forge AS r_forge, r.slug AS r_slug,
                     e.git_ref AS e_git_ref, e.sha AS e_sha
              FROM jobs j
@@ -795,6 +803,16 @@ impl JobStore for SqlxStore {
         .bind(id.get())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn record_cache_push_ms(&self, id: JobId, cache_push_ms: u64) -> Result<(), StoreError> {
+        let clamped = cache_push_ms.min(i64::MAX as u64) as i64;
+        sqlx::query("UPDATE jobs SET cache_push_ms = ?1 WHERE id = ?2")
+            .bind(clamped)
+            .bind(id.get())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

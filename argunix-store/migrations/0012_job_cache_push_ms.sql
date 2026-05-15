@@ -1,0 +1,15 @@
+-- Cache-push wall-clock duration.
+--
+-- The job has already reached a terminal status (and `finished_at`
+-- is stamped) by the time argunix shells out `nix copy --to <cache>`
+-- for the post-success publish — the push runs in a detached
+-- background task so the UI flips green as soon as the artifact
+-- is back on the coordinator. This column lets that background task
+-- write back how long the upload actually took, so the job's
+-- transport & build table can surface a fourth row labelled
+-- "publish to cache" and the `total` wall-clock stops feeling like
+-- a black box.
+--
+-- NULL for jobs whose deployment has no `binary_caches`, for failed
+-- jobs (no push attempted), and for jobs that pre-date this column.
+ALTER TABLE jobs ADD COLUMN cache_push_ms INTEGER;

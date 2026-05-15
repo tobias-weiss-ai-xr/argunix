@@ -30,7 +30,7 @@ use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{Instrument, info_span};
@@ -1773,19 +1773,33 @@ async fn build_one(
                 let output_paths = outcome.output_paths.clone();
                 let caches: Vec<argunix_build::PushCache> = push_caches.to_vec();
                 let job_id_n = job_id.get();
+                let store = ctx.store.clone();
                 tokio::spawn(
                     async move {
+                        let started = Instant::now();
                         let errs = argunix_build::push_to_caches(
                             &output_paths,
                             &caches,
                             Duration::from_secs(300),
                         )
                         .await;
+                        let elapsed_ms = started.elapsed().as_millis() as u64;
                         for e in errs {
                             tracing::warn!(
                                 job_id = job_id_n,
                                 error = %e,
                                 "cache push failed; job stays success, output not published",
+                            );
+                        }
+                        if let Err(e) = <SqlxStore as JobStore>::record_cache_push_ms(
+                            &store, job_id, elapsed_ms,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                job_id = job_id_n,
+                                error = %e,
+                                "failed to record cache_push_ms; row still shows blank",
                             );
                         }
                     }

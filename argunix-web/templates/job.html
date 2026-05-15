@@ -102,6 +102,13 @@
         <td class="py-1 pr-6 font-mono">{{ phase_metrics.pull_ms }}</td>
         <td class="py-1 font-mono">{{ phase_metrics.pull_bytes }}</td>
       </tr>
+      {% if phase_metrics.has_cache_push %}
+      <tr class="border-t border-border">
+        <td class="py-1 pr-6">publish (coord → binary cache)</td>
+        <td class="py-1 pr-6 font-mono">{{ phase_metrics.cache_push_ms }}</td>
+        <td class="py-1 text-subtle">—</td>
+      </tr>
+      {% endif %}
     </tbody>
   </table>
   </div>

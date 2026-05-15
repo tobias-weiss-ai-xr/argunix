@@ -381,6 +381,15 @@ struct PhaseMetricsRow {
     build_ms: String,
     pull_bytes: String,
     pull_ms: String,
+    /// Wall-clock of the post-success publish to every configured
+    /// `binary_caches` entry. Lands on the row asynchronously (the
+    /// push runs in a detached background task), so the row in the
+    /// transport & build table is only rendered once this is `Some`
+    /// — until then the job page just shows the push/build/pull
+    /// rows, and a refresh after the push settles surfaces the
+    /// extra row.
+    has_cache_push: bool,
+    cache_push_ms: String,
 }
 
 pub async fn index(State(state): State<AppState>) -> Result<Html<String>, UiError> {
@@ -1397,12 +1406,15 @@ async fn job_page(
             || pm.push_ms.is_some()
             || pm.build_ms.is_some()
             || pm.pull_bytes.is_some()
-            || pm.pull_ms.is_some(),
+            || pm.pull_ms.is_some()
+            || pm.cache_push_ms.is_some(),
         push_bytes: humanize_bytes(pm.push_bytes),
         push_ms: humanize_ms(pm.push_ms),
         build_ms: humanize_ms(pm.build_ms),
         pull_bytes: humanize_bytes(pm.pull_bytes),
         pull_ms: humanize_ms(pm.pull_ms),
+        has_cache_push: pm.cache_push_ms.is_some(),
+        cache_push_ms: humanize_ms(pm.cache_push_ms),
     };
 
     let live_builder = if matches!(job.status, JobStatus::Running) {
@@ -1475,6 +1487,7 @@ async fn job_json(
             "build_ms": job.phase_metrics.build_ms,
             "pull_bytes": job.phase_metrics.pull_bytes,
             "pull_ms": job.phase_metrics.pull_ms,
+            "cache_push_ms": job.phase_metrics.cache_push_ms,
         },
     });
     Ok((
