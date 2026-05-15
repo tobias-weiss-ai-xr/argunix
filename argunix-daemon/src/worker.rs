@@ -1470,6 +1470,15 @@ async fn persist_job(
         .clone()
         .or_else(|| system_from_attr_path(spec.attr_path.as_str()))
         .unwrap_or_else(|| "unknown".to_string());
+    // `meta.mainProgram` (when nix-eval-jobs's `--meta` includes it) lets
+    // the synthetic-flake endpoint emit a working `apps.<sys>.<attr>` for
+    // `nix run`. Missing for most derivations — that's fine, those
+    // attrs just won't show up under `apps` in the synthetic flake.
+    let main_program = spec
+        .meta
+        .get("mainProgram")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let job_id = <SqlxStore as JobStore>::create(
         store,
         argunix_store::NewJob {
@@ -1477,6 +1486,8 @@ async fn persist_job(
             attr_path: spec.attr_path.clone(),
             drv_path: spec.drv_path.clone(),
             system,
+            main_program,
+            outputs: spec.outputs.clone(),
         },
     )
     .await?;

@@ -346,6 +346,8 @@ mod tests {
                 attr_path: AttrPath::new("packages.x86_64-linux.demo"),
                 drv_path: None,
                 system: "x86_64-linux".into(),
+                main_program: None,
+                outputs: Default::default(),
             },
         )
         .await

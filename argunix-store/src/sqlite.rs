@@ -174,6 +174,15 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
     let pull_bytes: Option<i64> = row.try_get("pull_bytes")?;
     let pull_ms: Option<i64> = row.try_get("pull_ms")?;
     let cache_push_ms: Option<i64> = row.try_get("cache_push_ms")?;
+    let main_program: Option<String> = row.try_get("main_program")?;
+    let outputs_json: Option<String> = row.try_get("outputs_json")?;
+    // Pre-`outputs_json` rows store NULL; parse failures are surfaced
+    // as a soft "no outputs known" rather than a hard map error — the
+    // synthetic-flake endpoint just won't emit those jobs.
+    let outputs: std::collections::BTreeMap<String, String> = outputs_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     let to_u64 = |v: Option<i64>| v.map(|n| n.max(0) as u64);
     Ok(JobRecord {
         id: JobId::new(id),
@@ -197,6 +206,8 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
             to_u64(pull_ms),
             to_u64(cache_push_ms),
         ),
+        main_program,
+        outputs,
     })
 }
 
@@ -665,9 +676,21 @@ impl EvalStore for SqlxStore {
 #[async_trait]
 impl JobStore for SqlxStore {
     async fn create(&self, new: NewJob) -> Result<JobId, StoreError> {
+        // `outputs_json` is serialized once here so the synthetic-flake
+        // endpoint can decode without a second eval round-trip. An
+        // empty map serializes to "{}"; we store NULL in that case so
+        // the column is interpretable as "no outputs known" rather
+        // than "evaluated, derivation had zero outputs" (which doesn't
+        // happen in practice).
+        let outputs_json = if new.outputs.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&new.outputs).expect("BTreeMap<String,String> serializes"))
+        };
         let row = sqlx::query(
-            "INSERT INTO jobs (eval_id, attr_path, drv_path, system, status)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO jobs (eval_id, attr_path, drv_path, system, status,
+                               main_program, outputs_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              RETURNING id",
         )
         .bind(new.eval_id.get())
@@ -675,6 +698,8 @@ impl JobStore for SqlxStore {
         .bind(new.drv_path)
         .bind(new.system)
         .bind(JobStatus::Queued.as_str())
+        .bind(new.main_program)
+        .bind(outputs_json)
         .fetch_one(&self.pool)
         .await?;
         let id: i64 = row.try_get("id")?;
@@ -686,7 +711,7 @@ impl JobStore for SqlxStore {
             "SELECT id, eval_id, attr_path, drv_path, system, started_at, finished_at,
                     status, log_path, output_path, builder_id, interrupt_count, failure_reason,
                     push_bytes, push_ms, build_ms, pull_bytes, pull_ms,
-                    cache_push_ms
+                    cache_push_ms, main_program, outputs_json
              FROM jobs WHERE id = ?1",
         )
         .bind(id.get())
@@ -700,7 +725,7 @@ impl JobStore for SqlxStore {
             "SELECT id, eval_id, attr_path, drv_path, system, started_at, finished_at,
                     status, log_path, output_path, builder_id, interrupt_count, failure_reason,
                     push_bytes, push_ms, build_ms, pull_bytes, pull_ms,
-                    cache_push_ms
+                    cache_push_ms, main_program, outputs_json
              FROM jobs WHERE eval_id = ?1 ORDER BY id",
         )
         .bind(eval_id.get())
@@ -715,7 +740,7 @@ impl JobStore for SqlxStore {
                     j.started_at, j.finished_at, j.status, j.log_path, j.output_path,
                     j.builder_id, j.interrupt_count, j.failure_reason,
                     j.push_bytes, j.push_ms, j.build_ms, j.pull_bytes, j.pull_ms,
-                    j.cache_push_ms,
+                    j.cache_push_ms, j.main_program, j.outputs_json,
                     r.forge AS r_forge, r.slug AS r_slug,
                     e.git_ref AS e_git_ref, e.sha AS e_sha
              FROM jobs j
@@ -735,7 +760,7 @@ impl JobStore for SqlxStore {
                     j.started_at, j.finished_at, j.status, j.log_path, j.output_path,
                     j.builder_id, j.interrupt_count, j.failure_reason,
                     j.push_bytes, j.push_ms, j.build_ms, j.pull_bytes, j.pull_ms,
-                    j.cache_push_ms,
+                    j.cache_push_ms, j.main_program, j.outputs_json,
                     r.forge AS r_forge, r.slug AS r_slug,
                     e.git_ref AS e_git_ref, e.sha AS e_sha
              FROM jobs j
@@ -1322,6 +1347,8 @@ mod tests {
             attr_path: AttrPath::new(attr),
             drv_path: Some(format!("/nix/store/xxx-{attr}.drv")),
             system: "x86_64-linux".to_string(),
+            main_program: None,
+            outputs: Default::default(),
         };
         let interrupted = <SqlxStore as JobStore>::create(&s, mk("a")).await.unwrap();
         let queued = <SqlxStore as JobStore>::create(&s, mk("b")).await.unwrap();
@@ -1401,6 +1428,8 @@ mod tests {
                 attr_path: AttrPath::new("packages.x86_64-linux.foo"),
                 drv_path: Some("/nix/store/xxx-foo.drv".to_string()),
                 system: "x86_64-linux".to_string(),
+                main_program: None,
+                outputs: Default::default(),
             },
         )
         .await
@@ -1511,6 +1540,8 @@ mod tests {
                 attr_path: AttrPath::new("packages.x86_64-linux.kept"),
                 drv_path: None,
                 system: "x86_64-linux".into(),
+                main_program: None,
+                outputs: Default::default(),
             },
         )
         .await
@@ -1522,6 +1553,8 @@ mod tests {
                 attr_path: AttrPath::new("packages.x86_64-linux.drop"),
                 drv_path: None,
                 system: "x86_64-linux".into(),
+                main_program: None,
+                outputs: Default::default(),
             },
         )
         .await
@@ -1641,6 +1674,8 @@ mod tests {
                     attr_path: AttrPath::new(format!("packages.x86_64-linux.j{sha_pad}")),
                     drv_path: None,
                     system: "x86_64-linux".into(),
+                    main_program: None,
+                    outputs: Default::default(),
                 },
             )
             .await
@@ -2088,6 +2123,8 @@ mod tests {
                 attr_path: AttrPath::new("packages.x86_64-linux.foo"),
                 drv_path: Some("/nix/store/xxx-foo.drv".into()),
                 system: "x86_64-linux".into(),
+                main_program: None,
+                outputs: Default::default(),
             },
         )
         .await
@@ -2259,6 +2296,8 @@ mod tests {
                 attr_path: AttrPath::new("packages.x86_64-linux.run"),
                 drv_path: None,
                 system: "x86_64-linux".into(),
+                main_program: None,
+                outputs: Default::default(),
             },
         )
         .await
@@ -2270,6 +2309,8 @@ mod tests {
                 attr_path: AttrPath::new("packages.x86_64-linux.next"),
                 drv_path: None,
                 system: "x86_64-linux".into(),
+                main_program: None,
+                outputs: Default::default(),
             },
         )
         .await
@@ -2319,6 +2360,8 @@ mod tests {
                 attr_path: AttrPath::new("packages.x86_64-linux.zombie"),
                 drv_path: None,
                 system: "x86_64-linux".into(),
+                main_program: None,
+                outputs: Default::default(),
             },
         )
         .await

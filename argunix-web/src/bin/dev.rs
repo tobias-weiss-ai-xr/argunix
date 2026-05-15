@@ -816,6 +816,8 @@ async fn create_job(
             attr_path: AttrPath::new(attr.to_string()),
             drv_path: drv_path.map(|s| s.to_string()),
             system: system.into(),
+            main_program: None,
+            outputs: Default::default(),
         },
     )
     .await?;

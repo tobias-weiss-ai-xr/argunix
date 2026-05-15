@@ -783,6 +783,13 @@ async fn persist_job(
     eval_id: EvalId,
     spec: &argunix_eval::JobSpec,
 ) -> anyhow::Result<JobId> {
+    // Same capture as in worker::persist_job — kept in sync so jobs
+    // landed via either path show up in the synthetic-flake endpoint.
+    let main_program = spec
+        .meta
+        .get("mainProgram")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let job_id = <argunix_store::SqlxStore as JobStore>::create(
         store,
         argunix_store::NewJob {
@@ -790,6 +797,8 @@ async fn persist_job(
             attr_path: spec.attr_path.clone(),
             drv_path: spec.drv_path.clone(),
             system: spec.system.clone().unwrap_or_else(|| "unknown".to_string()),
+            main_program,
+            outputs: spec.outputs.clone(),
         },
     )
     .await

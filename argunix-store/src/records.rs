@@ -3,6 +3,7 @@ use argunix_domain::{
     JobId, JobStatus, RepoId, Sha, Slug,
 };
 use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoRecord {
@@ -75,6 +76,17 @@ pub struct NewJob {
     pub attr_path: AttrPath,
     pub drv_path: Option<String>,
     pub system: String,
+    /// `meta.mainProgram` from `nix-eval-jobs --meta`. The executable's
+    /// basename inside `<output>/bin/`. `None` when the derivation didn't
+    /// declare one; the synthetic-flake endpoint then omits the
+    /// `apps.<system>.<attr>` entry for that job.
+    pub main_program: Option<String>,
+    /// Output-name → store-path map as reported by nix-eval-jobs, e.g.
+    /// `{"out": "/nix/store/zzz-foo", "dev": "/nix/store/yyy-foo-dev"}`.
+    /// Persisted so the synthetic-flake endpoint can pick the right
+    /// output without a second eval pass. Empty for rows that didn't
+    /// produce outputs (eval errors).
+    pub outputs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +115,13 @@ pub struct JobRecord {
     /// Per-phase accounting for pool-dispatched builds. All `None`
     /// for jobs that were never dispatched or built locally.
     pub phase_metrics: JobPhaseMetrics,
+    /// `meta.mainProgram` captured at eval time. See [`NewJob::main_program`].
+    pub main_program: Option<String>,
+    /// Full output-name → store-path map captured at eval time. See
+    /// [`NewJob::outputs`]. Empty on rows that pre-date the
+    /// `outputs_json` column or that errored before nix-eval-jobs
+    /// reported outputs.
+    pub outputs: BTreeMap<String, String>,
 }
 
 /// Bytes through our russh tunnel + wall-clock per pool-dispatch phase.

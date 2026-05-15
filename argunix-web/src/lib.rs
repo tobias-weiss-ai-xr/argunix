@@ -17,6 +17,7 @@ mod live_log;
 mod pause;
 mod policy;
 mod state;
+mod synthetic_flake;
 mod ui;
 mod webhook;
 
@@ -51,6 +52,11 @@ pub fn router(state: AppState) -> Router {
         .route("/cache", get(ui::caches))
         .route("/healthz", get(healthz))
         .route("/r/{forge}/{*tail}", get(ui::dispatch_repo))
+        // Synthetic flake: returns a tar containing one `flake.nix`
+        // that points at already-cached store paths so `nix run` and
+        // `nix build` against this URL skip evaluation entirely.
+        // See `synthetic_flake.rs` for the URL shape.
+        .route("/flake/{forge}/{*tail}", get(synthetic_flake::serve))
         .route("/badge/{forge}/{*tail}", get(badge::handle))
         .route("/api/hosts", get(ui::hosts_json))
         .route("/api/host/stats", get(ui::host_stats))
