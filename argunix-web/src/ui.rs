@@ -1290,6 +1290,18 @@ async fn repo_page(
     // git_ref, then to "main".
     let snippet_branch = crate::badge::snippet_branch(repo.default_branch.as_deref(), &raw_evals);
 
+    // The bare-slug synthetic-flake URL only resolves when (a) we
+    // know the default branch (webhook landed) AND (b) there's at
+    // least one Done eval on it. The synthetic-flake handler would
+    // 404 otherwise, so showing the snippet in that state lies. Push
+    // refs land in `evaluations.git_ref` stripped of `refs/heads/`
+    // (see webhook.rs); the comparison is bare-name-to-bare-name.
+    let synthetic_flake_resolves = repo.default_branch.as_deref().is_some_and(|b| {
+        raw_evals
+            .iter()
+            .any(|e| e.status == EvalStatus::Done && e.git_ref == b)
+    });
+
     let evals = raw_evals
         .into_iter()
         .map(|e| {
@@ -1326,7 +1338,11 @@ async fn repo_page(
         crate::badge::badge_url(external_url, &forge, slug.as_str(), snippet_branch_ref);
     let badge_markdown =
         crate::badge::markdown_snippet(external_url, &forge, slug.as_str(), snippet_branch_ref);
-    let nix_run_snippet = synthetic_flake_run_snippet(&state, &forge, slug.as_str(), "", "<attr>");
+    let nix_run_snippet = if synthetic_flake_resolves {
+        synthetic_flake_run_snippet(&state, &forge, slug.as_str(), "", "<attr>")
+    } else {
+        None
+    };
     let html = render(&RepoTemplate {
         cluster_active,
         forge,

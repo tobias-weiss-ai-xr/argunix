@@ -164,16 +164,15 @@ pub async fn serve(
     Ok(resp)
 }
 
-/// Map a forge-supplied branch name (`main`, `master`, …) to the full
-/// git-ref form stored on `evaluations.git_ref`. Pass-through when the
-/// caller already gave us a `refs/`-prefixed value (so the `/ref/`
-/// endpoint accepts both `main` and `refs/heads/main`).
+/// Normalize the URL-supplied branch name to the bare form push-event
+/// rows store in `evaluations.git_ref`. The webhook ingest path strips
+/// `refs/heads/` on insert (see `argunix-web/src/webhook.rs`), so the
+/// `/ref/refs/heads/main` URL must match the same DB rows as `/ref/main`.
 fn normalize_branch_to_git_ref(branch: &str) -> String {
-    if branch.starts_with("refs/") {
-        branch.to_string()
-    } else {
-        format!("refs/heads/{branch}")
-    }
+    branch
+        .strip_prefix("refs/heads/")
+        .unwrap_or(branch)
+        .to_string()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -546,18 +545,17 @@ mod tests {
 
     #[test]
     fn normalizes_branch_to_git_ref() {
-        // The forge gives us bare branch names (`main`); we store
-        // git refs (`refs/heads/main`). Both forms work on the
-        // `/ref/<…>` URL.
-        assert_eq!(normalize_branch_to_git_ref("main"), "refs/heads/main");
-        assert_eq!(
-            normalize_branch_to_git_ref("refs/heads/main"),
-            "refs/heads/main",
-        );
+        // Push events land in `evaluations.git_ref` with the
+        // `refs/heads/` prefix already stripped (see webhook.rs).
+        // The normalize fn must agree with that on-disk shape, and
+        // tolerate `/ref/refs/heads/main` as an alias of `/ref/main`.
+        assert_eq!(normalize_branch_to_git_ref("main"), "main");
+        assert_eq!(normalize_branch_to_git_ref("refs/heads/main"), "main");
         // Slash-bearing branch (`feature/foo`).
+        assert_eq!(normalize_branch_to_git_ref("feature/foo"), "feature/foo",);
         assert_eq!(
-            normalize_branch_to_git_ref("feature/foo"),
-            "refs/heads/feature/foo",
+            normalize_branch_to_git_ref("refs/heads/feature/foo"),
+            "feature/foo",
         );
     }
 
