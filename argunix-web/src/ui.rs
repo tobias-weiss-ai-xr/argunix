@@ -649,6 +649,13 @@ fn render_nix_conf_snippet(public_url: &str, public_key: &str) -> String {
 /// `attr` is what goes after the `#` — pass `"<attr>"` literally as a
 /// placeholder on pages that don't know which attribute the user
 /// wants, or the concrete leaf name on the job page.
+///
+/// The `fetch-closure` experimental feature has to be enabled *before*
+/// the synthetic flake evaluates — the flake's own
+/// `nixConfig.extra-experimental-features` can't opt into it
+/// retroactively. `nix-command` + `flakes` are not in the flag because
+/// `nix run` itself depends on them, so anyone who has gotten this
+/// far already has those enabled.
 fn synthetic_flake_run_snippet(
     state: &AppState,
     forge: &str,
@@ -667,7 +674,9 @@ fn synthetic_flake_run_snippet(
     }
     let base = snap.config.external_url.trim_end_matches('/');
     Some(format!(
-        "nix run --accept-flake-config {base}/flake/{forge}/{slug}{selector_tail}#{attr}"
+        "nix run --extra-experimental-features fetch-closure \
+         --accept-flake-config \
+         {base}/flake/{forge}/{slug}{selector_tail}#{attr}"
     ))
 }
 
