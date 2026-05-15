@@ -1749,25 +1749,15 @@ async fn build_one(
                 .cloned()
                 .or_else(|| spec.primary_output().map(String::from));
 
-            // Best-effort publish to every push-enabled cache. A flaky
-            // cache logs but doesn't fail the job — the build is still
-            // a success locally; only the publish degraded.
-            if !push_caches.is_empty() && !outcome.output_paths.is_empty() {
-                let errs = argunix_build::push_to_caches(
-                    &outcome.output_paths,
-                    push_caches,
-                    Duration::from_secs(300),
-                )
-                .await;
-                for e in errs {
-                    tracing::warn!(
-                        job_id = job_id.get(),
-                        error = %e,
-                        "cache push failed; job stays success, output not published",
-                    );
-                }
-            }
-
+            // Mark the job done *before* the cache push so the UI flips
+            // green as soon as the build artifact is back on the
+            // coordinator. A 388 MB nix-shell to S3 can take minutes
+            // and would otherwise leave the job rendering as "still
+            // building" with a `total` that silently includes the
+            // upload. Publish is best-effort anyway (failures don't
+            // fail the job), so detaching it from the job lifecycle
+            // costs us nothing semantically — a flaky cache still logs
+            // a warning, just without holding the UI hostage.
             <SqlxStore as JobStore>::finish(
                 &ctx.store,
                 job_id,
@@ -1778,6 +1768,31 @@ async fn build_one(
                 &phase_metrics,
             )
             .await?;
+
+            if !push_caches.is_empty() && !outcome.output_paths.is_empty() {
+                let output_paths = outcome.output_paths.clone();
+                let caches: Vec<argunix_build::PushCache> = push_caches.to_vec();
+                let job_id_n = job_id.get();
+                tokio::spawn(
+                    async move {
+                        let errs = argunix_build::push_to_caches(
+                            &output_paths,
+                            &caches,
+                            Duration::from_secs(300),
+                        )
+                        .await;
+                        for e in errs {
+                            tracing::warn!(
+                                job_id = job_id_n,
+                                error = %e,
+                                "cache push failed; job stays success, output not published",
+                            );
+                        }
+                    }
+                    .in_current_span(),
+                );
+            }
+
             Ok(JobStatus::Success)
         }
         argunix_build::BuildStatus::Failure => {

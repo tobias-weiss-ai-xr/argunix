@@ -409,6 +409,27 @@ in
           ).strip()
           return int(n)
 
+      def in_flight_by_builder():
+          # Mirror of the daemon's in-memory in_flight counter, read
+          # directly from sqlite so the polling loop never touches the
+          # control socket. The dispatcher sets jobs.status='running' +
+          # jobs.builder_id when it places a build (see
+          # argunix-store::sqlite::dispatch), and `finish` flips the
+          # status to a terminal one — so "running rows per builder"
+          # is the same quantity the `builders list` JSON reports.
+          raw = coord.succeed(
+              "sqlite3 /var/lib/argunix/db.sqlite"
+              " \"SELECT b.name, COUNT(*) FROM jobs j"
+              " JOIN builders b ON j.builder_id = b.id"
+              " WHERE j.status = 'running' GROUP BY b.name;\""
+          ).strip()
+          out = {"b1": 0, "b2": 0}
+          for line in raw.splitlines():
+              parts = line.split("|")
+              if len(parts) == 2 and parts[0] in out:
+                  out[parts[0]] = int(parts[1])
+          return out
+
       def dump_failure_context(reason):
           print(f"--- failure context: {reason} ---")
           print(f"evals: {evals_status_snapshot()!r}")
@@ -543,51 +564,40 @@ in
       saw_both_saturated = False
       done = 0
       with subtest("poll until all jobs reach a terminal status"):
-          # Polling cadence: `coord.succeed("argunixctl ... builders list")`
-          # round-trips against the daemon's control socket, and under VM
-          # CPU pressure a single call routinely exceeds 1s. A
-          # `time.sleep(1)` in this loop then degenerates into a busy-poll
-          # of `coord.succeed`, hammering the same tokio runtime that
-          # drives dispatch and starving builders down to ~2 in-flight
-          # each. 3s gives the dispatcher breathing room while still
-          # sampling the ~30s saturation window many times over.
-          overall_deadline = time.monotonic() + 6 * sleep_secs + 180
+          # Both reads in this loop hit sqlite directly — never the
+          # daemon's control socket. The earlier `argunixctl builders
+          # list` round-trip routinely cost >1s under VM CPU pressure
+          # and ran on the same tokio runtime as the dispatcher, so a
+          # tight polling loop degenerated into a self-DoS on the
+          # process we were trying to observe. sqlite reads, by
+          # contrast, share nothing with dispatch.
+          overall_deadline = time.monotonic() + 8 * sleep_secs + 240
           last_diag = 0.0
           while time.monotonic() < overall_deadline:
-              # Once we've observed the headline assertion, stop the
-              # expensive control-socket roundtrip and just watch sqlite
-              # for terminal status — sqlite reads don't touch the
-              # daemon at all.
-              if not saw_both_saturated:
-                  bs = builders_json()
-                  by_name = {b["name"]: b for b in bs}
-                  b1 = by_name.get("b1", {}).get("in_flight", 0)
-                  b2 = by_name.get("b2", {}).get("in_flight", 0)
-                  peak["b1"] = max(peak["b1"], b1)
-                  peak["b2"] = max(peak["b2"], b2)
-                  if b1 >= parallel_jobs and b2 >= parallel_jobs:
-                      saw_both_saturated = True
-              else:
-                  b1 = b2 = None
+              flight = in_flight_by_builder()
+              b1, b2 = flight["b1"], flight["b2"]
+              peak["b1"] = max(peak["b1"], b1)
+              peak["b2"] = max(peak["b2"], b2)
+              if b1 >= parallel_jobs and b2 >= parallel_jobs:
+                  saw_both_saturated = True
               done = jobs_done_count()
               now = time.monotonic()
               if now - last_diag >= 10:
                   last_diag = now
-                  in_flight = (
-                      f"b1={b1} b2={b2}" if b1 is not None else "(not sampled)"
-                  )
                   print(
-                      f"[poll t={now:.0f}s] in_flight {in_flight} done={done}/{expected_jobs}"
+                      f"[poll t={now:.0f}s] in_flight b1={b1} b2={b2} done={done}/{expected_jobs}"
+                      f" saturated={saw_both_saturated} peak={peak!r}"
                       f" evals={evals_status_snapshot()!r}"
                   )
               if done >= expected_jobs:
                   break
-              time.sleep(3)
+              time.sleep(1)
 
           if done < expected_jobs:
               dump_failure_context(f"only {done}/{expected_jobs} jobs reached a terminal status before deadline")
               raise AssertionError(
-                  f"jobs did not finish in time: done={done}/{expected_jobs}, peak={peak!r}"
+                  f"jobs did not finish in time: done={done}/{expected_jobs},"
+                  f" peak={peak!r}, saturated={saw_both_saturated}"
               )
 
       with subtest("evaluations and jobs all finished successfully"):

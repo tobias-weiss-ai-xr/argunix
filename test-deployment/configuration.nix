@@ -1,7 +1,6 @@
 {
   modulesPath,
   pkgs,
-  lib,
   ...
 }:
 
@@ -59,6 +58,15 @@ in
         listen = "[::]:45678";
         token_path = "/var/lib/argunix-credentials/builder-enrollment-token";
       };
+      binary_caches = [
+        {
+          push_url = cacheUrl;
+          public_url = "https://nbg1.your-objectstorage.com/test-cache";
+          public_key = "test-cache:vUfGsNg1GFZRW1wHSFsjcklY2fpzGkPntpdOoW3mhTA=";
+          signing_key_path = "/var/lib/argunix-credentials/cache/test-cache-priv.key";
+        }
+      ];
+
       forges = {
         github = {
           kind = "github";
@@ -108,6 +116,10 @@ in
     };
   };
 
+  systemd.services.argunix.environment = {
+    AWS_SHARED_CREDENTIALS_FILE = "/var/lib/argunix-credentials/s3-credentials";
+  };
+
   security.acme = {
     acceptTerms = true;
     defaults.email = "service@applicative.systems";
@@ -150,16 +162,5 @@ in
       "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
       "test-cache:vUfGsNg1GFZRW1wHSFsjcklY2fpzGkPntpdOoW3mhTA="
     ];
-    secret-key-files = [ "/var/lib/argunix-credentials/cache/test-cache-priv.key" ];
-    post-build-hook = pkgs.writeShellScript "upload-to-test-cache" ''
-      set -eu
-      set -f
-      export IFS=' '
-      exec ${lib.getExe pkgs.nix} --extra-experimental-features 'nix-command flakes' copy --to '${cacheUrl}' $OUT_PATHS
-    '';
-  };
-
-  systemd.services.nix-daemon.environment = {
-    AWS_SHARED_CREDENTIALS_FILE = "/var/lib/argunix-credentials/s3-credentials";
   };
 }
