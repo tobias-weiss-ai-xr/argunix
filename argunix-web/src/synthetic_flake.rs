@@ -288,13 +288,25 @@ impl FlakeEntry {
         if !job.status.is_success() {
             return None;
         }
+        // Only `packages.<system>.<name>` jobs are exposed. devShells,
+        // checks, nixosConfigurations and similar flake outputs all
+        // also land as eval jobs and they share leaf names with
+        // packages (e.g. `devShells.x86_64-linux.default` vs
+        // `packages.x86_64-linux.default`) — surfacing them all would
+        // make leafs collide and silently shadow each other inside
+        // the synthetic flake's `packages.<system>` attrset. We only
+        // know how to express *packages* as `builtins.storePath`/
+        // `fetchClosure` outputs anyway; the rest don't belong in the
+        // synthetic flake even when they happen to have built green.
+        let leaf = packages_leaf(job.attr_path.as_str(), &job.system)?.to_string();
+
         // `out` is the only output we can faithfully expose via
-        // `builtins.storePath` (it can't reconstruct multi-output
-        // attrsets). Skip jobs with no `out` — they're rare enough
-        // (single-output `lib`-only derivations) that omitting them
-        // beats lying about the structure.
+        // `fetchClosure { inputAddressed = true; }` (it can't
+        // reconstruct multi-output attrsets). Skip jobs with no
+        // `out` — they're rare enough (single-output `lib`-only
+        // derivations) that omitting them beats lying about the
+        // structure.
         let out = job.outputs.get("out").cloned()?;
-        let leaf = leaf_attr(job.attr_path.as_str())?.to_string();
 
         // `getBin` semantics: prefer a dedicated `bin` output for
         // executables, fall back to `out`. Most packages put binaries
@@ -315,11 +327,22 @@ impl FlakeEntry {
     }
 }
 
-/// Last dot-separated segment of an attr path, e.g.
-/// `packages.x86_64-linux.hello` → `hello`. Returns None when the path
-/// is empty or doesn't have at least one segment after the system.
-fn leaf_attr(attr_path: &str) -> Option<&str> {
-    attr_path.rsplit('.').next().filter(|s| !s.is_empty())
+/// Extract `<name>` from `packages.<system>.<name>`. Returns `None` for
+/// any attribute path outside the `packages.<system>.` namespace
+/// (devShells, checks, nixosConfigurations, homeConfigurations, …) so
+/// the synthetic flake exposes only what it can faithfully reconstruct
+/// from a cached store path.
+fn packages_leaf<'a>(attr_path: &'a str, system: &str) -> Option<&'a str> {
+    let prefix = format!("packages.{system}.");
+    let rest = attr_path.strip_prefix(&prefix)?;
+    // `packages.<system>.<name>` is the supported shape; nested
+    // (`packages.<system>.foo.bar`) isn't expressible the same way in
+    // the synthetic flake, so skip those — they'd collide on the
+    // outermost segment anyway.
+    if rest.is_empty() || rest.contains('.') {
+        return None;
+    }
+    Some(rest)
 }
 
 /// Render the synthetic `flake.nix` source. The output is one trivial
@@ -632,6 +655,67 @@ mod tests {
         ))
         .expect("entry");
         assert!(entry.main_program.is_none());
+    }
+
+    #[test]
+    fn from_job_filters_non_packages_attrs() {
+        // Anything outside `packages.<system>.<name>` is dropped — a
+        // green `devShells.x86_64-linux.default` job would otherwise
+        // collide with `packages.x86_64-linux.default` and silently
+        // shadow it inside the rendered flake. Same story for
+        // `checks`, `nixosConfigurations`, etc.
+        for attr in [
+            "devShells.x86_64-linux.default",
+            "checks.x86_64-linux.smoke",
+            "nixosConfigurations.demo",
+            "homeConfigurations.user",
+            // Nested `packages.<system>.foo.bar` isn't representable
+            // as a single `builtins.fetchClosure` entry either —
+            // surface that as "skipped" too.
+            "packages.x86_64-linux.suite.nested",
+        ] {
+            assert!(
+                FlakeEntry::from_job(job(
+                    attr,
+                    "x86_64-linux",
+                    JobStatus::Success,
+                    Some("/nix/store/x-thing"),
+                ))
+                .is_none(),
+                "`{attr}` must be filtered out",
+            );
+        }
+    }
+
+    #[test]
+    fn from_job_keeps_packages_default() {
+        // The whole point of the filter: when both
+        // `packages.<sys>.default` and `devShells.<sys>.default` exist,
+        // we keep the packages one (and the devShells one drops out
+        // entirely via the test above).
+        let entry = FlakeEntry::from_job(job(
+            "packages.x86_64-linux.default",
+            "x86_64-linux",
+            JobStatus::Success,
+            Some("/nix/store/q-default"),
+        ))
+        .expect("entry");
+        assert_eq!(entry.leaf, "default");
+    }
+
+    #[test]
+    fn packages_leaf_pins_to_matching_system() {
+        // The system in the attr path must match the job's `system`
+        // column — a cross-system row (shouldn't happen, but defensive)
+        // doesn't accidentally promote into the wrong systems block.
+        assert_eq!(
+            packages_leaf("packages.x86_64-linux.hello", "x86_64-linux"),
+            Some("hello"),
+        );
+        assert_eq!(
+            packages_leaf("packages.aarch64-linux.hello", "x86_64-linux"),
+            None,
+        );
     }
 
     #[test]
