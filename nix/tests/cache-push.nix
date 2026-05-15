@@ -30,7 +30,7 @@
 # keeps the test free of forge tokens and webhook simulation while
 # still going through the same `argunix-build::push_to_caches`
 # code path the service uses.
-{ pkgs, lib, ... }:
+{ pkgs, ... }:
 
 let
   argunixPort = 8080;
@@ -55,26 +55,29 @@ let
 
   githubToken = pkgs.writeText "argunix-test-github-token" "tok";
 
-  # Generate a fresh ed25519 binary-cache key pair. `nix-store
-  # --generate-binary-cache-key` won't run in a build sandbox
-  # (it touches /nix/var/nix/profiles); `nix key …` is the pure
-  # crypto path. We hand the secret to argunix and use the public
-  # side to verify signed narinfo from the testScript. Both caches
-  # share one key — common in practice when an operator owns both
-  # backends.
-  signingKeys =
-    pkgs.runCommand "argunix-test-cache-keys"
-      {
-        nativeBuildInputs = [ pkgs.nix ];
-      }
-      ''
-        mkdir -p $out
-        export HOME=$TMPDIR
-        nix --extra-experimental-features 'nix-command' \
-          key generate-secret --key-name argunix-test-cache > "$out/secret"
-        nix --extra-experimental-features 'nix-command' \
-          key convert-secret-to-public < "$out/secret" > "$out/public"
-      '';
+  # ed25519 binary-cache key pair, hardcoded.
+  #
+  # We do *not* generate the keypair at build time (e.g. via `nix key
+  # generate-secret` inside `runCommand`) because that derivation is
+  # non-deterministic: every fresh build produces a different secret
+  # at the same input-addressed store path. In single-machine setups
+  # the path is built once and consistently reused, but in CI / on
+  # multi-host build farms the eval-time `builtins.readFile` of the
+  # public half and the VM-image read of the secret half can end up
+  # backed by *different* materialisations of the same path (e.g.
+  # one built locally, one fetched from a substituter that stored
+  # the previous run's bytes). The test then signs with key A,
+  # asserts key B on `/cache`, fails consistently in CI only.
+  #
+  # The test isn't validating keygen — only that signed narinfo
+  # round-trips through `nix copy --to` and `nix store verify`. A
+  # bundled keypair is the right shape: deterministic, identical
+  # across hosts, harmless to publish (it signs nothing outside
+  # this throwaway test fixture).
+  publicKey = "argunix-test-cache:UZ1XtpXG7700yGU/uH8x1OktzjErsyJeLnI53mINlNk=";
+  secretKeyFile = pkgs.writeText "argunix-test-cache-secret" ''
+    argunix-test-cache:H1Fnjk1DTDgWG8DWHqU3DDTzhLybUkAQSHzp0sNOFyBRnVe2lcbvvTTIZT+4fzHU6S3OMSuzIl4ucjneYg2U2Q==
+  '';
 
   # Standalone flake with no inputs. The pre-generated `flake.lock`
   # avoids `nix-eval-jobs` needing to write one (the source lives in
@@ -104,11 +107,6 @@ let
     EOF
   '';
 
-  # The public key is generated inside `signingKeys` at build time,
-  # so we read it back via IFD — one extra realisation at flake-eval
-  # time, fine for a test, and lets us hand the bare string to the
-  # NixOS module's `settings` option.
-  publicKey = lib.removeSuffix "\n" (builtins.readFile "${signingKeys}/public");
 in
 {
   name = "argunix-cache-push";
@@ -140,13 +138,13 @@ in
               push_url = s3CachePushUrl;
               public_url = s3CachePublicUrl;
               public_key = publicKey;
-              signing_key_path = "${signingKeys}/secret";
+              signing_key_path = "${secretKeyFile}";
             }
             # Symmetric local file cache — no `public_url`. The /cache
             # page renders this as "incomplete" with a hint.
             {
               push_url = localCacheUrl;
-              signing_key_path = "${signingKeys}/secret";
+              signing_key_path = "${secretKeyFile}";
             }
           ];
         };
@@ -274,7 +272,7 @@ in
     caches_html = machine.succeed(
         "curl -fsS http://127.0.0.1:${toString argunixPort}/cache"
     )
-    pubkey = machine.succeed("cat ${signingKeys}/public").strip()
+    pubkey = "${publicKey}"
     print(f"trusted-public-key: {pubkey}")
     assert "${s3CachePublicUrl}" in caches_html, (
         f"expected s3 public_url to appear on /cache, got: {caches_html[:500]!r}"
@@ -356,7 +354,7 @@ in
         f"unexpected output contents: {contents!r}"
     )
 
-    pubkey = machine.succeed("cat ${signingKeys}/public").strip()
+    pubkey = "${publicKey}"
     print(f"trusted-public-key: {pubkey}")
 
     # ---- Asymmetric cache assertions: S3 (Garage) ----
