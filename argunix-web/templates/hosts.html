@@ -63,36 +63,39 @@
 </article>
 
 <h2 class="text-lg font-semibold mb-2">Builders</h2>
-{% if rows.is_empty() %}
+{% if online_rows.is_empty() && offline_rows.is_empty() %}
 <p class="text-muted">
   No builders enrolled yet. Set <code class="text-xs font-mono">services.argunix-builder.enable = true;</code>
   on a host (with the enrollment token from
   <code class="text-xs font-mono">builder_enrollment.token_path</code>) to add capacity.
 </p>
 {% else %}
-<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-  {% for b in rows %}
+
+{% if online_rows.is_empty() %}
+<p class="text-muted mb-6">
+  No builders are currently connected. See the
+  "configured but offline" section below for builders that have
+  previously enrolled.
+</p>
+{% else %}
+<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mb-6">
+  {% for b in online_rows %}
   <article class="rounded border border-border bg-surface p-4 flex flex-col gap-3"
            data-builder="{{ b.name }}"
-           data-online="{% if b.is_online %}1{% else %}0{% endif %}"
-           {% if b.is_online %}data-stats-url="/api/builders/{{ b.name }}/stats"{% endif %}>
+           data-online="1"
+           data-stats-url="/api/builders/{{ b.name }}/stats">
     <header class="flex items-baseline justify-between gap-2">
       <h2 class="font-mono text-base font-semibold truncate" title="{{ b.name }}">{{ b.name }}</h2>
       <span class="inline-block px-2 py-0.5 rounded text-xs whitespace-nowrap {{ b.status_class }}">{{ b.status }}</span>
     </header>
 
     <div class="text-xs text-muted flex flex-wrap gap-x-4 gap-y-1">
-      {% if b.is_online %}
       <span><span class="text-fg font-mono" data-field="load">—</span> load</span>
       <span><span class="text-fg font-mono" data-field="cpu">—</span> cpu</span>
       <span><span class="text-fg font-mono" data-field="mem">—</span> mem</span>
       <span class="ml-auto">{{ b.in_flight }} / {{ b.max_jobs }} slots</span>
-      {% else %}
-      <span>last seen {{ b.last_seen }}</span>
-      {% endif %}
     </div>
 
-    {% if b.is_online %}
     <div class="grid grid-cols-3 gap-2 text-[11px]">
       <figure class="border border-border rounded p-1.5">
         <figcaption class="text-muted leading-none mb-1">cpu</figcaption>
@@ -113,12 +116,9 @@
         </svg>
       </figure>
     </div>
-    {% endif %}
 
     <div class="text-xs">
-      {% if !b.is_online %}
-      <p class="text-muted">offline — no live builds</p>
-      {% else if b.current_jobs.is_empty() %}
+      {% if b.current_jobs.is_empty() %}
       <p class="text-muted">ready · waiting for work</p>
       {% else %}
       <p class="text-muted mb-1">now building</p>
@@ -157,6 +157,52 @@
   </article>
   {% endfor %}
 </div>
+{% endif %}
+
+{% if !offline_rows.is_empty() %}
+<h2 class="text-lg font-semibold mb-2 text-muted">Configured but offline</h2>
+<p class="text-xs text-muted mb-3">
+  Builders enrolled in this argunix's roster but not currently dialed in.
+  Revoked rows stay here until <code class="font-mono">argunixctl builders forget</code>.
+</p>
+<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+  {% for b in offline_rows %}
+  {# Offline cards skip the live sparklines + slot counter — the
+     last-seen stamp + capability footer is all there is to show. #}
+  <article class="rounded border border-border bg-surface/60 p-4 flex flex-col gap-3 opacity-80"
+           data-builder="{{ b.name }}"
+           data-online="0">
+    <header class="flex items-baseline justify-between gap-2">
+      <h2 class="font-mono text-base font-semibold truncate" title="{{ b.name }}">{{ b.name }}</h2>
+      <span class="inline-block px-2 py-0.5 rounded text-xs whitespace-nowrap {{ b.status_class }}">{{ b.status }}</span>
+    </header>
+
+    <div class="text-xs text-muted">
+      last seen {{ b.last_seen }}
+    </div>
+
+    <footer class="border-t border-border pt-2 text-[11px] leading-5 flex flex-col gap-1">
+      <div class="flex flex-wrap items-baseline gap-1">
+        <span class="text-muted">systems</span>
+        {% for s in b.systems %}
+        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-chip text-chip-fg font-mono">{{ s }}</span>
+        {% endfor %}
+      </div>
+      <div class="flex flex-wrap items-baseline gap-1">
+        <span class="text-muted">features</span>
+        {% if b.features.is_empty() %}
+        <span class="text-subtle">—</span>
+        {% else %}{% for f in b.features %}
+        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-chip text-chip-fg font-mono">{{ f }}</span>
+        {% endfor %}{% endif %}
+      </div>
+      <div class="text-muted">nix <span class="font-mono text-fg">{{ b.nix_version }}</span></div>
+    </footer>
+  </article>
+  {% endfor %}
+</div>
+{% endif %}
+
 {% endif %}
 
 <script>

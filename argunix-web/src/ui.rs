@@ -62,7 +62,16 @@ struct HostsTemplate {
     /// The argunix coordinator card. Always rendered, even when the
     /// host has no live samples yet (template falls back to "—").
     coordinator: CoordinatorRow,
-    rows: Vec<BuilderRow>,
+    /// Builders that are currently connected (`online` or `draining`).
+    /// Rendered as the primary grid: live sparklines + slot counter +
+    /// current-builds list.
+    online_rows: Vec<BuilderRow>,
+    /// Builders enrolled in the roster but not currently dialed in,
+    /// plus revoked rows. Rendered below the online grid as
+    /// "Configured but offline" so they stay visible (operators want
+    /// to spot a builder that's *expected* to be online but isn't),
+    /// without polluting the live area with last-seen stamps.
+    offline_rows: Vec<BuilderRow>,
     online: usize,
     known: usize,
 }
@@ -532,10 +541,16 @@ pub async fn status(State(state): State<AppState>) -> Result<Html<String>, UiErr
 pub async fn hosts(State(state): State<AppState>) -> Result<Html<String>, UiError> {
     let view = collect_hosts_only(&state).await?;
     let cluster_active = view.rows.iter().any(|b| !b.current_jobs.is_empty());
+    // Two-bucket split: online (incl. draining) gets the live cards,
+    // offline + revoked drop into a separate "Configured but offline"
+    // section so the active fleet isn't visually drowned by stale rows.
+    let (online_rows, offline_rows): (Vec<_>, Vec<_>) =
+        view.rows.into_iter().partition(|b| b.is_online);
     Ok(Html(render(&HostsTemplate {
         cluster_active,
         coordinator: build_coordinator_row(&state),
-        rows: view.rows,
+        online_rows,
+        offline_rows,
         online: view.online,
         known: view.known,
     })?))
@@ -2122,7 +2137,8 @@ mod tests {
         let html = HostsTemplate {
             cluster_active: false,
             coordinator: fixture_coordinator(),
-            rows: vec![],
+            online_rows: vec![],
+            offline_rows: vec![],
             online: 0,
             known: 0,
         }
@@ -2150,7 +2166,8 @@ mod tests {
         let html = HostsTemplate {
             cluster_active: true,
             coordinator: fixture_coordinator(),
-            rows: vec![make_builder_row("alpha", true, vec![job])],
+            online_rows: vec![make_builder_row("alpha", true, vec![job])],
+            offline_rows: vec![],
             online: 1,
             known: 1,
         }
@@ -2168,6 +2185,8 @@ mod tests {
         // Sparkline JS attaches via [data-online="1"] selector — must
         // be present on busy cards.
         assert!(html.contains(r#"data-online="1""#));
+        // No offline section header when offline_rows is empty.
+        assert!(!html.contains("Configured but offline"));
     }
 
     #[test]
@@ -2175,7 +2194,8 @@ mod tests {
         let html = HostsTemplate {
             cluster_active: false,
             coordinator: fixture_coordinator(),
-            rows: vec![make_builder_row("beta", false, vec![])],
+            online_rows: vec![],
+            offline_rows: vec![make_builder_row("beta", false, vec![])],
             online: 0,
             known: 1,
         }
@@ -2191,6 +2211,40 @@ mod tests {
         assert_eq!(html.matches(r#"<svg data-spark="cpu""#).count(), 1);
         assert!(html.contains("last seen 5m ago"));
         assert!(html.contains(r#"data-online="0""#));
+        // Offline section header surfaces when there's at least one
+        // offline row — its presence is part of the contract operators
+        // rely on to spot stale builders at a glance.
+        assert!(html.contains("Configured but offline"));
+    }
+
+    #[test]
+    fn hosts_template_renders_offline_below_online() {
+        // When both sections have rows, offline_rows must come *after*
+        // online_rows in source order so the active fleet stays on top.
+        let html = HostsTemplate {
+            cluster_active: false,
+            coordinator: fixture_coordinator(),
+            online_rows: vec![make_builder_row("alpha", true, vec![])],
+            offline_rows: vec![make_builder_row("beta", false, vec![])],
+            online: 1,
+            known: 2,
+        }
+        .render()
+        .unwrap();
+        let alpha = html.find("alpha").expect("alpha card present");
+        let beta = html.find("beta").expect("beta card present");
+        assert!(alpha < beta, "online card must render before offline card");
+        let header = html
+            .find("Configured but offline")
+            .expect("offline header present");
+        assert!(
+            alpha < header,
+            "online card must render before the offline section header",
+        );
+        assert!(
+            header < beta,
+            "offline section header must precede the beta card",
+        );
     }
 
     #[test]
