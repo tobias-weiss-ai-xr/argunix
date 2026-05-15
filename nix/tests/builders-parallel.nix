@@ -543,28 +543,46 @@ in
       saw_both_saturated = False
       done = 0
       with subtest("poll until all jobs reach a terminal status"):
-          overall_deadline = time.monotonic() + 4 * sleep_secs + 120
+          # Polling cadence: `coord.succeed("argunixctl ... builders list")`
+          # round-trips against the daemon's control socket, and under VM
+          # CPU pressure a single call routinely exceeds 1s. A
+          # `time.sleep(1)` in this loop then degenerates into a busy-poll
+          # of `coord.succeed`, hammering the same tokio runtime that
+          # drives dispatch and starving builders down to ~2 in-flight
+          # each. 3s gives the dispatcher breathing room while still
+          # sampling the ~30s saturation window many times over.
+          overall_deadline = time.monotonic() + 6 * sleep_secs + 180
           last_diag = 0.0
           while time.monotonic() < overall_deadline:
-              bs = builders_json()
-              by_name = {b["name"]: b for b in bs}
-              b1 = by_name.get("b1", {}).get("in_flight", 0)
-              b2 = by_name.get("b2", {}).get("in_flight", 0)
-              peak["b1"] = max(peak["b1"], b1)
-              peak["b2"] = max(peak["b2"], b2)
-              if b1 >= parallel_jobs and b2 >= parallel_jobs:
-                  saw_both_saturated = True
+              # Once we've observed the headline assertion, stop the
+              # expensive control-socket roundtrip and just watch sqlite
+              # for terminal status — sqlite reads don't touch the
+              # daemon at all.
+              if not saw_both_saturated:
+                  bs = builders_json()
+                  by_name = {b["name"]: b for b in bs}
+                  b1 = by_name.get("b1", {}).get("in_flight", 0)
+                  b2 = by_name.get("b2", {}).get("in_flight", 0)
+                  peak["b1"] = max(peak["b1"], b1)
+                  peak["b2"] = max(peak["b2"], b2)
+                  if b1 >= parallel_jobs and b2 >= parallel_jobs:
+                      saw_both_saturated = True
+              else:
+                  b1 = b2 = None
               done = jobs_done_count()
               now = time.monotonic()
               if now - last_diag >= 10:
                   last_diag = now
+                  in_flight = (
+                      f"b1={b1} b2={b2}" if b1 is not None else "(not sampled)"
+                  )
                   print(
-                      f"[poll t={now:.0f}s] in_flight b1={b1} b2={b2} done={done}/{expected_jobs}"
+                      f"[poll t={now:.0f}s] in_flight {in_flight} done={done}/{expected_jobs}"
                       f" evals={evals_status_snapshot()!r}"
                   )
               if done >= expected_jobs:
                   break
-              time.sleep(1)
+              time.sleep(3)
 
           if done < expected_jobs:
               dump_failure_context(f"only {done}/{expected_jobs} jobs reached a terminal status before deadline")
