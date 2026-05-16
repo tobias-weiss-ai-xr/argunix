@@ -1,6 +1,13 @@
 -- argunix v1 schema.
 -- Timestamps are stored as RFC 3339 TEXT (UTC) to keep raw SQL inspection
 -- readable; sqlx maps them to chrono::DateTime<Utc>.
+--
+-- Foreign keys carry `ON DELETE CASCADE` and are enforced — argunix-store
+-- opens every connection with `PRAGMA foreign_keys = ON`. Deleting a
+-- `repos` row removes its evaluations, their jobs, and everything hanging
+-- off those; deleting an `evaluations` row removes its jobs and their
+-- dependents. Retention GC and config-driven repo pruning rely on this:
+-- they delete only the top row and let the database cascade.
 
 CREATE TABLE repos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -11,7 +18,7 @@ CREATE TABLE repos (
 
 CREATE TABLE evaluations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo_id INTEGER NOT NULL REFERENCES repos(id),
+    repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
     trigger TEXT NOT NULL,
     git_ref TEXT NOT NULL,
     sha TEXT NOT NULL,
@@ -25,7 +32,7 @@ CREATE INDEX idx_evaluations_status ON evaluations(status);
 
 CREATE TABLE jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    eval_id INTEGER NOT NULL REFERENCES evaluations(id),
+    eval_id INTEGER NOT NULL REFERENCES evaluations(id) ON DELETE CASCADE,
     attr_path TEXT NOT NULL,
     drv_path TEXT,
     system TEXT NOT NULL,
@@ -40,14 +47,14 @@ CREATE INDEX idx_jobs_eval ON jobs(eval_id);
 CREATE INDEX idx_jobs_status ON jobs(status);
 
 CREATE TABLE queue (
-    job_id INTEGER PRIMARY KEY REFERENCES jobs(id),
+    job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     priority INTEGER NOT NULL DEFAULT 0,
     enqueued_at TEXT NOT NULL,
     dispatched_at TEXT
 );
 
 CREATE TABLE forge_status (
-    eval_id INTEGER NOT NULL REFERENCES evaluations(id),
+    eval_id INTEGER NOT NULL REFERENCES evaluations(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
     handle TEXT,
     last_posted_at TEXT NOT NULL,

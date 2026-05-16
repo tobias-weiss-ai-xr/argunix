@@ -340,12 +340,10 @@ impl RepoStore for SqlxStore {
         &self,
         keep: &[(String, Slug)],
     ) -> Result<Vec<RepoRecord>, StoreError> {
-        let mut tx = self.pool.begin().await?;
-
         let all_rows = sqlx::query(
             "SELECT id, forge, slug, name, description, web_url, default_branch FROM repos",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&self.pool)
         .await?;
         let all: Vec<RepoRecord> = all_rows.iter().map(map_repo).collect::<Result<_, _>>()?;
         let kept: std::collections::HashSet<(&str, &str)> =
@@ -355,59 +353,21 @@ impl RepoStore for SqlxStore {
             .filter(|r| !kept.contains(&(r.forge.as_str(), r.slug.as_str())))
             .collect();
 
-        // Order matters: queue → forge_status → jobs → evaluations →
-        // repos. Each statement scopes by repo_id via subqueries; the
-        // whole thing runs in one transaction so a failure mid-cascade
-        // leaves no partial state.
+        // Deleting the repo row is enough: FK `ON DELETE CASCADE`
+        // takes its evaluations, their jobs, and every
+        // queue / forge_status / effect_runs / docker_images row with
+        // it. Each delete is its own atomic statement — no enclosing
+        // transaction, since a `SELECT`-then-`DELETE` transaction
+        // would hold a read lock it then upgrades and could deadlock
+        // a concurrent writer. A partial prune (process died
+        // mid-loop) simply completes on the next boot's prune pass.
         for r in &orphans {
-            let id = r.id.get();
-            sqlx::query(
-                "DELETE FROM queue WHERE job_id IN (
-                     SELECT j.id FROM jobs j
-                     JOIN evaluations e ON j.eval_id = e.id
-                     WHERE e.repo_id = ?1
-                 )",
-            )
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "DELETE FROM forge_status WHERE eval_id IN (
-                     SELECT id FROM evaluations WHERE repo_id = ?1
-                 )",
-            )
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "DELETE FROM effect_runs WHERE job_id IN (
-                     SELECT j.id FROM jobs j
-                     JOIN evaluations e ON j.eval_id = e.id
-                     WHERE e.repo_id = ?1
-                 )",
-            )
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "DELETE FROM jobs WHERE eval_id IN (
-                     SELECT id FROM evaluations WHERE repo_id = ?1
-                 )",
-            )
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("DELETE FROM evaluations WHERE repo_id = ?1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
             sqlx::query("DELETE FROM repos WHERE id = ?1")
-                .bind(id)
-                .execute(&mut *tx)
+                .bind(r.id.get())
+                .execute(&self.pool)
                 .await?;
         }
 
-        tx.commit().await?;
         Ok(orphans)
     }
 }
@@ -677,35 +637,14 @@ impl EvalStore for SqlxStore {
     }
 
     async fn delete_eval_cascade(&self, eval_id: EvalId) -> Result<(), StoreError> {
-        // Order matters: queue → forge_status → jobs → evaluations,
-        // mirroring the per-repo prune cascade in `prune_repos_not_in`.
-        let mut tx = self.pool.begin().await?;
-        let id = eval_id.get();
-        sqlx::query("DELETE FROM queue WHERE job_id IN (SELECT id FROM jobs WHERE eval_id = ?1)")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM forge_status WHERE eval_id = ?1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "DELETE FROM effect_runs WHERE job_id IN (
-                 SELECT id FROM jobs WHERE eval_id = ?1
-             )",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM jobs WHERE eval_id = ?1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        // One statement: FK `ON DELETE CASCADE` takes the eval's jobs
+        // and their queue / forge_status / effect_runs / docker_images
+        // rows with it. The delete is itself atomic, so no explicit
+        // transaction is needed.
         sqlx::query("DELETE FROM evaluations WHERE id = ?1")
-            .bind(id)
-            .execute(&mut *tx)
+            .bind(eval_id.get())
+            .execute(&self.pool)
             .await?;
-        tx.commit().await?;
         Ok(())
     }
 }
@@ -926,56 +865,52 @@ impl JobStore for SqlxStore {
         id: JobId,
         now: DateTime<Utc>,
     ) -> Result<InterruptOutcome, StoreError> {
-        let mut tx = self.pool.begin().await?;
-        // Read current state under the transaction so two concurrent
-        // interruption signals on the same job (e.g. SSH disconnect AND
-        // a worker timeout firing in the same tick) don't both see the
-        // same `interrupt_count` and double-increment it.
-        let row = sqlx::query("SELECT interrupt_count, builder_id FROM jobs WHERE id = ?1")
-            .bind(id.get())
-            .fetch_one(&mut *tx)
-            .await?;
-        let prev_count: i64 = row.try_get("interrupt_count")?;
-        let prior_builder: Option<i64> = row.try_get("builder_id")?;
-        let prior_builder = prior_builder.map(BuilderId::new);
-        let new_count = (prev_count.max(0) as u32).saturating_add(1);
+        // One atomic `UPDATE ... RETURNING`: bump the counter and, in
+        // the same statement, derive the new status from the
+        // post-increment count. As a single statement it is immune to
+        // the double-increment race (two interruption signals on the
+        // same job in the same tick) *and* — holding no read lock it
+        // would then upgrade — it cannot deadlock another writer, so
+        // the connection pool can stay multi-connection.
+        //
+        // In an `UPDATE`, every SET right-hand side sees the
+        // *pre-update* column value, so `MAX(interrupt_count, 0) + 1`
+        // is the same new count in every clause; `RETURNING` then
+        // yields the *post-update* values.
+        let row = sqlx::query(
+            "UPDATE jobs
+             SET interrupt_count = MAX(interrupt_count, 0) + 1,
+                 status = CASE WHEN MAX(interrupt_count, 0) + 1 <= ?1
+                               THEN ?2 ELSE ?3 END,
+                 finished_at = CASE WHEN MAX(interrupt_count, 0) + 1 <= ?1
+                                    THEN finished_at ELSE ?4 END,
+                 failure_reason = CASE WHEN MAX(interrupt_count, 0) + 1 <= ?1
+                                       THEN failure_reason
+                                       ELSE 'exceeded interruption retry limit' END
+             WHERE id = ?5
+             RETURNING interrupt_count, builder_id",
+        )
+        .bind(i64::from(MAX_INTERRUPTIONS))
+        .bind(JobStatus::Interrupted.as_str())
+        .bind(JobStatus::Failure.as_str())
+        .bind(now)
+        .bind(id.get())
+        .fetch_one(&self.pool)
+        .await?;
 
-        let outcome = if new_count <= MAX_INTERRUPTIONS {
-            sqlx::query(
-                "UPDATE jobs
-                 SET status = ?1, interrupt_count = ?2
-                 WHERE id = ?3",
-            )
-            .bind(JobStatus::Interrupted.as_str())
-            .bind(new_count as i64)
-            .bind(id.get())
-            .execute(&mut *tx)
-            .await?;
-            InterruptOutcome::ReQueued {
+        let new_count = row.try_get::<i64, _>("interrupt_count")?.max(0) as u32;
+        let prior_builder = row
+            .try_get::<Option<i64>, _>("builder_id")?
+            .map(BuilderId::new);
+
+        if new_count <= MAX_INTERRUPTIONS {
+            Ok(InterruptOutcome::ReQueued {
                 new_count,
                 prior_builder,
-            }
+            })
         } else {
-            sqlx::query(
-                "UPDATE jobs
-                 SET status = ?1,
-                     interrupt_count = ?2,
-                     finished_at = ?3,
-                     failure_reason = ?4
-                 WHERE id = ?5",
-            )
-            .bind(JobStatus::Failure.as_str())
-            .bind(new_count as i64)
-            .bind(now)
-            .bind("exceeded interruption retry limit")
-            .bind(id.get())
-            .execute(&mut *tx)
-            .await?;
-            InterruptOutcome::FailedExceeded { prior_builder }
-        };
-
-        tx.commit().await?;
-        Ok(outcome)
+            Ok(InterruptOutcome::FailedExceeded { prior_builder })
+        }
     }
 }
 
@@ -1077,24 +1012,21 @@ impl BuilderStore for SqlxStore {
     }
 
     async fn rename(&self, old: &str, new: &str) -> Result<bool, StoreError> {
-        // Two-step under a transaction so we can distinguish
-        // "old missing" from "new collides" cleanly.
-        let mut tx = self.pool.begin().await?;
-        let exists_new: Option<i64> = sqlx::query_scalar("SELECT id FROM builders WHERE name = ?1")
-            .bind(new)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if exists_new.is_some() {
-            return Ok(false);
-        }
-        let r = sqlx::query("UPDATE builders SET name = ?1 WHERE name = ?2")
+        // One `UPDATE`, no SELECT-then-write transaction (that pattern
+        // can deadlock a concurrent writer mid lock-upgrade). The
+        // `UNIQUE(name)` constraint rejects a collision with the new
+        // name; `rows_affected == 0` means `old` did not exist. Both
+        // are reported as `false`, per the trait contract.
+        match sqlx::query("UPDATE builders SET name = ?1 WHERE name = ?2")
             .bind(new)
             .bind(old)
-            .execute(&mut *tx)
-            .await?;
-        let renamed = r.rows_affected() > 0;
-        tx.commit().await?;
-        Ok(renamed)
+            .execute(&self.pool)
+            .await
+        {
+            Ok(r) => Ok(r.rows_affected() > 0),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn list_all(&self) -> Result<Vec<BuilderRecord>, StoreError> {

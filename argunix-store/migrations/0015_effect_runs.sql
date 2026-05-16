@@ -22,7 +22,7 @@
 
 CREATE TABLE effect_runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id      INTEGER NOT NULL REFERENCES jobs(id),
+    job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     kind        TEXT NOT NULL,
     target      TEXT NOT NULL,
     status      TEXT NOT NULL,

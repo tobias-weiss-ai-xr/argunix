@@ -47,21 +47,26 @@ let
   };
 
   # Standalone fixture flake with one output: a derivation that
-  # produces a docker-archive tarball (by copying `prebuiltImage`)
-  # and carries `meta.docker-image = true`. The references on the
-  # `args` string make `prebuiltImage`, `pkgs.bash`, and
-  # `pkgs.coreutils` runtime deps of the flake source tree, so they
-  # ride along into the VM's nix store.
+  # produces a docker-archive tarball (by copying the prebuilt image)
+  # and carries `meta.docker-image = true`.
+  #
+  # The derivation routes *every* build input — the image tarball and
+  # the static `busybox` that copies it — through `${self}`, the flake
+  # source. That gives it one real declared input and lets it build
+  # under the normal sandbox: a `sandbox = false` build with
+  # *undeclared* dependencies is resource-marginal in a test VM and
+  # gets SIGKILL'd under parallel load.
   flakeNix = pkgs.writeText "flake.nix" ''
     {
       outputs = { self }: {
         packages.x86_64-linux.hello-image = (derivation {
           name = "argunix-registry-fixture-image.tar.gz";
           system = "x86_64-linux";
-          builder = "${pkgs.bash}/bin/sh";
+          builder = "''${self}/busybox";
           args = [
+            "sh"
             "-c"
-            "${pkgs.coreutils}/bin/cp ${prebuiltImage} $out"
+            "''${self}/busybox cp ''${self}/hello-image.tar.gz $out"
           ];
         }) // { meta.docker-image = true; };
       };
@@ -71,6 +76,9 @@ let
   fixtureFlake = pkgs.runCommand "argunix-registry-fixture-flake" { } ''
     mkdir -p $out
     cp ${flakeNix} $out/flake.nix
+    cp ${prebuiltImage} $out/hello-image.tar.gz
+    cp ${pkgs.pkgsStatic.busybox}/bin/busybox $out/busybox
+    chmod +x $out/busybox
     cat > $out/flake.lock <<'EOF'
     { "nodes": { "root": {} }, "root": "root", "version": 7 }
     EOF
@@ -154,24 +162,13 @@ in
       };
       boot.tmp.useTmpfs = false;
 
-      # The fixture flake's inner derivation has empty inputSrcs:
-      # `pkgs.writeText` bakes the flake.nix to disk, so when Nix
-      # parses it inside the VM the string-context that would
-      # normally pull bash/coreutils/prebuiltImage in as inputs is
-      # gone. Real users reach for `pkgs.runCommand` /
-      # `stdenv.mkDerivation` which handle this through their own
-      # dependency machinery; the test fixture intentionally skips
-      # nixpkgs to keep the eval cheap, and pays for that with a
-      # sandbox-off build.
-      nix.settings.sandbox = false;
-
-      # Ride the fixture's closure (prebuilt image, bash, coreutils)
-      # into the VM store explicitly. They're already references of
-      # `fixtureFlake`'s flake.nix file, but additionalPaths makes
-      # the dependency loud rather than implicit.
+      # The fixture flake source carries everything its derivation
+      # needs (the image tarball + a static busybox), so the build has
+      # a real declared input and runs under the normal sandbox — no
+      # `nix.settings.sandbox = false`. Ride the flake source into the
+      # VM store explicitly.
       virtualisation.additionalPaths = [
         fixtureFlake
-        prebuiltImage
       ];
     };
 

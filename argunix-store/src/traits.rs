@@ -89,11 +89,12 @@ pub trait RepoStore: Send + Sync {
         web_url: Option<&str>,
         default_branch: Option<&str>,
     ) -> Result<(), StoreError>;
-    /// Delete every repo (and its cascaded evaluations / jobs / queue
-    /// rows / forge_status rows) whose `(forge, slug)` does not appear
-    /// in `keep`. Returns the deleted repo records so the caller can
-    /// also clean up their on-disk logs and GC roots. Runs in a single
-    /// transaction.
+    /// Delete every repo whose `(forge, slug)` does not appear in
+    /// `keep`. FK `ON DELETE CASCADE` removes each repo's evaluations,
+    /// jobs, and their queue / forge_status / effect_runs /
+    /// docker_images rows. Returns the deleted repo records so the
+    /// caller can also clean up their on-disk logs and GC roots. Runs
+    /// in a single transaction.
     async fn prune_repos_not_in(
         &self,
         keep: &[(String, Slug)],
@@ -221,12 +222,11 @@ pub trait EvalStore: Send + Sync {
         limit: u32,
     ) -> Result<Vec<EvalRecord>, StoreError>;
 
-    /// Cascade-delete one evaluation: removes its `queue` rows,
-    /// `forge_status` rows, `jobs` rows, and the `evaluations` row
-    /// itself in a single transaction. Mirrors the cascade shape used
-    /// by `RepoStore::prune_repos_not_in`. The caller is responsible
-    /// for cleaning up on-disk state (logs, GC roots) keyed on
-    /// `<repo_id>/<eval_id>/`. No-op if the row doesn't exist.
+    /// Delete one evaluation. FK `ON DELETE CASCADE` removes its jobs
+    /// and their queue / forge_status / effect_runs / docker_images
+    /// rows. The caller is responsible for cleaning up on-disk state
+    /// (logs, GC roots) keyed on `<repo_id>/<eval_id>/`. No-op if the
+    /// row doesn't exist.
     async fn delete_eval_cascade(&self, eval_id: EvalId) -> Result<(), StoreError>;
 }
 

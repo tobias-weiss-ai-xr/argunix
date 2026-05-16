@@ -15,9 +15,9 @@
 
 CREATE TABLE docker_images (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo_id INTEGER NOT NULL REFERENCES repos(id),
-    eval_id INTEGER NOT NULL REFERENCES evaluations(id),
-    job_id INTEGER NOT NULL REFERENCES jobs(id),
+    repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    eval_id INTEGER NOT NULL REFERENCES evaluations(id) ON DELETE CASCADE,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     image_name TEXT NOT NULL,        -- "<forge>/<owner>/<repo>/<attr-name>"
     system TEXT NOT NULL,            -- "x86_64-linux" etc.
     git_ref TEXT NOT NULL,           -- "refs/heads/main"
