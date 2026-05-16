@@ -2,13 +2,13 @@
    `{% import "_macros.html" as m %}` and invoked via `{% call %}`. #}
 
 {# Header logo. The `cluster_active` flag drives the spin animation
-   (see `argunix-spin` in `base.html`'s <style>); `oob_swap` adds the
-   `hx-swap-oob` attribute used by the htmx polling response from
-   `/_/status` to keep the spinner in sync between full navigations. #}
-{% macro logo(cluster_active, oob_swap) -%}
+   (see `argunix-spin` in `base.html`'s <style>). The logo lives outside
+   the htmx-polled status container; `_status_fragment.html` keeps its spin
+   state in sync by toggling the class on this node, instead of re-rendering
+   it, so the animation isn't reset on every 5s poll. #}
+{% macro logo(cluster_active) -%}
 <img
   id="argunix-logo"
-  {%- if oob_swap %} hx-swap-oob="true"{% endif %}
   src="/static/img/argunix-logo-square.svg"
   alt="argunix"
   class="h-10 w-10{% if cluster_active %} argunix-spin{% endif %} dark:invert"

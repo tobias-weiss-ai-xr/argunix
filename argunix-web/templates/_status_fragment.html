@@ -1,3 +1,13 @@
-{%- import "_macros.html" as m -%}
-{% call m::logo(cluster_active, true) %}
+{# Polling response for `/_/status` (htmx `every 5s`). It swaps the
+   `innerHTML` of the status container, so any <script> here runs on every
+   poll. Rather than re-rendering the header logo node — which would restart
+   the CSS spin animation each cycle — we toggle the `argunix-spin` class on
+   the existing element in place. `classList.toggle` with a force flag is a
+   no-op when the class is already in the desired state, so an ongoing spin
+   keeps running smoothly for as long as the cluster stays active. #}
+<script>
+  document
+    .getElementById("argunix-logo")
+    ?.classList.toggle("argunix-spin", {{ cluster_active }});
+</script>
 {% include "_status_inner.html" %}
