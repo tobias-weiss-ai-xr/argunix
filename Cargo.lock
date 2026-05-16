@@ -308,6 +308,7 @@ dependencies = [
 name = "argunix-effects"
 version = "0.0.1"
 dependencies = [
+ "argunix-domain",
  "async-trait",
  "tempfile",
  "thiserror 2.0.18",

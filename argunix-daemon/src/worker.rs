@@ -21,7 +21,7 @@ use argunix_builders::{
     BuildLifecycle, BuildOutcomeStatus, BuildPhase, BuilderDispatcher, NixCopyDirection,
     nix_copy_over_pool,
 };
-use argunix_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
+use argunix_domain::{EvalId, EvalStatus, ImageFormat, JobId, JobStatus, RepoId, Sha, Slug};
 use argunix_effects::{Effect, OutputContext};
 use argunix_forge::{CheckPost, CheckState, ForgeError, Provider};
 use argunix_sched::ScheduleStrategy;
@@ -1466,7 +1466,7 @@ async fn load_jobs_for_resume(
             meta: serde_json::Value::Null,
             is_cached: false,
             required_system_features: Vec::new(),
-            is_docker_image: false,
+            image_format: None,
         };
         out.push((spec, row.id));
     }
@@ -1833,17 +1833,32 @@ async fn build_one(
             // `/v2` surface) — independent of, and complementary to,
             // the external registry push above. Awaited inline since
             // it only writes to the local blob pool.
-            if spec.is_docker_image {
-                try_publish_docker_image(
-                    &ctx.store,
-                    &ctx.registry_state,
-                    repo_id,
-                    eval_id,
-                    job_id,
-                    spec,
-                    primary.as_deref(),
-                )
-                .await;
+            //
+            // Only `docker` images are ingested here: the embedded
+            // registry's converter is single-manifest, so an `oci`
+            // (potentially multi-arch) image is distributed solely via
+            // the `registry-push` effect — see `argunix-effects`.
+            match spec.image_format {
+                Some(ImageFormat::Docker) => {
+                    try_publish_docker_image(
+                        &ctx.store,
+                        &ctx.registry_state,
+                        repo_id,
+                        eval_id,
+                        job_id,
+                        spec,
+                        primary.as_deref(),
+                    )
+                    .await;
+                }
+                Some(ImageFormat::Oci) => {
+                    tracing::info!(
+                        job_id = job_id.get(),
+                        "oci image: embedded registry publish skipped \
+                         (oci images are distributed via the registry-push effect)",
+                    );
+                }
+                None => {}
             }
 
             Ok(JobStatus::Success)
@@ -1893,7 +1908,7 @@ fn spawn_post_build_effects(
     let sha = eval.sha.as_str().to_string();
     let attr_path = spec.attr_path.as_str().to_string();
     let system = spec.system.clone().unwrap_or_else(|| "unknown".to_string());
-    let is_docker_image = spec.is_docker_image;
+    let image_format = spec.image_format;
     tokio::spawn(
         async move {
             if !caches.is_empty() {
@@ -1914,7 +1929,7 @@ fn spawn_post_build_effects(
                     system: &system,
                     git_ref: &git_ref,
                     sha: &sha,
-                    is_docker_image,
+                    image_format,
                     output_paths: &output_paths,
                 };
                 crate::effects::run_effects(&store, job_id, &reg_effects, &octx).await;
@@ -2593,7 +2608,7 @@ mod tests {
             meta: serde_json::Value::Null,
             is_cached: false,
             required_system_features: required.iter().map(|s| s.to_string()).collect(),
-            is_docker_image: false,
+            image_format: None,
         }
     }
 

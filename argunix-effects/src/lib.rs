@@ -27,6 +27,8 @@ pub mod registry;
 
 pub use registry::RegistryPush;
 
+pub use argunix_domain::ImageFormat;
+
 use async_trait::async_trait;
 
 /// Everything an [`Effect`] needs to know about the build output it is
@@ -48,10 +50,10 @@ pub struct OutputContext<'a> {
     pub git_ref: &'a str,
     /// Full commit sha.
     pub sha: &'a str,
-    /// True when the JobSpec carried `meta.docker-image == true`.
-    /// Effects that only make sense for images (registry push) skip
-    /// when this is false.
-    pub is_docker_image: bool,
+    /// `Some` when the JobSpec declared `meta.image-format`, carrying
+    /// the archive format. Effects that only make sense for images
+    /// (registry push) skip when this is `None`.
+    pub image_format: Option<ImageFormat>,
     /// Realised output store paths. The first entry is the primary
     /// output — for a `dockerTools` image that is the docker-archive
     /// tarball.
@@ -200,7 +202,7 @@ mod tests {
             system: "x86_64-linux",
             git_ref: "refs/heads/main",
             sha: "0123456789abcdef0123456789abcdef01234567",
-            is_docker_image: true,
+            image_format: Some(ImageFormat::Docker),
             output_paths: &[],
         };
         assert_eq!(ctx.branch(), Some("main"));
@@ -216,7 +218,7 @@ mod tests {
             system: "x86_64-linux",
             git_ref: "refs/pull/7/head",
             sha: "abc",
-            is_docker_image: true,
+            image_format: Some(ImageFormat::Docker),
             output_paths: &[],
         };
         assert_eq!(ctx.branch(), None);

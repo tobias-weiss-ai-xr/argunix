@@ -5,7 +5,7 @@ mod gc;
 mod worker;
 
 use anyhow::{Context, anyhow};
-use argunix_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
+use argunix_domain::{EvalId, EvalStatus, ImageFormat, JobId, JobStatus, RepoId, Sha, Slug};
 use argunix_store::{EvalStore, JobPhaseMetrics, JobStore, RepoStore};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
@@ -1017,17 +1017,30 @@ async fn build_one_job(
 
             // Internal embedded registry (argunix's own /v2 surface) —
             // independent of, and complementary to, the external push.
-            if spec.is_docker_image {
-                try_publish_docker_image_cli(
-                    store,
-                    registry_state,
-                    repo_id,
-                    eval_id,
-                    job_id,
-                    spec,
-                    primary_output.as_deref(),
-                )
-                .await;
+            // Only `docker` images are ingested here; an `oci` image
+            // (potentially multi-arch) goes out via the registry-push
+            // effect only — the embedded converter is single-manifest.
+            match spec.image_format {
+                Some(ImageFormat::Docker) => {
+                    try_publish_docker_image_cli(
+                        store,
+                        registry_state,
+                        repo_id,
+                        eval_id,
+                        job_id,
+                        spec,
+                        primary_output.as_deref(),
+                    )
+                    .await;
+                }
+                Some(ImageFormat::Oci) => {
+                    tracing::info!(
+                        job_id = job_id.get(),
+                        "oci image: embedded registry publish skipped \
+                         (oci images are distributed via the registry-push effect)",
+                    );
+                }
+                None => {}
             }
 
             Ok(JobStatus::Success)
@@ -1080,7 +1093,7 @@ async fn run_registry_effects_cli(
         system: spec.system.as_deref().unwrap_or("unknown"),
         git_ref,
         sha,
-        is_docker_image: spec.is_docker_image,
+        image_format: spec.image_format,
         output_paths,
     };
     effects::run_effects(store, job_id, registry_effects, &ctx).await;

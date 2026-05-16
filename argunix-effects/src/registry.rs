@@ -7,20 +7,25 @@
 //! argunix is additive infrastructure, not a replacement, and argunix
 //! carries no image-lifecycle responsibility.
 //!
-//! Mechanics: `skopeo copy docker-archive:<tarball> docker://<ref>`,
-//! once per tag. The image is tagged with the branch name (when the
-//! eval ran on a `refs/heads/*` ref) and always with an immutable
+//! Mechanics: `skopeo copy <transport>:<archive> docker://<ref>`, once
+//! per tag. The transport follows the job's `meta.image-format` — a
+//! `docker` job is a `docker-archive:` tarball, an `oci` job is an
+//! `oci-archive:` layout — so the effect never has to sniff the
+//! archive. The image is tagged with the branch name (when the eval
+//! ran on a `refs/heads/*` ref) and always with an immutable
 //! `sha-<short>` tag. Registry credentials come from a file holding a
 //! single `user:password` line, read at push time — never at config
 //! time, and never logged.
 //!
-//! Multi-arch: one `skopeo copy` of a single docker-archive pushes a
-//! single-platform manifest. When several systems build the same
-//! attribute they currently race on the branch tag (last write wins);
-//! assembling a cross-system OCI image index on the external registry
-//! is future work, tracked against the same `Effect` seam.
+//! Multi-arch: an `oci-archive` may carry a manifest list, so its push
+//! adds `--multi-arch all` to copy every platform rather than only the
+//! runner's. A `docker-archive` cannot carry a list — `docker save`
+//! has no multi-arch — so a `docker` job is always single-platform.
+//! When several `docker` jobs build the same attribute they still race
+//! on the branch tag (last write wins); assembling one cross-system
+//! index is future work, tracked against the same `Effect` seam.
 
-use crate::{Effect, EffectOutcome, OutputContext, Severity, image_segment};
+use crate::{Effect, EffectOutcome, ImageFormat, OutputContext, Severity, image_segment};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -101,9 +106,9 @@ impl Effect for RegistryPush {
     }
 
     async fn run(&self, ctx: &OutputContext<'_>) -> EffectOutcome {
-        if !ctx.is_docker_image {
-            return EffectOutcome::skipped("not a docker image");
-        }
+        let Some(fmt) = ctx.image_format else {
+            return EffectOutcome::skipped("not a container image");
+        };
         let Some(archive) = ctx.primary_output() else {
             return EffectOutcome::failure("build produced no output path to push");
         };
@@ -143,7 +148,10 @@ impl Effect for RegistryPush {
         let mut pushed: Vec<String> = Vec::new();
         for tag in &tags {
             let dest = format!("{base}:{tag}");
-            if let Err(detail) = self.skopeo_copy(archive, &dest, creds.as_deref()).await {
+            if let Err(detail) = self
+                .skopeo_copy(fmt, archive, &dest, creds.as_deref())
+                .await
+            {
                 return EffectOutcome::failure(format!(
                     "pushing {} to {}: {detail}",
                     redact_dest(&dest),
@@ -158,11 +166,15 @@ impl Effect for RegistryPush {
 }
 
 impl RegistryPush {
-    /// Run one `skopeo copy docker-archive:<archive> <dest>`. `Ok` on a
-    /// zero exit, `Err(detail)` carries the failure reason (timeout,
-    /// spawn error, or skopeo's own stderr).
+    /// Run one `skopeo copy <transport>:<archive> <dest>`. The
+    /// transport (`docker-archive:` / `oci-archive:`) is chosen from
+    /// `fmt`; an OCI archive additionally gets `--multi-arch all` so a
+    /// manifest list is copied whole rather than just the runner's
+    /// platform. `Ok` on a zero exit, `Err(detail)` carries the failure
+    /// reason (timeout, spawn error, or skopeo's own stderr).
     async fn skopeo_copy(
         &self,
+        fmt: ImageFormat,
         archive: &str,
         dest: &str,
         creds: Option<&str>,
@@ -174,8 +186,14 @@ impl RegistryPush {
         // `argunix-registry::convert`.
         cmd.arg("--insecure-policy")
             .arg("copy")
-            .arg(format!("docker-archive:{archive}"))
+            .arg(format!("{}:{archive}", fmt.skopeo_transport()))
             .arg(dest);
+        // An OCI archive may be a manifest list — copy every platform.
+        // Harmless on a single-arch OCI archive; a docker-archive can't
+        // carry a list at all, so the flag stays OCI-only.
+        if fmt == ImageFormat::Oci {
+            cmd.arg("--multi-arch").arg("all");
+        }
         if self.insecure {
             cmd.arg("--dest-tls-verify=false");
         }
@@ -319,7 +337,7 @@ mod tests {
             system: "x86_64-linux",
             git_ref: "refs/heads/main",
             sha: "0123456789abcdef",
-            is_docker_image: false,
+            image_format: None,
             output_paths: &["/nix/store/x".to_string()],
         };
         let outcome = push().run(&ctx).await;
@@ -335,7 +353,7 @@ mod tests {
             system: "x86_64-linux",
             git_ref: "refs/heads/main",
             sha: "0123456789abcdef",
-            is_docker_image: true,
+            image_format: Some(ImageFormat::Docker),
             output_paths: &[],
         };
         let outcome = push().run(&ctx).await;
@@ -352,7 +370,7 @@ mod tests {
             system: "x86_64-linux",
             git_ref: "refs/heads/main",
             sha: "0123456789abcdef",
-            is_docker_image: true,
+            image_format: Some(ImageFormat::Docker),
             output_paths: &["/nix/store/does-not-matter".to_string()],
         };
         let p = RegistryPush {
@@ -366,5 +384,25 @@ mod tests {
             "got: {}",
             outcome.detail,
         );
+    }
+
+    #[tokio::test]
+    async fn oci_job_passes_the_image_gate() {
+        // An `oci` job is an image like a `docker` one: it must clear
+        // the `image_format` gate and fail only on the missing output,
+        // not be skipped as a non-image.
+        let ctx = OutputContext {
+            forge: "gh",
+            repo_slug: "o/r",
+            attr_path: "packages.x86_64-linux.img",
+            system: "x86_64-linux",
+            git_ref: "refs/heads/main",
+            sha: "0123456789abcdef",
+            image_format: Some(ImageFormat::Oci),
+            output_paths: &[],
+        };
+        let outcome = push().run(&ctx).await;
+        assert_eq!(outcome.status, crate::EffectStatus::Failure);
+        assert!(outcome.detail.contains("no output"));
     }
 }

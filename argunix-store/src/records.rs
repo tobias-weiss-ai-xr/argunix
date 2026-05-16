@@ -210,7 +210,7 @@ pub struct BuilderRecord {
 
 /// Fields supplied when registering a converted docker image. Inserted
 /// after a successful build of an attribute flagged with
-/// `meta.docker-image == true` and a successful skopeo conversion of
+/// `meta.image-format = "docker"` and a successful skopeo conversion of
 /// the docker-archive tarball into the registry blob pool.
 #[derive(Debug, Clone)]
 pub struct NewDockerImage {

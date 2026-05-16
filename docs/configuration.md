@@ -183,8 +183,8 @@ Set `web_url` to the instance hostname (e.g. `https://codeberg.org`,
 ## Registries
 
 `registries:` is a named catalog of external docker registries the
-`registry-push` effect copies built `dockerTools` images to. A repo
-opts in via `push_to_registries` (settable per repo, per forge, or in
+`registry-push` effect copies built container images to. A repo opts
+in via `push_to_registries` (settable per repo, per forge, or in
 `defaults` — the lists merge). Each entry:
 
 | Field       | Meaning                                                                 |
@@ -197,6 +197,30 @@ opts in via `push_to_registries` (settable per repo, per forge, or in
 An image is pushed to `<url>/<namespace>/<image>:<tag>`, where
 `<image>` is the build attribute's leaf name and `<tag>` is the branch
 name plus an immutable `sha-<short>` tag.
+
+### Marking a build as an image
+
+argunix only treats a build output as a container image — and only
+then runs `registry-push` — when its derivation declares the
+`meta.image-format` attribute:
+
+```nix
+# a docker save / dockerTools.buildLayeredImage tarball
+meta.image-format = "docker";
+
+# an OCI image-layout archive, possibly a multi-arch index
+meta.image-format = "oci";
+```
+
+The value selects the `skopeo` transport: a `docker` build is pushed
+from a `docker-archive:`, an `oci` build from an `oci-archive:` with
+`--multi-arch all` so a manifest list is copied whole. A build without
+`meta.image-format` is an ordinary package and is never pushed. argunix
+does not sniff the archive — the format is declared, not guessed.
+
+Note: argunix's own embedded read-only registry ingests `docker`
+images only; `oci` images are distributed solely through the
+`registry-push` effect.
 
 ### The `{slug}` namespace placeholder
 

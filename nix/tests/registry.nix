@@ -1,6 +1,6 @@
 # End-to-end test of the docker-image registry.
 #
-# A successful build of a derivation marked `meta.docker-image = true`
+# A successful build of a derivation marked `meta.image-format = "docker"`
 # triggers `argunix-registry::publish`: skopeo copies the
 # docker-archive into a content-addressed blob pool, the per-build
 # manifest goes into `<state>/manifests/...`, and a `docker_images`
@@ -19,7 +19,7 @@
 #   3. The fixture flake is trivial (no nixpkgs flake input, no IFD)
 #      — its only output is a derivation that `cp`s a prebuilt
 #      `dockerTools.buildLayeredImage` tarball into place and
-#      attaches `meta.docker-image = true`. This keeps eval cheap
+#      attaches `meta.image-format = "docker"`. This keeps eval cheap
 #      without sacrificing a real docker-archive payload.
 #   4. The unit is restarted after the build, then a real docker
 #      client (configured to treat the local registry as insecure
@@ -48,7 +48,7 @@ let
 
   # Standalone fixture flake with one output: a derivation that
   # produces a docker-archive tarball (by copying the prebuilt image)
-  # and carries `meta.docker-image = true`.
+  # and carries `meta.image-format = "docker"`.
   #
   # The derivation routes *every* build input — the image tarball and
   # the static `busybox` that copies it — through `${self}`, the flake
@@ -68,7 +68,7 @@ let
             "-c"
             "''${self}/busybox cp ''${self}/hello-image.tar.gz $out"
           ];
-        }) // { meta.docker-image = true; };
+        }) // { meta.image-format = "docker"; };
       };
     }
   '';
@@ -196,7 +196,7 @@ in
     machine.succeed("systemctl stop argunix.service")
 
     # Confirm what the eval pass actually sees on `meta`. If the
-    # `docker-image` flag is missing here, the publish helper will
+    # `image-format` marker is missing here, the publish helper will
     # never even be called downstream — so this is the right
     # diagnostic to read first when docker_images comes up empty.
     eval_json = machine.succeed(
@@ -207,8 +207,8 @@ in
     )
     print("--- nix-eval-jobs JSON (raw) ---")
     print(eval_json)
-    assert '"docker-image":true' in eval_json, (
-        "meta.docker-image was not surfaced by nix-eval-jobs --meta; "
+    assert '"image-format":"docker"' in eval_json, (
+        "meta.image-format was not surfaced by nix-eval-jobs --meta; "
         f"got: {eval_json!r}"
     )
 
@@ -231,8 +231,8 @@ in
     # carries the literal text below. Two distinct cases:
     #   - "docker registry publish failed" present → helper ran,
     #     skopeo or the db insert errored.
-    #   - absent → helper never ran (spec.is_docker_image was false,
-    #     i.e. the meta flag didn't propagate from eval to JobSpec).
+    #   - absent → helper never ran (spec.image_format was None,
+    #     i.e. the meta marker didn't propagate from eval to JobSpec).
     publish_warned = "docker registry publish failed" in out
     print(f"publish helper logged a warning: {publish_warned}")
     # When the helper warned, the line itself carries the actual

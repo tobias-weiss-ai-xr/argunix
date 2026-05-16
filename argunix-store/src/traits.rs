@@ -369,8 +369,8 @@ pub trait BuilderStore: Send + Sync {
 pub trait DockerImageStore: Send + Sync {
     /// Insert a converted docker image. Called by the worker after a
     /// successful build of an attribute flagged with
-    /// `meta.docker-image == true` and a successful skopeo conversion
-    /// to OCI blobs in the registry pool.
+    /// `meta.image-format = "docker"` and a successful skopeo
+    /// conversion to OCI blobs in the registry pool.
     async fn create(&self, new: NewDockerImage) -> Result<(), StoreError>;
 
     /// Most recent row matching `(image_name, system, git_ref)`. Drives

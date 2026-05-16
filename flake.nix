@@ -135,6 +135,7 @@
             synthetic-flake = pkgs.testers.runNixOSTest ./nix/tests/synthetic-flake.nix;
             registry = pkgs.testers.runNixOSTest ./nix/tests/registry.nix;
             registry-push = pkgs.testers.runNixOSTest ./nix/tests/registry-push.nix;
+            registry-push-oci = pkgs.testers.runNixOSTest ./nix/tests/registry-push-oci.nix;
           };
         };
     };

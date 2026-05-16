@@ -1,4 +1,4 @@
-use argunix_domain::AttrPath;
+use argunix_domain::{AttrPath, ImageFormat};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -48,10 +48,11 @@ pub struct JobSpec {
     /// `requiredSystemFeatures` from the .drv (e.g. `["cuda"]`,
     /// `["uid-range"]`). Empty when the derivation didn't declare any.
     pub required_system_features: Vec<String>,
-    /// True when `meta.docker-image == true`. Marks the build output as
-    /// a `dockerTools.{buildImage,buildLayeredImage}` tarball that the
-    /// argunix registry should pick up after a successful build.
-    pub is_docker_image: bool,
+    /// `Some` when the derivation declared `meta.image-format`, marking
+    /// the build output as a container image argunix should publish
+    /// after a successful build; the variant records the archive
+    /// format. `None` for an ordinary package.
+    pub image_format: Option<ImageFormat>,
 }
 
 impl JobSpec {
@@ -65,10 +66,24 @@ impl JobSpec {
     }
 }
 
-fn meta_docker_image(meta: &serde_json::Value) -> bool {
-    meta.get("docker-image")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+/// Read the `meta.image-format` marker. A missing attribute means an
+/// ordinary package (`None`); an attribute carrying an unrecognised
+/// value is logged and treated as `None` rather than failing the whole
+/// evaluation — one bad `meta` field shouldn't sink every other job in
+/// the same flake.
+fn meta_image_format(attr: &str, meta: &serde_json::Value) -> Option<ImageFormat> {
+    let raw = meta.get("image-format")?;
+    let Some(s) = raw.as_str() else {
+        tracing::warn!(attr, ?raw, "meta.image-format is not a string; ignoring");
+        return None;
+    };
+    match s.parse() {
+        Ok(fmt) => Some(fmt),
+        Err(e) => {
+            tracing::warn!(attr, %e, "ignoring unrecognised meta.image-format value");
+            None
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,7 +110,7 @@ pub fn parse_lines(prefix: &str, body: &str) -> Result<Vec<JobSpec>, ParseError>
             line: idx + 1,
             source: e,
         })?;
-        let is_docker_image = meta_docker_image(&raw.meta);
+        let image_format = meta_image_format(&raw.attr, &raw.meta);
         out.push(JobSpec {
             attr_path: AttrPath::new(if raw.attr.is_empty() {
                 prefix.to_string()
@@ -109,7 +124,7 @@ pub fn parse_lines(prefix: &str, body: &str) -> Result<Vec<JobSpec>, ParseError>
             meta: raw.meta,
             is_cached: raw.is_cached,
             required_system_features: raw.required_system_features,
-            is_docker_image,
+            image_format,
         });
     }
     Ok(out)
@@ -216,17 +231,33 @@ mod tests {
     }
 
     #[test]
-    fn detects_docker_image_meta() {
-        let body = r#"{"attr":"img","drvPath":"/nix/store/x.drv","system":"x86_64-linux","meta":{"docker-image":true}}"#;
+    fn detects_oci_image_format_meta() {
+        let body = r#"{"attr":"img","drvPath":"/nix/store/x.drv","system":"x86_64-linux","meta":{"image-format":"oci"}}"#;
         let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
-        assert!(jobs[0].is_docker_image);
+        assert_eq!(jobs[0].image_format, Some(ImageFormat::Oci));
     }
 
     #[test]
-    fn missing_docker_image_meta_is_false() {
+    fn detects_docker_image_format_meta() {
+        let body = r#"{"attr":"img","drvPath":"/nix/store/x.drv","system":"x86_64-linux","meta":{"image-format":"docker"}}"#;
+        let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
+        assert_eq!(jobs[0].image_format, Some(ImageFormat::Docker));
+    }
+
+    #[test]
+    fn missing_image_format_meta_is_none() {
         let body = r#"{"attr":"x","drvPath":"/nix/store/x.drv","system":"x86_64-linux","meta":{"description":"hi"}}"#;
         let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
-        assert!(!jobs[0].is_docker_image);
+        assert!(jobs[0].image_format.is_none());
+    }
+
+    #[test]
+    fn unrecognised_image_format_meta_is_none() {
+        // A typo'd value is ignored, not fatal — the job is simply
+        // treated as a non-image build.
+        let body = r#"{"attr":"x","drvPath":"/nix/store/x.drv","system":"x86_64-linux","meta":{"image-format":"tarball"}}"#;
+        let jobs = parse_lines("packages.x86_64-linux", body).unwrap();
+        assert!(jobs[0].image_format.is_none());
     }
 
     #[test]

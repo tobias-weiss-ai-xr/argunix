@@ -1,6 +1,6 @@
 //! Read-only Docker Registry V2 surface for argunix-built docker images.
 //!
-//! When `meta.docker-image == true` is set on a derivation that
+//! When `meta.image-format = "docker"` is set on a derivation that
 //! `dockerTools.{buildImage,buildLayeredImage}` produces, argunix:
 //!
 //! 1. Builds it via the normal pipeline (its output is a docker-archive
