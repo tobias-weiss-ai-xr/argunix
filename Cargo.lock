@@ -274,6 +274,7 @@ dependencies = [
  "argunix-config",
  "argunix-control",
  "argunix-domain",
+ "argunix-effects",
  "argunix-eval",
  "argunix-forge",
  "argunix-registry",
@@ -301,6 +302,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "argunix-effects"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

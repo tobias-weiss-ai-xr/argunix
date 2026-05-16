@@ -1,5 +1,6 @@
 mod control;
 mod dispatch_driver;
+mod effects;
 mod gc;
 mod worker;
 
@@ -741,6 +742,16 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
         })
         .collect();
 
+    // Post-build registry-push effects for this repo, resolved from
+    // the `registries` catalog via the repo's effective
+    // `push_to_registries` binding.
+    let registry_effects = config
+        .repos
+        .iter()
+        .find(|r| r.forge == args.forge && r.slug == slug)
+        .map(|r| effects::registry_push_effects(&config, r))
+        .unwrap_or_default();
+
     let log_base = args
         .log_dir
         .clone()
@@ -773,6 +784,9 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
             job_id,
             &spec,
             &push_caches,
+            &registry_effects,
+            &args.git_ref,
+            &args.sha,
             push_timeout,
             build_timeout,
             &log_base,
@@ -852,6 +866,9 @@ async fn build_one_job(
     job_id: JobId,
     spec: &argunix_eval::JobSpec,
     push_caches: &[argunix_build::PushCache],
+    registry_effects: &[Arc<dyn argunix_effects::Effect>],
+    git_ref: &str,
+    sha: &str,
     push_timeout: Duration,
     build_timeout: Duration,
     log_base: &Path,
@@ -876,16 +893,46 @@ async fn build_one_job(
     if spec.is_cached {
         if let Some(output) = spec.primary_output() {
             tracing::info!(job_id = job_id.get(), output = %output, "local store hit");
+            let output = output.to_string();
             <argunix_store::SqlxStore as JobStore>::finish(
                 store,
                 job_id,
                 JobStatus::Cached,
                 Utc::now(),
                 None,
-                Some(output),
+                Some(&output),
                 &JobPhaseMetrics::default(),
             )
             .await?;
+            // Post-build effects run for cache hits too: a cached
+            // output is valid locally, but the external registry /
+            // binary cache may not have it yet. The output closure is
+            // already realised, so the effects have everything they
+            // need.
+            let outputs = [output];
+            if !push_caches.is_empty() {
+                let _ = effects::run_cache_push_effects(
+                    store,
+                    job_id,
+                    &outputs,
+                    push_caches,
+                    push_timeout,
+                )
+                .await;
+            }
+            if !registry_effects.is_empty() {
+                run_registry_effects_cli(
+                    store,
+                    job_id,
+                    spec,
+                    repo_id,
+                    git_ref,
+                    sha,
+                    &outputs,
+                    registry_effects,
+                )
+                .await;
+            }
             return Ok(JobStatus::Cached);
         }
     }
@@ -926,20 +973,18 @@ async fn build_one_job(
                 .cloned()
                 .or_else(|| spec.primary_output().map(String::from));
 
-            // Best-effort publish to every push-enabled cache. A flaky
-            // cache logs but doesn't fail the job — the build is still
-            // a success locally; only the publish degraded.
+            // Binary-cache push — a post-build effect, recorded one
+            // `effect_runs` row per cache. Best-effort: a flaky cache
+            // is logged, the job stays a local success.
             if !push_caches.is_empty() && !outcome.output_paths.is_empty() {
-                let errs =
-                    argunix_build::push_to_caches(&outcome.output_paths, push_caches, push_timeout)
-                        .await;
-                for e in errs {
-                    tracing::warn!(
-                        job_id = job_id.get(),
-                        error = %e,
-                        "cache push failed; job stays success, output not published",
-                    );
-                }
+                let _ = effects::run_cache_push_effects(
+                    store,
+                    job_id,
+                    &outcome.output_paths,
+                    push_caches,
+                    push_timeout,
+                )
+                .await;
             }
 
             <argunix_store::SqlxStore as JobStore>::finish(
@@ -953,6 +998,25 @@ async fn build_one_job(
             )
             .await?;
 
+            // Post-build registry-push effects: push the built image
+            // out to every external registry the repo binds. Recorded
+            // in `effect_runs`; best-effort like the cache push.
+            if !registry_effects.is_empty() {
+                run_registry_effects_cli(
+                    store,
+                    job_id,
+                    spec,
+                    repo_id,
+                    git_ref,
+                    sha,
+                    &outcome.output_paths,
+                    registry_effects,
+                )
+                .await;
+            }
+
+            // Internal embedded registry (argunix's own /v2 surface) —
+            // independent of, and complementary to, the external push.
             if spec.is_docker_image {
                 try_publish_docker_image_cli(
                     store,
@@ -982,6 +1046,44 @@ async fn build_one_job(
             Ok(JobStatus::Failure)
         }
     }
+}
+
+/// Build an [`OutputContext`] for `job_id`'s output and run every
+/// registry-push effect against it, recording `effect_runs` rows.
+/// Single-shot CLI counterpart of `worker::run_registry_effects`.
+#[allow(clippy::too_many_arguments)]
+async fn run_registry_effects_cli(
+    store: &argunix_store::SqlxStore,
+    job_id: JobId,
+    spec: &argunix_eval::JobSpec,
+    repo_id: RepoId,
+    git_ref: &str,
+    sha: &str,
+    output_paths: &[String],
+    registry_effects: &[Arc<dyn argunix_effects::Effect>],
+) {
+    let repo = match <argunix_store::SqlxStore as RepoStore>::get(store, repo_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(repo_id = repo_id.get(), "effects: repo row missing");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "effects: repo lookup failed");
+            return;
+        }
+    };
+    let ctx = argunix_effects::OutputContext {
+        forge: &repo.forge,
+        repo_slug: repo.slug.as_str(),
+        attr_path: spec.attr_path.as_str(),
+        system: spec.system.as_deref().unwrap_or("unknown"),
+        git_ref,
+        sha,
+        is_docker_image: spec.is_docker_image,
+        output_paths,
+    };
+    effects::run_effects(store, job_id, registry_effects, &ctx).await;
 }
 
 /// Single-shot CLI variant of the worker's docker-image publish. Same

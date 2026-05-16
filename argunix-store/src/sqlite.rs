@@ -1,10 +1,10 @@
 use crate::records::{
-    BuilderRecord, DockerImageRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord, JobRecord,
-    JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob, RepoRecord,
+    BuilderRecord, DockerImageRecord, EffectRunRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord,
+    JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob, RepoRecord,
 };
 use crate::traits::{
-    BuilderStore, DockerImageStore, EvalStore, ForgeStatusStore, InterruptOutcome, JobStore,
-    MAX_INTERRUPTIONS, RepoStore, StoreError,
+    BuilderStore, DockerImageStore, EffectRunStore, EvalStore, ForgeStatusStore, InterruptOutcome,
+    JobStore, MAX_INTERRUPTIONS, RepoStore, StoreError,
 };
 use argunix_domain::{
     AttrPath, BuilderCapabilities, BuilderId, BuilderName, BuilderNameError, BuilderPubkey,
@@ -380,6 +380,16 @@ impl RepoStore for SqlxStore {
             .execute(&mut *tx)
             .await?;
             sqlx::query(
+                "DELETE FROM effect_runs WHERE job_id IN (
+                     SELECT j.id FROM jobs j
+                     JOIN evaluations e ON j.eval_id = e.id
+                     WHERE e.repo_id = ?1
+                 )",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
                 "DELETE FROM jobs WHERE eval_id IN (
                      SELECT id FROM evaluations WHERE repo_id = ?1
                  )",
@@ -679,6 +689,14 @@ impl EvalStore for SqlxStore {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query(
+            "DELETE FROM effect_runs WHERE job_id IN (
+                 SELECT id FROM jobs WHERE eval_id = ?1
+             )",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM jobs WHERE eval_id = ?1")
             .bind(id)
             .execute(&mut *tx)
@@ -1277,6 +1295,80 @@ impl DockerImageStore for SqlxStore {
         .fetch_optional(&self.pool)
         .await?;
         row.map(|r| map_docker_image(&r)).transpose()
+    }
+}
+
+fn map_effect_run(row: &SqliteRow) -> Result<EffectRunRecord, StoreError> {
+    Ok(EffectRunRecord {
+        id: row.try_get("id")?,
+        job_id: JobId::new(row.try_get("job_id")?),
+        kind: row.try_get("kind")?,
+        target: row.try_get("target")?,
+        status: row.try_get("status")?,
+        detail: row.try_get("detail")?,
+        started_at: row.try_get("started_at")?,
+        finished_at: row.try_get("finished_at")?,
+    })
+}
+
+#[async_trait]
+impl EffectRunStore for SqlxStore {
+    async fn create_effect_run(
+        &self,
+        job_id: JobId,
+        kind: &str,
+        target: &str,
+        started_at: DateTime<Utc>,
+    ) -> Result<i64, StoreError> {
+        let row = sqlx::query(
+            "INSERT INTO effect_runs (job_id, kind, target, status, started_at)
+             VALUES (?1, ?2, ?3, 'running', ?4)
+             RETURNING id",
+        )
+        .bind(job_id.get())
+        .bind(kind)
+        .bind(target)
+        .bind(started_at)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get("id")?)
+    }
+
+    async fn finish_effect_run(
+        &self,
+        id: i64,
+        status: &str,
+        detail: Option<&str>,
+        finished_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE effect_runs
+             SET status = ?2, detail = ?3, finished_at = ?4
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(detail)
+        .bind(finished_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_effect_runs_by_job(
+        &self,
+        job_id: JobId,
+    ) -> Result<Vec<EffectRunRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, job_id, kind, target, status, detail, started_at, finished_at
+             FROM effect_runs
+             WHERE job_id = ?1
+             ORDER BY id",
+        )
+        .bind(job_id.get())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_effect_run).collect()
     }
 }
 
@@ -2568,5 +2660,81 @@ mod tests {
         assert!(all[0].revoked_at.is_some());
         assert_eq!(all[1].name.as_str(), "second");
         assert!(all[1].revoked_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn effect_run_lifecycle() {
+        let s = store().await;
+        let (_builder, job_id) = fixture_job(&s).await;
+
+        // create_effect_run lands a `running` row.
+        let id = <SqlxStore as EffectRunStore>::create_effect_run(
+            &s,
+            job_id,
+            "registry-push",
+            "ghcr",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let runs = <SqlxStore as EffectRunStore>::list_effect_runs_by_job(&s, job_id)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "running");
+        assert_eq!(runs[0].kind, "registry-push");
+        assert_eq!(runs[0].target, "ghcr");
+        assert!(runs[0].detail.is_none());
+        assert!(runs[0].finished_at.is_none());
+
+        // finish_effect_run moves it terminal with a detail string.
+        <SqlxStore as EffectRunStore>::finish_effect_run(
+            &s,
+            id,
+            "success",
+            Some("pushed ghcr.io/o/r/img:main"),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let runs = <SqlxStore as EffectRunStore>::list_effect_runs_by_job(&s, job_id)
+            .await
+            .unwrap();
+        assert_eq!(runs[0].status, "success");
+        assert_eq!(
+            runs[0].detail.as_deref(),
+            Some("pushed ghcr.io/o/r/img:main")
+        );
+        assert!(runs[0].finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_eval_cascade_removes_effect_runs() {
+        let s = store().await;
+        let (_builder, job_id) = fixture_job(&s).await;
+        <SqlxStore as EffectRunStore>::create_effect_run(
+            &s,
+            job_id,
+            "registry-push",
+            "ghcr",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let eval_id = <SqlxStore as JobStore>::get(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .eval_id;
+        <SqlxStore as EvalStore>::delete_eval_cascade(&s, eval_id)
+            .await
+            .unwrap();
+        // The job row is gone; its effect_runs must go with it.
+        assert!(
+            <SqlxStore as EffectRunStore>::list_effect_runs_by_job(&s, job_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

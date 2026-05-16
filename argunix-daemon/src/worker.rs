@@ -22,6 +22,7 @@ use argunix_builders::{
     nix_copy_over_pool,
 };
 use argunix_domain::{EvalId, EvalStatus, JobId, JobStatus, RepoId, Sha, Slug};
+use argunix_effects::{Effect, OutputContext};
 use argunix_forge::{CheckPost, CheckState, ForgeError, Provider};
 use argunix_sched::ScheduleStrategy;
 use argunix_store::{EvalStore, JobPhaseMetrics, JobStore, RepoStore, SqlxStore};
@@ -30,7 +31,7 @@ use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{Instrument, info_span};
@@ -468,6 +469,14 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
     let threshold = repo_cfg
         .and_then(|r| r.collapsed_check_threshold)
         .unwrap_or(snap.config.schedule.collapsed_check_threshold);
+
+    // Post-build registry-push effects for this repo, resolved from
+    // the `registries` catalog. Built once per eval and cloned into
+    // each per-job build task, mirroring `push_caches`.
+    let registry_effects: Vec<Arc<dyn Effect>> = repo_cfg
+        .map(|r| crate::effects::registry_push_effects(&snap.config, r))
+        .unwrap_or_default();
+
     let total = persisted.len();
     let collapsed_mode = total as u32 > threshold;
     if collapsed_mode {
@@ -589,6 +598,7 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
             total,
             collapsed_mode,
             push_caches,
+            registry_effects,
             cancel,
             work_dir,
             cancel_guard,
@@ -621,6 +631,7 @@ async fn run_build_phase(
     total: usize,
     collapsed_mode: bool,
     push_caches: Vec<argunix_build::PushCache>,
+    registry_effects: Vec<Arc<dyn Effect>>,
     cancel: argunix_web::CancelToken,
     work_dir: PathBuf,
     // Owns the cancel-token deregister responsibility. Drops at the
@@ -746,7 +757,9 @@ async fn run_build_phase(
                 let ctx_c = ctx.clone();
                 let cancel_c = cancel.clone();
                 let push_caches_c = push_caches.clone();
-                let repo_id = repo.id;
+                let registry_effects_c = registry_effects.clone();
+                let repo_c = repo.clone();
+                let eval_c = eval.clone();
                 let span = info_span!(
                     "job",
                     job_id = job_id.get(),
@@ -756,11 +769,12 @@ async fn run_build_phase(
                     let _permit = permit; // released on drop
                     let res = build_one(
                         &ctx_c,
-                        repo_id,
-                        eval_id,
+                        &repo_c,
+                        &eval_c,
                         job_id,
                         &spec,
                         &push_caches_c,
+                        &registry_effects_c,
                         &cancel_c,
                     )
                     .instrument(span)
@@ -1556,16 +1570,18 @@ fn format_eval_error_log(attr_path: &str, error: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn build_one(
     ctx: &WorkerContext,
-    repo_id: RepoId,
-    eval_id: EvalId,
+    repo: &argunix_store::RepoRecord,
+    eval: &argunix_store::EvalRecord,
     job_id: JobId,
     spec: &argunix_eval::JobSpec,
     push_caches: &[argunix_build::PushCache],
+    registry_effects: &[Arc<dyn Effect>],
     cancel: &argunix_web::CancelToken,
 ) -> anyhow::Result<JobStatus> {
+    let repo_id = repo.id;
+    let eval_id = eval.id;
     if spec.error.is_some() {
         return Ok(JobStatus::Failure);
     }
@@ -1582,16 +1598,29 @@ async fn build_one(
     if spec.is_cached {
         if let Some(output) = spec.primary_output() {
             tracing::info!(job_id = job_id.get(), output = %output, "local store hit");
+            let output = output.to_string();
             <SqlxStore as JobStore>::finish(
                 &ctx.store,
                 job_id,
                 JobStatus::Cached,
                 Utc::now(),
                 None,
-                Some(output),
+                Some(&output),
                 &JobPhaseMetrics::default(),
             )
             .await?;
+            // Post-build effects run for cache hits too — a cached
+            // image still needs to reach the external registry.
+            spawn_post_build_effects(
+                ctx,
+                repo,
+                eval,
+                spec,
+                job_id,
+                push_caches,
+                registry_effects,
+                vec![output],
+            );
             return Ok(JobStatus::Cached);
         }
     }
@@ -1785,54 +1814,25 @@ async fn build_one(
             )
             .await?;
 
-            // Two post-success side-effects, both independent and
-            // both best-effort (failure of either keeps the job
-            // status as Success):
-            //   1. cache push: fans the output closure out to every
-            //      configured `binary_caches` entry in a detached
-            //      task so we don't hold the build loop while a
-            //      slow cache writes. Wall-clock lands on the job
-            //      row via `record_cache_push_ms`.
-            //   2. docker registry publish: when the attribute is a
-            //      `dockerTools` image, copy it into the embedded
-            //      registry so users can `docker pull` by tag.
-            if !push_caches.is_empty() && !outcome.output_paths.is_empty() {
-                let output_paths = outcome.output_paths.clone();
-                let caches: Vec<argunix_build::PushCache> = push_caches.to_vec();
-                let job_id_n = job_id.get();
-                let store = ctx.store.clone();
-                tokio::spawn(
-                    async move {
-                        let started = Instant::now();
-                        let errs = argunix_build::push_to_caches(
-                            &output_paths,
-                            &caches,
-                            Duration::from_secs(300),
-                        )
-                        .await;
-                        let elapsed_ms = started.elapsed().as_millis() as u64;
-                        for e in errs {
-                            tracing::warn!(
-                                job_id = job_id_n,
-                                error = %e,
-                                "cache push failed; job stays success, output not published",
-                            );
-                        }
-                        if let Err(e) = <SqlxStore as JobStore>::record_cache_push_ms(
-                            &store, job_id, elapsed_ms,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                job_id = job_id_n,
-                                error = %e,
-                                "failed to record cache_push_ms; row still shows blank",
-                            );
-                        }
-                    }
-                    .in_current_span(),
-                );
-            }
+            // Post-build effects (binary-cache push + external
+            // registry push), detached so a slow push doesn't hold the
+            // build loop's concurrency slot. Each attempt is recorded
+            // in `effect_runs`.
+            spawn_post_build_effects(
+                ctx,
+                repo,
+                eval,
+                spec,
+                job_id,
+                push_caches,
+                registry_effects,
+                outcome.output_paths.clone(),
+            );
+
+            // Internal embedded registry (argunix's own read-only
+            // `/v2` surface) — independent of, and complementary to,
+            // the external registry push above. Awaited inline since
+            // it only writes to the local blob pool.
             if spec.is_docker_image {
                 try_publish_docker_image(
                     &ctx.store,
@@ -1862,6 +1862,66 @@ async fn build_one(
             Ok(JobStatus::Failure)
         }
     }
+}
+
+/// Spawn the detached post-build effects task: binary-cache push +
+/// external registry push, each recorded in `effect_runs`. Detached so
+/// a slow push (minutes, for a multi-GB closure or a layered image)
+/// doesn't hold the build loop's concurrency slot. Called from both
+/// the fresh-`Success` and the `Cached` paths — a cached image still
+/// needs to reach the registry.
+#[allow(clippy::too_many_arguments)]
+fn spawn_post_build_effects(
+    ctx: &WorkerContext,
+    repo: &argunix_store::RepoRecord,
+    eval: &argunix_store::EvalRecord,
+    spec: &argunix_eval::JobSpec,
+    job_id: JobId,
+    push_caches: &[argunix_build::PushCache],
+    registry_effects: &[Arc<dyn Effect>],
+    output_paths: Vec<String>,
+) {
+    if (push_caches.is_empty() && registry_effects.is_empty()) || output_paths.is_empty() {
+        return;
+    }
+    let store = ctx.store.clone();
+    let caches: Vec<argunix_build::PushCache> = push_caches.to_vec();
+    let reg_effects: Vec<Arc<dyn Effect>> = registry_effects.to_vec();
+    let forge = repo.forge.clone();
+    let slug = repo.slug.as_str().to_string();
+    let git_ref = eval.git_ref.clone();
+    let sha = eval.sha.as_str().to_string();
+    let attr_path = spec.attr_path.as_str().to_string();
+    let system = spec.system.clone().unwrap_or_else(|| "unknown".to_string());
+    let is_docker_image = spec.is_docker_image;
+    tokio::spawn(
+        async move {
+            if !caches.is_empty() {
+                crate::effects::cache_push_and_record(
+                    &store,
+                    job_id,
+                    &output_paths,
+                    &caches,
+                    Duration::from_secs(300),
+                )
+                .await;
+            }
+            if !reg_effects.is_empty() {
+                let octx = OutputContext {
+                    forge: &forge,
+                    repo_slug: &slug,
+                    attr_path: &attr_path,
+                    system: &system,
+                    git_ref: &git_ref,
+                    sha: &sha,
+                    is_docker_image,
+                    output_paths: &output_paths,
+                };
+                crate::effects::run_effects(&store, job_id, &reg_effects, &octx).await;
+            }
+        }
+        .in_current_span(),
+    );
 }
 
 /// Best-effort docker registry publish. Any error is logged at `warn`

@@ -1,6 +1,7 @@
 use crate::records::{
-    BuilderRecord, DockerImageRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord, JobPhaseMetrics,
-    JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob, RepoRecord,
+    BuilderRecord, DockerImageRecord, EffectRunRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord,
+    JobPhaseMetrics, JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob,
+    RepoRecord,
 };
 use argunix_domain::{
     BuilderId, BuilderPubkey, EvalId, EvalStatus, JobId, JobStatus, RepoId, Slug,
@@ -408,6 +409,41 @@ pub trait DockerImageStore: Send + Sync {
         image_name: &str,
         manifest_digest: &str,
     ) -> Result<Option<DockerImageRecord>, StoreError>;
+}
+
+#[async_trait]
+pub trait EffectRunStore: Send + Sync {
+    /// Insert a `running` effect-run row, returning its id. Called by
+    /// the post-build effect runner *before* invoking the effect, so
+    /// an effect that hangs or a daemon that dies mid-effect still
+    /// leaves a visible `running` row.
+    async fn create_effect_run(
+        &self,
+        job_id: JobId,
+        kind: &str,
+        target: &str,
+        started_at: DateTime<Utc>,
+    ) -> Result<i64, StoreError>;
+
+    /// Move an effect-run row to a terminal state: `status` is one of
+    /// `success` / `failure` / `skipped`, `detail` carries the
+    /// one-line summary or error. No-op if the row is gone (retention
+    /// pass raced the effect).
+    async fn finish_effect_run(
+        &self,
+        id: i64,
+        status: &str,
+        detail: Option<&str>,
+        finished_at: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+
+    /// Every effect-run row for `job_id`, oldest first. Used by the
+    /// job detail page (and tests) to render what argunix did with the
+    /// build output.
+    async fn list_effect_runs_by_job(
+        &self,
+        job_id: JobId,
+    ) -> Result<Vec<EffectRunRecord>, StoreError>;
 }
 
 #[async_trait]

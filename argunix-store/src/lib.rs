@@ -13,13 +13,14 @@ mod sqlite;
 mod traits;
 
 pub use records::{
-    BuilderRecord, DockerImageRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord, JobPhaseMetrics,
-    JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob, RepoRecord,
+    BuilderRecord, DockerImageRecord, EffectRunRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord,
+    JobPhaseMetrics, JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob,
+    RepoRecord,
 };
 pub use sqlite::SqlxStore;
 pub use traits::{
-    BuilderStore, DockerImageStore, EvalStore, ForgeStatusStore, InterruptOutcome, JobStore,
-    MAX_INTERRUPTIONS, RepoStore, StoreError,
+    BuilderStore, DockerImageStore, EffectRunStore, EvalStore, ForgeStatusStore, InterruptOutcome,
+    JobStore, MAX_INTERRUPTIONS, RepoStore, StoreError,
 };
 
 use sqlx::sqlite::SqlitePool;

@@ -175,6 +175,7 @@ mod tests {
             collapsed_check_threshold: None,
             weight: 1,
             retention: argunix_config::RepoRetention::default(),
+            push_to_registries: Vec::new(),
         }
     }
 

@@ -16,6 +16,11 @@ pub enum ValidationError {
     SecretUnreadable { path: PathBuf, error: String },
     #[error("builder_enrollment.listen `{listen}` is not a valid socket address: {error}")]
     BuilderListenInvalid { listen: String, error: String },
+    #[error(
+        "repo `{repo}` references registry `{registry}` in push_to_registries, \
+         but no such entry exists under `registries`"
+    )]
+    UnknownRegistry { repo: String, registry: String },
 }
 
 impl Config {
@@ -39,6 +44,18 @@ impl Config {
                 return Err(ValidationError::SshWithoutKey {
                     repo: repo.slug.as_str().to_string(),
                 });
+            }
+            // Every name a repo pushes to must resolve to a catalog
+            // entry. The merge in `TryFrom` folds in the global +
+            // forge bindings, so this one loop covers all three
+            // binding levels.
+            for registry in &repo.push_to_registries {
+                if !self.registries.contains_key(registry) {
+                    return Err(ValidationError::UnknownRegistry {
+                        repo: repo.slug.as_str().to_string(),
+                        registry: registry.clone(),
+                    });
+                }
             }
         }
         if let Some(b) = &self.builder_enrollment {
@@ -73,6 +90,11 @@ impl Config {
         }
         for cache in &self.binary_caches {
             check_readable(&cache.signing_key_path)?;
+        }
+        for registry in self.registries.values() {
+            if let Some(auth) = &registry.auth_path {
+                check_readable(auth)?;
+            }
         }
         for repo in &self.repos {
             if let Some(key) = &repo.clone.ssh_key_path {
@@ -152,6 +174,79 @@ forges:
     token_path: /tmp/argunix-definitely-not-a-real-path-zzz
 "#,
         );
+        let err = c.validate_secrets_exist().unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ValidationError::SecretUnreadable { .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_registry_binding_rejected() {
+        let c = parse(
+            r#"
+external_url: https://m.example.com
+forges:
+  gh:
+    kind: github
+    web_url: https://github.com
+    token_path: /tmp/tok
+    repos:
+      a/b:
+        push_to_registries: [ghost]
+"#,
+        );
+        let err = c.validate_references().unwrap_err();
+        assert!(
+            matches!(err, crate::ValidationError::UnknownRegistry { .. }),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn known_registry_binding_accepted() {
+        let c = parse(
+            r#"
+external_url: https://m.example.com
+registries:
+  ghcr:
+    url: ghcr.io
+    namespace: myorg
+forges:
+  gh:
+    kind: github
+    web_url: https://github.com
+    token_path: /tmp/tok
+    repos:
+      a/b:
+        push_to_registries: [ghcr]
+"#,
+        );
+        c.validate_references().unwrap();
+    }
+
+    #[test]
+    fn registry_auth_path_checked_by_secrets_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("tok");
+        std::fs::write(&tok, "x").unwrap();
+        let yaml = format!(
+            r#"
+external_url: https://m.example.com
+registries:
+  ghcr:
+    url: ghcr.io
+    namespace: myorg
+    auth_path: /tmp/argunix-registry-creds-does-not-exist-zzz
+forges:
+  gh:
+    kind: github
+    web_url: https://github.com
+    token_path: {tok}
+"#,
+            tok = tok.display(),
+        );
+        let c: crate::Config = serde_yaml::from_str(&yaml).unwrap();
         let err = c.validate_secrets_exist().unwrap_err();
         assert!(matches!(
             err,

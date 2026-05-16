@@ -24,6 +24,11 @@ pub struct Config {
     pub web: WebConfig,
     pub forges: BTreeMap<String, ForgeConfig>,
     pub binary_caches: Vec<BinaryCache>,
+    /// Named catalog of external docker registries argunix may push
+    /// built images to. Keyed by a short operator-chosen name that
+    /// repos / forges reference via `push_to_registries`. Empty when
+    /// the operator only uses argunix's own embedded registry.
+    pub registries: BTreeMap<String, Registry>,
     pub repos: Vec<Repo>,
     /// Dynamic builder pool listener. Absent ⇒ argunix falls back to
     /// the host's existing `nix.buildMachines`. Present ⇒ argunix runs an
@@ -343,6 +348,47 @@ pub struct BinaryCache {
     pub signing_key_path: SecretFile,
 }
 
+/// An external docker registry argunix can push built `dockerTools`
+/// images to via the `registry-push` effect (see `argunix-effects`).
+///
+/// Distinct from a [`BinaryCache`]: a cache is a nix substituter
+/// (bidirectional, signed narinfo, `nix copy`); a registry is an OCI
+/// distribution endpoint reached with `skopeo` and docker-style
+/// credentials. They share only the *scoping* mechanism — both global
+/// catalogs whose entries repos opt into.
+///
+/// `url` is the registry host, optionally with a port and *without* a
+/// scheme (`ghcr.io`, `registry.example.com:5000`). Pushed images land
+/// at `<url>/<namespace>/<image>:<tag>`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Registry {
+    pub url: String,
+    /// Namespace / project segment images are pushed under.
+    pub namespace: String,
+    /// File holding one `user:password` line, handed to `skopeo
+    /// --dest-creds`. Absent ⇒ anonymous push (a registry that
+    /// accepts unauthenticated writes, e.g. a throwaway local one).
+    #[serde(default)]
+    pub auth_path: Option<SecretFile>,
+    /// Skip TLS verification on push. Needed for a plain-HTTP registry
+    /// (a local `registry:2`, an internal mirror). Defaults to `false`
+    /// — operators must opt into the insecure path explicitly.
+    #[serde(default)]
+    pub insecure: bool,
+}
+
+/// Global default effect bindings, applied to every repo on top of
+/// any per-forge / per-repo bindings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Defaults {
+    /// Registry catalog names every repo pushes images to unless a
+    /// forge / repo narrows or extends the set.
+    #[serde(default)]
+    pub push_to_registries: Vec<String>,
+}
+
 /// Runtime model of a configured repo. Built from [`WireRepo`] +
 /// the parent forge name during deserialization.
 #[derive(Debug, Clone)]
@@ -359,6 +405,13 @@ pub struct Repo {
     pub collapsed_check_threshold: Option<u32>,
     pub weight: u32,
     pub retention: RepoRetention,
+    /// Effective set of [`Config::registries`] names this repo pushes
+    /// built docker images to — the union of the global
+    /// `defaults.push_to_registries`, the parent forge's
+    /// `push_to_registries`, and the repo's own, deduplicated.
+    /// Computed once during deserialization so callsites never have to
+    /// re-merge.
+    pub push_to_registries: Vec<String>,
 }
 
 impl Repo {
@@ -380,6 +433,21 @@ fn default_build_prs() -> bool {
 
 fn default_weight() -> u32 {
     1
+}
+
+/// Concatenate several string lists into one, dropping duplicates and
+/// preserving first-seen order. Used to fold the global / forge / repo
+/// `push_to_registries` bindings into a single effective list.
+fn merge_dedup(lists: &[&Vec<String>]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for list in lists {
+        for item in *list {
+            if !out.contains(item) {
+                out.push(item.clone());
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -446,6 +514,10 @@ struct WireConfig {
     #[serde(default)]
     binary_caches: Vec<BinaryCache>,
     #[serde(default)]
+    registries: BTreeMap<String, Registry>,
+    #[serde(default)]
+    defaults: Defaults,
+    #[serde(default)]
     builder_enrollment: Option<WireBuilderEnrollment>,
 }
 
@@ -462,6 +534,10 @@ struct WireForgeConfig {
     token_path: Option<SecretFile>,
     app_id: Option<u64>,
     app_private_key_path: Option<SecretFile>,
+    /// Registry catalog names every repo under this forge pushes to,
+    /// merged with the global default and each repo's own bindings.
+    #[serde(default)]
+    push_to_registries: Vec<String>,
     #[serde(default)]
     repos: BTreeMap<String, WireRepo>,
 }
@@ -484,6 +560,11 @@ struct WireRepo {
     weight: u32,
     #[serde(default)]
     retention: RepoRetention,
+    /// Registry catalog names this repo pushes built docker images
+    /// to, merged with the global default and the parent forge's
+    /// bindings.
+    #[serde(default)]
+    push_to_registries: Vec<String>,
 }
 
 impl TryFrom<WireConfig> for Config {
@@ -498,6 +579,15 @@ impl TryFrom<WireConfig> for Config {
                 let slug = Slug::new(slug_str.clone()).map_err(|e| {
                     format!("invalid slug `{slug_str}` under forge `{forge_name}`: {e}",)
                 })?;
+                // Effective registry bindings: global default, then
+                // the parent forge's, then the repo's own — unioned
+                // and deduplicated, insertion order preserved so the
+                // push order is stable and operator-predictable.
+                let push_to_registries = merge_dedup(&[
+                    &wire.defaults.push_to_registries,
+                    &wire_forge.push_to_registries,
+                    &wire_repo.push_to_registries,
+                ]);
                 repos.push(Repo {
                     slug,
                     forge: forge_name.clone(),
@@ -509,6 +599,7 @@ impl TryFrom<WireConfig> for Config {
                     collapsed_check_threshold: wire_repo.collapsed_check_threshold,
                     weight: wire_repo.weight,
                     retention: wire_repo.retention,
+                    push_to_registries,
                 });
             }
             forges.insert(
@@ -534,6 +625,7 @@ impl TryFrom<WireConfig> for Config {
             web: wire.web,
             forges,
             binary_caches: wire.binary_caches,
+            registries: wire.registries,
             repos,
             builder_enrollment: wire.builder_enrollment.map(|w| BuilderEnrollment {
                 token_path: w.token_path,
@@ -821,6 +913,79 @@ forges:
             forge(ForgeKind::Gitlab, "https://gitlab.com").api_url(),
             "https://gitlab.com/api/v4",
         );
+    }
+
+    #[test]
+    fn registries_default_to_empty() {
+        let c = parse(&minimal_yaml());
+        assert!(c.registries.is_empty());
+        assert!(c.repos[0].push_to_registries.is_empty());
+    }
+
+    #[test]
+    fn parses_registry_catalog_and_merges_bindings() {
+        let s = r#"
+external_url: https://argunix.example.com
+registries:
+  ghcr:
+    url: ghcr.io
+    namespace: myorg
+    auth_path: /tmp/ghcr-creds
+  local:
+    url: 127.0.0.1:5000
+    namespace: team
+    insecure: true
+defaults:
+  push_to_registries: [ghcr]
+forges:
+  gh:
+    kind: github
+    web_url: https://github.com
+    token_path: /tmp/tok
+    push_to_registries: [local]
+    repos:
+      myorg/plain: {}
+      myorg/opencode:
+        push_to_registries: [ghcr]
+"#;
+        let c = parse(s);
+        assert_eq!(c.registries.len(), 2);
+        assert_eq!(c.registries["ghcr"].url, "ghcr.io");
+        assert!(c.registries["local"].insecure);
+        assert!(!c.registries["ghcr"].insecure);
+
+        let by_slug: std::collections::BTreeMap<_, _> =
+            c.repos.iter().map(|r| (r.slug.as_str(), r)).collect();
+        // `plain`: global default (ghcr) ∪ forge (local), deduped.
+        assert_eq!(
+            by_slug["myorg/plain"].push_to_registries,
+            vec!["ghcr".to_string(), "local".to_string()],
+        );
+        // `opencode`: default (ghcr) ∪ forge (local) ∪ repo (ghcr) —
+        // ghcr already present, so no duplicate.
+        assert_eq!(
+            by_slug["myorg/opencode"].push_to_registries,
+            vec!["ghcr".to_string(), "local".to_string()],
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_registry_key() {
+        let s = r#"
+external_url: https://argunix.example.com
+registries:
+  ghcr:
+    url: ghcr.io
+    namespace: myorg
+    bogus: 1
+forges:
+  gh:
+    kind: github
+    web_url: https://github.com
+    token_path: /tmp/tok
+"#;
+        let err = serde_yaml::from_str::<Config>(s).unwrap_err();
+        assert!(err.to_string().contains("bogus"));
     }
 
     #[test]

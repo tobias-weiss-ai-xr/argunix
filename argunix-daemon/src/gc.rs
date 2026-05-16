@@ -281,6 +281,7 @@ mod tests {
             web: WebConfig::default(),
             forges,
             binary_caches: Vec::<BinaryCache>::new(),
+            registries: BTreeMap::new(),
             repos,
             builder_enrollment: None,
         }
@@ -298,6 +299,7 @@ mod tests {
             collapsed_check_threshold: None,
             weight: 1,
             retention,
+            push_to_registries: Vec::new(),
         }
     }
 

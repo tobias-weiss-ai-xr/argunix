@@ -14,6 +14,7 @@ argunix-builders = { path = "../argunix-builders" }
 argunix-config = { workspace = true }
 argunix-control = { path = "../argunix-control" }
 argunix-domain = { workspace = true }
+argunix-effects = { workspace = true }
 argunix-eval = { path = "../argunix-eval" }
 argunix-forge = { path = "../argunix-forge" }
 argunix-registry = { workspace = true }

@@ -73,6 +73,28 @@ pub async fn push_to_caches(
     errors
 }
 
+/// Push `output_paths` (and their closure) to a single cache.
+///
+/// The per-cache building block behind [`push_to_caches`], exposed so
+/// callers that record one `effect_runs` row per cache can drive the
+/// caches individually and pair each result with its own row.
+pub async fn push_one_to_cache(
+    output_paths: &[String],
+    cache: &PushCache,
+    per_cache_timeout: Duration,
+) -> Result<(), PushError> {
+    if output_paths.is_empty() {
+        return Ok(());
+    }
+    push_one(
+        &cache.url,
+        &cache.signing_key_path,
+        output_paths,
+        per_cache_timeout,
+    )
+    .await
+}
+
 async fn push_one(
     url: &str,
     signing_key_path: &Path,

@@ -8,6 +8,7 @@ members = [
   "argunix-eval",
   "argunix-build",
   "argunix-registry",
+  "argunix-effects",
   "argunix-sched",
   "argunix-web",
   "argunix-control",
@@ -27,6 +28,7 @@ argunix-domain = { path = "argunix-domain" }
 argunix-config = { path = "argunix-config" }
 argunix-store = { path = "argunix-store" }
 argunix-registry = { path = "argunix-registry" }
+argunix-effects = { path = "argunix-effects" }
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

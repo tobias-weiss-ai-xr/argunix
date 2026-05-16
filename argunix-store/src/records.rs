@@ -229,6 +229,28 @@ pub struct NewDockerImage {
     pub manifest_path: String,
 }
 
+/// One row of `effect_runs` — a single attempt of one post-build
+/// effect against one target. See `argunix-effects` for the effect
+/// model and `migrations/0015_effect_runs.sql` for the column
+/// semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectRunRecord {
+    pub id: i64,
+    pub job_id: JobId,
+    /// Effect family, e.g. `registry-push` / `cache-push`.
+    pub kind: String,
+    /// Named target acted on — a registry catalog name or a cache URL.
+    pub target: String,
+    /// `running` | `success` | `failure` | `skipped`.
+    pub status: String,
+    /// One-line summary (success/skip) or error (failure). `None`
+    /// while the row is still `running`.
+    pub detail: Option<String>,
+    pub started_at: DateTime<Utc>,
+    /// `None` while still `running`.
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
 /// One row of `docker_images`. Returned by registry lookups so the
 /// HTTP layer can serve manifests / blobs from disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
