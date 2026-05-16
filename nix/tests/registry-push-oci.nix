@@ -222,7 +222,10 @@ in
         " --slug myorg/myrepo"
         " --forge gh"
         " --systems x86_64-linux"
-        " --git-ref refs/heads/main"
+        # A bare branch name — the shape the daemon stores for a push
+        # eval (it strips `refs/heads/`). Exercises the production
+        # `git_ref` form, not just the CLI's raw `refs/heads/…`.
+        " --git-ref main"
         " --gc-root-dir /var/lib/argunix/gcroots"
         " --log-dir /var/lib/argunix/logs"
         " 2>&1"

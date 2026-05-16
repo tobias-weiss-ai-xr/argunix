@@ -12,8 +12,9 @@
 //! `docker` job is a `docker-archive:` tarball, an `oci` job is an
 //! `oci-archive:` layout — so the effect never has to sniff the
 //! archive. The image is tagged with the branch name (when the eval
-//! ran on a `refs/heads/*` ref) and always with an immutable
-//! `sha-<short>` tag. Registry credentials come from a file holding a
+//! ran on a `refs/heads/*` ref), with `latest` when that branch is the
+//! repo's default branch, and always with an immutable `sha-<short>`
+//! tag. Registry credentials come from a file holding a
 //! single `user:password` line, read at push time — never at config
 //! time, and never logged.
 //!
@@ -117,17 +118,7 @@ impl Effect for RegistryPush {
         let namespace = self.resolve_namespace(ctx.repo_slug);
         let base = self.dest_base(&namespace, &image);
 
-        // Tag set: the branch (mutable, human) plus an immutable
-        // `sha-<short>` tag. Dedup so a branch literally named
-        // `sha-<short>` doesn't push twice.
-        let mut tags: Vec<String> = Vec::new();
-        if let Some(branch) = ctx.branch() {
-            tags.push(sanitize_tag(branch));
-        }
-        let sha_tag = format!("sha-{}", ctx.short_sha());
-        if !tags.contains(&sha_tag) {
-            tags.push(sha_tag);
-        }
+        let tags = push_tags(ctx);
 
         // Credentials are read once, here — not at config load — and
         // never logged. A read failure fails the effect rather than
@@ -236,6 +227,35 @@ impl RegistryPush {
     }
 }
 
+/// The tag set one push covers, in push order:
+///
+/// * the **branch** name, when the build ran on a `refs/heads/*` ref
+///   — a mutable, human-facing tag;
+/// * **`latest`**, when that branch is the repo's *default* branch, so
+///   `latest` always names the newest mainline image and a PR or
+///   feature-branch build never moves it;
+/// * an immutable **`sha-<short>`** tag, always.
+///
+/// Deduplicated, so a branch literally named `latest` or `sha-<short>`
+/// does not push the same ref twice.
+fn push_tags(ctx: &OutputContext<'_>) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    if let Some(branch) = ctx.branch() {
+        tags.push(sanitize_tag(branch));
+    }
+    if ctx.is_default_branch() {
+        let latest = "latest".to_string();
+        if !tags.contains(&latest) {
+            tags.push(latest);
+        }
+    }
+    let sha_tag = format!("sha-{}", ctx.short_sha());
+    if !tags.contains(&sha_tag) {
+        tags.push(sha_tag);
+    }
+    tags
+}
+
 /// Coerce an arbitrary branch name into a docker tag. Docker tags
 /// allow `[A-Za-z0-9_.-]` and cap at 128 chars; `/` in particular
 /// (release branches like `release/1.2`) is illegal, so map every
@@ -336,6 +356,7 @@ mod tests {
             attr_path: "packages.x86_64-linux.hello",
             system: "x86_64-linux",
             git_ref: "refs/heads/main",
+            default_branch: None,
             sha: "0123456789abcdef",
             image_format: None,
             output_paths: &["/nix/store/x".to_string()],
@@ -352,6 +373,7 @@ mod tests {
             attr_path: "packages.x86_64-linux.img",
             system: "x86_64-linux",
             git_ref: "refs/heads/main",
+            default_branch: None,
             sha: "0123456789abcdef",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
@@ -369,6 +391,7 @@ mod tests {
             attr_path: "packages.x86_64-linux.img",
             system: "x86_64-linux",
             git_ref: "refs/heads/main",
+            default_branch: None,
             sha: "0123456789abcdef",
             image_format: Some(ImageFormat::Docker),
             output_paths: &["/nix/store/does-not-matter".to_string()],
@@ -397,6 +420,7 @@ mod tests {
             attr_path: "packages.x86_64-linux.img",
             system: "x86_64-linux",
             git_ref: "refs/heads/main",
+            default_branch: None,
             sha: "0123456789abcdef",
             image_format: Some(ImageFormat::Oci),
             output_paths: &[],
@@ -404,5 +428,60 @@ mod tests {
         let outcome = push().run(&ctx).await;
         assert_eq!(outcome.status, crate::EffectStatus::Failure);
         assert!(outcome.detail.contains("no output"));
+    }
+
+    fn tag_ctx<'a>(git_ref: &'a str, default_branch: Option<&'a str>) -> OutputContext<'a> {
+        OutputContext {
+            forge: "gh",
+            repo_slug: "o/r",
+            attr_path: "packages.x86_64-linux.img",
+            system: "x86_64-linux",
+            git_ref,
+            default_branch,
+            sha: "0123456789abcdef",
+            image_format: Some(ImageFormat::Docker),
+            output_paths: &[],
+        }
+    }
+
+    #[test]
+    fn push_tags_default_branch_gets_latest() {
+        let tags = push_tags(&tag_ctx("refs/heads/main", Some("main")));
+        assert_eq!(tags, vec!["main", "latest", "sha-0123456789ab"]);
+    }
+
+    #[test]
+    fn push_tags_bare_daemon_push_ref_gets_latest() {
+        // The daemon stores a push eval's git_ref as the bare branch
+        // name — this is the real production shape, and it must tag
+        // the branch + `latest` just like the `refs/heads/` form.
+        let tags = push_tags(&tag_ctx("main", Some("main")));
+        assert_eq!(tags, vec!["main", "latest", "sha-0123456789ab"]);
+    }
+
+    #[test]
+    fn push_tags_feature_branch_has_no_latest() {
+        let tags = push_tags(&tag_ctx("refs/heads/feature", Some("main")));
+        assert_eq!(tags, vec!["feature", "sha-0123456789ab"]);
+    }
+
+    #[test]
+    fn push_tags_pr_ref_is_sha_only() {
+        let tags = push_tags(&tag_ctx("refs/pull/7/head", Some("main")));
+        assert_eq!(tags, vec!["sha-0123456789ab"]);
+    }
+
+    #[test]
+    fn push_tags_no_latest_when_default_branch_unknown() {
+        let tags = push_tags(&tag_ctx("refs/heads/main", None));
+        assert_eq!(tags, vec!["main", "sha-0123456789ab"]);
+    }
+
+    #[test]
+    fn push_tags_dedups_branch_named_latest() {
+        // A branch literally named `latest` that is also the default
+        // branch must not enqueue `latest` twice.
+        let tags = push_tags(&tag_ctx("refs/heads/latest", Some("latest")));
+        assert_eq!(tags, vec!["latest", "sha-0123456789ab"]);
     }
 }

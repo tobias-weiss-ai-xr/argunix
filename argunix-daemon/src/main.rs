@@ -1092,6 +1092,7 @@ async fn run_registry_effects_cli(
         attr_path: spec.attr_path.as_str(),
         system: spec.system.as_deref().unwrap_or("unknown"),
         git_ref,
+        default_branch: repo.default_branch.as_deref(),
         sha,
         image_format: spec.image_format,
         output_paths,

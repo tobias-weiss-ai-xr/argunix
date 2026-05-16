@@ -195,8 +195,18 @@ in via `push_to_registries` (settable per repo, per forge, or in
 | `insecure`  | Skip TLS verification — for a plain-HTTP registry. Defaults to `false`. |
 
 An image is pushed to `<url>/<namespace>/<image>:<tag>`, where
-`<image>` is the build attribute's leaf name and `<tag>` is the branch
-name plus an immutable `sha-<short>` tag.
+`<image>` is the build attribute's leaf name. Each push covers a set
+of tags:
+
+- the **branch name**, when the build ran on a `refs/heads/*` ref;
+- **`latest`**, when that branch is the repo's default branch — so
+  `latest` always names the newest mainline image, and a PR or
+  feature-branch build never moves it;
+- an immutable **`sha-<short>`** tag, always.
+
+The default branch is the one the forge reports on webhook payloads;
+a repo argunix has not yet received a webhook for has no known
+default branch, so its builds get no `latest` tag until then.
 
 ### Marking a build as an image
 

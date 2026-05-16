@@ -1904,6 +1904,7 @@ fn spawn_post_build_effects(
     let reg_effects: Vec<Arc<dyn Effect>> = registry_effects.to_vec();
     let forge = repo.forge.clone();
     let slug = repo.slug.as_str().to_string();
+    let default_branch = repo.default_branch.clone();
     let git_ref = eval.git_ref.clone();
     let sha = eval.sha.as_str().to_string();
     let attr_path = spec.attr_path.as_str().to_string();
@@ -1928,6 +1929,7 @@ fn spawn_post_build_effects(
                     attr_path: &attr_path,
                     system: &system,
                     git_ref: &git_ref,
+                    default_branch: default_branch.as_deref(),
                     sha: &sha,
                     image_format,
                     output_paths: &output_paths,

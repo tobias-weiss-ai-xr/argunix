@@ -48,6 +48,11 @@ pub struct OutputContext<'a> {
     /// Git ref the eval ran against, e.g. `refs/heads/main` or a PR
     /// ref. Effects derive a human tag from it via [`Self::branch`].
     pub git_ref: &'a str,
+    /// The repo's default branch (`main` / `master`), as reported by
+    /// the forge on webhook payloads. `None` when argunix has not yet
+    /// seen a webhook for the repo. Drives the `latest` tag — only a
+    /// build *on* the default branch moves it.
+    pub default_branch: Option<&'a str>,
     /// Full commit sha.
     pub sha: &'a str,
     /// `Some` when the JobSpec declared `meta.image-format`, carrying
@@ -61,11 +66,40 @@ pub struct OutputContext<'a> {
 }
 
 impl OutputContext<'_> {
-    /// Branch name when `git_ref` is a `refs/heads/<branch>` ref;
-    /// `None` for PR refs, tags, or anything else. Used as a docker
-    /// image tag.
+    /// Branch name this build ran on, or `None` for a pull-request /
+    /// non-branch build. Used as a docker image tag.
+    ///
+    /// `git_ref` reaches an effect in one of three shapes; this
+    /// flattens all of them:
+    ///
+    /// * `<branch>` — a bare branch name: how the daemon stores a
+    ///   *push* eval's ref (`argunix-web::webhook` drops the
+    ///   `refs/heads/` prefix on ingest);
+    /// * `refs/heads/<branch>` — the raw form the `argunix build` CLI
+    ///   passes straight through `--git-ref`;
+    /// * `refs/pull/<n>/head:<branch>` — the synthetic form a daemon
+    ///   *pull-request* eval carries. Not a branch build → `None`.
     pub fn branch(&self) -> Option<&str> {
-        self.git_ref.strip_prefix("refs/heads/")
+        if let Some(b) = self.git_ref.strip_prefix("refs/heads/") {
+            return Some(b);
+        }
+        // A PR ref (or any other `refs/*` shape, or an empty ref) is
+        // not a branch; anything else is a bare branch name.
+        if self.git_ref.is_empty() || self.git_ref.starts_with("refs/") {
+            return None;
+        }
+        Some(self.git_ref)
+    }
+
+    /// True when this build ran *on* the repo's default branch — the
+    /// condition under which `registry-push` also moves the `latest`
+    /// tag. False when the ref is not a `refs/heads/*` branch or the
+    /// default branch is not known.
+    pub fn is_default_branch(&self) -> bool {
+        matches!(
+            (self.branch(), self.default_branch),
+            (Some(b), Some(d)) if b == d,
+        )
     }
 
     /// Short (12-hex) form of the commit sha, used as an immutable
@@ -201,12 +235,15 @@ mod tests {
             attr_path: "packages.x86_64-linux.img",
             system: "x86_64-linux",
             git_ref: "refs/heads/main",
+            default_branch: Some("main"),
             sha: "0123456789abcdef0123456789abcdef01234567",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
         };
         assert_eq!(ctx.branch(), Some("main"));
         assert_eq!(ctx.short_sha(), "0123456789ab");
+        // Built on the default branch — `latest` applies.
+        assert!(ctx.is_default_branch());
     }
 
     #[test]
@@ -217,6 +254,7 @@ mod tests {
             attr_path: "x",
             system: "x86_64-linux",
             git_ref: "refs/pull/7/head",
+            default_branch: Some("main"),
             sha: "abc",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
@@ -224,6 +262,80 @@ mod tests {
         assert_eq!(ctx.branch(), None);
         // short_sha falls back when the sha is shorter than 12.
         assert_eq!(ctx.short_sha(), "abc");
+        // A PR ref is never the default branch.
+        assert!(!ctx.is_default_branch());
+    }
+
+    #[test]
+    fn is_default_branch_false_for_other_branch() {
+        let ctx = OutputContext {
+            forge: "gh",
+            repo_slug: "o/r",
+            attr_path: "x",
+            system: "x86_64-linux",
+            git_ref: "refs/heads/feature",
+            default_branch: Some("main"),
+            sha: "abc",
+            image_format: Some(ImageFormat::Docker),
+            output_paths: &[],
+        };
+        assert_eq!(ctx.branch(), Some("feature"));
+        assert!(!ctx.is_default_branch());
+    }
+
+    #[test]
+    fn is_default_branch_false_when_default_unknown() {
+        let ctx = OutputContext {
+            forge: "gh",
+            repo_slug: "o/r",
+            attr_path: "x",
+            system: "x86_64-linux",
+            git_ref: "refs/heads/main",
+            default_branch: None,
+            sha: "abc",
+            image_format: Some(ImageFormat::Docker),
+            output_paths: &[],
+        };
+        assert!(!ctx.is_default_branch());
+    }
+
+    #[test]
+    fn branch_handles_bare_daemon_push_ref() {
+        // The daemon stores a push eval's git_ref as the bare branch
+        // name — the common production shape. This must resolve to the
+        // branch (and, against a matching default, be the default).
+        let ctx = OutputContext {
+            forge: "gh",
+            repo_slug: "o/r",
+            attr_path: "x",
+            system: "x86_64-linux",
+            git_ref: "main",
+            default_branch: Some("main"),
+            sha: "abc",
+            image_format: Some(ImageFormat::Docker),
+            output_paths: &[],
+        };
+        assert_eq!(ctx.branch(), Some("main"));
+        assert!(ctx.is_default_branch());
+    }
+
+    #[test]
+    fn branch_none_for_daemon_pr_ref() {
+        // A daemon PR eval carries the synthetic
+        // `refs/pull/<n>/head:<branch>` form — not a branch build.
+        let ctx = OutputContext {
+            forge: "gh",
+            repo_slug: "o/r",
+            attr_path: "x",
+            system: "x86_64-linux",
+            git_ref: "refs/pull/7/head:feature-x",
+            default_branch: Some("main"),
+            sha: "abc",
+            image_format: Some(ImageFormat::Docker),
+            output_paths: &[],
+        };
+        assert_eq!(ctx.branch(), None);
+        assert!(!ctx.is_default_branch());
     }
 
     #[test]
