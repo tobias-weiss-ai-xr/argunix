@@ -43,7 +43,10 @@ pub struct RegistryPush {
     pub target: String,
     /// Registry host[:port], no scheme — `ghcr.io`, `127.0.0.1:5000`.
     pub registry_url: String,
-    /// Namespace / project the image lands under on the registry.
+    /// Namespace / project the image lands under on the registry. May
+    /// contain a `{slug}` placeholder, resolved per-build to the repo's
+    /// slug by [`RegistryPush::resolve_namespace`] — that is what lets
+    /// one catalog entry serve many repos.
     pub namespace: String,
     /// Path to a file containing one `user:password` line. `None` for
     /// an anonymous-push registry. Read at push time.
@@ -54,12 +57,27 @@ pub struct RegistryPush {
 }
 
 impl RegistryPush {
+    /// Resolve the configured `namespace` against the repo being built:
+    /// every `{slug}` occurrence is replaced with the repo's slug (the
+    /// forge-side `owner/repo` path). A namespace with no placeholder —
+    /// a literal `myorg` — comes back unchanged.
+    ///
+    /// `{slug}` is what lets a single `registries:` catalog entry serve
+    /// many repos. On GitLab the registry path *is* the project path,
+    /// and the argunix repo slug already equals it, so `{slug}` pushes
+    /// each repo under its own project; on ghcr it yields the
+    /// conventional `<owner>/<repo>/<image>` layout.
+    fn resolve_namespace(&self, repo_slug: &str) -> String {
+        self.namespace.replace("{slug}", repo_slug)
+    }
+
     /// `docker://<url>/<namespace>/<image>` — the dest minus the tag.
-    fn dest_base(&self, image: &str) -> String {
+    /// `namespace` is the already-`{slug}`-resolved value.
+    fn dest_base(&self, namespace: &str, image: &str) -> String {
         format!(
             "docker://{}/{}/{}",
             self.registry_url.trim_end_matches('/'),
-            self.namespace.trim_matches('/'),
+            namespace.trim_matches('/'),
             image,
         )
     }
@@ -91,7 +109,8 @@ impl Effect for RegistryPush {
         };
 
         let image = image_segment(ctx.attr_path);
-        let base = self.dest_base(&image);
+        let namespace = self.resolve_namespace(ctx.repo_slug);
+        let base = self.dest_base(&namespace, &image);
 
         // Tag set: the branch (mutable, human) plus an immutable
         // `sha-<short>` tag. Dedup so a branch literally named
@@ -246,7 +265,7 @@ mod tests {
     #[test]
     fn dest_base_joins_cleanly() {
         assert_eq!(
-            push().dest_base("my-image"),
+            push().dest_base("myorg", "my-image"),
             "docker://ghcr.io/myorg/my-image",
         );
     }
@@ -255,10 +274,28 @@ mod tests {
     fn dest_base_tolerates_stray_slashes() {
         let p = RegistryPush {
             registry_url: "ghcr.io/".into(),
-            namespace: "/myorg/".into(),
             ..push()
         };
-        assert_eq!(p.dest_base("img"), "docker://ghcr.io/myorg/img");
+        assert_eq!(p.dest_base("/myorg/", "img"), "docker://ghcr.io/myorg/img");
+    }
+
+    #[test]
+    fn resolve_namespace_substitutes_slug() {
+        let p = RegistryPush {
+            namespace: "{slug}".into(),
+            ..push()
+        };
+        assert_eq!(
+            p.resolve_namespace("oci-community/images/example"),
+            "oci-community/images/example",
+        );
+    }
+
+    #[test]
+    fn resolve_namespace_passes_literal_through() {
+        // No placeholder — the configured namespace is used verbatim,
+        // ignoring the repo slug.
+        assert_eq!(push().resolve_namespace("some/repo"), "myorg");
     }
 
     #[test]

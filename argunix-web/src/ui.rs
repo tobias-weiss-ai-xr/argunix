@@ -97,18 +97,19 @@ struct CoordinatorRow {
     nix_eval_jobs_version: String,
 }
 
-/// Polled fragment of the status page: the section content plus an
-/// `hx-swap-oob` image that re-targets the header logo, so the
-/// `argunix-spin` class tracks `cluster_active` between full
-/// navigations. The wrapper template (`_status_fragment.html`)
-/// emits the OOB image and then `{% include %}`s the same partial
+/// Polled fragment of the status page: the section content plus a
+/// small `<script>` that toggles the `argunix-spin` class on the
+/// existing header logo, so the spinner tracks `cluster_active`
+/// between full navigations without restarting the CSS animation on
+/// every poll. The wrapper template (`_status_fragment.html`) emits
+/// that script and then `{% include %}`s the same partial
 /// (`_status_inner.html`) that the full page renders inline — so
 /// the section markup stays defined in exactly one place.
 #[derive(Template)]
 #[template(path = "_status_fragment.html")]
 struct StatusInnerTemplate {
-    /// Drives the OOB image's `argunix-spin` class. Recomputed each
-    /// poll from the same predicate the full-page render uses.
+    /// Drives the `classList.toggle` spin flag. Recomputed each poll
+    /// from the same predicate the full-page render uses.
     cluster_active: bool,
     totals: ClusterTotals,
     builders: Vec<BuilderRow>,
@@ -2095,11 +2096,12 @@ mod tests {
         // duplicate every 5s.
         assert!(!html.contains("cluster status"));
         assert!(!html.contains("hx-get"));
-        // Logo OOB swap is what keeps the header spinner in sync.
-        assert!(html.contains(r#"id="argunix-logo""#));
-        assert!(html.contains(r#"hx-swap-oob="true""#));
-        // Idle cluster → no spin class on the OOB image.
-        assert!(!html.contains("argunix-spin"));
+        // The header spinner is kept in sync by a class toggle on the
+        // existing logo element — not an OOB node swap, which would
+        // restart the CSS animation on every 5s poll.
+        assert!(html.contains(r#"getElementById("argunix-logo")"#));
+        // Idle cluster → the toggle forces the spin class *off*.
+        assert!(html.contains(r#"classList.toggle("argunix-spin", false)"#));
     }
 
     #[test]
@@ -2135,7 +2137,8 @@ mod tests {
             queued_truncated: false,
         };
         let html = tmpl.render().unwrap();
-        assert!(html.contains("argunix-spin"));
+        // Active cluster → the toggle forces the spin class *on*.
+        assert!(html.contains(r#"classList.toggle("argunix-spin", true)"#));
     }
 
     fn make_builder_row(name: &str, online: bool, jobs: Vec<CurrentJob>) -> BuilderRow {

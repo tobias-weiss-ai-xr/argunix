@@ -120,6 +120,34 @@ For self-hosted GitLab: set `web_url` to the instance hostname
 (e.g. `https://gitlab.example.com`); argunix derives the API URL
 as `<web_url>/api/v4`.
 
+**Reusing the same token for registry pushes**: the `api` scope
+already grants read/write access to the GitLab container registry,
+so the _same_ token that drives the forge can also authenticate the
+`registry-push` effect (`registries.<name>.auth_path`) — no second
+token, no extra scope. The standalone `read_registry` /
+`write_registry` scopes only matter for tokens that do _nothing
+else_; with `api` present they are redundant.
+
+The two consumers want the token in different file formats, so write
+it to two files:
+
+| Consumer        | Config key                 | File contents        |
+| --------------- | -------------------------- | -------------------- |
+| Forge API       | `forges.<f>.token_path`    | the token, bare      |
+| `registry-push` | `registries.<r>.auth_path` | `<username>:<token>` |
+
+For the `auth_path` file the username depends on the token type: a
+**project or group access token** uses the token's _name_ as the
+username; a **personal access token** uses your GitLab username.
+`registry-push` reads `auth_path` at push time, hands it to
+`skopeo --dest-creds`, and never logs it.
+
+```sh
+printf '%s' "$TOKEN"          > /var/lib/argunix-credentials/opencode-token
+printf '%s' "argunix:$TOKEN"  > /var/lib/argunix-credentials/opencode-registry-creds
+chmod 600 /var/lib/argunix-credentials/opencode-*
+```
+
 ---
 
 ### Forgejo / Gitea / Codeberg
@@ -151,3 +179,51 @@ re-create it on the next reload.
 Set `web_url` to the instance hostname (e.g. `https://codeberg.org`,
 `https://forgejo.example.com`); argunix derives the API URL as
 `<web_url>/api/v1`.
+
+## Registries
+
+`registries:` is a named catalog of external docker registries the
+`registry-push` effect copies built `dockerTools` images to. A repo
+opts in via `push_to_registries` (settable per repo, per forge, or in
+`defaults` — the lists merge). Each entry:
+
+| Field       | Meaning                                                                 |
+| ----------- | ----------------------------------------------------------------------- |
+| `url`       | Registry host, no scheme — `ghcr.io`, `registry.example.com:5000`.      |
+| `namespace` | Path segment images land under (see `{slug}` below).                    |
+| `auth_path` | File with one `user:password` line for `skopeo --dest-creds`. Optional. |
+| `insecure`  | Skip TLS verification — for a plain-HTTP registry. Defaults to `false`. |
+
+An image is pushed to `<url>/<namespace>/<image>:<tag>`, where
+`<image>` is the build attribute's leaf name and `<tag>` is the branch
+name plus an immutable `sha-<short>` tag.
+
+### The `{slug}` namespace placeholder
+
+`namespace` may contain a `{slug}` placeholder. The effect substitutes
+the building repo's slug at push time, so **one catalog entry can
+serve many repos**:
+
+```yaml
+registries:
+  opencode:
+    url: registry.opencode.de
+    namespace: "{slug}"
+    auth_path: /var/lib/argunix-credentials/opencode-registry-creds
+```
+
+This matters because the right namespace differs by registry:
+
+- **GitLab** (gitlab.com, self-hosted, opencode.de): the registry path
+  _is_ the project path, and an argunix repo's slug already equals its
+  project path — so `namespace: "{slug}"` pushes each repo under its
+  own project, which is also the only path the per-project push
+  permission allows.
+- **ghcr.io**: `{slug}` yields the conventional
+  `ghcr.io/<owner>/<repo>/<image>` layout. A literal `namespace: myorg`
+  also works, but then every bound repo shares it — two repos with the
+  same image attribute name would collide.
+- **Docker Hub / generic registries**: a literal namespace is usually
+  what you want; reach for `{slug}` only if you need per-repo paths.
+
+A namespace with no `{slug}` is used verbatim for every bound repo.

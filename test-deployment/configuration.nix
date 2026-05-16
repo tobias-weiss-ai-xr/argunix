@@ -67,6 +67,25 @@ in
         }
       ];
 
+      # External docker registry the `registry-push` effect copies built
+      # dockerTools images to. Unlike the integration test's local
+      # `registry:2`, the opencode registry requires a login: `auth_path`
+      # holds one `user:password` line, read at push time and handed to
+      # `skopeo --dest-creds`.
+      #
+      # `namespace = "{slug}"`: the effect substitutes each repo's slug,
+      # so this one entry serves every opencode repo. On GitLab the
+      # registry path is the project path — which is exactly the slug —
+      # so an image lands at
+      # `registry.opencode.de/<repo-slug>/<image>:<tag>`.
+      registries = {
+        opencode = {
+          url = "registry.opencode.de";
+          namespace = "{slug}";
+          auth_path = "/var/lib/argunix-credentials/opencode-registry-creds";
+        };
+      };
+
       forges = {
         github = {
           kind = "github";
@@ -109,7 +128,12 @@ in
           web_url = "https://gitlab.opencode.de";
           token_path = "/var/lib/argunix-credentials/opencode-token";
           repos = {
-            "oci-community/images/applicative-systems/example-build-and-attest" = { };
+            "oci-community/images/applicative-systems/example-build-and-attest" = {
+              push_to_registries = [ "opencode" ];
+            };
+            "oci-community/images/applicative-systems/images" = {
+              push_to_registries = [ "opencode" ];
+            };
           };
         };
       };

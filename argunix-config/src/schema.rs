@@ -360,11 +360,21 @@ pub struct BinaryCache {
 /// `url` is the registry host, optionally with a port and *without* a
 /// scheme (`ghcr.io`, `registry.example.com:5000`). Pushed images land
 /// at `<url>/<namespace>/<image>:<tag>`.
+///
+/// `namespace` may contain a `{slug}` placeholder: the `registry-push`
+/// effect substitutes the building repo's slug at push time, so a
+/// single catalog entry serves every repo bound to it. On GitLab —
+/// where the registry path *is* the project path, and the argunix repo
+/// slug already equals it — `namespace = "{slug}"` pushes each repo
+/// under its own project. A namespace with no placeholder is used
+/// verbatim by every repo, which collides unless the bound repos'
+/// image attribute names are themselves distinct.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Registry {
     pub url: String,
-    /// Namespace / project segment images are pushed under.
+    /// Namespace / project segment images are pushed under. A `{slug}`
+    /// placeholder is replaced per-build with the repo's slug.
     pub namespace: String,
     /// File holding one `user:password` line, handed to `skopeo
     /// --dest-creds`. Absent ⇒ anonymous push (a registry that
