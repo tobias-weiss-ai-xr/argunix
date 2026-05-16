@@ -94,16 +94,29 @@ in
       example = "/run/agenix/argunix-builder-token";
       description = ''
         Path on the host to a file containing the shared
-        builder-enrollment token. Used only on first contact (or
-        after `argunixctl builders revoke`); subsequent connects use
-        the persistent pubkey. Once argunix has the row, the file
-        can be wiped — the agent treats a missing file as
-        "pubkey-only" and keeps running, so leaving this option set
-        across re-deploys is fine.
+        builder-enrollment token. Used on first contact, after
+        `argunixctl builders revoke`, and — importantly — whenever
+        the coordinator no longer recognises this builder's pubkey,
+        e.g. after its `builders` table was reset: the agent tries
+        pubkey auth first and falls back to the token.
 
-        Read directly by the agent, which runs as the static
-        `argunix-builder` user. The file must be readable by that
-        user (e.g. an agenix secret with `owner = "argunix-builder"`).
+        The file is handed to the agent via systemd's `LoadCredential=`
+        — systemd reads it as root at unit start, before the service
+        sandbox exists — so the path may be anywhere readable by
+        root (an agenix/sops secret, a plain root-owned file) and its
+        ownership is irrelevant. It must, however, *exist* whenever
+        this option is set, or the unit fails to start.
+
+        Recommendation: leave this set and the file in place
+        permanently. The enrollment token is single-purpose (it only
+        authorises enrolment) and keeping it available is what lets a
+        builder re-enrol unattended after a coordinator database
+        reset or a builder re-image. To deliberately move a builder
+        to pubkey-only, set this option to `null` rather than
+        deleting the file out from under it.
+
+        Avoid `/tmp` and `/var/tmp`: they are cleared on reboot, so
+        the token would vanish across a restart.
       '';
     };
 
@@ -179,12 +192,30 @@ in
             cfg.name
           ]
           ++ lib.optionals (cfg.enrollmentTokenFile != null) [
+            # `%d` is systemd's credentials-directory specifier
+            # ($CREDENTIALS_DIRECTORY). The token is handed to the
+            # agent via `LoadCredential=` below — systemd reads the
+            # operator's file as root at unit start, *before* the
+            # service sandbox (PrivateTmp, ProtectHome, …) exists, and
+            # re-exposes it here. So the operator's path can be
+            # anywhere — `/tmp`, an agenix secret, a `/home` dotfile —
+            # and ownership does not matter.
             "--enrollment-token-path"
-            (toString cfg.enrollmentTokenFile)
+            "%d/enrollment-token"
           ]
         );
         Restart = "on-failure";
         RestartSec = 5;
+
+        # Hand the enrollment token to the agent through systemd's
+        # credential mechanism rather than letting it read the
+        # operator's path directly: a direct read collides with the
+        # sandbox below (`PrivateTmp` gives the service its own empty
+        # `/tmp`; `ProtectHome` hides `/home`), which silently
+        # presents as "enrollment token file not found".
+        LoadCredential = lib.optional (
+          cfg.enrollmentTokenFile != null
+        ) "enrollment-token:${toString cfg.enrollmentTokenFile}";
 
         User = cfg.user;
         Group = cfg.group;
