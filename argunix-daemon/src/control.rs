@@ -197,6 +197,18 @@ async fn handle_test_dispatch_drv(
                 "pull_ms": phase_metrics.pull_ms,
             },
         })),
+        crate::worker::PoolDispatchResult::TransportFailure { phase_metrics } => {
+            Ok(serde_json::json!({
+                "status": "transport_failure",
+                "phase_metrics": {
+                    "push_bytes": phase_metrics.push_bytes,
+                    "push_ms": phase_metrics.push_ms,
+                    "build_ms": phase_metrics.build_ms,
+                    "pull_bytes": phase_metrics.pull_bytes,
+                    "pull_ms": phase_metrics.pull_ms,
+                },
+            }))
+        }
         crate::worker::PoolDispatchResult::Cancelled => {
             anyhow::bail!("test dispatch cancelled (unexpected — no cancel token)");
         }

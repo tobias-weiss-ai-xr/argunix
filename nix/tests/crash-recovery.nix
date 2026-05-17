@@ -170,6 +170,7 @@ let
 in
 {
   name = "argunix-crash-recovery";
+  globalTimeout = 900; # 15 min: build, crash, requeue + recovery
 
   defaults = {
     networking.dhcpcd.enable = false;

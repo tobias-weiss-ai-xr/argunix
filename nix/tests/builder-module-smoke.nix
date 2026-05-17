@@ -20,6 +20,7 @@ let
 in
 {
   name = "argunix-builder-module-smoke";
+  globalTimeout = 600; # 10 min: single-VM builder-module smoke
 
   defaults = {
     networking.dhcpcd.enable = false;

@@ -45,6 +45,7 @@ let
 in
 {
   name = "argunix-builder-build-dispatch";
+  globalTimeout = 900; # 15 min: 2 VMs + a real build dispatch
 
   defaults = {
     networking.dhcpcd.enable = false;

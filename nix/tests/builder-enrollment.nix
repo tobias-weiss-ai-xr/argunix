@@ -14,6 +14,7 @@ let
 in
 {
   name = "argunix-builder-enrollment";
+  globalTimeout = 600; # 10 min: 2-VM enrollment handshake
 
   defaults = {
     networking.dhcpcd.enable = false;

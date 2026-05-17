@@ -9,6 +9,7 @@ use russh::keys::PrivateKey;
 use russh::keys::ssh_key;
 use russh::server::{Auth, Handle as SessionHandle, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet};
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,6 +64,17 @@ impl BuilderServer {
             methods,
             auth_rejection_time: std::time::Duration::from_secs(1),
             inactivity_timeout: Some(std::time::Duration::from_secs(120)),
+            // App-layer keepalive: probe each builder every 30s and
+            // tear the session down after 3 unanswered probes (~90s to
+            // detect a half-open connection). Symmetric with the
+            // agent's client-side keepalive — without it a builder
+            // whose connection silently dies (NAT mapping expiry, host
+            // vanished) lingers as a zombie registry entry, and any
+            // side channels opened on it stay wedged until the kernel's
+            // TCP retransmit budget runs out, minutes later.
+            keepalive_interval: Some(std::time::Duration::from_secs(30)),
+            keepalive_max: 3,
+            nodelay: true,
             ..Default::default()
         };
         let russh_cfg = Arc::new(russh_cfg);
@@ -73,14 +85,50 @@ impl BuilderServer {
             registry: cfg.registry,
         };
         let listen = cfg.listen;
-        server
-            .run_on_address(russh_cfg, listen)
+        // Accept connections ourselves rather than via `run_on_address`
+        // so we can set SO_KEEPALIVE on each accepted socket. The russh
+        // keepalive above already detects half-open connections at the
+        // SSH layer; TCP keepalive is the same belt-and-suspenders the
+        // agent runs, and trips faster when the peer is fully
+        // unreachable.
+        let listener = tokio::net::TcpListener::bind(listen)
             .await
             .map_err(|source| ServerError::Run {
                 addr: listen,
                 source,
             })?;
-        Ok(())
+        loop {
+            let (socket, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(source) => {
+                    return Err(ServerError::Run {
+                        addr: listen,
+                        source,
+                    });
+                }
+            };
+            let keepalive = TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(30))
+                .with_interval(std::time::Duration::from_secs(10))
+                .with_retries(3);
+            if let Err(e) = SockRef::from(&socket).set_tcp_keepalive(&keepalive) {
+                tracing::warn!(error = %e, %peer, "set_tcp_keepalive() on builder socket failed");
+            }
+            let handler = server.new_client(Some(peer));
+            let russh_cfg = russh_cfg.clone();
+            tokio::spawn(async move {
+                match russh::server::run_stream(russh_cfg, socket, handler).await {
+                    Ok(session) => {
+                        if let Err(e) = session.await {
+                            tracing::debug!(error = %e, %peer, "builder connection closed with error");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, %peer, "builder connection setup failed");
+                    }
+                }
+            });
+        }
     }
 }
 

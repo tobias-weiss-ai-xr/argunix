@@ -12,7 +12,8 @@ base64 = { workspace = true }
 russh = { workspace = true }
 ed25519-dalek = { workspace = true }
 
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+socket2 = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }

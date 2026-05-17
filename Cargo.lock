@@ -236,6 +236,7 @@ dependencies = [
  "russh",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

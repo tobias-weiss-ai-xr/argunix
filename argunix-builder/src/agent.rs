@@ -304,17 +304,36 @@ async fn serve_one_connection(
     loop {
         tokio::select! {
             _ = &mut *shutdown => {
+                // Best-effort goodbye, bounded by a short timeout. Over
+                // a half-open connection an un-timeouted
+                // `channel.data().await` blocks until russh's keepalive
+                // tears the session down (~90s), which makes
+                // `systemctl stop`/`restart` of the agent unit hang
+                // until systemd escalates to SIGKILL. We're exiting
+                // regardless — a dropped `Shutdown` message just means
+                // argunix reaps us via its own keepalive instead of
+                // seeing a clean drain.
                 let bye = ControlMessage::Shutdown {
                     reason: "agent stopping".into(),
                     drain: false,
                 };
-                let _ = channel.data(&bye.encode_line()[..]).await;
-                let _ = channel.close().await;
-                let _ = session.disconnect(
-                    russh::Disconnect::ByApplication,
-                    "agent shutdown",
-                    "en",
-                ).await;
+                let goodbye = async {
+                    let _ = channel.data(&bye.encode_line()[..]).await;
+                    let _ = channel.close().await;
+                    let _ = session.disconnect(
+                        russh::Disconnect::ByApplication,
+                        "agent shutdown",
+                        "en",
+                    ).await;
+                };
+                if tokio::time::timeout(Duration::from_secs(3), goodbye)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "graceful shutdown timed out (connection likely half-open); exiting anyway",
+                    );
+                }
                 return Ok(true);
             }
             _ = hb_interval.tick() => {

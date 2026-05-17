@@ -231,6 +231,7 @@ let
 in
 {
   name = "argunix-builders-parallel";
+  globalTimeout = 30 * 60; # 30 min: 3 VMs, parallel build waves
 
   defaults = {
     networking.dhcpcd.enable = false;

@@ -110,6 +110,7 @@ let
 in
 {
   name = "argunix-cache-push";
+  globalTimeout = 900; # 15 min: build + binary-cache push
 
   defaults = {
     networking.dhcpcd.enable = false;

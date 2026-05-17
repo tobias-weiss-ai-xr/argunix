@@ -22,6 +22,7 @@ let
 in
 {
   name = "argunix-module-smoke";
+  globalTimeout = 600; # 10 min: single-VM service smoke
 
   nodes.machine =
     { ... }:

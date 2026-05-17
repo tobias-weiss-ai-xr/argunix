@@ -86,6 +86,7 @@ let
 in
 {
   name = "argunix-registry-push-oci";
+  globalTimeout = 900; # 15 min: build + OCI registry push
 
   defaults = {
     networking.dhcpcd.enable = false;

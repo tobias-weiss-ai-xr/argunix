@@ -1192,28 +1192,28 @@ fn summarise_for_check(err: &str, max_chars: usize) -> String {
 }
 
 /// Pick the builder this derivation should run on. Walks
-/// `BuilderRegistry::eligible(system, required_features, exclude={})`
-/// and takes the first entry — which `eligible()` already sorts
+/// `BuilderRegistry::eligible(system, required_features, exclude)` and
+/// takes the first entry — which `eligible()` already sorts
 /// least-loaded-first. Returns `None` when:
 ///
 /// - the spec has no `system` (we can't filter and shouldn't guess);
 /// - no connected builder advertises the system *and* every required
-///   feature *and* has free `max_jobs` capacity right now.
+///   feature *and* has free `max_jobs` capacity right now;
+/// - every such builder is in `exclude` — `build_one` populates this
+///   with builders that already hit a transport failure for this job,
+///   so a flapping builder isn't retried in a tight loop.
 ///
-/// In the second case the caller falls through to a local
+/// In the None case the caller falls through to a local
 /// `nix-store --realise` (no `--builders`), which honours the host's
 /// `nix.buildMachines` if any. The pre-flight earlier in `build_one`
 /// has already failed-fast for the unsatisfiable-features subset.
 fn pick_builder_for_spec(
     registry: &argunix_builders::BuilderRegistry,
     spec: &argunix_eval::JobSpec,
+    exclude: &std::collections::HashSet<argunix_domain::BuilderName>,
 ) -> Option<argunix_builders::BuilderSnapshot> {
     let system = spec.system.as_deref()?;
-    let eligible = registry.eligible(
-        system,
-        &spec.required_system_features,
-        &std::collections::HashSet::new(),
-    );
+    let eligible = registry.eligible(system, &spec.required_system_features, exclude);
     eligible.into_iter().next()
 }
 
@@ -1676,104 +1676,134 @@ async fn build_one(
         }
     }
 
-    // Pick a specific builder for this derivation and pin nix to
-    // it. `eligible()` already returns least-loaded-first, filtered by
-    // (system, requiredSystemFeatures, max_jobs cap). We reserve the
-    // slot before recording dispatch + starting the build so a
-    // concurrent worker task sees the up-to-date in_flight number.
-    //
-    // If `eligible` returns nothing — either no connected builders at
-    // all, or none match this derivation's system/features — we fall
-    // through to the legacy multi-builder `--builders` arg (or to the
-    // host's `nix.buildMachines` if that's also empty). Pre-flight
-    // for required-feature jobs already short-circuits the
-    // "connected pool exists but nothing matches" case above.
-    let chosen = pick_builder_for_spec(&ctx.builder_registry, spec);
-    let _slot = chosen
-        .as_ref()
-        .map(|b| BuilderSlot::reserve(ctx.builder_registry.clone(), b.name.clone()));
-
     <SqlxStore as JobStore>::start(&ctx.store, job_id, Utc::now()).await?;
-    if let Some(b) = &chosen {
-        // Surfaces the chosen builder in the read-only UI's running
-        // table and keeps per-builder running counts grouped from the
-        // DB honest.
-        <SqlxStore as JobStore>::dispatch(&ctx.store, job_id, b.builder_id, Utc::now()).await?;
-    }
 
     // Pre-create the gcroot parent dir so `nix-store --add-root` can drop
     // the symlink atomically with the build (otherwise it ENOENTs and the
-    // realise call fails before any building happens).
+    // realise call fails before any building happens). Done once, before
+    // any dispatch attempt.
     let gc_root = argunix_build::gc_root_path(&ctx.gc_root_dir, repo_id, eval_id, job_id);
     if let Some(parent) = gc_root.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
             tracing::warn!(error = %e, dir = %parent.display(), "failed to create gcroot parent dir; build will run without a gcroot");
         }
     }
-    tracing::info!(
-        eval_id = eval_id.get(),
-        drv = %drv_path,
-        log = %log_path.display(),
-        pinned_builder = chosen.as_ref().map(|b| b.name.as_str()),
-        "dispatching build",
-    );
-    // Race the build against the eval's cancel signal. `biased;`
-    // polls the build first — if it just resolved with success we
-    // honour that even if cancel arrived in the same event-loop tick
-    // (cancellation is cooperative; a green build is not retroactively
-    // failed). On cancel-wins we drop the build future; for the local
-    // fallback path, `Command::kill_on_drop(true)` reaps the child;
-    // for the remote (pool) path, `dispatch_build_via_pool` sends an
-    // `Abort` control message and drains the resulting
-    // `BuildFinished{Killed}` itself. See [docs/concepts/cancel-on-push.md].
-    let (outcome, phase_metrics) = match &chosen {
-        Some(b) => {
-            // Dispatch via the dynamic builder pool through side
-            // channels. The helper drives push-closure → Build
-            // → drain lifecycle → pull-closure → register-gcroot
-            // entirely; the `cancel` token is honoured inside.
-            dispatch_build_via_pool(
-                ctx,
-                &b.name,
-                job_id,
-                &drv_path,
-                &gc_root,
-                &log_path,
-                argunix_build::LogCaptureLimit::default(),
-                cancel,
-            )
-            .await?
-        }
-        None => {
-            // No matching connected builder: fall back to a local
-            // `nix-store --realise` (no `--builders`). The host's
-            // `nix.buildMachines`, if any, is honoured natively; if
-            // not, the build runs locally. Local builds have no
-            // remote-transport phases, so we record empty metrics.
-            let request = argunix_build::BuildRequest {
-                drv_path: drv_path.clone(),
-                log_path: log_path.clone(),
-                timeout: ctx.build_timeout,
-                log_limit: argunix_build::LogCaptureLimit::default(),
-                gc_root: Some(gc_root.clone()),
-            };
-            let local_outcome = tokio::select! {
-                biased;
-                res = argunix_build::run_build(&request) => res?,
-                _ = cancel.cancelled() => {
-                    tracing::info!(
-                        job_id = job_id.get(),
-                        attr = %spec.attr_path,
-                        "build cancelled by new push; killing nix-store",
-                    );
-                    <SqlxStore as JobStore>::finish(
-                        &ctx.store, job_id, JobStatus::Cancelled, Utc::now(), None, None,
-                        &JobPhaseMetrics::default(),
-                    ).await?;
-                    return Ok(JobStatus::Cancelled);
+
+    // Dispatch loop. `pick_builder_for_spec` returns the least-loaded
+    // eligible builder not in `excluded`; `eligible()` already filters
+    // by (system, requiredSystemFeatures, max_jobs cap). On a transport
+    // failure — the builder disconnected before producing a verdict —
+    // we add it to `excluded` and pick the next one. A genuine build
+    // verdict (success / failure / timeout) ends the loop.
+    //
+    // When `pick_builder_for_spec` returns None — no connected builder
+    // matches at all, or every eligible one already hit a transport
+    // failure — we fall back to a local `nix-store --realise` (no
+    // `--builders`), which honours the host's `nix.buildMachines` if
+    // any. Pre-flight for required-feature jobs already short-circuits
+    // the "connected pool exists but nothing matches" case above.
+    //
+    // The loop is bounded by the pool size (each builder is excluded
+    // after at most one attempt), so it always terminates.
+    //
+    // Cancellation: `biased;` in the local arm polls the build first so
+    // a build that resolved in the same tick as cancel is honoured; the
+    // pool path's `dispatch_build_via_pool` handles cancel internally
+    // (it sends `Abort` and drains `BuildFinished{Killed}`).
+    // See [docs/concepts/cancel-on-push.md].
+    let mut excluded: std::collections::HashSet<argunix_domain::BuilderName> =
+        std::collections::HashSet::new();
+    let (outcome, phase_metrics) = loop {
+        match pick_builder_for_spec(&ctx.builder_registry, spec, &excluded) {
+            Some(b) => {
+                // Reserve the slot before recording dispatch so a
+                // concurrent worker sees the up-to-date in_flight
+                // number. `_slot` drops at the end of the iteration —
+                // including the retry `continue`.
+                let _slot = BuilderSlot::reserve(ctx.builder_registry.clone(), b.name.clone());
+                // Surfaces the chosen builder in the read-only UI's
+                // running table and keeps per-builder running counts
+                // grouped from the DB honest.
+                <SqlxStore as JobStore>::dispatch(&ctx.store, job_id, b.builder_id, Utc::now())
+                    .await?;
+                tracing::info!(
+                    eval_id = eval_id.get(),
+                    drv = %drv_path,
+                    log = %log_path.display(),
+                    pinned_builder = %b.name,
+                    "dispatching build",
+                );
+                // Dispatch via the dynamic builder pool through side
+                // channels. The helper drives push-closure → Build
+                // → drain lifecycle → pull-closure → register-gcroot
+                // entirely; the `cancel` token is honoured inside.
+                match dispatch_build_via_pool(
+                    ctx,
+                    &b.name,
+                    job_id,
+                    &drv_path,
+                    &gc_root,
+                    &log_path,
+                    argunix_build::LogCaptureLimit::default(),
+                    cancel,
+                )
+                .await?
+                {
+                    PoolAttempt::Verdict(outcome, phase_metrics) => {
+                        break (outcome, phase_metrics);
+                    }
+                    PoolAttempt::TransportFailure => {
+                        tracing::warn!(
+                            job_id = job_id.get(),
+                            builder = %b.name,
+                            "pool dispatch hit a transport failure; \
+                             excluding this builder and retrying elsewhere",
+                        );
+                        excluded.insert(b.name.clone());
+                        continue;
+                    }
                 }
-            };
-            (local_outcome, JobPhaseMetrics::default())
+            }
+            None => {
+                // No (more) matching connected builder: fall back to a
+                // local `nix-store --realise` (no `--builders`). The
+                // host's `nix.buildMachines`, if any, is honoured
+                // natively; if not, the build runs locally. Local
+                // builds have no remote-transport phases, so we record
+                // empty metrics.
+                if !excluded.is_empty() {
+                    tracing::warn!(
+                        job_id = job_id.get(),
+                        tried = excluded.len(),
+                        "every eligible pool builder hit a transport failure; \
+                         falling back to a local build",
+                    );
+                }
+                let request = argunix_build::BuildRequest {
+                    drv_path: drv_path.clone(),
+                    log_path: log_path.clone(),
+                    timeout: ctx.build_timeout,
+                    log_limit: argunix_build::LogCaptureLimit::default(),
+                    gc_root: Some(gc_root.clone()),
+                };
+                let local_outcome = tokio::select! {
+                    biased;
+                    res = argunix_build::run_build(&request) => res?,
+                    _ = cancel.cancelled() => {
+                        tracing::info!(
+                            job_id = job_id.get(),
+                            attr = %spec.attr_path,
+                            "build cancelled by new push; killing nix-store",
+                        );
+                        <SqlxStore as JobStore>::finish(
+                            &ctx.store, job_id, JobStatus::Cancelled, Utc::now(), None, None,
+                            &JobPhaseMetrics::default(),
+                        ).await?;
+                        return Ok(JobStatus::Cancelled);
+                    }
+                };
+                break (local_outcome, JobPhaseMetrics::default());
+            }
         }
     };
     let log_path_str = log_path.to_string_lossy().into_owned();
@@ -2022,21 +2052,46 @@ pub struct PoolDispatchSpec<'a> {
     pub live_logs: Option<Arc<argunix_web::LiveLogRegistry>>,
 }
 
-/// Distinguishes "build cancelled by caller" from "build finished
-/// (success or failure) with this BuildOutcome". The worker's
-/// `build_one` translates `Cancelled` into a `JobStatus::Cancelled`
-/// row update and a `JobStatus::Cancelled` return value; the test
-/// dispatch path never sees `Cancelled` (no cancel token is wired in).
+/// Outcome of one pool-dispatch attempt against a single builder.
+///
+/// - `Outcome` — the builder produced a genuine verdict (the
+///   derivation built, or it failed to build, or it timed out). This
+///   is terminal: `build_one` records it as-is.
+/// - `Cancelled` — the caller's cancel token fired. The worker's
+///   `build_one` translates this into a `JobStatus::Cancelled` row
+///   update; the test dispatch path never sees it (no cancel token).
+/// - `TransportFailure` — the builder connection broke *before* a
+///   verdict was reached (push-closure failed, the `Build` message
+///   couldn't be sent, or the lifecycle channel closed mid-build).
+///   The derivation never actually failed to build — `build_one`
+///   should re-dispatch it to another eligible builder rather than
+///   recording `JobStatus::Failure`.
 pub enum PoolDispatchResult {
     Outcome {
         outcome: argunix_build::BuildOutcome,
         phase_metrics: JobPhaseMetrics,
     },
     Cancelled,
+    TransportFailure {
+        phase_metrics: JobPhaseMetrics,
+    },
 }
 
-/// Worker-side wrapper that translates `PoolDispatchResult::Cancelled`
-/// into a `JobStore` row update + the `JobStatus::Cancelled` return.
+/// What one `dispatch_build_via_pool` attempt yielded. `build_one`
+/// loops on `TransportFailure`, re-dispatching to another builder.
+enum PoolAttempt {
+    /// The builder reached a genuine verdict (success / failure /
+    /// timeout). Terminal — recorded as-is.
+    Verdict(argunix_build::BuildOutcome, JobPhaseMetrics),
+    /// The builder connection broke before a verdict. The derivation
+    /// never actually failed to build; try another builder.
+    TransportFailure,
+}
+
+/// Worker-side wrapper around [`dispatch_pool_build`]. Translates
+/// `PoolDispatchResult::Cancelled` into a `JobStore` row update + the
+/// `JobStatus::Cancelled` return, and maps `Outcome` / `TransportFailure`
+/// onto [`PoolAttempt`] for `build_one`'s retry loop.
 async fn dispatch_build_via_pool(
     ctx: &WorkerContext,
     builder_name: &argunix_domain::BuilderName,
@@ -2046,7 +2101,7 @@ async fn dispatch_build_via_pool(
     log_path: &Path,
     log_limit: argunix_build::LogCaptureLimit,
     cancel: &argunix_web::CancelToken,
-) -> anyhow::Result<(argunix_build::BuildOutcome, JobPhaseMetrics)> {
+) -> anyhow::Result<PoolAttempt> {
     let spec = PoolDispatchSpec {
         registry: ctx.builder_registry.clone(),
         builder_name,
@@ -2064,7 +2119,8 @@ async fn dispatch_build_via_pool(
         PoolDispatchResult::Outcome {
             outcome,
             phase_metrics,
-        } => Ok((outcome, phase_metrics)),
+        } => Ok(PoolAttempt::Verdict(outcome, phase_metrics)),
+        PoolDispatchResult::TransportFailure { .. } => Ok(PoolAttempt::TransportFailure),
         PoolDispatchResult::Cancelled => {
             <SqlxStore as JobStore>::finish(
                 &ctx.store,
@@ -2139,18 +2195,13 @@ pub async fn dispatch_pool_build(
     let mut log_buf: Vec<u8> = Vec::new();
     let mut log_truncated = false;
 
+    // A pre-verdict transport failure (push-closure / dispatch). The
+    // derivation never reached the builder's `nix-store --realise`, so
+    // this is a `TransportFailure`, not a build `Failure` — `build_one`
+    // re-dispatches to another builder.
     let early_failure = |log_buf: Vec<u8>, log_path: PathBuf, phase_metrics: JobPhaseMetrics| async move {
         argunix_build::write_zstd_log(&log_path, log_buf).await?;
-        Ok::<_, anyhow::Error>(PoolDispatchResult::Outcome {
-            outcome: argunix_build::BuildOutcome {
-                status: argunix_build::BuildStatus::Failure,
-                exit_code: None,
-                output_paths: Vec::new(),
-                log_path,
-                log_truncated: false,
-            },
-            phase_metrics,
-        })
+        Ok::<_, anyhow::Error>(PoolDispatchResult::TransportFailure { phase_metrics })
     };
 
     // 1+2. Push the drv (and its closure) to the builder via
@@ -2249,6 +2300,11 @@ pub async fn dispatch_pool_build(
     let mut exit_code: Option<i32> = None;
     let mut aborted = false;
     let mut timed_out = false;
+    // Set when the builder connection broke before a genuine verdict
+    // (lifecycle channel closed mid-build, or output-closure pull
+    // failed). Turns the result into a `TransportFailure` so the job
+    // is retried on another builder instead of recorded as a failure.
+    let mut transport_failed = false;
     // Wall-clock between agent's `BuildStarted` and `BuildFinished`.
     // None until BuildStarted arrives.
     let mut build_started_at: Option<std::time::Instant> = None;
@@ -2297,6 +2353,7 @@ pub async fn dispatch_pool_build(
                         tracing::warn!(job_id = build_id, builder = %builder_name, "lifecycle channel closed before BuildFinished");
                         log_buf.extend_from_slice(b"\nargunix: builder disconnected mid-build.\n");
                         final_status = BuildOutcomeStatus::Failure;
+                        transport_failed = true;
                         break;
                     }
                 }
@@ -2423,6 +2480,10 @@ pub async fn dispatch_pool_build(
                 phase_metrics.pull_ms = Some(pull_started_at.elapsed().as_millis() as u64);
                 phase_metrics.pull_bytes = Some(0);
                 final_status = BuildOutcomeStatus::Failure;
+                // The derivation built fine on the builder; only the
+                // output transfer broke. Retry on another builder
+                // rather than reporting a spurious build failure.
+                transport_failed = true;
             }
         }
     }
@@ -2431,6 +2492,14 @@ pub async fn dispatch_pool_build(
         log_buf.extend_from_slice(b"\n--- log truncated by argunix ---\n");
     }
     argunix_build::write_zstd_log(log_path, log_buf).await?;
+
+    // A mid-build disconnect or a failed output pull is a transport
+    // failure, not a build verdict — surface it so `build_one` retries
+    // on another builder. The log written above is kept so the last
+    // attempt's diagnostics survive if every builder fails.
+    if transport_failed {
+        return Ok(PoolDispatchResult::TransportFailure { phase_metrics });
+    }
 
     Ok(PoolDispatchResult::Outcome {
         outcome: argunix_build::BuildOutcome {
@@ -2638,14 +2707,20 @@ mod tests {
     #[test]
     fn pick_builder_returns_none_when_pool_empty() {
         let reg = BuilderRegistry::new();
-        assert!(pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[])).is_none());
+        assert!(
+            pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]), &Default::default())
+                .is_none()
+        );
     }
 
     #[test]
     fn pick_builder_returns_none_when_no_system_match() {
         let reg = BuilderRegistry::new();
         register(&reg, "darwin", 1, caps(&["aarch64-darwin"], &[], 4));
-        assert!(pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[])).is_none());
+        assert!(
+            pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]), &Default::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -2656,8 +2731,9 @@ mod tests {
         // Saturate "busy" with one slot taken.
         let _slot = BuilderSlot::reserve(reg.clone(), BuilderName::new("busy").unwrap());
 
-        let chosen = pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]))
-            .expect("eligible builder should be returned");
+        let chosen =
+            pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]), &Default::default())
+                .expect("eligible builder should be returned");
         assert_eq!(
             chosen.name.as_str(),
             "idle",
@@ -2671,8 +2747,12 @@ mod tests {
         register(&reg, "plain", 1, caps(&["x86_64-linux"], &[], 4));
         register(&reg, "kvm", 2, caps(&["x86_64-linux"], &["kvm"], 4));
 
-        let chosen = pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &["kvm"]))
-            .expect("kvm-capable builder exists");
+        let chosen = pick_builder_for_spec(
+            &reg,
+            &spec(Some("x86_64-linux"), &["kvm"]),
+            &Default::default(),
+        )
+        .expect("kvm-capable builder exists");
         assert_eq!(
             chosen.name.as_str(),
             "kvm",
@@ -2687,9 +2767,33 @@ mod tests {
         let _slot = BuilderSlot::reserve(reg.clone(), BuilderName::new("tiny").unwrap());
 
         assert!(
-            pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[])).is_none(),
+            pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]), &Default::default())
+                .is_none(),
             "saturated builder must not be chosen — caller falls back to multi-builder \
              arg so nix's own scheduler can retry against the full pool",
+        );
+    }
+
+    #[test]
+    fn pick_builder_skips_excluded_builders() {
+        let reg = BuilderRegistry::new();
+        register(&reg, "alpha", 1, caps(&["x86_64-linux"], &[], 4));
+        register(&reg, "beta", 2, caps(&["x86_64-linux"], &[], 4));
+        let mut excluded = std::collections::HashSet::new();
+        excluded.insert(BuilderName::new("alpha").unwrap());
+        let chosen = pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]), &excluded)
+            .expect("beta is still eligible");
+        assert_eq!(
+            chosen.name.as_str(),
+            "beta",
+            "an excluded builder must not be chosen for a retry",
+        );
+        // Excluding every eligible builder yields None — `build_one`
+        // then falls back to a local build.
+        excluded.insert(BuilderName::new("beta").unwrap());
+        assert!(
+            pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]), &excluded).is_none(),
+            "all eligible builders excluded → caller falls back to local",
         );
     }
 

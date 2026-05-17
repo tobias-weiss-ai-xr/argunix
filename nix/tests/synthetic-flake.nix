@@ -53,6 +53,7 @@ let
 in
 {
   name = "argunix-synthetic-flake";
+  globalTimeout = 900; # 15 min: 2 VMs + synthetic-flake eval/build
 
   defaults = {
     networking.dhcpcd.enable = false;

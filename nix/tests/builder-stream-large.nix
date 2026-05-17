@@ -93,6 +93,7 @@ let
 in
 {
   name = "argunix-builder-stream-large";
+  globalTimeout = 30 * 60; # 30 min: 512 MiB closure stream + 2-VM boot
 
   defaults = {
     networking.dhcpcd.enable = false;

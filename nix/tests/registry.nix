@@ -88,6 +88,7 @@ let
 in
 {
   name = "argunix-registry";
+  globalTimeout = 900; # 15 min: embedded registry serve + pull
 
   defaults = {
     networking.dhcpcd.enable = false;

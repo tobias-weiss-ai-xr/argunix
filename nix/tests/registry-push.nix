@@ -96,6 +96,7 @@ let
 in
 {
   name = "argunix-registry-push";
+  globalTimeout = 900; # 15 min: build + external registry push
 
   defaults = {
     networking.dhcpcd.enable = false;
