@@ -16,6 +16,7 @@ mod host_stats;
 mod live_log;
 mod pause;
 mod policy;
+mod slogans;
 mod state;
 mod synthetic_flake;
 mod ui;

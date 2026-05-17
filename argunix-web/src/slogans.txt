@@ -1,0 +1,28 @@
+# Header slogans — one per line. A random one shows on every page load.
+# Blank lines and lines starting with `#` are ignored.
+
+# --- Forge independence ---
+Your CI is too good to be locked in a forge.
+One CI. Every forge.
+Switch forges any day — keep your CI.
+Host projects anywhere, get the same CI everywhere.
+Your CI shouldn't care which forge you use.
+Forge-specific CI is a forge-specific cage.
+CI that outlives your choice of forge.
+
+# --- Reproducible: no more single source of truth ---
+Works on your machine? Then it works in CI.
+No more commit-push-wait-hope.
+Run the exact CI build on your own laptop.
+The CI shouldn't be the only place your build works.
+Same sandbox on your laptop and in CI.
+Stop debugging the CI - reproduce it locally.
+
+# --- Less complexity ---
+CI without the thousand-line YAML.
+Your CI config shouldn't outgrow your code.
+Describe your build once, in Nix - not in CI.
+
+# --- Speed & caching ---
+Nix-cached builds: most jobs finish in a second.
+Caching that just works — because Nix already did it.

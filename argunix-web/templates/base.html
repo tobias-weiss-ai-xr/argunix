@@ -17,28 +17,51 @@
     {% block head_extra %}{% endblock %}
   </head>
   <body class="bg-bg text-fg font-sans">
-    <header class="max-w-5xl mx-auto px-4 pt-6 pb-2 flex items-center justify-between">
-      <div class="flex items-center gap-3">
-        <a class="flex items-center gap-3 no-underline text-fg" href="/">
+    <header class="max-w-5xl mx-auto px-4 pt-6 pb-2 flex items-center justify-between gap-3">
+      <div class="flex items-center gap-3 min-w-0">
+        <a class="flex items-center gap-3 no-underline text-fg shrink-0" href="/">
           {% call m::logo(cluster_active) %}
           <span class="text-xl font-semibold">argunix</span>
         </a>
-        <span class="font-semibold text-subtle hidden lg:block">
-          Your CI is too good to be locked in a forge.
-        </span>
+        {# Slogan: a random one per page load (see `slogan()` in ui.rs).
+           Hidden below `lg` — it doesn't fit next to the nav on small
+           screens. `truncate` guards against an overly long slogan. #}
+        <span class="font-semibold text-subtle hidden lg:block truncate">{{ crate::slogans::pick() }}</span>
       </div>
-      <nav class="font-medium text-muted flex items-center gap-6">
-        <a class="hover:underline" href="/">status</a>
-        <a class="hover:underline" href="/repos">repos</a>
-        <a class="hover:underline" href="/cache">cache</a>
-        <a class="hover:underline" href="/hosts">hosts</a>
+      {# Wide screens: inline nav. #}
+      <nav class="font-medium text-muted hidden sm:flex items-center gap-6">
+        {% call m::nav_links("hover:underline") %}
       </nav>
+      {# Small screens: pure-CSS hamburger. `<details>` toggles natively (no
+         JS); navigating reloads the page so the open state needn't persist. #}
+      <details class="relative sm:hidden">
+        <summary class="list-none cursor-pointer rounded border border-border p-2 text-fg [&::-webkit-details-marker]:hidden">
+          <span class="block text-lg leading-none">☰</span>
+        </summary>
+        <nav class="absolute right-0 mt-2 z-10 flex flex-col gap-1 rounded border border-border bg-surface p-2 font-medium text-muted shadow">
+          {% call m::nav_links("hover:underline px-3 py-1") %}
+        </nav>
+      </details>
     </header>
     <main class="max-w-5xl mx-auto px-4 py-6">
       {% block content %}{% endblock %}
     </main>
-    <footer class="max-w-5xl mx-auto px-4 py-4 text-xs text-muted">
-      <a href="https://codeberg.org/tfc/argunix">argunix CI</a>
+    <footer class="max-w-5xl mx-auto px-4 py-6 mt-8 border-t border-border text-xs text-muted flex flex-col sm:flex-row sm:items-center gap-3">
+      <a href="https://applicative.systems" class="shrink-0">
+        <img
+          src="/static/img/applicative-systems-logo.svg"
+          alt="Applicative Systems"
+          class="h-8 dark:invert"
+        />
+      </a>
+      <p>
+        <a class="text-link hover:underline" href="https://codeberg.org/tfc/argunix">argunix</a>
+        is a self-hosted CI server: build straight from your own
+        infrastructure, integrate with multiple forges, post results back as
+        commit statuses and badges, and push artifacts to OCI/Docker
+        registries. Free software, maintained by
+        <a class="text-link hover:underline" href="https://applicative.systems">Applicative Systems</a>.
+      </p>
     </footer>
     <script>
       {# Global copy-target listener. Any element with `data-copy-target="<id>"`

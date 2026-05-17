@@ -15,6 +15,17 @@
 />
 {%- endmacro %}
 
+{# Top-bar navigation links. Shared by the wide-screen inline `<nav>` and the
+   small-screen hamburger menu in `base.html` so the link list stays in one
+   place. `item_class` is applied to every `<a>` (the two contexts want
+   different spacing). #}
+{% macro nav_links(item_class) -%}
+<a class="{{ item_class }}" href="/">status</a>
+<a class="{{ item_class }}" href="/repos">repos</a>
+<a class="{{ item_class }}" href="/cache">cache</a>
+<a class="{{ item_class }}" href="/hosts">hosts</a>
+{%- endmacro %}
+
 {# Copy-pasteable `nix run` snippet for the synthetic-flake feature.
    Used on the repo, eval, and job pages — `id` must be unique per
    page, `command` is the literal shell line. `note` is rendered as
