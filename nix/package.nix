@@ -6,22 +6,32 @@
 }:
 
 let
+  workspaceRoot = ./..;
+
+  # The build source is exactly the Cargo workspace: the two manifests
+  # plus every member crate's directory — with the member list read
+  # from `Cargo.toml` itself. So a new crate, or a new non-Rust asset a
+  # crate embeds (`include_str!`-ed data like `slogans.txt`, an Askama
+  # template, a `.sql` migration), needs no change here: `Cargo.toml`
+  # is the single source of truth, not an ever-growing extension
+  # whitelist.
+  #
+  # Scoping to crate directories (rather than filtering the whole tree
+  # by file extension) also keeps the build cache honest — editing
+  # `docs/`, `nix/`, `flake.nix` or the README never enters this
+  # fileset, so it never rebuilds the Rust crates. Untracked files are
+  # already excluded upstream: a flake's source is its git tree.
+  members = (builtins.fromTOML (builtins.readFile (workspaceRoot + "/Cargo.toml"))).workspace.members;
+
   src = lib.fileset.toSource {
-    root = ./..;
-    fileset = lib.fileset.fileFilter (
-      file:
-      file.hasExt "rs"
-      || file.hasExt "sql"
-      || file.hasExt "css"
-      || file.hasExt "html"
-      || file.hasExt "svg"
-      || file.hasExt "ico"
-      || file.hasExt "png"
-      || file.hasExt "js"
-      || file.hasExt "LICENSE"
-      || file.name == "Cargo.toml"
-      || file.name == "Cargo.lock"
-    ) ./..;
+    root = workspaceRoot;
+    fileset = lib.fileset.unions (
+      [
+        (workspaceRoot + "/Cargo.toml")
+        (workspaceRoot + "/Cargo.lock")
+      ]
+      ++ map (member: workspaceRoot + "/${member}") members
+    );
   };
 
   rust = naersk.buildPackage {
