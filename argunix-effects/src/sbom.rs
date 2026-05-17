@@ -312,46 +312,68 @@ fn classify(head: &[u8]) -> Option<Blob> {
     None
 }
 
-/// Walk an `oci-archive` tarball: try every blob as a (possibly
-/// compressed) layer tar and union the `/nix/store` directory names
-/// they contain. JSON manifest / config blobs do not classify as a
-/// layer and are skipped; a multi-arch index simply has more layers.
+/// Scan an OCI image archive and union the `/nix/store` directory names
+/// across all of its layer blobs.
+///
+/// The archive itself may be a plain, gzip- or zstd-compressed tar (the
+/// `oci-image-*.tar.gz` shape nix produces), and inside it each layer
+/// blob may again be compressed — both levels are sniffed and
+/// decompressed. JSON manifest / config blobs do not classify as a tar
+/// and are skipped; a multi-arch index simply has more layer blobs, so
+/// every platform's paths land in one set.
 fn scan_oci_archive(archive: &Path) -> Result<Vec<String>, String> {
     let file =
         std::fs::File::open(archive).map_err(|e| format!("opening {}: {e}", archive.display()))?;
-    let mut outer = tar::Archive::new(file);
-    let entries = outer
-        .entries()
-        .map_err(|e| format!("reading image archive: {e}"))?;
+    let outer = open_maybe_tar(file)
+        .map_err(|e| format!("reading image archive: {e}"))?
+        .ok_or("image archive is not a tar (plain, gzip or zstd)")?;
 
     let mut names: BTreeSet<String> = BTreeSet::new();
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("reading image archive entry: {e}"))?;
-        if entry.header().entry_type().is_dir() {
-            continue;
-        }
-        // Sniff the head, then put it back in front of the rest of the
-        // blob so the classifier's peek is not lost.
-        let mut head = [0u8; SNIFF_LEN];
-        let n = read_fill(&mut entry, &mut head).map_err(|e| format!("reading blob: {e}"))?;
-        let Some(kind) = classify(&head[..n]) else {
-            continue;
-        };
-        let reader = Cursor::new(head[..n].to_vec()).chain(entry);
-        match kind {
-            Blob::Gzip => collect_layer(GzDecoder::new(reader), &mut names)?,
-            Blob::Zstd => {
-                let dec = zstd::stream::read::Decoder::new(reader)
-                    .map_err(|e| format!("zstd decoder: {e}"))?;
-                collect_layer(dec, &mut names)?;
-            }
-            Blob::Tar => collect_layer(reader, &mut names)?,
-        }
-    }
+    scan_layout_tar(outer, &mut names)?;
     Ok(names
         .into_iter()
         .map(|n| format!("/nix/store/{n}"))
         .collect())
+}
+
+/// Iterate one OCI-layout tar; every blob is tried as a layer.
+fn scan_layout_tar<R: Read>(reader: R, names: &mut BTreeSet<String>) -> Result<(), String> {
+    let mut layout = tar::Archive::new(reader);
+    let entries = layout
+        .entries()
+        .map_err(|e| format!("reading image archive entries: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("reading image archive entry: {e}"))?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        // A blob that does not sniff as a tar is a JSON manifest /
+        // config — skip it.
+        if let Some(layer) =
+            open_maybe_tar(entry).map_err(|e| format!("reading layer blob: {e}"))?
+        {
+            collect_layer(layer, names)?;
+        }
+    }
+    Ok(())
+}
+
+/// Sniff the head of `reader`; if it is a plain, gzip- or
+/// zstd-compressed tar, return a reader yielding the decompressed tar
+/// stream. `None` when the bytes are not a tar at all. The sniffed
+/// prefix is chained back in front so no bytes are lost.
+fn open_maybe_tar<'a, R: Read + 'a>(mut reader: R) -> std::io::Result<Option<Box<dyn Read + 'a>>> {
+    let mut head = [0u8; SNIFF_LEN];
+    let n = read_fill(&mut reader, &mut head)?;
+    let Some(kind) = classify(&head[..n]) else {
+        return Ok(None);
+    };
+    let chained = Cursor::new(head[..n].to_vec()).chain(reader);
+    Ok(Some(match kind {
+        Blob::Gzip => Box::new(GzDecoder::new(chained)),
+        Blob::Zstd => Box::new(zstd::stream::read::Decoder::new(chained)?),
+        Blob::Tar => Box::new(chained),
+    }))
 }
 
 /// Read into `buf` until it is full or the reader is exhausted,
@@ -647,6 +669,11 @@ mod tests {
             nix_store_name(Path::new("./nix/store/abc-bar")),
             Some("abc-bar".to_string()),
         );
+        // …as is an absolute path — nix image layers record these.
+        assert_eq!(
+            nix_store_name(Path::new("/nix/store/abc-baz-2.0/lib/x.so")),
+            Some("abc-baz-2.0".to_string()),
+        );
         // Not under /nix/store, and the store-optimiser `.links` dir.
         assert_eq!(nix_store_name(Path::new("etc/passwd")), None);
         assert_eq!(nix_store_name(Path::new("nix/store/.links")), None);
@@ -677,6 +704,57 @@ mod tests {
         assert_eq!(
             names.into_iter().collect::<Vec<_>>(),
             vec!["aaa-foo-1.0".to_string(), "bbb-libc-2.39".to_string()],
+        );
+    }
+
+    #[test]
+    fn scan_layout_tar_reads_compressed_layers_and_skips_json() {
+        use std::io::Write;
+
+        // A gzip-compressed layer carrying one store path, recorded
+        // with an absolute `/nix/store/...` path as nix images do.
+        let layer_gz = {
+            let mut layer = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut layer);
+                let data = b"x";
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, "nix/store/zzz-pkg-1.0/bin/pkg", &data[..])
+                    .unwrap();
+                builder.finish().unwrap();
+            }
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&layer).unwrap();
+            enc.finish().unwrap()
+        };
+
+        // An OCI-layout tar holding that layer blob plus a JSON blob —
+        // the JSON manifest must be skipped, the layer scanned.
+        let mut layout = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut layout);
+            for (path, body) in [
+                ("blobs/sha256/aaa", layer_gz.as_slice()),
+                ("index.json", br#"{"schemaVersion":2}"#.as_slice()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_cksum();
+                builder.append_data(&mut header, path, body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+
+        let mut names = BTreeSet::new();
+        scan_layout_tar(Cursor::new(layout), &mut names).unwrap();
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["zzz-pkg-1.0".to_string()],
         );
     }
 }

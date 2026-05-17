@@ -220,7 +220,9 @@ in
         "skopeo --insecure-policy copy"
         " docker-archive:${prebuiltImage} oci:/tmp/oci-layout"
     )
-    machine.succeed("tar -cf /tmp/fixture/oci-image.tar -C /tmp/oci-layout .")
+    # gzip-compress the outer archive, matching the `oci-image-*.tar.gz`
+    # shape nix produces — argunix must decompress it before scanning.
+    machine.succeed("tar -czf /tmp/fixture/oci-image.tar -C /tmp/oci-layout .")
 
     # Build with the daemon stopped so a single sqlite writer touches
     # /var/lib/argunix/db.sqlite.
