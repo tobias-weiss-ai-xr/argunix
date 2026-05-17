@@ -111,9 +111,10 @@ impl Effect for SbomAttach {
     }
 
     fn severity(&self) -> Severity {
-        // A missing SBOM is a degraded supply-chain surface, not a
-        // broken build — same policy as `registry-push`.
-        Severity::Advisory
+        // The SBOM attach gets its own forge check so contributors see
+        // it was published. A failure does not fail the job — same
+        // policy as `registry-push`.
+        Severity::Reported
     }
 
     async fn run(&self, ctx: &OutputContext<'_>) -> EffectOutcome {
@@ -136,33 +137,12 @@ impl Effect for SbomAttach {
             tag,
         );
 
-        // Generation — pure. Either the flake declared the contents
-        // (`meta.sbom-runtime-roots`), or — the default — argunix reads
-        // the `/nix/store` entries straight out of the built image's
-        // OCI layers.
-        let store_paths = if ctx.sbom_runtime_roots.is_empty() {
-            let Some(archive) = ctx.primary_output() else {
-                return EffectOutcome::failure("build produced no image archive to read");
+        // Generation — pure (see `generate_sbom`).
+        let (sbom, n_components) =
+            match generate_sbom(ctx.attr_path, ctx.output_paths, ctx.sbom_runtime_roots).await {
+                Ok(v) => v,
+                Err(e) => return EffectOutcome::failure(e),
             };
-            match store_paths_from_image(archive).await {
-                Ok(p) => p,
-                Err(e) => return EffectOutcome::failure(format!("reading image contents: {e}")),
-            }
-        } else {
-            match closure_from_roots(ctx.sbom_runtime_roots).await {
-                Ok(p) => p,
-                Err(e) => return EffectOutcome::failure(format!("resolving sbom roots: {e}")),
-            }
-        };
-        if store_paths.is_empty() {
-            return EffectOutcome::failure("no /nix/store paths found for the image");
-        }
-        let n_components = store_paths.len();
-        let doc = build_cyclonedx(&image, &store_paths);
-        let sbom = match serde_json::to_vec_pretty(&doc) {
-            Ok(bytes) => bytes,
-            Err(e) => return EffectOutcome::failure(format!("serializing SBOM: {e}")),
-        };
 
         // `oras attach` reads the SBOM from a file; stage it next to
         // the system temp dir, remove it once the push is done.
@@ -249,6 +229,45 @@ impl SbomAttach {
             .await
             .map(|_| ())
     }
+}
+
+/// Generate the CycloneDX SBOM for an OCI image job: resolve the
+/// runtime store paths (from the image layers, or `meta`-declared
+/// roots) and serialize a CycloneDX document. Returns
+/// `(json_bytes, component_count)`.
+///
+/// Pure — a function of the Nix store graph, and deterministic (no
+/// timestamp). The daemon calls this both to attach the SBOM as a
+/// registry referrer ([`SbomAttach`]) and to persist it to the store;
+/// because it is deterministic, both callers get byte-identical
+/// documents. Takes the raw inputs rather than an [`OutputContext`] so
+/// the daemon can call it without building one. `Err` carries a
+/// human-readable reason.
+pub async fn generate_sbom(
+    attr_path: &str,
+    output_paths: &[String],
+    sbom_runtime_roots: &[String],
+) -> Result<(Vec<u8>, usize), String> {
+    let image = image_segment(attr_path);
+    let store_paths = if sbom_runtime_roots.is_empty() {
+        let archive = output_paths
+            .first()
+            .ok_or_else(|| "build produced no image archive to read".to_string())?;
+        store_paths_from_image(archive)
+            .await
+            .map_err(|e| format!("reading image contents: {e}"))?
+    } else {
+        closure_from_roots(sbom_runtime_roots)
+            .await
+            .map_err(|e| format!("resolving sbom roots: {e}"))?
+    };
+    if store_paths.is_empty() {
+        return Err("no /nix/store paths found for the image".to_string());
+    }
+    let count = store_paths.len();
+    let doc = build_cyclonedx(&image, &store_paths);
+    let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| format!("serializing SBOM: {e}"))?;
+    Ok((bytes, count))
 }
 
 /// Resolve declared `meta.sbom-runtime-roots` to the full runtime

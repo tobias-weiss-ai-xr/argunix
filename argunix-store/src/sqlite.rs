@@ -1,11 +1,11 @@
 use crate::records::{
     BuilderRecord, DockerImageRecord, EffectRunRecord, EvalJobTally, EvalRecord, EvalWithRepo,
     ForgeStatusRecord, JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation,
-    NewJob, RepoRecord,
+    NewJob, RepoRecord, SbomRecord,
 };
 use crate::traits::{
     BuilderStore, DockerImageStore, EffectRunStore, EvalStore, ForgeStatusStore, InterruptOutcome,
-    JobStore, MAX_INTERRUPTIONS, RepoStore, StoreError,
+    JobStore, MAX_INTERRUPTIONS, RepoStore, SbomStore, StoreError,
 };
 use argunix_domain::{
     AttrPath, BuilderCapabilities, BuilderId, BuilderName, BuilderNameError, BuilderPubkey,
@@ -176,6 +176,7 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
     let pull_bytes: Option<i64> = row.try_get("pull_bytes")?;
     let pull_ms: Option<i64> = row.try_get("pull_ms")?;
     let cache_push_ms: Option<i64> = row.try_get("cache_push_ms")?;
+    let image_size_bytes: Option<i64> = row.try_get("image_size_bytes")?;
     let main_program: Option<String> = row.try_get("main_program")?;
     let outputs_json: Option<String> = row.try_get("outputs_json")?;
     // Pre-`outputs_json` rows store NULL; parse failures are surfaced
@@ -210,6 +211,7 @@ fn map_job(row: &SqliteRow) -> Result<JobRecord, StoreError> {
         ),
         main_program,
         outputs,
+        image_size_bytes: to_u64(image_size_bytes),
     })
 }
 
@@ -689,7 +691,7 @@ impl JobStore for SqlxStore {
             "SELECT id, eval_id, attr_path, drv_path, system, started_at, finished_at,
                     status, log_path, output_path, builder_id, interrupt_count, failure_reason,
                     push_bytes, push_ms, build_ms, pull_bytes, pull_ms,
-                    cache_push_ms, main_program, outputs_json
+                    cache_push_ms, main_program, outputs_json, image_size_bytes
              FROM jobs WHERE id = ?1",
         )
         .bind(id.get())
@@ -703,7 +705,7 @@ impl JobStore for SqlxStore {
             "SELECT id, eval_id, attr_path, drv_path, system, started_at, finished_at,
                     status, log_path, output_path, builder_id, interrupt_count, failure_reason,
                     push_bytes, push_ms, build_ms, pull_bytes, pull_ms,
-                    cache_push_ms, main_program, outputs_json
+                    cache_push_ms, main_program, outputs_json, image_size_bytes
              FROM jobs WHERE eval_id = ?1 ORDER BY id",
         )
         .bind(eval_id.get())
@@ -751,7 +753,7 @@ impl JobStore for SqlxStore {
                     j.started_at, j.finished_at, j.status, j.log_path, j.output_path,
                     j.builder_id, j.interrupt_count, j.failure_reason,
                     j.push_bytes, j.push_ms, j.build_ms, j.pull_bytes, j.pull_ms,
-                    j.cache_push_ms, j.main_program, j.outputs_json,
+                    j.cache_push_ms, j.main_program, j.outputs_json, j.image_size_bytes,
                     r.forge AS r_forge, r.slug AS r_slug,
                     e.git_ref AS e_git_ref, e.sha AS e_sha
              FROM jobs j
@@ -771,7 +773,7 @@ impl JobStore for SqlxStore {
                     j.started_at, j.finished_at, j.status, j.log_path, j.output_path,
                     j.builder_id, j.interrupt_count, j.failure_reason,
                     j.push_bytes, j.push_ms, j.build_ms, j.pull_bytes, j.pull_ms,
-                    j.cache_push_ms, j.main_program, j.outputs_json,
+                    j.cache_push_ms, j.main_program, j.outputs_json, j.image_size_bytes,
                     r.forge AS r_forge, r.slug AS r_slug,
                     e.git_ref AS e_git_ref, e.sha AS e_sha
              FROM jobs j
@@ -845,6 +847,16 @@ impl JobStore for SqlxStore {
     async fn record_cache_push_ms(&self, id: JobId, cache_push_ms: u64) -> Result<(), StoreError> {
         let clamped = cache_push_ms.min(i64::MAX as u64) as i64;
         sqlx::query("UPDATE jobs SET cache_push_ms = ?1 WHERE id = ?2")
+            .bind(clamped)
+            .bind(id.get())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn record_image_size(&self, id: JobId, size_bytes: u64) -> Result<(), StoreError> {
+        let clamped = size_bytes.min(i64::MAX as u64) as i64;
+        sqlx::query("UPDATE jobs SET image_size_bytes = ?1 WHERE id = ?2")
             .bind(clamped)
             .bind(id.get())
             .execute(&self.pool)
@@ -1339,6 +1351,59 @@ impl EffectRunStore for SqlxStore {
     }
 }
 
+fn map_sbom(row: &SqliteRow) -> Result<SbomRecord, StoreError> {
+    let component_count: i64 = row.try_get("component_count")?;
+    Ok(SbomRecord {
+        id: row.try_get("id")?,
+        job_id: JobId::new(row.try_get("job_id")?),
+        format: row.try_get("format")?,
+        content: row.try_get("content")?,
+        component_count: component_count.max(0) as u32,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+#[async_trait]
+impl SbomStore for SqlxStore {
+    async fn upsert_sbom(
+        &self,
+        job_id: JobId,
+        format: &str,
+        content: &str,
+        component_count: u32,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO sboms (job_id, format, content, component_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(job_id) DO UPDATE SET
+                 format = excluded.format,
+                 content = excluded.content,
+                 component_count = excluded.component_count,
+                 created_at = excluded.created_at",
+        )
+        .bind(job_id.get())
+        .bind(format)
+        .bind(content)
+        .bind(component_count as i64)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_sbom_by_job(&self, job_id: JobId) -> Result<Option<SbomRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, job_id, format, content, component_count, created_at
+             FROM sboms WHERE job_id = ?1",
+        )
+        .bind(job_id.get())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(map_sbom).transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1668,6 +1733,96 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, job_id);
+    }
+
+    #[tokio::test]
+    async fn image_size_and_sbom_round_trip() {
+        let s = store().await;
+        let repo_id = <SqlxStore as RepoStore>::upsert(&s, "github", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        let eval_id = <SqlxStore as EvalStore>::create(
+            &s,
+            NewEvaluation {
+                repo_id,
+                trigger: "push".to_string(),
+                git_ref: "refs/heads/main".to_string(),
+                sha: Sha::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                pr_number: None,
+            },
+        )
+        .await
+        .unwrap();
+        let job_id = <SqlxStore as JobStore>::create(
+            &s,
+            NewJob {
+                eval_id,
+                attr_path: AttrPath::new("packages.x86_64-linux.img"),
+                drv_path: Some("/nix/store/xxx-img.drv".to_string()),
+                system: "x86_64-linux".to_string(),
+                main_program: None,
+                outputs: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // image size: unset until recorded, then surfaced on the JobRecord.
+        let j = <SqlxStore as JobStore>::get(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(j.image_size_bytes, None);
+        <SqlxStore as JobStore>::record_image_size(&s, job_id, 26_091_520)
+            .await
+            .unwrap();
+        let j = <SqlxStore as JobStore>::get(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(j.image_size_bytes, Some(26_091_520));
+
+        // SBOM: none, then upsert, then overwrite (one row per job).
+        assert!(
+            <SqlxStore as SbomStore>::get_sbom_by_job(&s, job_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        <SqlxStore as SbomStore>::upsert_sbom(
+            &s,
+            job_id,
+            "cyclonedx",
+            r#"{"bomFormat":"CycloneDX"}"#,
+            7,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let got = <SqlxStore as SbomStore>::get_sbom_by_job(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.format, "cyclonedx");
+        assert_eq!(got.component_count, 7);
+        assert!(got.content.contains("CycloneDX"));
+
+        // upsert overwrites in place — still one row for the job.
+        <SqlxStore as SbomStore>::upsert_sbom(
+            &s,
+            job_id,
+            "cyclonedx",
+            r#"{"bomFormat":"CycloneDX","v":2}"#,
+            9,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let got = <SqlxStore as SbomStore>::get_sbom_by_job(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.component_count, 9);
     }
 
     #[tokio::test]

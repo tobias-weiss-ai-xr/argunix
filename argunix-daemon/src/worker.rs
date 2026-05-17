@@ -22,7 +22,7 @@ use argunix_builders::{
     nix_copy_over_pool,
 };
 use argunix_domain::{EvalId, EvalStatus, ImageFormat, JobId, JobStatus, RepoId, Sha, Slug};
-use argunix_effects::{Effect, OutputContext};
+use argunix_effects::{Effect, EffectStatus, OutputContext, Severity};
 use argunix_forge::{CheckPost, CheckState, ForgeError, Provider};
 use argunix_sched::ScheduleStrategy;
 use argunix_store::{EvalStore, JobPhaseMetrics, JobStore, RepoStore, SqlxStore};
@@ -775,6 +775,7 @@ async fn run_build_phase(
                         &spec,
                         &push_caches_c,
                         &registry_effects_c,
+                        collapsed_mode,
                         &cancel_c,
                     )
                     .instrument(span)
@@ -1570,6 +1571,7 @@ fn format_eval_error_log(attr_path: &str, error: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn build_one(
     ctx: &WorkerContext,
     repo: &argunix_store::RepoRecord,
@@ -1578,6 +1580,7 @@ async fn build_one(
     spec: &argunix_eval::JobSpec,
     push_caches: &[argunix_build::PushCache],
     registry_effects: &[Arc<dyn Effect>],
+    collapsed_mode: bool,
     cancel: &argunix_web::CancelToken,
 ) -> anyhow::Result<JobStatus> {
     let repo_id = repo.id;
@@ -1619,6 +1622,7 @@ async fn build_one(
                 job_id,
                 push_caches,
                 registry_effects,
+                collapsed_mode,
                 vec![output],
             );
             return Ok(JobStatus::Cached);
@@ -1856,6 +1860,7 @@ async fn build_one(
                 job_id,
                 push_caches,
                 registry_effects,
+                collapsed_mode,
                 outcome.output_paths.clone(),
             );
 
@@ -1924,25 +1929,51 @@ fn spawn_post_build_effects(
     job_id: JobId,
     push_caches: &[argunix_build::PushCache],
     registry_effects: &[Arc<dyn Effect>],
+    collapsed_mode: bool,
     output_paths: Vec<String>,
 ) {
-    if (push_caches.is_empty() && registry_effects.is_empty()) || output_paths.is_empty() {
+    // An OCI image always has post-build work even with no caches /
+    // registries configured: its size and SBOM are recorded regardless.
+    let is_oci = spec.image_format == Some(ImageFormat::Oci);
+    if output_paths.is_empty() || (push_caches.is_empty() && registry_effects.is_empty() && !is_oci)
+    {
         return;
     }
     let store = ctx.store.clone();
     let caches: Vec<argunix_build::PushCache> = push_caches.to_vec();
     let reg_effects: Vec<Arc<dyn Effect>> = registry_effects.to_vec();
     let forge = repo.forge.clone();
-    let slug = repo.slug.as_str().to_string();
+    let slug = repo.slug.clone();
+    let sha = eval.sha.clone();
+    let eval_id = eval.id;
     let default_branch = repo.default_branch.clone();
     let git_ref = eval.git_ref.clone();
-    let sha = eval.sha.as_str().to_string();
     let attr_path = spec.attr_path.as_str().to_string();
     let system = spec.system.clone().unwrap_or_else(|| "unknown".to_string());
     let image_format = spec.image_format;
     let sbom_roots = argunix_effects::sbom::runtime_roots(&spec.meta);
+    // Resolved up front so the spawned task doesn't borrow the config
+    // snapshot. `Reported` effects post their own forge check through
+    // this provider.
+    let snap = ctx.current.load();
+    let provider = snap.providers.get(&repo.forge).cloned();
+    let external_url = snap.config.external_url.clone();
+    drop(snap);
+    let pauses = ctx.pauses.clone();
     tokio::spawn(
         async move {
+            // Record image size + persist the CycloneDX SBOM for OCI
+            // images, before any push — independent of effect config.
+            if image_format == Some(ImageFormat::Oci) {
+                crate::effects::record_image_artifacts(
+                    &store,
+                    job_id,
+                    &attr_path,
+                    &output_paths,
+                    &sbom_roots,
+                )
+                .await;
+            }
             if !caches.is_empty() {
                 crate::effects::cache_push_and_record(
                     &store,
@@ -1956,21 +1987,71 @@ fn spawn_post_build_effects(
             if !reg_effects.is_empty() {
                 let octx = OutputContext {
                     forge: &forge,
-                    repo_slug: &slug,
+                    repo_slug: slug.as_str(),
                     attr_path: &attr_path,
                     system: &system,
                     git_ref: &git_ref,
                     default_branch: default_branch.as_deref(),
-                    sha: &sha,
+                    sha: sha.as_str(),
                     image_format,
                     output_paths: &output_paths,
                     sbom_runtime_roots: &sbom_roots,
                 };
-                crate::effects::run_effects(&store, job_id, &reg_effects, &octx).await;
+                let reports =
+                    crate::effects::run_effects(&store, job_id, &reg_effects, &octx).await;
+                // `Reported` effects (registry-push, sbom-attach) post
+                // their own forge check, so a contributor sees the
+                // published image / SBOM in their PR checks. Suppressed
+                // in collapsed-check mode, like per-job checks.
+                if !collapsed_mode {
+                    if let Some(provider) = &provider {
+                        for r in &reports {
+                            if r.severity != Severity::Reported {
+                                continue;
+                            }
+                            let state = match r.status {
+                                EffectStatus::Success => CheckState::Success,
+                                EffectStatus::Failure => CheckState::Failure,
+                                // A skipped effect (e.g. a non-image
+                                // job) gets no forge check at all.
+                                EffectStatus::Skipped => continue,
+                            };
+                            let post = CheckPost {
+                                slug: slug.clone(),
+                                sha: sha.clone(),
+                                context: format!(
+                                    "argunix: {} · {}",
+                                    effect_check_label(r.kind),
+                                    r.target,
+                                ),
+                                state,
+                                description: Some(summarise_for_check(&r.detail, 140)),
+                                target_url: Some(job_target_url(
+                                    &external_url,
+                                    &forge,
+                                    &slug,
+                                    eval_id,
+                                    &attr_path,
+                                )),
+                            };
+                            spawn_post_check(provider.clone(), post, forge.clone(), pauses.clone());
+                        }
+                    }
+                }
             }
         }
         .in_current_span(),
     );
+}
+
+/// Short label for an effect's forge-check context: `registry-push` →
+/// `registry`, `sbom-attach` → `sbom`; any other kind passes through.
+fn effect_check_label(kind: &str) -> &str {
+    match kind {
+        "registry-push" => "registry",
+        "sbom-attach" => "sbom",
+        other => other,
+    }
 }
 
 /// Best-effort docker registry publish. Any error is logged at `warn`

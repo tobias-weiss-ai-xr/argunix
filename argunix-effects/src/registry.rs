@@ -100,10 +100,11 @@ impl Effect for RegistryPush {
     }
 
     fn severity(&self) -> Severity {
-        // A registry that rejects a push is a degraded distribution
-        // path, not a broken build — the artifact is already realised
-        // and (typically) in a cache. Same policy as binary-cache push.
-        Severity::Advisory
+        // A push gets its own forge check so contributors see the
+        // published image (and its pull reference) in their PR checks.
+        // A rejected push still does not fail the job — the artifact is
+        // realised, only distribution degraded.
+        Severity::Reported
     }
 
     async fn run(&self, ctx: &OutputContext<'_>) -> EffectOutcome {

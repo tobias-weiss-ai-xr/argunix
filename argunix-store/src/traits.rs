@@ -1,7 +1,7 @@
 use crate::records::{
     BuilderRecord, DockerImageRecord, EffectRunRecord, EvalJobTally, EvalRecord, EvalWithRepo,
     ForgeStatusRecord, JobPhaseMetrics, JobRecord, JobWithContext, NewBuilder, NewDockerImage,
-    NewEvaluation, NewJob, RepoRecord,
+    NewEvaluation, NewJob, RepoRecord, SbomRecord,
 };
 use argunix_domain::{
     BuilderId, BuilderPubkey, EvalId, EvalStatus, JobId, JobStatus, RepoId, Slug,
@@ -305,6 +305,11 @@ pub trait JobStore: Send + Sync {
     /// row was already gone (operator-deleted, retention pass, etc.).
     async fn record_cache_push_ms(&self, id: JobId, cache_push_ms: u64) -> Result<(), StoreError>;
 
+    /// Record the on-disk size of an image job's built archive. Called
+    /// post-`finish` by the coordinator once the output closure is
+    /// local. No-op if the row was already gone.
+    async fn record_image_size(&self, id: JobId, size_bytes: u64) -> Result<(), StoreError>;
+
     /// Transport-failure recovery for the dynamic builder pool. Under
     /// a single transaction: increment `interrupt_count`; if the new
     /// count is ≤ `MAX_INTERRUPTIONS`, flip status to `Interrupted`;
@@ -453,6 +458,26 @@ pub trait EffectRunStore: Send + Sync {
         &self,
         job_id: JobId,
     ) -> Result<Vec<EffectRunRecord>, StoreError>;
+}
+
+#[async_trait]
+pub trait SbomStore: Send + Sync {
+    /// Insert or replace the stored SBOM for `job_id`. One SBOM per job
+    /// — a rebuilt job overwrites. `format` is e.g. `cyclonedx`;
+    /// `content` is the verbatim JSON document; `component_count` is
+    /// denormalised from it for cheap display.
+    async fn upsert_sbom(
+        &self,
+        job_id: JobId,
+        format: &str,
+        content: &str,
+        component_count: u32,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+
+    /// The stored SBOM for `job_id`, or `None` if the job has no SBOM
+    /// (not an image, or built before SBOM storage existed).
+    async fn get_sbom_by_job(&self, job_id: JobId) -> Result<Option<SbomRecord>, StoreError>;
 }
 
 #[async_trait]

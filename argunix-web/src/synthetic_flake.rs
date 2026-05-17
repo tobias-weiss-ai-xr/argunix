@@ -498,6 +498,7 @@ mod tests {
             phase_metrics: Default::default(),
             main_program: None,
             outputs,
+            image_size_bytes: None,
         }
     }
 

@@ -399,5 +399,60 @@ in
     assert '"name": "busybox"' in sbom, (
         f"expected a `busybox` component in the SBOM{envelope}\nSBOM:\n{sbom}"
     )
+
+    # --- DB persistence + web UI -------------------------------------
+    # The post-build step records the image archive size and persists
+    # the SBOM in the database, independent of the registry push.
+    img_size = machine.succeed(
+        "sqlite3 /var/lib/argunix/db.sqlite "
+        "'SELECT image_size_bytes FROM jobs WHERE id = 1;'"
+    ).strip()
+    print(f"jobs.image_size_bytes: {img_size!r}")
+    assert img_size.isdigit() and int(img_size) > 0, (
+        f"expected a non-zero jobs.image_size_bytes, got {img_size!r}{envelope}"
+    )
+
+    sbom_row = machine.succeed(
+        "sqlite3 /var/lib/argunix/db.sqlite "
+        "'SELECT format, component_count FROM sboms WHERE job_id = 1;'"
+    ).strip()
+    print(f"sboms row: {sbom_row!r}")
+    assert sbom_row.startswith("cyclonedx|"), (
+        f"expected a stored cyclonedx SBOM row{envelope}\nsboms: {sbom_row!r}"
+    )
+
+    # Bring the daemon back up to serve the web UI against the same db.
+    machine.succeed("systemctl start argunix.service")
+    machine.wait_for_open_port(${toString argunixPort})
+
+    job_url = (
+        "http://127.0.0.1:${toString argunixPort}"
+        "/r/gh/myorg/myrepo/eval/1/job/packages.x86_64-linux.oci-image"
+    )
+    job_html = machine.succeed(f"curl -fsS {job_url}")
+    print(f"--- job page ---\n{job_html}")
+    assert "image size" in job_html, (
+        f"job page is missing the image-size row{envelope}"
+    )
+    assert "registry-push" in job_html, (
+        f"job page is missing the effects panel{envelope}"
+    )
+    assert "browse the SBOM" in job_html, (
+        f"job page is missing the SBOM link{envelope}"
+    )
+
+    # The SBOM browser page renders the component table server-side.
+    sbom_html = machine.succeed(f"curl -fsS {job_url}/sbom")
+    print(f"--- sbom page ---\n{sbom_html}")
+    assert "Software Bill of Materials" in sbom_html, "SBOM page did not render"
+    assert "busybox" in sbom_html, "SBOM page is missing the busybox component"
+
+    # Content negotiation: the same route yields the raw CycloneDX JSON.
+    sbom_api = machine.succeed(
+        f"curl -fsS -H 'Accept: application/json' {job_url}/sbom"
+    )
+    assert '"bomFormat": "CycloneDX"' in sbom_api, (
+        f"the SBOM route did not return CycloneDX JSON{envelope}\n{sbom_api}"
+    )
   '';
 }

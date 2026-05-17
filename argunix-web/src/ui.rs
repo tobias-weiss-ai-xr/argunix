@@ -6,6 +6,7 @@
 //!   GET /r/<forge>/<...slug>/eval/<id>                          — eval detail (job table)
 //!   GET /r/<forge>/<...slug>/eval/<id>/job/<attr>               — single job detail
 //!   GET /r/<forge>/<...slug>/eval/<id>/job/<attr>/log           — decompressed build log
+//!   GET /r/<forge>/<...slug>/eval/<id>/job/<attr>/sbom          — the job's CycloneDX SBOM
 //!
 //! All `/r/...` paths share a single axum catch-all (`/r/{forge}/{*tail}`)
 //! and dispatch on segment markers (`/eval/`, `/job/`) — that's the
@@ -21,7 +22,9 @@ use crate::state::AppState;
 use argunix_builders::ConnState;
 use argunix_config::ForgeConfig;
 use argunix_domain::{EvalId, EvalStatus, JobStatus, Slug};
-use argunix_store::{BuilderStore, EvalJobTally, EvalStore, JobStore, RepoStore};
+use argunix_store::{
+    BuilderStore, EffectRunStore, EvalJobTally, EvalStore, JobStore, RepoStore, SbomStore,
+};
 use askama::Template;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -414,6 +417,56 @@ struct JobTemplate {
     /// non-green jobs (nothing to expose), or instances with no
     /// public cache configured.
     nix_run_snippet: Option<String>,
+    /// Humanized on-disk size of the built image archive. `Some` only
+    /// for image jobs — drives an "image size" row next to `total`.
+    image_size: Option<String>,
+    /// Post-build effect outcomes (registry push, SBOM attach) for this
+    /// job. Empty for ordinary package jobs.
+    effects: Vec<EffectRow>,
+    /// True when a stored SBOM exists for this job — drives the
+    /// "browse SBOM" link.
+    has_sbom: bool,
+}
+
+/// One post-build effect outcome, rendered in the job page's effects
+/// panel.
+struct EffectRow {
+    /// Effect family — `registry-push`, `sbom-attach`, `cache-push`.
+    kind: String,
+    /// Named target — a registry catalog name or a cache URL.
+    target: String,
+    /// `running` | `success` | `failure` | `skipped`.
+    status: String,
+    /// One-line human summary — for a registry push this carries the
+    /// pull reference a user copy-pastes.
+    detail: String,
+}
+
+#[derive(Template)]
+#[template(path = "sbom.html")]
+struct SbomTemplate {
+    cluster_active: bool,
+    forge: String,
+    slug: String,
+    eval_id: i64,
+    attr_path: String,
+    /// `metadata.component.name` from the CycloneDX document.
+    image_name: String,
+    component_count: usize,
+    components: Vec<SbomComponentRow>,
+    /// The whole stored SBOM document, shown verbatim in a collapsible
+    /// `<pre>` for copy / inspection.
+    raw_json: String,
+}
+
+/// One CycloneDX component, flattened for the SBOM page's table.
+struct SbomComponentRow {
+    name: String,
+    /// `"—"` when the component declares no version.
+    version: String,
+    purl: String,
+    /// The `nix:store_path` property, or empty if absent.
+    store_path: String,
 }
 
 #[derive(Default)]
@@ -1224,6 +1277,13 @@ pub async fn dispatch_repo(
         TailKind::Log { eval_id, attr } => {
             log_handler(state, forge, slug, EvalId::new(eval_id), attr.to_string()).await
         }
+        TailKind::Sbom { eval_id, attr } => {
+            if wants_json(&headers) {
+                sbom_json(state, forge, slug, EvalId::new(eval_id), attr.to_string()).await
+            } else {
+                sbom_page(state, forge, slug, EvalId::new(eval_id), attr.to_string()).await
+            }
+        }
     }
 }
 
@@ -1251,6 +1311,7 @@ enum TailKind<'a> {
     Eval(i64),
     Job { eval_id: i64, attr: &'a str },
     Log { eval_id: i64, attr: &'a str },
+    Sbom { eval_id: i64, attr: &'a str },
 }
 
 /// Parse the path tail of `/r/<forge>/<tail>` into a slug + page kind.
@@ -1284,6 +1345,11 @@ fn parse_repo_tail(tail: &str) -> Option<ParsedTail<'_>> {
                     Some(ParsedTail {
                         slug,
                         kind: TailKind::Log { eval_id, attr },
+                    })
+                } else if let Some(attr) = after.strip_suffix("/sbom") {
+                    Some(ParsedTail {
+                        slug,
+                        kind: TailKind::Sbom { eval_id, attr },
                     })
                 } else {
                     Some(ParsedTail {
@@ -1600,6 +1666,23 @@ async fn job_page(
     } else {
         None
     };
+    // Post-build effects (registry push, SBOM attach) and whether a
+    // stored SBOM exists — surfaced in the job page's effects panel.
+    let effects =
+        <argunix_store::SqlxStore as EffectRunStore>::list_effect_runs_by_job(&state.store, job.id)
+            .await?
+            .into_iter()
+            .map(|e| EffectRow {
+                kind: e.kind,
+                target: e.target,
+                status: e.status,
+                detail: e.detail.unwrap_or_default(),
+            })
+            .collect();
+    let has_sbom = <argunix_store::SqlxStore as SbomStore>::get_sbom_by_job(&state.store, job.id)
+        .await?
+        .is_some();
+
     let cluster_active = cluster_is_active(&state).await?;
     let html = render(&JobTemplate {
         cluster_active,
@@ -1619,6 +1702,9 @@ async fn job_page(
         live_builder,
         phase_metrics,
         nix_run_snippet,
+        image_size: job.image_size_bytes.map(|b| humanize_bytes(Some(b))),
+        effects,
+        has_sbom,
     })?;
     Ok(Html(html).into_response())
 }
@@ -1642,6 +1728,20 @@ async fn job_json(
         .find(|j| j.attr_path.as_str() == attr)
         .ok_or(UiError::NotFound)?;
 
+    let effects: Vec<_> =
+        <argunix_store::SqlxStore as EffectRunStore>::list_effect_runs_by_job(&state.store, job.id)
+            .await?
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "kind": e.kind,
+                    "target": e.target,
+                    "status": e.status,
+                    "detail": e.detail,
+                })
+            })
+            .collect();
+
     let body = serde_json::json!({
         "forge": forge,
         "slug": slug.as_str(),
@@ -1654,6 +1754,8 @@ async fn job_json(
         "drv_path": job.drv_path,
         "output_path": job.output_path,
         "log_path": job.log_path,
+        // On-disk size of the built image archive; `null` for non-image jobs.
+        "image_size_bytes": job.image_size_bytes,
         // Per-phase transport accounting. `null` for jobs that
         // were built locally (no remote-transport phases).
         "phase_metrics": {
@@ -1664,6 +1766,8 @@ async fn job_json(
             "pull_ms": job.phase_metrics.pull_ms,
             "cache_push_ms": job.phase_metrics.cache_push_ms,
         },
+        // Post-build effect outcomes (registry push, SBOM attach, …).
+        "effects": effects,
     });
     Ok((
         StatusCode::OK,
@@ -1672,6 +1776,120 @@ async fn job_json(
             "application/json; charset=utf-8",
         )],
         serde_json::to_vec_pretty(&body).map_err(UiError::Json)?,
+    )
+        .into_response())
+}
+
+/// Look up a job by `(eval_id, attr)`. Shared by the job and SBOM
+/// handlers — both address a job that way.
+async fn job_by_attr(
+    state: &AppState,
+    eval_id: EvalId,
+    attr: &str,
+) -> Result<argunix_store::JobRecord, UiError> {
+    <argunix_store::SqlxStore as JobStore>::list_by_eval(&state.store, eval_id)
+        .await?
+        .into_iter()
+        .find(|j| j.attr_path.as_str() == attr)
+        .ok_or(UiError::NotFound)
+}
+
+/// The SBOM browser page: a stored CycloneDX document rendered as a
+/// component table, with the raw JSON in a collapsible block.
+async fn sbom_page(
+    State(state): State<AppState>,
+    forge: String,
+    slug: Slug,
+    eval_id: EvalId,
+    attr: String,
+) -> Result<Response, UiError> {
+    let job = job_by_attr(&state, eval_id, &attr).await?;
+    let sbom = <argunix_store::SqlxStore as SbomStore>::get_sbom_by_job(&state.store, job.id)
+        .await?
+        .ok_or(UiError::NotFound)?;
+
+    // Parse the stored CycloneDX document into a flat component table.
+    let doc: serde_json::Value = serde_json::from_str(&sbom.content).map_err(UiError::Json)?;
+    let image_name = doc
+        .pointer("/metadata/component/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let components = doc
+        .get("components")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|c| {
+                    let store_path = c
+                        .get("properties")
+                        .and_then(|p| p.as_array())
+                        .and_then(|props| {
+                            props.iter().find(|p| {
+                                p.get("name").and_then(|n| n.as_str()) == Some("nix:store_path")
+                            })
+                        })
+                        .and_then(|p| p.get("value").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                        .to_string();
+                    SbomComponentRow {
+                        name: c
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        version: c
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("—")
+                            .to_string(),
+                        purl: c
+                            .get("purl")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        store_path,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let cluster_active = cluster_is_active(&state).await?;
+    let html = render(&SbomTemplate {
+        cluster_active,
+        forge,
+        slug: slug.as_str().to_string(),
+        eval_id: eval_id.get(),
+        attr_path: job.attr_path.to_string(),
+        image_name,
+        component_count: sbom.component_count as usize,
+        components,
+        raw_json: sbom.content,
+    })?;
+    Ok(Html(html).into_response())
+}
+
+/// Raw stored SBOM, served when the client sends
+/// `Accept: application/json` to the `/sbom` route.
+async fn sbom_json(
+    State(state): State<AppState>,
+    _forge: String,
+    _slug: Slug,
+    eval_id: EvalId,
+    attr: String,
+) -> Result<Response, UiError> {
+    let job = job_by_attr(&state, eval_id, &attr).await?;
+    let sbom = <argunix_store::SqlxStore as SbomStore>::get_sbom_by_job(&state.store, job.id)
+        .await?
+        .ok_or(UiError::NotFound)?;
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        sbom.content.into_bytes(),
     )
         .into_response())
 }
@@ -2482,6 +2700,20 @@ mod tests {
         assert_eq!(
             p.kind,
             TailKind::Log {
+                eval_id: 3,
+                attr: "packages.x86_64-linux.hello",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_sbom() {
+        let p =
+            parse_repo_tail("myorg/myrepo/eval/3/job/packages.x86_64-linux.hello/sbom").unwrap();
+        assert_eq!(p.slug, "myorg/myrepo");
+        assert_eq!(
+            p.kind,
+            TailKind::Sbom {
                 eval_id: 3,
                 attr: "packages.x86_64-linux.hello",
             }

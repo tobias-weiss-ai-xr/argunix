@@ -126,22 +126,18 @@ impl OutputContext<'_> {
     }
 }
 
-/// How seriously a failing effect should be taken.
-///
-/// Declared per effect *kind*, never hardcoded globally — a flaky
-/// cache and a failed production deploy are not the same event.
+/// How an effect's outcome is surfaced. Declared per effect *kind*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
-    /// Failure is logged and recorded in `effect_runs`, but the job
-    /// stays green. Correct for opportunistic pushes (cache, registry):
-    /// the build itself succeeded, only distribution degraded.
-    Advisory,
-    /// Failure must surface on its own status line. Reserved for
-    /// effects like deploy where "did it actually happen" is the
-    /// whole point; no effect uses it yet, but [`Effect::severity`]
-    /// is the seam so a future deploy effect doesn't have to retrofit
-    /// the call site.
+    /// The outcome lives only in `effect_runs` and the daemon log — no
+    /// forge check of its own. A failure never fails the job. The seam
+    /// for a future purely-internal effect; no effect uses it today.
     #[allow(dead_code)]
+    Advisory,
+    /// The effect posts its **own** forge check — success or failure —
+    /// so a contributor sees it in their PR / commit checks alongside
+    /// the build. A failure still does *not* fail the job: a degraded
+    /// push is not a broken build; only the effect's own check goes red.
     Reported,
 }
 

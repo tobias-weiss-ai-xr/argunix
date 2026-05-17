@@ -21,6 +21,10 @@
   <dd class="text-muted">{{ finished }}</dd>
   <dt class="text-muted">total</dt>
   <dd class="font-mono">{{ total }}</dd>
+  {% if let Some(sz) = image_size %}
+  <dt class="text-muted">image size</dt>
+  <dd class="font-mono">{{ sz }}</dd>
+  {% endif %}
   {% if let Some(d) = drv_path %}
   <dt class="text-muted">derivation</dt>
   <dd class="font-mono break-all">{{ d }}</dd>
@@ -122,6 +126,46 @@
     </tbody>
   </table>
   </div>
+</section>
+{% endif %}
+
+{% if !effects.is_empty() %}
+<section class="mb-6">
+  <h2 class="text-lg font-semibold mb-2">registry &amp; effects</h2>
+  <p class="text-xs text-muted mb-2">
+    What argunix did with this build's output after it was realised —
+    pushing the image to a registry, attaching its SBOM. The detail
+    line of a registry push is the reference you pull.
+  </p>
+  <div class="overflow-x-auto">
+    <table class="text-sm border-collapse min-w-[32rem]">
+      <thead class="text-left text-muted">
+        <tr>
+          <th class="py-1 pr-6">effect</th>
+          <th class="py-1 pr-6">status</th>
+          <th class="py-1">detail</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in effects %}
+        <tr class="border-t border-border">
+          <td class="py-1 pr-6 font-mono">{{ e.kind }} · {{ e.target }}</td>
+          <td class="py-1 pr-6">{{ e.status }}</td>
+          <td class="py-1 font-mono break-all">{{ e.detail }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if has_sbom %}
+  <p class="mt-2">
+    <a
+      class="text-link hover:underline"
+      href="/r/{{ forge }}/{{ slug }}/eval/{{ eval_id }}/job/{{ attr_path }}/sbom"
+      >browse the SBOM →</a
+    >
+  </p>
+  {% endif %}
 </section>
 {% endif %}
 

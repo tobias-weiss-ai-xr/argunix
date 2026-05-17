@@ -933,6 +933,16 @@ async fn build_one_job(
                 )
                 .await;
             }
+            if spec.image_format == Some(ImageFormat::Oci) {
+                effects::record_image_artifacts(
+                    store,
+                    job_id,
+                    spec.attr_path.as_str(),
+                    &outputs,
+                    &argunix_effects::sbom::runtime_roots(&spec.meta),
+                )
+                .await;
+            }
             return Ok(JobStatus::Cached);
         }
     }
@@ -1011,6 +1021,16 @@ async fn build_one_job(
                     sha,
                     &outcome.output_paths,
                     registry_effects,
+                )
+                .await;
+            }
+            if spec.image_format == Some(ImageFormat::Oci) {
+                effects::record_image_artifacts(
+                    store,
+                    job_id,
+                    spec.attr_path.as_str(),
+                    &outcome.output_paths,
+                    &argunix_effects::sbom::runtime_roots(&spec.meta),
                 )
                 .await;
             }

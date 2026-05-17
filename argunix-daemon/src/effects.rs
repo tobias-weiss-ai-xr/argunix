@@ -16,11 +16,68 @@
 //! surface for it.
 
 use argunix_domain::JobId;
-use argunix_effects::{Effect, EffectStatus, OutputContext};
-use argunix_store::{EffectRunStore, JobStore, SqlxStore};
+use argunix_effects::{Effect, EffectStatus, OutputContext, Severity};
+use argunix_store::{EffectRunStore, JobStore, SbomStore, SqlxStore};
 use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Post-build bookkeeping for a successful OCI-image job: stamp the
+/// built archive's on-disk size onto the job row, and generate +
+/// persist its CycloneDX SBOM. Both are best-effort — a failure is
+/// logged and the job stays green. Runs independently of any
+/// registry/cache config, so size and SBOM are recorded even for an
+/// image that is never pushed.
+pub async fn record_image_artifacts(
+    store: &SqlxStore,
+    job_id: JobId,
+    attr_path: &str,
+    output_paths: &[String],
+    sbom_runtime_roots: &[String],
+) {
+    if let Some(archive) = output_paths.first() {
+        match tokio::fs::metadata(archive).await {
+            Ok(meta) => {
+                if let Err(e) =
+                    <SqlxStore as JobStore>::record_image_size(store, job_id, meta.len()).await
+                {
+                    tracing::warn!(job_id = job_id.get(), error = %e, "recording image size failed");
+                }
+            }
+            Err(e) => tracing::warn!(
+                job_id = job_id.get(),
+                path = %archive,
+                error = %e,
+                "stat of image archive failed; size not recorded",
+            ),
+        }
+    }
+
+    match argunix_effects::sbom::generate_sbom(attr_path, output_paths, sbom_runtime_roots).await {
+        Ok((bytes, count)) => {
+            let content = String::from_utf8_lossy(&bytes).into_owned();
+            if let Err(e) = <SqlxStore as SbomStore>::upsert_sbom(
+                store,
+                job_id,
+                "cyclonedx",
+                &content,
+                count as u32,
+                Utc::now(),
+            )
+            .await
+            {
+                tracing::warn!(job_id = job_id.get(), error = %e, "storing SBOM failed");
+            } else {
+                tracing::info!(job_id = job_id.get(), components = count, "stored SBOM");
+            }
+        }
+        Err(e) => tracing::warn!(
+            job_id = job_id.get(),
+            error = %e,
+            "SBOM generation failed; nothing stored",
+        ),
+    }
+}
 
 /// Build the post-build effects that apply to `repo`, resolving each
 /// `push_to_registries` name against the global `registries` catalog.
@@ -71,16 +128,29 @@ pub fn registry_push_effects(
     pushes
 }
 
+/// One effect's outcome, returned by [`run_effects`] so the caller can
+/// surface `Reported` effects as forge checks. The `effect_runs` rows
+/// are already written inside `run_effects`.
+pub struct EffectReport {
+    pub kind: &'static str,
+    pub target: String,
+    pub severity: Severity,
+    pub status: EffectStatus,
+    pub detail: String,
+}
+
 /// Run every effect in `effects` against `ctx`, recording an
 /// `effect_runs` row per attempt. The row is inserted `running`
 /// *before* the effect runs, so an effect that hangs or a daemon that
-/// dies mid-effect still leaves a visible row.
+/// dies mid-effect still leaves a visible row. Returns one
+/// [`EffectReport`] per effect, in order.
 pub async fn run_effects(
     store: &SqlxStore,
     job_id: JobId,
     effects: &[Arc<dyn Effect>],
     ctx: &OutputContext<'_>,
-) {
+) -> Vec<EffectReport> {
+    let mut reports = Vec::with_capacity(effects.len());
     for effect in effects {
         let run_id = match store
             .create_effect_run(job_id, effect.kind(), effect.target(), Utc::now())
@@ -135,7 +205,16 @@ pub async fn run_effects(
                 tracing::warn!(error = %e, "effect_runs finish update failed");
             }
         }
+
+        reports.push(EffectReport {
+            kind: effect.kind(),
+            target: effect.target().to_string(),
+            severity: effect.severity(),
+            status: outcome.status,
+            detail: outcome.detail,
+        });
     }
+    reports
 }
 
 /// Push a successful build's output closure to every configured binary

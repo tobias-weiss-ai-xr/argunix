@@ -122,6 +122,11 @@ pub struct JobRecord {
     /// `outputs_json` column or that errored before nix-eval-jobs
     /// reported outputs.
     pub outputs: BTreeMap<String, String>,
+    /// On-disk size of the built `oci-archive` / `docker-archive`, in
+    /// bytes. `Some` only for image jobs (those with
+    /// `meta.image-format`) that built successfully; `None` for
+    /// ordinary packages, failed jobs, and rows pre-dating the column.
+    pub image_size_bytes: Option<u64>,
 }
 
 /// Bytes through our russh tunnel + wall-clock per pool-dispatch phase.
@@ -270,6 +275,21 @@ pub struct EffectRunRecord {
     pub started_at: DateTime<Utc>,
     /// `None` while still `running`.
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// One row of `sboms` — a stored CycloneDX SBOM for an image job. See
+/// `migrations/0017_sboms.sql`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SbomRecord {
+    pub id: i64,
+    pub job_id: JobId,
+    /// SBOM format tag, e.g. `cyclonedx`.
+    pub format: String,
+    /// The whole SBOM document, verbatim JSON text.
+    pub content: String,
+    /// Number of components, denormalised from `content` at write time.
+    pub component_count: u32,
+    pub created_at: DateTime<Utc>,
 }
 
 /// One row of `docker_images`. Returned by registry lookups so the

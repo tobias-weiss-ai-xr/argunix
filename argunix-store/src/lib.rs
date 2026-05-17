@@ -15,12 +15,12 @@ mod traits;
 pub use records::{
     BuilderRecord, DockerImageRecord, EffectRunRecord, EvalJobTally, EvalRecord, EvalWithRepo,
     ForgeStatusRecord, JobPhaseMetrics, JobRecord, JobWithContext, NewBuilder, NewDockerImage,
-    NewEvaluation, NewJob, RepoRecord,
+    NewEvaluation, NewJob, RepoRecord, SbomRecord,
 };
 pub use sqlite::SqlxStore;
 pub use traits::{
     BuilderStore, DockerImageStore, EffectRunStore, EvalStore, ForgeStatusStore, InterruptOutcome,
-    JobStore, MAX_INTERRUPTIONS, RepoStore, StoreError,
+    JobStore, MAX_INTERRUPTIONS, RepoStore, SbomStore, StoreError,
 };
 
 use sqlx::sqlite::{
