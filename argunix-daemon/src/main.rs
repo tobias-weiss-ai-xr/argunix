@@ -1086,6 +1086,7 @@ async fn run_registry_effects_cli(
             return;
         }
     };
+    let sbom_roots = argunix_effects::sbom::runtime_roots(&spec.meta);
     let ctx = argunix_effects::OutputContext {
         forge: &repo.forge,
         repo_slug: repo.slug.as_str(),
@@ -1096,6 +1097,7 @@ async fn run_registry_effects_cli(
         sha,
         image_format: spec.image_format,
         output_paths,
+        sbom_runtime_roots: &sbom_roots,
     };
     effects::run_effects(store, job_id, registry_effects, &ctx).await;
 }

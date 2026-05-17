@@ -22,16 +22,26 @@ use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Build the `registry-push` effects that apply to `repo`, resolving
-/// each `push_to_registries` name against the global `registries`
-/// catalog. Config validation (`validate_references`) guarantees every
-/// name resolves; an unresolved name here is treated defensively as a
-/// skip rather than a panic.
+/// Build the post-build effects that apply to `repo`, resolving each
+/// `push_to_registries` name against the global `registries` catalog.
+///
+/// Each bound registry yields two effects: a `registry-push` (push the
+/// image) and a `sbom-attach` (generate an SBOM for an OCI image and
+/// attach it to the pushed image as an OCI referrer). All the pushes
+/// come first, then all the attaches — `run_effects` runs the list in
+/// order, so an attach always runs after its registry's push has
+/// landed the image it will hang the SBOM off. A `sbom-attach` against
+/// a non-OCI job self-skips at run time.
+///
+/// Config validation (`validate_references`) guarantees every name
+/// resolves; an unresolved name here is treated defensively as a skip
+/// rather than a panic.
 pub fn registry_push_effects(
     config: &argunix_config::Config,
     repo: &argunix_config::Repo,
 ) -> Vec<Arc<dyn Effect>> {
-    let mut out: Vec<Arc<dyn Effect>> = Vec::new();
+    let mut pushes: Vec<Arc<dyn Effect>> = Vec::new();
+    let mut attaches: Vec<Arc<dyn Effect>> = Vec::new();
     for name in &repo.push_to_registries {
         let Some(reg) = config.registries.get(name) else {
             tracing::warn!(
@@ -41,15 +51,24 @@ pub fn registry_push_effects(
             );
             continue;
         };
-        out.push(Arc::new(argunix_effects::RegistryPush {
+        let auth_path = reg.auth_path.as_ref().map(|p| p.path().to_path_buf());
+        pushes.push(Arc::new(argunix_effects::RegistryPush {
             target: name.clone(),
             registry_url: reg.url.clone(),
             namespace: reg.namespace.clone(),
-            auth_path: reg.auth_path.as_ref().map(|p| p.path().to_path_buf()),
+            auth_path: auth_path.clone(),
+            insecure: reg.insecure,
+        }));
+        attaches.push(Arc::new(argunix_effects::SbomAttach {
+            target: name.clone(),
+            registry_url: reg.url.clone(),
+            namespace: reg.namespace.clone(),
+            auth_path,
             insecure: reg.insecure,
         }));
     }
-    out
+    pushes.extend(attaches);
+    pushes
 }
 
 /// Run every effect in `effects` against `ctx`, recording an

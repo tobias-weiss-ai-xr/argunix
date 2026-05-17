@@ -180,6 +180,9 @@ in
         # `argunix-registry::convert` after each docker-image build's
         # `BuildStatus::Success`.
         pkgs.skopeo
+        # Attaches CycloneDX SBOMs to pushed OCI images as referrers —
+        # the `sbom-attach` effect (`argunix-effects::sbom`).
+        pkgs.oras
       ];
 
       serviceConfig = {

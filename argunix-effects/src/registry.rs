@@ -360,6 +360,7 @@ mod tests {
             sha: "0123456789abcdef",
             image_format: None,
             output_paths: &["/nix/store/x".to_string()],
+            sbom_runtime_roots: &[],
         };
         let outcome = push().run(&ctx).await;
         assert_eq!(outcome.status, crate::EffectStatus::Skipped);
@@ -377,6 +378,7 @@ mod tests {
             sha: "0123456789abcdef",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
+            sbom_runtime_roots: &[],
         };
         let outcome = push().run(&ctx).await;
         assert_eq!(outcome.status, crate::EffectStatus::Failure);
@@ -395,6 +397,7 @@ mod tests {
             sha: "0123456789abcdef",
             image_format: Some(ImageFormat::Docker),
             output_paths: &["/nix/store/does-not-matter".to_string()],
+            sbom_runtime_roots: &[],
         };
         let p = RegistryPush {
             auth_path: Some(PathBuf::from("/nonexistent/argunix-creds-zzz")),
@@ -424,6 +427,7 @@ mod tests {
             sha: "0123456789abcdef",
             image_format: Some(ImageFormat::Oci),
             output_paths: &[],
+            sbom_runtime_roots: &[],
         };
         let outcome = push().run(&ctx).await;
         assert_eq!(outcome.status, crate::EffectStatus::Failure);
@@ -441,6 +445,7 @@ mod tests {
             sha: "0123456789abcdef",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
+            sbom_runtime_roots: &[],
         }
     }
 

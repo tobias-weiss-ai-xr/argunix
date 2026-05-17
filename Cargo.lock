@@ -311,10 +311,14 @@ version = "0.0.1"
 dependencies = [
  "argunix-domain",
  "async-trait",
+ "flate2",
+ "serde_json",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

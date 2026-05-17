@@ -21,11 +21,16 @@
 //! Effect` — the trait is the extension point, so the door stays open
 //! without a generic config escape hatch.
 //!
-//! v1 ships exactly one effect: [`registry::RegistryPush`].
+//! Effects shipped here: [`registry::RegistryPush`] pushes a built
+//! image to an external registry; [`sbom::SbomAttach`] generates a
+//! CycloneDX SBOM for an OCI image and attaches it to that image as an
+//! OCI referrer. See `design/sbom.md`.
 
 pub mod registry;
+pub mod sbom;
 
 pub use registry::RegistryPush;
+pub use sbom::SbomAttach;
 
 pub use argunix_domain::ImageFormat;
 
@@ -63,6 +68,11 @@ pub struct OutputContext<'a> {
     /// output — for a `dockerTools` image that is the docker-archive
     /// tarball.
     pub output_paths: &'a [String],
+    /// Store paths the flake declared via `meta.sbom-runtime-roots` —
+    /// the runtime contents of an OCI image, the roots whose closure
+    /// [`sbom::SbomAttach`] transcribes into an SBOM. Empty for any job
+    /// that did not declare the attribute.
+    pub sbom_runtime_roots: &'a [String],
 }
 
 impl OutputContext<'_> {
@@ -239,6 +249,7 @@ mod tests {
             sha: "0123456789abcdef0123456789abcdef01234567",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
+            sbom_runtime_roots: &[],
         };
         assert_eq!(ctx.branch(), Some("main"));
         assert_eq!(ctx.short_sha(), "0123456789ab");
@@ -258,6 +269,7 @@ mod tests {
             sha: "abc",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
+            sbom_runtime_roots: &[],
         };
         assert_eq!(ctx.branch(), None);
         // short_sha falls back when the sha is shorter than 12.
@@ -278,6 +290,7 @@ mod tests {
             sha: "abc",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
+            sbom_runtime_roots: &[],
         };
         assert_eq!(ctx.branch(), Some("feature"));
         assert!(!ctx.is_default_branch());
@@ -295,6 +308,7 @@ mod tests {
             sha: "abc",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
+            sbom_runtime_roots: &[],
         };
         assert!(!ctx.is_default_branch());
     }
@@ -314,6 +328,7 @@ mod tests {
             sha: "abc",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
+            sbom_runtime_roots: &[],
         };
         assert_eq!(ctx.branch(), Some("main"));
         assert!(ctx.is_default_branch());
@@ -333,6 +348,7 @@ mod tests {
             sha: "abc",
             image_format: Some(ImageFormat::Docker),
             output_paths: &[],
+            sbom_runtime_roots: &[],
         };
         assert_eq!(ctx.branch(), None);
         assert!(!ctx.is_default_branch());

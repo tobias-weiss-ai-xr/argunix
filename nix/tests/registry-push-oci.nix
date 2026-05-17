@@ -27,6 +27,13 @@
 # into a writable copy of the fixture flake, and the fixture's job is
 # then a clean, sandboxed `cp` of that archive out of `${self}` —
 # exactly the shape `registry-push.nix` uses for the docker case.
+#
+# This test also covers the `sbom-attach` effect (`design/sbom.md`):
+# with no flake cooperation at all, argunix reads the image's runtime
+# contents straight out of its OCI layer blobs, generates a CycloneDX
+# SBOM, and attaches it to the pushed image as an OCI *referrer* — a
+# separate artifact, leaving the image bytes untouched. The test then
+# rediscovers and pulls the SBOM back with `oras`.
 { pkgs, ... }:
 
 let
@@ -143,6 +150,10 @@ in
         pkgs.argunix
         pkgs.nix-eval-jobs
         pkgs.skopeo
+        # The `sbom-attach` effect shells out to `oras` to attach the
+        # CycloneDX SBOM as an OCI referrer; the test script also uses
+        # it to rediscover and pull the SBOM back.
+        pkgs.oras
         pkgs.podman
         pkgs.gnutar
         pkgs.zstd
@@ -339,6 +350,52 @@ in
     assert sha_tag, f"could not find a sha- tag in {tags_json!r}"
     machine.succeed(
         f"podman pull ${registryHost}/myorg/oci-image:{sha_tag.group(1)}"
+    )
+
+    # --- SBOM ---------------------------------------------------------
+    # The `sbom-attach` effect must have read the image's `/nix/store`
+    # contents out of its OCI layer blobs (no flake cooperation),
+    # generated a CycloneDX SBOM, and attached it to the pushed image
+    # as an OCI referrer. Recorded as its own `effect_runs` row.
+    assert "sbom-attach|local|success" in rows, (
+        f"expected a successful sbom-attach effect_run{envelope}"
+    )
+
+    sha = sha_tag.group(1)
+    image_ref = "${registryHost}/myorg/oci-image"
+
+    # The SBOM must be discoverable as a referrer of the pushed image,
+    # carrying the standard CycloneDX artifact type. The image itself
+    # is untouched — the SBOM is a separate artifact whose manifest
+    # `subject` points back at the image.
+    discover = machine.succeed(f"oras discover --plain-http {image_ref}:{sha}")
+    print(f"--- oras discover {image_ref}:{sha} ---\n{discover}")
+    assert "application/vnd.cyclonedx+json" in discover, (
+        f"SBOM referrer not discoverable via oras{envelope}\n"
+        f"oras discover:\n{discover}"
+    )
+
+    # Pull the SBOM artifact back by digest and confirm it is a real
+    # CycloneDX document naming a component from the image's closure —
+    # proof the SBOM has content, not just an empty manifest.
+    m = re.search(
+        r"application/vnd\.cyclonedx\+json.*?(sha256:[0-9a-f]+)",
+        discover,
+        re.DOTALL,
+    )
+    assert m, f"could not find the SBOM digest in oras discover output{envelope}"
+    sbom_digest = m.group(1)
+    print(f"SBOM referrer digest: {sbom_digest}")
+
+    machine.succeed("rm -rf /tmp/sbom-dl && mkdir -p /tmp/sbom-dl")
+    machine.succeed(
+        f"cd /tmp/sbom-dl && oras pull --plain-http {image_ref}@{sbom_digest}"
+    )
+    sbom = machine.succeed("cat /tmp/sbom-dl/*.cdx.json")
+    print(f"--- pulled SBOM ---\n{sbom}")
+    assert '"bomFormat": "CycloneDX"' in sbom, f"not a CycloneDX SBOM: {sbom!r}"
+    assert '"name": "busybox"' in sbom, (
+        f"expected a `busybox` component in the SBOM{envelope}\nSBOM:\n{sbom}"
     )
   '';
 }

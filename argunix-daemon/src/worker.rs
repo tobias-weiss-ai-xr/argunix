@@ -1940,6 +1940,7 @@ fn spawn_post_build_effects(
     let attr_path = spec.attr_path.as_str().to_string();
     let system = spec.system.clone().unwrap_or_else(|| "unknown".to_string());
     let image_format = spec.image_format;
+    let sbom_roots = argunix_effects::sbom::runtime_roots(&spec.meta);
     tokio::spawn(
         async move {
             if !caches.is_empty() {
@@ -1963,6 +1964,7 @@ fn spawn_post_build_effects(
                     sha: &sha,
                     image_format,
                     output_paths: &output_paths,
+                    sbom_runtime_roots: &sbom_roots,
                 };
                 crate::effects::run_effects(&store, job_id, &reg_effects, &octx).await;
             }
