@@ -178,6 +178,27 @@ pub struct EvalWithRepo {
     pub slug: Slug,
 }
 
+/// Per-evaluation aggregate of job outcomes. Produced by
+/// [`crate::JobStore::job_tallies_by_repo`] so the repo page can colour
+/// each eval row by whether every one of its jobs passed, without an
+/// N+1 `list_by_eval` per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EvalJobTally {
+    /// Total number of job rows recorded for the evaluation.
+    pub total: u32,
+    /// Jobs that did not succeed — anything not `success`/`cached`
+    /// (failed, interrupted, cancelled, skipped, or still in flight).
+    pub not_succeeded: u32,
+}
+
+impl EvalJobTally {
+    /// True when the evaluation has at least one job and every one of
+    /// them succeeded (`success` or `cached`).
+    pub fn all_succeeded(&self) -> bool {
+        self.total > 0 && self.not_succeeded == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeStatusRecord {
     pub eval_id: EvalId,

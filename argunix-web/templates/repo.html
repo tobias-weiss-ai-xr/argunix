@@ -49,44 +49,53 @@
 <p class="text-muted">No evaluations yet.</p>
 {% else %}
 <div class="overflow-x-auto">
-<table class="w-full min-w-xl text-sm border-collapse">
+<table class="w-full min-w-xl text-sm  border-separate border-spacing-y-2">
   <thead class="text-left text-muted">
     <tr>
-      <th class="py-2 pr-4">id</th>
-      <th class="py-2 pr-4">ref</th>
-      <th class="py-2 pr-4">sha</th>
-      <th class="py-2 pr-4">status</th>
-      <th class="py-2 pr-4">finished</th>
-      <th class="py-2">total</th>
+      <th class="px-1">id</th>
+      <th class="">ref</th>
+      <th class="">sha</th>
+      <th class="">status</th>
+      <th class="">result</th>
+      <th class="">finished</th>
+      <th class="">total</th>
     </tr>
   </thead>
   <tbody>
     {% for e in evals %}
-    <tr class="border-t border-border">
-      <td class="py-2 pr-4">
+    <tr class="{{ e.row_class }}">
+      <td class="px-1">
         <a
           class="text-link hover:underline"
           href="/r/{{ forge }}/{{ slug }}/eval/{{ e.id }}"
           >#{{ e.id }}</a
         >
       </td>
-      <td class="py-2 pr-4 font-mono">
+      <td class="font-mono">
         {% if e.forge_link.is_empty() %}
           {% if let Some(n) = e.pr_number %}PR #{{ n }}{% else %}{{ e.git_ref }}{% endif %}
         {% else %}
           <a class="text-link hover:underline" href="{{ e.forge_link }}">↗ {% if let Some(n) = e.pr_number %}PR #{{ n }}{% else %}{{ e.git_ref }}{% endif %}</a>
         {% endif %}
       </td>
-      <td class="py-2 pr-4 font-mono">
+      <td class="font-mono">
         {% if e.commit_link.is_empty() %}
           {{ e.short_sha }}
         {% else %}
           <a class="text-link hover:underline" href="{{ e.commit_link }}">↗ {{ e.short_sha }}</a>
         {% endif %}
       </td>
-      <td class="py-2 pr-4">{{ e.status }}</td>
-      <td class="py-2 pr-4 text-muted">{{ e.finished }}</td>
-      <td class="py-2 font-mono">{{ e.total }}</td>
+      <td class="">{{ e.status }}</td>
+      <td class="">
+        {% if e.result_glyph.is_empty() %}
+          <span class="text-subtle">—</span>
+        {% else %}
+          <span class="{{ e.result_glyph_class }}" aria-hidden="true">{{ e.result_glyph }}</span>
+          <span>{{ e.result_label }}</span>
+        {% endif %}
+      </td>
+      <td class="text-muted">{{ e.finished }}</td>
+      <td class="font-mono">{{ e.total }}</td>
     </tr>
     {% endfor %}
   </tbody>

@@ -65,6 +65,13 @@
     /* Failure call-out box (lighter background, distinct border) */
     --fail-faint: #fef2f2; /* red-50 */
     --fail-edge: #fecaca; /* red-200 */
+
+    /* Result-row tints — faint background wash on table rows that
+     * carry a pass/fail outcome (eval rows on the repo page, job rows
+     * on the eval page). Deliberately subtler than the status-badge
+     * `*-soft` pairs so a whole table of green rows stays calm. */
+    --row-ok: oklch(95% 0.052 163.051); /* emerald-100 */
+    --row-fail: oklch(94.1% 0.03 12.58); /* rose-100 */
   }
 
   @media (prefers-color-scheme: dark) {
@@ -96,6 +103,12 @@
 
       --fail-faint: #450a0a; /* red-950 */
       --fail-edge: #7f1d1d; /* red-900 */
+
+      /* Dark-mode result-row tints — dark, desaturated green/red that
+       * sit a touch above the near-black page background so the wash
+       * stays legible without glowing. */
+      --row-ok: #0d2a1e; /* dark emerald wash */
+      --row-fail: #2d1620; /* dark rose wash */
     }
   }
 
@@ -139,4 +152,8 @@
   /* Failure call-out box */
   --color-fail-faint: var(--fail-faint);
   --color-fail-edge: var(--fail-edge);
+
+  /* Result-row tints */
+  --color-row-ok: var(--row-ok);
+  --color-row-fail: var(--row-fail);
 }

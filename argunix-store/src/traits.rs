@@ -1,13 +1,14 @@
 use crate::records::{
-    BuilderRecord, DockerImageRecord, EffectRunRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord,
-    JobPhaseMetrics, JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob,
-    RepoRecord,
+    BuilderRecord, DockerImageRecord, EffectRunRecord, EvalJobTally, EvalRecord, EvalWithRepo,
+    ForgeStatusRecord, JobPhaseMetrics, JobRecord, JobWithContext, NewBuilder, NewDockerImage,
+    NewEvaluation, NewJob, RepoRecord,
 };
 use argunix_domain::{
     BuilderId, BuilderPubkey, EvalId, EvalStatus, JobId, JobStatus, RepoId, Slug,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -235,6 +236,14 @@ pub trait JobStore: Send + Sync {
     async fn create(&self, new: NewJob) -> Result<JobId, StoreError>;
     async fn get(&self, id: JobId) -> Result<Option<JobRecord>, StoreError>;
     async fn list_by_eval(&self, eval_id: EvalId) -> Result<Vec<JobRecord>, StoreError>;
+    /// Aggregate job outcomes per evaluation for a single repo, keyed by
+    /// eval id. Only evals that have at least one job row appear in the
+    /// map. Lets the repo page colour each eval row by whether all its
+    /// jobs passed without an N+1 `list_by_eval` per row.
+    async fn job_tallies_by_repo(
+        &self,
+        repo_id: RepoId,
+    ) -> Result<HashMap<EvalId, EvalJobTally>, StoreError>;
     /// Every job currently in `Running` state across the cluster, joined
     /// with its evaluation and repo so the status page can render it
     /// without N+1 lookups. Oldest-started first (so "longest in flight"

@@ -1,6 +1,7 @@
 use crate::records::{
-    BuilderRecord, DockerImageRecord, EffectRunRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord,
-    JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob, RepoRecord,
+    BuilderRecord, DockerImageRecord, EffectRunRecord, EvalJobTally, EvalRecord, EvalWithRepo,
+    ForgeStatusRecord, JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation,
+    NewJob, RepoRecord,
 };
 use crate::traits::{
     BuilderStore, DockerImageStore, EffectRunStore, EvalStore, ForgeStatusStore, InterruptOutcome,
@@ -15,6 +16,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqliteRow};
+use std::collections::HashMap;
 use std::str::FromStr;
 
 #[derive(Clone)]
@@ -708,6 +710,39 @@ impl JobStore for SqlxStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(map_job).collect()
+    }
+
+    async fn job_tallies_by_repo(
+        &self,
+        repo_id: RepoId,
+    ) -> Result<HashMap<EvalId, EvalJobTally>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT j.eval_id AS eval_id,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN j.status IN ('success', 'cached') THEN 0 ELSE 1 END)
+                        AS not_succeeded
+             FROM jobs j
+             JOIN evaluations e ON j.eval_id = e.id
+             WHERE e.repo_id = ?1
+             GROUP BY j.eval_id",
+        )
+        .bind(repo_id.get())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut tallies = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let eval_id: i64 = row.try_get("eval_id")?;
+            let total: i64 = row.try_get("total")?;
+            let not_succeeded: i64 = row.try_get("not_succeeded")?;
+            tallies.insert(
+                EvalId::new(eval_id),
+                EvalJobTally {
+                    total: total as u32,
+                    not_succeeded: not_succeeded as u32,
+                },
+            );
+        }
+        Ok(tallies)
     }
 
     async fn list_running(&self) -> Result<Vec<JobWithContext>, StoreError> {
@@ -1633,6 +1668,80 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, job_id);
+    }
+
+    #[tokio::test]
+    async fn job_tallies_by_repo_aggregates_per_eval() {
+        let s = store().await;
+        let repo_id = <SqlxStore as RepoStore>::upsert(&s, "github", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        let mk_eval = |gref: &str| NewEvaluation {
+            repo_id,
+            trigger: "push".to_string(),
+            git_ref: gref.to_string(),
+            sha: Sha::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            pr_number: None,
+        };
+        let mk_job = |eval_id: EvalId, attr: &str| NewJob {
+            eval_id,
+            attr_path: AttrPath::new(attr),
+            drv_path: None,
+            system: "x86_64-linux".to_string(),
+            main_program: None,
+            outputs: Default::default(),
+        };
+
+        // Eval A: two jobs, both green → all_succeeded.
+        let eval_a = <SqlxStore as EvalStore>::create(&s, mk_eval("refs/heads/main"))
+            .await
+            .unwrap();
+        for (attr, status) in [
+            ("packages.x86_64-linux.ok1", JobStatus::Success),
+            ("packages.x86_64-linux.ok2", JobStatus::Cached),
+        ] {
+            let id = <SqlxStore as JobStore>::create(&s, mk_job(eval_a, attr))
+                .await
+                .unwrap();
+            <SqlxStore as JobStore>::set_status(&s, id, status)
+                .await
+                .unwrap();
+        }
+
+        // Eval B: one green, one failed → not all succeeded.
+        let eval_b = <SqlxStore as EvalStore>::create(&s, mk_eval("refs/heads/dev"))
+            .await
+            .unwrap();
+        for (attr, status) in [
+            ("packages.x86_64-linux.ok", JobStatus::Success),
+            ("packages.x86_64-linux.bad", JobStatus::Failure),
+        ] {
+            let id = <SqlxStore as JobStore>::create(&s, mk_job(eval_b, attr))
+                .await
+                .unwrap();
+            <SqlxStore as JobStore>::set_status(&s, id, status)
+                .await
+                .unwrap();
+        }
+
+        // Eval C: no jobs at all → absent from the map.
+        let eval_c = <SqlxStore as EvalStore>::create(&s, mk_eval("refs/heads/empty"))
+            .await
+            .unwrap();
+
+        let tallies = <SqlxStore as JobStore>::job_tallies_by_repo(&s, repo_id)
+            .await
+            .unwrap();
+
+        let a = tallies.get(&eval_a).unwrap();
+        assert_eq!((a.total, a.not_succeeded), (2, 0));
+        assert!(a.all_succeeded());
+
+        let b = tallies.get(&eval_b).unwrap();
+        assert_eq!((b.total, b.not_succeeded), (2, 1));
+        assert!(!b.all_succeeded());
+
+        assert!(tallies.get(&eval_c).is_none());
     }
 
     #[tokio::test]

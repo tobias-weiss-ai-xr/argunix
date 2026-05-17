@@ -13,9 +13,9 @@ mod sqlite;
 mod traits;
 
 pub use records::{
-    BuilderRecord, DockerImageRecord, EffectRunRecord, EvalRecord, EvalWithRepo, ForgeStatusRecord,
-    JobPhaseMetrics, JobRecord, JobWithContext, NewBuilder, NewDockerImage, NewEvaluation, NewJob,
-    RepoRecord,
+    BuilderRecord, DockerImageRecord, EffectRunRecord, EvalJobTally, EvalRecord, EvalWithRepo,
+    ForgeStatusRecord, JobPhaseMetrics, JobRecord, JobWithContext, NewBuilder, NewDockerImage,
+    NewEvaluation, NewJob, RepoRecord,
 };
 pub use sqlite::SqlxStore;
 pub use traits::{

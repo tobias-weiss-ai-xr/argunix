@@ -21,7 +21,7 @@ use crate::state::AppState;
 use argunix_builders::ConnState;
 use argunix_config::ForgeConfig;
 use argunix_domain::{EvalId, EvalStatus, JobStatus, Slug};
-use argunix_store::{BuilderStore, EvalStore, JobStore, RepoStore};
+use argunix_store::{BuilderStore, EvalJobTally, EvalStore, JobStore, RepoStore};
 use askama::Template;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -281,6 +281,19 @@ struct EvalRow {
     git_ref: String,
     short_sha: String,
     status: &'static str,
+    /// Glyph summarising the *result* of the eval — whether every job
+    /// passed. `✓` when the eval finished and all jobs succeeded, `✗`
+    /// on an eval failure or any non-green job, empty for in-flight /
+    /// cancelled evals where there is no pass/fail to report.
+    result_glyph: &'static str,
+    /// Human label paired with `result_glyph` ("passed" / "failed").
+    /// Empty when `result_glyph` is empty.
+    result_label: &'static str,
+    /// Text-colour class for `result_glyph`.
+    result_glyph_class: &'static str,
+    /// Background-tint class for the whole row — `bg-row-ok` when the
+    /// eval succeeded, `bg-row-fail` when it failed, empty otherwise.
+    row_class: &'static str,
     finished: String,
     /// Wall-clock between `started_at` and `finished_at`, humanized.
     /// `"—"` when either is missing.
@@ -351,6 +364,10 @@ struct JobRow {
     attr_path: String,
     system: String,
     status: &'static str,
+    /// Background-tint class for the job's table row — `bg-row-ok` for
+    /// a green job, `bg-row-fail` for a failed/interrupted one, empty
+    /// for queued / running / cancelled / skipped jobs.
+    row_class: &'static str,
     /// Unicode glyph rendered in place of the status text (✓, ✗, …).
     /// The visible text label moves into `aria-label` on the wrapping
     /// span so screen readers still announce the status.
@@ -1298,6 +1315,10 @@ async fn repo_page(
         .await?
         .ok_or(UiError::NotFound)?;
     let raw_evals = state.store.list_by_repo(repo.id, 50).await?;
+    // Per-eval job-outcome aggregate, in one query — drives the
+    // pass/fail result column and row tint without an N+1 per row.
+    let job_tallies =
+        <argunix_store::SqlxStore as JobStore>::job_tallies_by_repo(&state.store, repo.id).await?;
 
     let snap = state.current.load_full();
     let forge_cfg = snap.config.forges.get(&forge);
@@ -1332,11 +1353,16 @@ async fn repo_page(
                 e.pr_number,
                 e.sha.as_str(),
             );
+            let outcome = eval_outcome(&e.status, job_tallies.get(&e.id));
             EvalRow {
                 id: e.id.get(),
                 git_ref: display_git_ref(&e.git_ref),
                 short_sha: short_sha(e.sha.as_str()).to_string(),
                 status: eval_status_label(&e.status),
+                result_glyph: outcome.glyph,
+                result_label: outcome.label,
+                result_glyph_class: outcome.glyph_class,
+                row_class: outcome.row_class,
                 finished: fmt_opt_time(e.finished_at),
                 total: humanize_duration(e.started_at, e.finished_at),
                 pr_number: e.pr_number,
@@ -1438,6 +1464,7 @@ async fn eval_page(
             attr_path: j.attr_path.to_string(),
             system: j.system,
             status: job_status_label(&j.status),
+            row_class: job_status_row_class(&j.status),
             glyph: job_status_glyph(&j.status),
             glyph_class: job_status_glyph_class(&j.status),
             finished: fmt_opt_time(j.finished_at),
@@ -1929,6 +1956,79 @@ fn eval_status_phase_class(s: &EvalStatus) -> &'static str {
     }
 }
 
+/// Visual outcome of an evaluation, used to colour the eval row on the
+/// repo page. All fields are empty strings for evals with no pass/fail
+/// to report (in-flight or cancelled).
+struct EvalOutcome {
+    /// Result glyph — `✓` / `✗` / empty.
+    glyph: &'static str,
+    /// Label paired with the glyph — `passed` / `failed` / empty.
+    label: &'static str,
+    /// Text-colour class for the glyph.
+    glyph_class: &'static str,
+    /// Background-tint class for the row — `bg-row-ok` / `bg-row-fail`
+    /// / empty.
+    row_class: &'static str,
+}
+
+/// Classify an evaluation as passed / failed / neither for the repo
+/// page's result column and row tint.
+///
+/// A `Done` eval reaching terminal state does *not* by itself mean
+/// success — the worker stamps `Done` regardless of per-job outcome
+/// (see `argunix-daemon::worker`). So we consult the job tally: an
+/// eval passes only when it `Done` *and* every one of its jobs
+/// succeeded. A `Done` eval with no jobs at all (flake exposed nothing
+/// to build) counts as a pass — nothing failed. `EvaluationFailed` and
+/// a `Done` eval with any non-green job are failures. `Cancelled` and
+/// in-flight evals have no result to surface.
+fn eval_outcome(status: &EvalStatus, tally: Option<&EvalJobTally>) -> EvalOutcome {
+    const PASS: EvalOutcome = EvalOutcome {
+        glyph: "✓",
+        label: "passed",
+        glyph_class: "text-ok-strong",
+        row_class: "bg-row-ok",
+    };
+    const FAIL: EvalOutcome = EvalOutcome {
+        glyph: "✗",
+        label: "failed",
+        glyph_class: "text-fail-strong",
+        row_class: "bg-row-fail",
+    };
+    const NONE: EvalOutcome = EvalOutcome {
+        glyph: "",
+        label: "",
+        glyph_class: "",
+        row_class: "",
+    };
+    match status {
+        EvalStatus::Done => match tally {
+            // No jobs recorded — vacuously a pass.
+            None => PASS,
+            Some(t) if t.not_succeeded == 0 => PASS,
+            Some(_) => FAIL,
+        },
+        EvalStatus::EvaluationFailed => FAIL,
+        EvalStatus::Queued | EvalStatus::Evaluating | EvalStatus::Building => NONE,
+        EvalStatus::Cancelled => NONE,
+    }
+}
+
+/// Background-tint class for a job's row in the per-eval jobs table.
+/// Green for a successful build, red for a failed / interrupted one,
+/// no tint for jobs that never reached a real result (queued, running,
+/// cancelled, skipped).
+fn job_status_row_class(s: &JobStatus) -> &'static str {
+    match s {
+        JobStatus::Success | JobStatus::Cached => "bg-row-ok",
+        JobStatus::Failure | JobStatus::Interrupted => "bg-row-fail",
+        JobStatus::Running
+        | JobStatus::Queued
+        | JobStatus::Cancelled
+        | JobStatus::SkippedNoBuilder => "",
+    }
+}
+
 /// Header for the per-eval jobs section. Tells the user whether the
 /// list they're looking at is final ("jobs (N)") or still in progress
 /// ("jobs (N so far)" while building, etc.).
@@ -2403,5 +2503,65 @@ mod tests {
         let p = parse_repo_tail("myorg/myrepo/").unwrap();
         assert_eq!(p.slug, "myorg/myrepo");
         assert_eq!(p.kind, TailKind::Repo);
+    }
+
+    #[test]
+    fn eval_outcome_done_all_green_passes() {
+        let tally = EvalJobTally {
+            total: 3,
+            not_succeeded: 0,
+        };
+        let o = eval_outcome(&EvalStatus::Done, Some(&tally));
+        assert_eq!(o.glyph, "✓");
+        assert_eq!(o.row_class, "bg-row-ok");
+    }
+
+    #[test]
+    fn eval_outcome_done_with_failed_job_fails() {
+        // A Done eval is NOT automatically a pass — the worker stamps
+        // Done regardless of per-job outcome.
+        let tally = EvalJobTally {
+            total: 3,
+            not_succeeded: 1,
+        };
+        let o = eval_outcome(&EvalStatus::Done, Some(&tally));
+        assert_eq!(o.glyph, "✗");
+        assert_eq!(o.row_class, "bg-row-fail");
+    }
+
+    #[test]
+    fn eval_outcome_done_no_jobs_passes() {
+        let o = eval_outcome(&EvalStatus::Done, None);
+        assert_eq!(o.row_class, "bg-row-ok");
+    }
+
+    #[test]
+    fn eval_outcome_evaluation_failed_fails() {
+        let o = eval_outcome(&EvalStatus::EvaluationFailed, None);
+        assert_eq!(o.row_class, "bg-row-fail");
+    }
+
+    #[test]
+    fn eval_outcome_in_flight_and_cancelled_are_neutral() {
+        for s in [
+            EvalStatus::Queued,
+            EvalStatus::Evaluating,
+            EvalStatus::Building,
+            EvalStatus::Cancelled,
+        ] {
+            let o = eval_outcome(&s, None);
+            assert_eq!(o.glyph, "");
+            assert_eq!(o.row_class, "");
+        }
+    }
+
+    #[test]
+    fn job_status_row_class_buckets() {
+        assert_eq!(job_status_row_class(&JobStatus::Success), "bg-row-ok");
+        assert_eq!(job_status_row_class(&JobStatus::Cached), "bg-row-ok");
+        assert_eq!(job_status_row_class(&JobStatus::Failure), "bg-row-fail");
+        assert_eq!(job_status_row_class(&JobStatus::Interrupted), "bg-row-fail");
+        assert_eq!(job_status_row_class(&JobStatus::Running), "");
+        assert_eq!(job_status_row_class(&JobStatus::Queued), "");
     }
 }
