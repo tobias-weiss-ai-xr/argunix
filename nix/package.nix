@@ -63,6 +63,12 @@ let
       }
       ''
         mkdir -p $out
+        # Copies everything checked into `argunix-web/static/` —
+        # including the vendored, self-hosted Raleway woff2 fonts under
+        # `static/fonts/` (GDPR: never hot-link Google's font CDN). They
+        # are committed assets, like `htmx.min.js`, so the dev server
+        # (`argunix-web-dev`, which serves the source tree directly) and
+        # this build serve byte-identical files.
         cp -r ${src}/argunix-web/static/. $out/
         chmod -R u+w $out
         # Strip the placeholder ui.css that's checked in (read-only

@@ -414,9 +414,14 @@ struct JobTemplate {
     phase_metrics: PhaseMetricsRow,
     /// Concrete `nix run` snippet pinned to this exact attr — e.g.
     /// `nix run … /flake/<forge>/<slug>/eval/<id>#<leaf>`. `None` for
-    /// non-green jobs (nothing to expose), or instances with no
+    /// non-green jobs (nothing to expose), image jobs (`nix run` makes
+    /// no sense — see `registry_run_snippets`), or instances with no
     /// public cache configured.
     nix_run_snippet: Option<String>,
+    /// `docker run` lines, one per registry the image was successfully
+    /// pushed to. Empty for non-image jobs. The image counterpart of
+    /// `nix_run_snippet`.
+    registry_run_snippets: Vec<String>,
     /// Humanized on-disk size of the built image archive. `Some` only
     /// for image jobs — drives an "image size" row next to `total`.
     image_size: Option<String>,
@@ -1640,12 +1645,35 @@ async fn job_page(
         None
     };
 
-    // Only a green job has an attr the synthetic flake exposes. For
-    // failed/cancelled jobs the synthetic-flake endpoint silently
-    // omits the attr (its `nix run` would just fail "missing
-    // attribute"), so we hide the snippet rather than show one that
-    // doesn't work.
-    let nix_run_snippet = if job.status.is_success() {
+    // Post-build effects (registry push, SBOM attach). Fetched first
+    // because they decide whether this job is a container image.
+    let effect_runs =
+        <argunix_store::SqlxStore as EffectRunStore>::list_effect_runs_by_job(&state.store, job.id)
+            .await?;
+
+    // An image job: `nix run` makes no sense for it (the output is an
+    // image archive, not an app), but `docker run` does. Detected from
+    // a recorded archive size, or from a non-skipped registry / SBOM
+    // effect — the latter also catches docker-format images, whose
+    // size argunix does not record.
+    let is_image = job.image_size_bytes.is_some()
+        || effect_runs.iter().any(|e| {
+            matches!(e.kind.as_str(), "registry-push" | "sbom-attach") && e.status != "skipped"
+        });
+
+    // "Run from registry" — a `docker run` line per registry the image
+    // was successfully pushed to, parsed from the push effect's detail.
+    let registry_run_snippets: Vec<String> = effect_runs
+        .iter()
+        .filter(|e| e.kind == "registry-push" && e.status == "success")
+        .filter_map(|e| e.detail.as_deref().and_then(registry_run_command))
+        .collect();
+
+    // The `nix run` snippet — only for a *successful, non-image* job:
+    // the synthetic flake omits a failed job's attr (its `nix run`
+    // would fail "missing attribute"), and an image is not runnable
+    // with `nix run` at all — `docker run` covers it instead.
+    let nix_run_snippet = if job.status.is_success() && !is_image {
         // The leaf attr is what shows up under `apps.<sys>.<here>` /
         // `packages.<sys>.<here>` in the synthetic flake — same
         // last-segment slicing as `synthetic_flake::leaf_attr`.
@@ -1666,19 +1694,16 @@ async fn job_page(
     } else {
         None
     };
-    // Post-build effects (registry push, SBOM attach) and whether a
-    // stored SBOM exists — surfaced in the job page's effects panel.
-    let effects =
-        <argunix_store::SqlxStore as EffectRunStore>::list_effect_runs_by_job(&state.store, job.id)
-            .await?
-            .into_iter()
-            .map(|e| EffectRow {
-                kind: e.kind,
-                target: e.target,
-                status: e.status,
-                detail: e.detail.unwrap_or_default(),
-            })
-            .collect();
+
+    let effects: Vec<EffectRow> = effect_runs
+        .into_iter()
+        .map(|e| EffectRow {
+            kind: e.kind,
+            target: e.target,
+            status: e.status,
+            detail: e.detail.unwrap_or_default(),
+        })
+        .collect();
     let has_sbom = <argunix_store::SqlxStore as SbomStore>::get_sbom_by_job(&state.store, job.id)
         .await?
         .is_some();
@@ -1702,6 +1727,7 @@ async fn job_page(
         live_builder,
         phase_metrics,
         nix_run_snippet,
+        registry_run_snippets,
         image_size: job.image_size_bytes.map(|b| humanize_bytes(Some(b))),
         effects,
         has_sbom,
@@ -2079,6 +2105,27 @@ async fn log_handler(
 
 fn render<T: Template>(t: &T) -> Result<String, UiError> {
     t.render().map_err(UiError::Render)
+}
+
+/// Extract a `docker run` line from a `registry-push` effect's detail.
+///
+/// The detail is `"pushed <ref>, <ref>, … to <target>"` (see
+/// `argunix-effects::registry`). Pick the friendliest tag — `:latest`
+/// when the push produced one (default-branch builds do), else the
+/// first reference. `None` if the detail is not in that shape.
+fn registry_run_command(detail: &str) -> Option<String> {
+    let body = detail.strip_prefix("pushed ")?;
+    let refs_part = body.rsplit_once(" to ").map_or(body, |(left, _)| left);
+    let refs: Vec<&str> = refs_part
+        .split(", ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let chosen = refs
+        .iter()
+        .find(|r| r.ends_with(":latest"))
+        .or_else(|| refs.first())?;
+    Some(format!("docker run --rm {chosen}"))
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -2718,6 +2765,27 @@ mod tests {
                 attr: "packages.x86_64-linux.hello",
             }
         );
+    }
+
+    #[test]
+    fn registry_run_command_prefers_latest() {
+        let detail = "pushed reg.io/o/img:main, reg.io/o/img:latest, reg.io/o/img:sha-abc to ghcr";
+        assert_eq!(
+            registry_run_command(detail).as_deref(),
+            Some("docker run --rm reg.io/o/img:latest"),
+        );
+    }
+
+    #[test]
+    fn registry_run_command_falls_back_and_rejects_garbage() {
+        // A feature-branch build has no `:latest` tag — take the first.
+        let detail = "pushed reg.io/o/img:feature-x, reg.io/o/img:sha-abc to ghcr";
+        assert_eq!(
+            registry_run_command(detail).as_deref(),
+            Some("docker run --rm reg.io/o/img:feature-x"),
+        );
+        // A detail not in the `pushed … to …` shape yields nothing.
+        assert_eq!(registry_run_command("something else entirely"), None);
     }
 
     #[test]

@@ -26,7 +26,7 @@
         {# Slogan: a random one per page load (see `slogan()` in ui.rs).
            Hidden below `lg` — it doesn't fit next to the nav on small
            screens. `truncate` guards against an overly long slogan. #}
-        <span class="font-semibold text-subtle hidden lg:block truncate">{{ crate::slogans::pick() }}</span>
+        <span class="text-xl font-semibold text-subtle hidden lg:block truncate">{{ crate::slogans::pick() }}</span>
       </div>
       {# Wide screens: inline nav. #}
       <nav class="font-medium text-muted hidden sm:flex items-center gap-6">
@@ -51,7 +51,7 @@
         <img
           src="/static/img/applicative-systems-logo.svg"
           alt="Applicative Systems"
-          class="h-8 dark:invert"
+          class="h-10 dark:invert"
         />
       </a>
       <p>

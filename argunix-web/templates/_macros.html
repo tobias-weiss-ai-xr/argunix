@@ -57,3 +57,30 @@
   </p>
 </section>
 {%- endmacro %}
+
+{# Copy-pasteable `docker run` snippet for an image argunix pushed to a
+   registry — the image counterpart of `nix_run_snippet`. `idx` makes
+   the element id unique when a page renders several (one per
+   registry); `command` is the literal shell line. The copy button is
+   handled by the global `data-copy-target` listener in base.html. #}
+{% macro registry_run_snippet(idx, command) -%}
+<section class="mb-4 rounded border border-border bg-surface p-3">
+  <div class="flex items-baseline justify-between gap-2 mb-2 flex-wrap">
+    <h2 class="text-sm font-semibold">Run from registry</h2>
+    <button
+      type="button"
+      class="px-3 py-1 rounded border border-border text-xs hover:border-link"
+      data-copy-target="snippet-registry-run-{{ idx }}"
+    >copy</button>
+  </div>
+  <pre
+    id="snippet-registry-run-{{ idx }}"
+    class="font-mono text-xs whitespace-pre-wrap break-all px-3 py-2 rounded border border-border bg-bg text-fg overflow-x-auto"
+  >{{ command }}</pre>
+  <p class="text-xs text-muted mt-2">
+    Pulls the image straight from the registry argunix pushed it to —
+    no Nix required. <code class="font-mono">podman run</code> works
+    the same way.
+  </p>
+</section>
+{%- endmacro %}

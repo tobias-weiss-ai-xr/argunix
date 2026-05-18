@@ -440,6 +440,14 @@ in
     assert "browse the SBOM" in job_html, (
         f"job page is missing the SBOM link{envelope}"
     )
+    # An image job offers `docker run`, not `nix run` (meaningless for
+    # an image — the output is an archive, not an app).
+    assert "Run from registry" in job_html and "docker run" in job_html, (
+        f"job page is missing the `docker run` snippet for the image{envelope}"
+    )
+    assert "Run from cache" not in job_html, (
+        f"job page should not offer `nix run` for an image job{envelope}"
+    )
 
     # The SBOM browser page renders the component table server-side.
     sbom_html = machine.succeed(f"curl -fsS {job_url}/sbom")

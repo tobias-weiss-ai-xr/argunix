@@ -31,6 +31,40 @@
  * the .rs files. */
 @source "../src/**/*.rs";
 
+/* Self-hosted Raleway web font. `nix/package.nix` converts nixpkgs'
+ * Raleway TTFs to woff2 and serves them from /static/fonts/ — hosted
+ * here rather than loaded from Google's font CDN so no visitor IP ever
+ * reaches a third party (GDPR). `font-display: swap` paints text
+ * immediately in the fallback face and swaps Raleway in once loaded. */
+@font-face {
+  font-family: "Raleway";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/fonts/Raleway-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Raleway";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/static/fonts/Raleway-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Raleway";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/static/fonts/Raleway-SemiBold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Raleway";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/static/fonts/Raleway-Bold.woff2") format("woff2");
+}
+
 @layer base {
   :root {
     color-scheme: light;
@@ -122,6 +156,11 @@
 }
 
 @theme {
+  /* The UI typeface — self-hosted Raleway (see the `@font-face` rules
+   * above), with a system sans-serif fallback for first paint. Drives
+   * every `font-sans` utility, including the one on `<body>`. */
+  --font-sans: "Raleway", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
   /* Surfaces & text */
   --color-bg: var(--bg);
   --color-surface: var(--surface);
