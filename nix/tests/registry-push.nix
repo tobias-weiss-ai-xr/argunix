@@ -8,6 +8,13 @@
 # `registry:2` — and a real podman client then pulls and runs it from
 # *that* registry.
 #
+# It also covers `sbom-attach` for a *single-arch* `docker` image:
+# argunix transcribes the image's `/nix/store` closure into a CycloneDX
+# SBOM and attaches it to the pushed image as an OCI referrer — exactly
+# the treatment an `oci` image gets — and the test rediscovers it with
+# `oras`. (`design/multi-arch.md` — every image, lone or grouped,
+# docker or oci, gets an SBOM.)
+#
 # The fixture's docker-image job builds *cleanly* inside the VM: every
 # build input — the image tarball and the static `busybox` that copies
 # it — rides in through the flake's `${self}`, so the derivation has a
@@ -152,6 +159,8 @@ in
         pkgs.argunix
         pkgs.nix-eval-jobs
         pkgs.skopeo
+        # The test script rediscovers the attached SBOM with `oras`.
+        pkgs.oras
         pkgs.podman
         pkgs.zstd
         pkgs.sqlite
@@ -269,6 +278,23 @@ in
         f"an effect_run was left in `running`{envelope}"
     )
 
+    # The image is a single-arch `docker` job. Its SBOM is transcribed
+    # from the image's /nix/store layers and attached to the registry
+    # as a CycloneDX referrer — the same treatment `oci` images get.
+    assert "sbom-attach|local|success" in rows, (
+        f"expected a successful sbom-attach effect_run for the docker image{envelope}"
+    )
+
+    # ...and persisted in the DB for the web UI / future effect stages.
+    sbom_row = machine.succeed(
+        "sqlite3 /var/lib/argunix/db.sqlite "
+        "'SELECT format, component_count FROM sboms WHERE job_id = 1;'"
+    ).strip()
+    print(f"sboms row: {sbom_row!r}")
+    assert sbom_row.startswith("cyclonedx|"), (
+        f"expected a stored CycloneDX SBOM for the docker image{envelope}\nsboms: {sbom_row!r}"
+    )
+
     # The external registry itself must now hold the image under both
     # the branch tag and the immutable sha-<short> tag. This is the
     # load-bearing check — it proves the bytes left argunix and landed
@@ -304,6 +330,17 @@ in
     assert sha_tag, f"could not find a sha- tag in {tags_json!r}"
     machine.succeed(
         f"podman pull ${registryHost}/myorg/hello-image:{sha_tag.group(1)}"
+    )
+
+    # `oras discover` finds the CycloneDX SBOM as a referrer of the
+    # image's immutable sha-<short> manifest — discoverable straight
+    # from the registry in standard OCI terms, no argunix needed.
+    discover = machine.succeed(
+        f"oras discover --plain-http ${registryHost}/myorg/hello-image:{sha_tag.group(1)}"
+    )
+    print(f"--- oras discover ---\n{discover}")
+    assert "application/vnd.cyclonedx+json" in discover, (
+        f"SBOM referrer not discoverable via oras{envelope}\noras discover:\n{discover}"
     )
   '';
 }

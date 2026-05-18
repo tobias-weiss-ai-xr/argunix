@@ -665,6 +665,11 @@ async fn run_build_phase(
         .collect();
     let specs_by_id: std::collections::HashMap<JobId, argunix_eval::JobSpec> =
         persisted.iter().map(|(s, j)| (*j, s.clone())).collect();
+    // Image jobs sharing a logical name across systems — their per-job
+    // `registry-push` is suppressed; the post-build multi-arch fan-in
+    // (or, for an `oci` clash, an errored effect) handles them instead.
+    // See `design/multi-arch.md`.
+    let suppressed_push_ids = crate::multiarch::suppressed_push_job_ids(&specs_by_id);
     let mut strategy = argunix_sched::DagStrategy::new(None);
     strategy.set_weight(repo.id, 1);
     // Jobs without a drv_path (eval-error jobs) were already finalised
@@ -754,6 +759,7 @@ async fn run_build_phase(
                     .expect("spec present for every enqueued job_id")
                     .clone();
                 let token = d.token;
+                let is_multiarch_member = suppressed_push_ids.contains(&job_id);
                 let ctx_c = ctx.clone();
                 let cancel_c = cancel.clone();
                 let push_caches_c = push_caches.clone();
@@ -776,6 +782,7 @@ async fn run_build_phase(
                         &push_caches_c,
                         &registry_effects_c,
                         collapsed_mode,
+                        is_multiarch_member,
                         &cancel_c,
                     )
                     .instrument(span)
@@ -994,6 +1001,19 @@ async fn run_build_phase(
         failure = tally.failure,
         "evaluation finished",
     );
+
+    // Cross-system multi-arch fan-in: per-arch `docker` image jobs of
+    // one logical name get stitched into a multi-arch OCI index.
+    run_multiarch_fan_in(
+        &ctx,
+        &repo,
+        &eval,
+        eval_id,
+        &provider,
+        collapsed_mode,
+        &specs_by_id,
+    )
+    .await;
 
     let overall_state = if tally.failure > 0 {
         CheckState::Failure
@@ -1581,6 +1601,7 @@ async fn build_one(
     push_caches: &[argunix_build::PushCache],
     registry_effects: &[Arc<dyn Effect>],
     collapsed_mode: bool,
+    is_multiarch_member: bool,
     cancel: &argunix_web::CancelToken,
 ) -> anyhow::Result<JobStatus> {
     let repo_id = repo.id;
@@ -1623,6 +1644,7 @@ async fn build_one(
                 push_caches,
                 registry_effects,
                 collapsed_mode,
+                is_multiarch_member,
                 vec![output],
             );
             return Ok(JobStatus::Cached);
@@ -1861,6 +1883,7 @@ async fn build_one(
                 push_caches,
                 registry_effects,
                 collapsed_mode,
+                is_multiarch_member,
                 outcome.output_paths.clone(),
             );
 
@@ -1930,18 +1953,30 @@ fn spawn_post_build_effects(
     push_caches: &[argunix_build::PushCache],
     registry_effects: &[Arc<dyn Effect>],
     collapsed_mode: bool,
+    is_multiarch_member: bool,
     output_paths: Vec<String>,
 ) {
-    // An OCI image always has post-build work even with no caches /
-    // registries configured: its size and SBOM are recorded regardless.
-    let is_oci = spec.image_format == Some(ImageFormat::Oci);
-    if output_paths.is_empty() || (push_caches.is_empty() && registry_effects.is_empty() && !is_oci)
+    // A container image always has post-build work even with no caches
+    // / registries configured: its size and SBOM are recorded
+    // regardless (both `docker` and `oci` archives carry a closure).
+    let is_image = spec.image_format.is_some();
+    if output_paths.is_empty()
+        || (push_caches.is_empty() && registry_effects.is_empty() && !is_image)
     {
         return;
     }
     let store = ctx.store.clone();
     let caches: Vec<argunix_build::PushCache> = push_caches.to_vec();
-    let reg_effects: Vec<Arc<dyn Effect>> = registry_effects.to_vec();
+    // A job that is one arch slice of a multi-arch group must run
+    // neither its own `registry-push` (it would race the shared tags)
+    // nor its own `sbom-attach` (that would bind a per-arch SBOM to the
+    // index tag). The post-build fan-in pushes the assembled index and
+    // attaches a per-arch SBOM to each per-arch manifest digest.
+    let reg_effects: Vec<Arc<dyn Effect>> = registry_effects
+        .iter()
+        .filter(|e| !(is_multiarch_member && matches!(e.kind(), "registry-push" | "sbom-attach")))
+        .cloned()
+        .collect();
     let forge = repo.forge.clone();
     let slug = repo.slug.clone();
     let sha = eval.sha.clone();
@@ -1962,9 +1997,10 @@ fn spawn_post_build_effects(
     let pauses = ctx.pauses.clone();
     tokio::spawn(
         async move {
-            // Record image size + persist the CycloneDX SBOM for OCI
-            // images, before any push — independent of effect config.
-            if image_format == Some(ImageFormat::Oci) {
+            // Record image size + persist the CycloneDX SBOM for any
+            // container image, before any push — independent of effect
+            // config.
+            if image_format.is_some() {
                 crate::effects::record_image_artifacts(
                     &store,
                     job_id,
@@ -2052,6 +2088,91 @@ fn effect_check_label(kind: &str) -> &str {
         "sbom-attach" => "sbom",
         other => other,
     }
+}
+
+/// Cross-system multi-arch fan-in. After the build phase, stitch the
+/// per-arch `docker` image jobs of one logical name into a multi-arch
+/// OCI index (the work lives in `multiarch::run_fan_in`); post each
+/// outcome as an `argunix: multi-arch · …` forge check. Best-effort —
+/// a failed push never fails the eval. See `design/multi-arch.md`.
+async fn run_multiarch_fan_in(
+    ctx: &WorkerContext,
+    repo: &argunix_store::RepoRecord,
+    eval: &argunix_store::EvalRecord,
+    eval_id: EvalId,
+    provider: &Arc<dyn Provider>,
+    collapsed_mode: bool,
+    specs_by_id: &std::collections::HashMap<JobId, argunix_eval::JobSpec>,
+) {
+    let config = ctx.current.load().config.clone();
+    let outcomes = crate::multiarch::run_fan_in(
+        &ctx.store,
+        eval_id,
+        specs_by_id,
+        &config,
+        &repo.forge,
+        repo.slug.as_str(),
+        repo.default_branch.as_deref(),
+        &eval.git_ref,
+        eval.sha.as_str(),
+    )
+    .await;
+    if collapsed_mode {
+        return;
+    }
+    for outcome in outcomes {
+        let state = if outcome.ok {
+            CheckState::Success
+        } else {
+            CheckState::Failure
+        };
+        post_multiarch_check(
+            ctx,
+            provider,
+            repo,
+            &eval.sha,
+            eval_id,
+            &config.external_url,
+            &outcome.label,
+            state,
+            &outcome.detail,
+        );
+    }
+}
+
+/// Post the `argunix: multi-arch · <label>` forge check for one fan-in
+/// outcome. Mirrors `post_overall_check`.
+#[allow(clippy::too_many_arguments)]
+fn post_multiarch_check(
+    ctx: &WorkerContext,
+    provider: &Arc<dyn Provider>,
+    repo: &argunix_store::RepoRecord,
+    sha: &Sha,
+    eval_id: EvalId,
+    external_url: &str,
+    label: &str,
+    state: CheckState,
+    description: &str,
+) {
+    let post = CheckPost {
+        slug: repo.slug.clone(),
+        sha: sha.clone(),
+        context: format!("argunix: multi-arch · {label}"),
+        state,
+        description: Some(summarise_for_check(description, 140)),
+        target_url: Some(eval_target_url(
+            external_url,
+            &repo.forge,
+            &repo.slug,
+            eval_id,
+        )),
+    };
+    spawn_post_check(
+        provider.clone(),
+        post,
+        repo.forge.clone(),
+        ctx.pauses.clone(),
+    );
 }
 
 /// Best-effort docker registry publish. Any error is logged at `warn`

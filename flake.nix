@@ -136,6 +136,7 @@
             registry = pkgs.testers.runNixOSTest ./nix/tests/registry.nix;
             registry-push = pkgs.testers.runNixOSTest ./nix/tests/registry-push.nix;
             registry-push-oci = pkgs.testers.runNixOSTest ./nix/tests/registry-push-oci.nix;
+            multi-arch = pkgs.testers.runNixOSTest ./nix/tests/multi-arch.nix;
           };
         };
     };

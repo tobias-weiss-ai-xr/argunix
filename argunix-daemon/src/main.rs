@@ -2,6 +2,7 @@ mod control;
 mod dispatch_driver;
 mod effects;
 mod gc;
+mod multiarch;
 mod worker;
 
 use anyhow::{Context, anyhow};
@@ -773,18 +774,29 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
         tracing::warn!(error = %e, "failed to create registry state dirs");
     }
 
-    let mut summary = Summary::default();
+    // Persist every job up front so the multi-arch grouping sees all
+    // of the eval's job ids before the build phase.
+    let mut persisted: Vec<(argunix_eval::JobSpec, JobId)> = Vec::new();
     for spec in jobs {
         let job_id = persist_job(&store, eval_id, &spec).await?;
+        persisted.push((spec, job_id));
+    }
+    let specs_by_id: std::collections::HashMap<JobId, argunix_eval::JobSpec> =
+        persisted.iter().map(|(s, j)| (*j, s.clone())).collect();
+    let suppressed = crate::multiarch::suppressed_push_job_ids(&specs_by_id);
+
+    let mut summary = Summary::default();
+    for (spec, job_id) in &persisted {
         let outcome = build_one_job(
             &store,
             &registry_state,
             repo_id,
             eval_id,
-            job_id,
-            &spec,
+            *job_id,
+            spec,
             &push_caches,
             &registry_effects,
+            suppressed.contains(job_id),
             &args.git_ref,
             &args.sha,
             push_timeout,
@@ -804,6 +816,22 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
 
     <argunix_store::SqlxStore as EvalStore>::finish(&store, eval_id, EvalStatus::Done, Utc::now())
         .await?;
+
+    // Cross-system multi-arch fan-in. The single-shot CLI has no forge
+    // provider, so the returned outcomes (the worker would post them as
+    // forge checks) are dropped — the `effect_runs` rows still land.
+    crate::multiarch::run_fan_in(
+        &store,
+        eval_id,
+        &specs_by_id,
+        &config,
+        &args.forge,
+        &args.slug,
+        None,
+        &args.git_ref,
+        &args.sha,
+    )
+    .await;
     println!(
         "eval={eval_id} cached={c} success={s} failure={f} skipped={k} errors={e}",
         eval_id = eval_id.get(),
@@ -867,6 +895,7 @@ async fn build_one_job(
     spec: &argunix_eval::JobSpec,
     push_caches: &[argunix_build::PushCache],
     registry_effects: &[Arc<dyn argunix_effects::Effect>],
+    is_multiarch_member: bool,
     git_ref: &str,
     sha: &str,
     push_timeout: Duration,
@@ -930,10 +959,11 @@ async fn build_one_job(
                     sha,
                     &outputs,
                     registry_effects,
+                    is_multiarch_member,
                 )
                 .await;
             }
-            if spec.image_format == Some(ImageFormat::Oci) {
+            if spec.image_format.is_some() {
                 effects::record_image_artifacts(
                     store,
                     job_id,
@@ -1021,10 +1051,11 @@ async fn build_one_job(
                     sha,
                     &outcome.output_paths,
                     registry_effects,
+                    is_multiarch_member,
                 )
                 .await;
             }
-            if spec.image_format == Some(ImageFormat::Oci) {
+            if spec.image_format.is_some() {
                 effects::record_image_artifacts(
                     store,
                     job_id,
@@ -1094,6 +1125,7 @@ async fn run_registry_effects_cli(
     sha: &str,
     output_paths: &[String],
     registry_effects: &[Arc<dyn argunix_effects::Effect>],
+    is_multiarch_member: bool,
 ) {
     let repo = match <argunix_store::SqlxStore as RepoStore>::get(store, repo_id).await {
         Ok(Some(r)) => r,
@@ -1119,7 +1151,16 @@ async fn run_registry_effects_cli(
         output_paths,
         sbom_runtime_roots: &sbom_roots,
     };
-    effects::run_effects(store, job_id, registry_effects, &ctx).await;
+    // A job that is one arch slice of a multi-arch group must run
+    // neither its own `registry-push` nor its own `sbom-attach` — the
+    // post-build fan-in pushes the assembled index and attaches a
+    // per-arch SBOM to each per-arch manifest digest.
+    let reg_effects: Vec<Arc<dyn argunix_effects::Effect>> = registry_effects
+        .iter()
+        .filter(|e| !(is_multiarch_member && matches!(e.kind(), "registry-push" | "sbom-attach")))
+        .cloned()
+        .collect();
+    effects::run_effects(store, job_id, &reg_effects, &ctx).await;
 }
 
 /// Single-shot CLI variant of the worker's docker-image publish. Same

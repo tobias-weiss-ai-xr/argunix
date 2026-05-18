@@ -26,9 +26,11 @@
 //! CycloneDX SBOM for an OCI image and attaches it to that image as an
 //! OCI referrer. See `design/sbom.md`.
 
+pub mod multiarch;
 pub mod registry;
 pub mod sbom;
 
+pub use multiarch::{ArchSlice, MultiArchTarget};
 pub use registry::RegistryPush;
 pub use sbom::SbomAttach;
 

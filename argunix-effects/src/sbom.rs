@@ -42,7 +42,7 @@
 //! attachment is the impure, authenticated part. [`SbomAttach`] does
 //! both in one [`Effect::run`] so the call site stays effect-shaped.
 
-use crate::{Effect, EffectOutcome, ImageFormat, OutputContext, Severity, image_segment};
+use crate::{Effect, EffectOutcome, OutputContext, Severity, image_segment};
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
 use serde_json::{Value, json};
@@ -118,10 +118,14 @@ impl Effect for SbomAttach {
     }
 
     async fn run(&self, ctx: &OutputContext<'_>) -> EffectOutcome {
-        // Scope: OCI images only. A `docker` job is single-arch and
-        // distributed differently — see `design/sbom.md`.
-        if ctx.image_format != Some(ImageFormat::Oci) {
-            return EffectOutcome::skipped("not an oci image");
+        // Any container image — `docker` or `oci`. The CycloneDX
+        // document is transcribed from the image's `/nix/store`
+        // closure, which both archive formats carry. (For a multi-arch
+        // `docker` group this per-job effect is suppressed: the fan-in
+        // attaches a per-arch SBOM to each per-arch manifest digest —
+        // see `design/multi-arch.md`.)
+        if ctx.image_format.is_none() {
+            return EffectOutcome::skipped("not a container image");
         }
         let image = image_segment(ctx.attr_path);
         let namespace = self.namespace.replace("{slug}", ctx.repo_slug);
@@ -144,20 +148,11 @@ impl Effect for SbomAttach {
                 Err(e) => return EffectOutcome::failure(e),
             };
 
-        // `oras attach` reads the SBOM from a file; stage it next to
-        // the system temp dir, remove it once the push is done.
-        let staged =
-            std::env::temp_dir().join(format!("argunix-sbom-{image}-{}.cdx.json", ctx.short_sha()));
-        if let Err(e) = tokio::fs::write(&staged, &sbom).await {
-            return EffectOutcome::failure(format!("writing SBOM to {}: {e}", staged.display(),));
-        }
-
         // Credentials read here, never at config time, never logged.
         let creds = match &self.auth_path {
             Some(path) => match tokio::fs::read_to_string(path).await {
                 Ok(s) => Some(s.trim().to_string()),
                 Err(e) => {
-                    let _ = tokio::fs::remove_file(&staged).await;
                     return EffectOutcome::failure(format!(
                         "reading registry credentials {}: {e}",
                         path.display(),
@@ -167,12 +162,10 @@ impl Effect for SbomAttach {
             None => None,
         };
 
-        let result = self
-            .oras_attach(&reference, &staged, creds.as_deref())
-            .await;
-        let _ = tokio::fs::remove_file(&staged).await;
-
-        match result {
+        let hint = format!("argunix-sbom-{image}-{}", ctx.short_sha());
+        match attach_cyclonedx_referrer(&reference, &sbom, &hint, self.insecure, creds.as_deref())
+            .await
+        {
             Ok(()) => EffectOutcome::success(format!(
                 "attached SBOM ({n_components} components) to {reference}",
             )),
@@ -183,52 +176,74 @@ impl Effect for SbomAttach {
     }
 }
 
-impl SbomAttach {
-    /// `oras attach --artifact-type <cyclonedx> <image-ref> <file>` —
-    /// pushes the SBOM as an artifact whose manifest `subject` is the
-    /// image. On a registry without the OCI 1.1 referrers API, `oras`
-    /// transparently falls back to the referrers tag schema.
-    async fn oras_attach(
-        &self,
-        reference: &str,
-        file: &Path,
-        creds: Option<&str>,
-    ) -> Result<(), String> {
-        // `oras` records the file argument verbatim as the artifact's
-        // title annotation and rejects absolute paths. Run it from the
-        // file's directory and pass the bare name, so the title is a
-        // clean filename (and `oras pull` writes it back sensibly).
-        let dir = file.parent().unwrap_or_else(|| Path::new("."));
-        let name = file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| "staged SBOM path has no file name".to_string())?;
-
-        let mut cmd = Command::new("oras");
-        cmd.current_dir(dir)
-            .arg("attach")
-            .arg("--artifact-type")
-            .arg(CYCLONEDX_MEDIA_TYPE);
-        // `oras` may touch `$HOME` (docker-style config / cache). The
-        // daemon runs as a system user whose home may be unwritable —
-        // point it at the temp dir so an anonymous push never fails on
-        // a read-only home.
-        cmd.env("HOME", std::env::temp_dir());
-        if self.insecure {
-            cmd.arg("--plain-http");
-        }
-        if let Some(creds) = creds {
-            let Some((user, pass)) = creds.split_once(':') else {
-                return Err("credentials file is not in `user:password` form".into());
-            };
-            cmd.arg("--username").arg(user).arg("--password").arg(pass);
-        }
-        cmd.arg(reference)
-            .arg(format!("{name}:{CYCLONEDX_MEDIA_TYPE}"));
-        run_capture(cmd, "oras attach", ATTACH_TIMEOUT)
-            .await
-            .map(|_| ())
+/// Stage `sbom` to a temp file and `oras attach` it as a CycloneDX
+/// referrer of `reference` — the artifact's manifest `subject` is the
+/// target manifest. On a registry without the OCI 1.1 referrers API,
+/// `oras` transparently falls back to the referrers tag schema.
+///
+/// Shared by the single-arch [`SbomAttach`] effect and the multi-arch
+/// fan-in ([`crate::multiarch`]), which attaches a per-arch SBOM to
+/// each per-arch manifest digest. `name_hint` becomes the staged
+/// filename — and so the artifact's title annotation — so pass
+/// something unique per attach to keep concurrent attaches from
+/// colliding on the temp path.
+pub(crate) async fn attach_cyclonedx_referrer(
+    reference: &str,
+    sbom: &[u8],
+    name_hint: &str,
+    insecure: bool,
+    creds: Option<&str>,
+) -> Result<(), String> {
+    let staged = std::env::temp_dir().join(format!("{name_hint}.cdx.json"));
+    if let Err(e) = tokio::fs::write(&staged, sbom).await {
+        return Err(format!("writing SBOM to {}: {e}", staged.display()));
     }
+    let result = run_oras_attach(&staged, reference, insecure, creds).await;
+    let _ = tokio::fs::remove_file(&staged).await;
+    result
+}
+
+/// `oras attach --artifact-type <cyclonedx> <image-ref> <file>`.
+async fn run_oras_attach(
+    file: &Path,
+    reference: &str,
+    insecure: bool,
+    creds: Option<&str>,
+) -> Result<(), String> {
+    // `oras` records the file argument verbatim as the artifact's
+    // title annotation and rejects absolute paths. Run it from the
+    // file's directory and pass the bare name, so the title is a
+    // clean filename (and `oras pull` writes it back sensibly).
+    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "staged SBOM path has no file name".to_string())?;
+
+    let mut cmd = Command::new("oras");
+    cmd.current_dir(dir)
+        .arg("attach")
+        .arg("--artifact-type")
+        .arg(CYCLONEDX_MEDIA_TYPE);
+    // `oras` may touch `$HOME` (docker-style config / cache). The
+    // daemon runs as a system user whose home may be unwritable —
+    // point it at the temp dir so an anonymous push never fails on
+    // a read-only home.
+    cmd.env("HOME", std::env::temp_dir());
+    if insecure {
+        cmd.arg("--plain-http");
+    }
+    if let Some(creds) = creds {
+        let Some((user, pass)) = creds.split_once(':') else {
+            return Err("credentials file is not in `user:password` form".into());
+        };
+        cmd.arg("--username").arg(user).arg("--password").arg(pass);
+    }
+    cmd.arg(reference)
+        .arg(format!("{name}:{CYCLONEDX_MEDIA_TYPE}"));
+    run_capture(cmd, "oras attach", ATTACH_TIMEOUT)
+        .await
+        .map(|_| ())
 }
 
 /// Generate the CycloneDX SBOM for an OCI image job: resolve the
@@ -522,7 +537,12 @@ fn parse_name_version(basename: &str) -> (String, Option<String>) {
 /// Spawn `cmd`, wait with a timeout, return stdout on a zero exit.
 /// `Err` carries a human reason (spawn error, timeout, or the trimmed
 /// stderr). `kill_on_drop` plus the timeout guarantees no orphan.
-async fn run_capture(mut cmd: Command, what: &str, limit: Duration) -> Result<Vec<u8>, String> {
+/// Shared with `multiarch` — both shell out to the same image tools.
+pub(crate) async fn run_capture(
+    mut cmd: Command,
+    what: &str,
+    limit: Duration,
+) -> Result<Vec<u8>, String> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -549,6 +569,7 @@ async fn run_capture(mut cmd: Command, what: &str, limit: Duration) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ImageFormat;
 
     #[test]
     fn runtime_roots_reads_string_array() {
@@ -642,25 +663,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_non_oci_jobs() {
+    async fn skips_non_image_jobs() {
+        // A job with no image format is not a container image — the
+        // SBOM effect has nothing to attach.
         let roots = vec!["/nix/store/x".to_string()];
-        let ctx = oci_ctx(&roots, Some(ImageFormat::Docker));
+        let ctx = oci_ctx(&roots, None);
         let outcome = attach().run(&ctx).await;
         assert_eq!(outcome.status, crate::EffectStatus::Skipped);
     }
 
     #[tokio::test]
-    async fn fails_when_oci_image_has_no_archive() {
-        // No declared roots *and* no build output to scan — the effect
-        // has nothing to read, so it fails rather than skipping.
-        let ctx = oci_ctx(&[], Some(ImageFormat::Oci));
-        let outcome = attach().run(&ctx).await;
-        assert_eq!(outcome.status, crate::EffectStatus::Failure);
-        assert!(
-            outcome.detail.contains("no image archive"),
-            "got: {}",
-            outcome.detail,
-        );
+    async fn docker_and_oci_images_are_both_in_scope() {
+        // Both archive formats carry a `/nix/store` closure, so both
+        // are SBOM'd. With neither declared roots nor a build output to
+        // scan, generation *fails* rather than skipping — proving the
+        // effect ran instead of bailing on the format.
+        for fmt in [ImageFormat::Docker, ImageFormat::Oci] {
+            let ctx = oci_ctx(&[], Some(fmt));
+            let outcome = attach().run(&ctx).await;
+            assert_eq!(outcome.status, crate::EffectStatus::Failure);
+            assert!(
+                outcome.detail.contains("no image archive"),
+                "got: {}",
+                outcome.detail,
+            );
+        }
     }
 
     #[test]
