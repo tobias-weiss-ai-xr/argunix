@@ -45,6 +45,12 @@
 ) %}
 {% endif %}
 
+{% if !registry_run_snippets.is_empty() %}
+{% for cmd in registry_run_snippets %}
+{% call m::registry_run_snippet(loop.index, cmd) %}
+{% endfor %}
+{% endif %}
+
 {% if let Some(builder_name) = live_builder %}
 <section class="mb-6" id="live-stats" data-builder="{{ builder_name }}">
   <h2 class="text-lg font-semibold mb-2">live (5s)</h2>
@@ -157,13 +163,6 @@
       </tbody>
     </table>
   </div>
-  {% if !registry_run_snippets.is_empty() %}
-  <div class="mt-3">
-    {% for cmd in registry_run_snippets %}
-    {% call m::registry_run_snippet(loop.index, cmd) %}
-    {% endfor %}
-  </div>
-  {% endif %}
   {% if has_sbom %}
   <p class="mt-2">
     <a
