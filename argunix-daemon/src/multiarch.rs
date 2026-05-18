@@ -45,6 +45,10 @@ pub fn suppressed_push_job_ids(specs: &HashMap<JobId, JobSpec>) -> HashSet<JobId
 /// SBOM. `classify` is synchronous; per-arch SBOM generation is async,
 /// so [`run_fan_in`] turns each `PendingSlice` into an [`ArchSlice`].
 pub struct PendingSlice {
+    /// The per-arch job that produced this slice. The fan-in records a
+    /// `registry-index` effect_run against it, so the job's own page
+    /// shows the assembly it was part of.
+    pub job_id: JobId,
     /// Nix system tuple, e.g. `aarch64-linux`.
     pub system: String,
     /// The `docker-archive` store path the build produced.
@@ -63,11 +67,10 @@ pub enum ImageGroup {
     MultiArch {
         /// Logical image name (the registry image segment).
         name: String,
-        /// Per-arch slices whose member job built successfully.
+        /// Per-arch slices whose member job built successfully — each
+        /// carries its own job id (the fan-in records a per-slice
+        /// `registry-index` effect_run).
         slices: Vec<PendingSlice>,
-        /// Member job id the `effect_runs` row is attributed to
-        /// (lowest id — deterministic).
-        anchor: JobId,
         /// Systems whose member job did *not* build — named in the
         /// outcome detail when the index is assembled partial.
         missing: Vec<String>,
@@ -102,7 +105,6 @@ pub fn classify(specs: &HashMap<JobId, JobSpec>, records: &[JobRecord]) -> Vec<I
         if members.len() < 2 {
             continue; // a lone image — nothing to fan in.
         }
-        let anchor = members.iter().map(|(j, _)| *j).min().expect("non-empty");
         let oci = members
             .iter()
             .filter(|(_, s)| s.image_format == Some(ImageFormat::Oci))
@@ -112,6 +114,7 @@ pub fn classify(specs: &HashMap<JobId, JobSpec>, records: &[JobRecord]) -> Vec<I
             // Two or more same-name image jobs with any `oci` among
             // them — a complete `oci` image exposed across systems, or
             // `oci` mixed with `docker` slices. Either way ambiguous.
+            let anchor = members.iter().map(|(j, _)| *j).min().expect("non-empty");
             out.push(ImageGroup::Clash {
                 name,
                 anchor,
@@ -136,6 +139,7 @@ pub fn classify(specs: &HashMap<JobId, JobSpec>, records: &[JobRecord]) -> Vec<I
                         && r.output_path.is_some() =>
                 {
                     slices.push(PendingSlice {
+                        job_id: *job_id,
                         system,
                         archive: r.output_path.clone().expect("checked"),
                         attr_path: spec.attr_path.as_str().to_string(),
@@ -148,7 +152,6 @@ pub fn classify(specs: &HashMap<JobId, JobSpec>, records: &[JobRecord]) -> Vec<I
         out.push(ImageGroup::MultiArch {
             name,
             slices,
-            anchor,
             missing,
         });
     }
@@ -234,7 +237,6 @@ pub async fn run_fan_in(
             ImageGroup::MultiArch {
                 name,
                 slices,
-                anchor,
                 missing,
             } => {
                 if slices.is_empty() {
@@ -283,15 +285,23 @@ pub async fn run_fan_in(
                     });
                 }
                 for target in &targets {
-                    let run_id = <SqlxStore as EffectRunStore>::create_effect_run(
-                        store,
-                        anchor,
-                        "registry-index",
-                        &target.target,
-                        Utc::now(),
-                    )
-                    .await
-                    .ok();
+                    // One `registry-index` effect_run per slice job, so
+                    // every per-arch job page shows the assembly it was
+                    // part of — not just the lowest-id member.
+                    let mut runs = Vec::with_capacity(slices.len());
+                    for ps in &slices {
+                        runs.push(
+                            <SqlxStore as EffectRunStore>::create_effect_run(
+                                store,
+                                ps.job_id,
+                                "registry-index",
+                                &target.target,
+                                Utc::now(),
+                            )
+                            .await
+                            .ok(),
+                        );
+                    }
                     let result = target
                         .assemble(repo_slug, &name, short_sha, &arch_slices, &tags)
                         .await;
@@ -306,10 +316,10 @@ pub async fn run_fan_in(
                         }
                         Err(e) => ("failure", e.clone(), false),
                     };
-                    if let Some(id) = run_id {
+                    for run_id in runs.into_iter().flatten() {
                         if let Err(e) = <SqlxStore as EffectRunStore>::finish_effect_run(
                             store,
-                            id,
+                            run_id,
                             status,
                             Some(&detail),
                             Utc::now(),
@@ -437,12 +447,13 @@ mod tests {
             ImageGroup::MultiArch {
                 name,
                 slices,
-                anchor,
                 missing,
             } => {
                 assert_eq!(name, "app");
                 assert_eq!(slices.len(), 2);
-                assert_eq!(*anchor, JobId::new(1));
+                // each slice carries the job id of its per-arch build
+                let ids: Vec<_> = slices.iter().map(|s| s.job_id).collect();
+                assert!(ids.contains(&JobId::new(1)) && ids.contains(&JobId::new(2)));
                 assert!(missing.is_empty());
             }
             ImageGroup::Clash { .. } => panic!("expected a multi-arch group, got a clash"),

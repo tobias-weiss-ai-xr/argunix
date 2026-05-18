@@ -231,6 +231,16 @@ in
     assert "registry-index|local|success" in rows, (
         f"expected a successful registry-index effect_run{envelope}"
     )
+    # ...recorded against *every* per-arch job, so each job's own page
+    # shows the assembly it was part of — not just the lowest-id one.
+    index_jobs = machine.succeed(
+        "sqlite3 /var/lib/argunix/db.sqlite "
+        "\"SELECT job_id FROM effect_runs WHERE kind = 'registry-index' ORDER BY job_id;\""
+    ).strip().splitlines()
+    print(f"registry-index job_ids: {index_jobs!r}")
+    assert index_jobs == ["1", "2"], (
+        f"registry-index should be recorded for both per-arch jobs{envelope}"
+    )
     # The grouped jobs' per-job `registry-push` *and* `sbom-attach`
     # must have been suppressed — the fan-in owns the tags and attaches
     # a per-arch SBOM to each per-arch manifest digest, so neither

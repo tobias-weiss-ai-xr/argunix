@@ -65,6 +65,28 @@ in
       '';
     };
 
+    systems = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
+      description = ''
+        Nix systems argunix evaluates every flake for — it walks
+        `packages.<system>.*` (and `checks`, `devShells`) for each
+        system listed. The default (empty) evaluates only the
+        coordinator host's own system, so a flake's `aarch64-linux`
+        outputs are silently ignored until `aarch64-linux` is added
+        here.
+
+        Each listed system needs a builder that can realise it — a
+        native builder of that system, or one advertising it through
+        binfmt emulation — otherwise its jobs land in
+        `SkippedNoBuilder`.
+      '';
+    };
+
     stateDir = lib.mkOption {
       type = lib.types.path;
       default = "/var/lib/argunix";
@@ -188,14 +210,20 @@ in
       serviceConfig = {
         Type = "notify-reload";
         NotifyAccess = "main";
-        ExecStart = lib.concatStringsSep " " [
-          (lib.getExe' cfg.package "argunix")
-          "serve"
-          "--config"
-          settingsFile
-          "--listen"
-          cfg.listen
-        ];
+        ExecStart = lib.concatStringsSep " " (
+          [
+            (lib.getExe' cfg.package "argunix")
+            "serve"
+            "--config"
+            settingsFile
+            "--listen"
+            cfg.listen
+          ]
+          ++ lib.optionals (cfg.systems != [ ]) [
+            "--systems"
+            (lib.concatStringsSep "," cfg.systems)
+          ]
+        );
         ExecReload = lib.concatStringsSep " " [
           (lib.getExe' cfg.package "argunixctl")
           "reload"

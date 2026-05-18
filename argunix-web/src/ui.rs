@@ -1654,18 +1654,24 @@ async fn job_page(
     // An image job: `nix run` makes no sense for it (the output is an
     // image archive, not an app), but `docker run` does. Detected from
     // a recorded archive size, or from a non-skipped registry / SBOM
-    // effect — the latter also catches docker-format images, whose
-    // size argunix does not record.
+    // effect.
     let is_image = job.image_size_bytes.is_some()
         || effect_runs.iter().any(|e| {
-            matches!(e.kind.as_str(), "registry-push" | "sbom-attach") && e.status != "skipped"
+            matches!(
+                e.kind.as_str(),
+                "registry-push" | "sbom-attach" | "registry-index"
+            ) && e.status != "skipped"
         });
 
-    // "Run from registry" — a `docker run` line per registry the image
-    // was successfully pushed to, parsed from the push effect's detail.
+    // "Run from registry" — a `docker run` line for the image, parsed
+    // from the effect detail: a per-job `registry-push` for a lone
+    // image, or the multi-arch `registry-index` for a job that is one
+    // arch slice of a group (both slices share the same index line).
     let registry_run_snippets: Vec<String> = effect_runs
         .iter()
-        .filter(|e| e.kind == "registry-push" && e.status == "success")
+        .filter(|e| {
+            matches!(e.kind.as_str(), "registry-push" | "registry-index") && e.status == "success"
+        })
         .filter_map(|e| e.detail.as_deref().and_then(registry_run_command))
         .collect();
 
@@ -2107,25 +2113,54 @@ fn render<T: Template>(t: &T) -> Result<String, UiError> {
     t.render().map_err(UiError::Render)
 }
 
-/// Extract a `docker run` line from a `registry-push` effect's detail.
+/// Extract a `docker run` line from a `registry-push` *or*
+/// `registry-index` effect's detail.
 ///
-/// The detail is `"pushed <ref>, <ref>, … to <target>"` (see
-/// `argunix-effects::registry`). Pick the friendliest tag — `:latest`
-/// when the push produced one (default-branch builds do), else the
-/// first reference. `None` if the detail is not in that shape.
+/// - `registry-push` detail is `"pushed <ref>, <ref>, … to <target>"`
+///   (see `argunix-effects::registry`) — a list of full references.
+/// - `registry-index` detail (the multi-arch fan-in) ends
+///   `"… → <base>:<tag>, <tag>, …"` — one base, then the tag list.
+///
+/// Either way: pick the friendliest tag — `:latest` when present
+/// (default-branch builds produce it), else the first — and build the
+/// `docker run` line. `None` if the detail matches neither shape.
 fn registry_run_command(detail: &str) -> Option<String> {
-    let body = detail.strip_prefix("pushed ")?;
-    let refs_part = body.rsplit_once(" to ").map_or(body, |(left, _)| left);
-    let refs: Vec<&str> = refs_part
-        .split(", ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let chosen = refs
-        .iter()
-        .find(|r| r.ends_with(":latest"))
-        .or_else(|| refs.first())?;
-    Some(format!("docker run --rm {chosen}"))
+    // `registry-push`: "pushed <ref>, <ref>, … to <target>"
+    if let Some(body) = detail.strip_prefix("pushed ") {
+        let refs_part = body.rsplit_once(" to ").map_or(body, |(left, _)| left);
+        let refs: Vec<&str> = refs_part
+            .split(", ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let chosen = refs
+            .iter()
+            .find(|r| r.ends_with(":latest"))
+            .or_else(|| refs.first())?;
+        return Some(format!("docker run --rm {chosen}"));
+    }
+
+    // `registry-index`: "assembled … → <base>:<tag>, <tag>, …"
+    if let Some((_, refs_part)) = detail.split_once(" → ") {
+        // A trailing "(missing arch: …)" rides on the last tag — keep
+        // only each entry's first whitespace-delimited token.
+        let mut parts = refs_part
+            .split(", ")
+            .filter_map(|p| p.split_whitespace().next())
+            .filter(|s| !s.is_empty());
+        let first = parts.next()?; // "<base>:<tag1>"
+        let (base, tag1) = first.rsplit_once(':')?;
+        let mut tags = vec![tag1];
+        tags.extend(parts);
+        let tag = tags
+            .iter()
+            .find(|t| **t == "latest")
+            .copied()
+            .unwrap_or(tags[0]);
+        return Some(format!("docker run --rm {base}:{tag}"));
+    }
+
+    None
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -2786,6 +2821,23 @@ mod tests {
         );
         // A detail not in the `pushed … to …` shape yields nothing.
         assert_eq!(registry_run_command("something else entirely"), None);
+    }
+
+    #[test]
+    fn registry_run_command_handles_multiarch_index() {
+        // The `registry-index` fan-in detail: one base, then tags.
+        let detail = "assembled 2-arch index (amd64+arm64, 2 per-arch SBOMs) → reg.io/o/img:main, latest, sha-abc";
+        assert_eq!(
+            registry_run_command(detail).as_deref(),
+            Some("docker run --rm reg.io/o/img:latest"),
+        );
+        // A partial index appends "(missing arch: …)" to the last tag —
+        // it must not leak into the chosen reference.
+        let partial = "assembled 1-arch index (amd64) → reg.io/o/img:main, sha-abc (missing arch: aarch64-linux)";
+        assert_eq!(
+            registry_run_command(partial).as_deref(),
+            Some("docker run --rm reg.io/o/img:main"),
+        );
     }
 
     #[test]

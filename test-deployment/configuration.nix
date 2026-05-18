@@ -52,6 +52,12 @@ in
   services.argunix = {
     enable = true;
     listen = "127.0.0.1:8080";
+
+    systems = [
+      "x86_64-linux"
+      "aarch64-linux"
+    ];
+
     settings = {
       external_url = "https://${fqdn}";
       builder_enrollment = {
