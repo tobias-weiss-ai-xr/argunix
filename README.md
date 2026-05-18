@@ -80,7 +80,9 @@ remote builders enrolled over SSH.
 A deeper tour of these design choices lives in
 [docs/concepts/](docs/concepts/). The
 [configuration guide](docs/configuration.md) covers the YAML/NixOS
-module options and which forge token scopes are actually used.
+module options and which forge token scopes are actually used, and the
+[container-images guide](docs/images.md) shows flake authors how to
+build, multi-arch, and SBOM their images.
 
 ## Quickstart
 
