@@ -258,6 +258,14 @@
       const acts = new Map(); // activity id -> { act, label }
       let prog = null; // last Progress event
 
+      // Keep the live view bounded: a long verbose build streams far
+      // more lines than a browser can hold as DOM nodes, and one
+      // append + reflow per SSE event pins the main thread. We cap the
+      // rendered scrollback and coalesce bursts into a single DOM
+      // write per animation frame. The complete log is on disk once
+      // the build finishes.
+      const MAX_LOG_LINES = 2000;
+
       // Stable per-derivation hue so a package keeps its colour for
       // the whole build — light enough to read on the dark log.
       const labelColor = (s) => {
@@ -268,11 +276,9 @@
       const esc = (s) =>
         s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 
-      const appendLine = (label, text, lineColor) => {
-        const stick =
-          log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+      const makeLineDiv = ({ label, text, color }) => {
         const div = document.createElement("div");
-        if (lineColor) div.style.color = lineColor;
+        if (color) div.style.color = color;
         if (label) {
           const tag = document.createElement("span");
           tag.textContent = label + "> ";
@@ -280,11 +286,56 @@
           div.appendChild(tag);
         }
         div.appendChild(document.createTextNode(text));
-        log.appendChild(div);
-        if (stick) log.scrollTop = log.scrollHeight;
+        return div;
+      };
+
+      // Pending log lines and a tree-dirty flag, flushed together at
+      // most once per animation frame.
+      let pending = [];
+      let treeDirty = false;
+      let flushScheduled = false;
+
+      const flush = () => {
+        flushScheduled = false;
+        if (pending.length) {
+          const stick =
+            log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+          const frag = document.createDocumentFragment();
+          for (const p of pending) frag.appendChild(makeLineDiv(p));
+          pending = [];
+          log.appendChild(frag);
+          // Trim oldest nodes so the DOM never grows without bound.
+          while (log.childElementCount > MAX_LOG_LINES)
+            log.removeChild(log.firstChild);
+          if (stick) log.scrollTop = log.scrollHeight;
+        }
+        if (treeDirty) {
+          treeDirty = false;
+          renderTreeNow();
+        }
+      };
+      const scheduleFlush = () => {
+        if (flushScheduled) return;
+        flushScheduled = true;
+        requestAnimationFrame(flush);
+      };
+
+      const appendLine = (label, text, color) => {
+        pending.push({ label, text, color });
+        // Bound `pending` too — a backgrounded tab pauses
+        // requestAnimationFrame, so without this it could grow without
+        // limit. Only the last MAX_LOG_LINES are ever rendered anyway.
+        if (pending.length > MAX_LOG_LINES)
+          pending.splice(0, pending.length - MAX_LOG_LINES);
+        scheduleFlush();
       };
 
       const renderTree = () => {
+        treeDirty = true;
+        scheduleFlush();
+      };
+
+      const renderTreeNow = () => {
         if (!tree) return;
         const builds = [];
         let dl = 0, sub = 0, cp = 0;

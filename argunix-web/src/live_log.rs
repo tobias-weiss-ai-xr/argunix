@@ -9,17 +9,20 @@
 //! log endpoint serves the zstd-compressed final log from disk.
 
 use argunix_nom::NomEvent;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 const BROADCAST_CAPACITY: usize = 256;
 
-/// Cap on the replayed prefix a late-joining subscriber receives. A
-/// runaway build does not grow this without bound; live subscribers
-/// still see every event via the broadcast — only the catch-up buffer
-/// stops at the cap, with one sentinel event marking the gap.
-const MAX_BUFFERED_EVENTS: usize = 50_000;
+/// Cap on the catch-up buffer a late-joining subscriber replays. The
+/// buffer is a ring of the most-recent events: a runaway build cannot
+/// grow it without bound, and a late joiner always sees the *recent*
+/// tail rather than a stale frozen prefix. Live subscribers still get
+/// every event via the broadcast — only the one-shot catch-up replay
+/// is bounded. Kept modest so connecting a viewer mid-firehose is a
+/// small burst, not a multi-second stall on the client.
+const MAX_BUFFERED_EVENTS: usize = 2_000;
 
 /// Per-build state. Buffer + broadcaster are coupled under one mutex
 /// so a subscriber's snapshot-then-subscribe is atomic relative to
@@ -29,8 +32,7 @@ pub struct LiveLog {
 }
 
 struct Inner {
-    buf: Vec<NomEvent>,
-    truncated: bool,
+    buf: VecDeque<NomEvent>,
     tx: broadcast::Sender<NomEvent>,
 }
 
@@ -39,36 +41,32 @@ impl LiveLog {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Arc::new(Self {
             inner: Mutex::new(Inner {
-                buf: Vec::new(),
-                truncated: false,
+                buf: VecDeque::new(),
                 tx,
             }),
         })
     }
 
-    /// Append an event and fan it out to live subscribers. `send`
+    /// Append an event and fan it out to live subscribers. The buffer
+    /// is a ring — once full, the oldest event is dropped. `send`
     /// errors are ignored — they only mean no subscribers, which is
     /// the common case (most builds finish without anyone watching).
     pub fn push(&self, event: NomEvent) {
         let mut g = self.inner.lock().unwrap();
-        if g.buf.len() < MAX_BUFFERED_EVENTS {
-            g.buf.push(event.clone());
-        } else if !g.truncated {
-            g.truncated = true;
-            g.buf.push(NomEvent::Raw {
-                text: "argunix: live log buffer truncated — open the full log".to_string(),
-            });
+        g.buf.push_back(event.clone());
+        if g.buf.len() > MAX_BUFFERED_EVENTS {
+            g.buf.pop_front();
         }
         let _ = g.tx.send(event);
     }
 
-    /// Take a snapshot of the buffered prefix and a subscription to
+    /// Take a snapshot of the buffered tail and a subscription to
     /// future events. The two are produced under one lock so the
     /// caller cannot miss an event (or see it twice) in the gap
     /// between snapshot and subscribe.
     pub fn subscribe(&self) -> (Vec<NomEvent>, broadcast::Receiver<NomEvent>) {
         let g = self.inner.lock().unwrap();
-        (g.buf.clone(), g.tx.subscribe())
+        (g.buf.iter().cloned().collect(), g.tx.subscribe())
     }
 }
 
@@ -128,6 +126,23 @@ mod tests {
         log.push(raw("world"));
         let event = rx.recv().await.unwrap();
         assert_eq!(event, raw("world"));
+    }
+
+    #[tokio::test]
+    async fn buffer_is_a_bounded_ring_keeping_the_recent_tail() {
+        let log = LiveLog::new();
+        // Push well past the cap; the buffer must not grow unbounded.
+        for i in 0..(MAX_BUFFERED_EVENTS + 500) {
+            log.push(raw(&format!("line {i}")));
+        }
+        let (snap, _rx) = log.subscribe();
+        assert_eq!(snap.len(), MAX_BUFFERED_EVENTS);
+        // The oldest events rolled off; the most recent are retained.
+        assert_eq!(snap.first(), Some(&raw("line 500")));
+        assert_eq!(
+            snap.last(),
+            Some(&raw(&format!("line {}", MAX_BUFFERED_EVENTS + 499))),
+        );
     }
 
     #[tokio::test]
