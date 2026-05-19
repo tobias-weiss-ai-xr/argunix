@@ -61,6 +61,20 @@
   ) %}
   {% endif %}
 
+  {% if !registry_paths.is_empty() %}
+  <section class="mb-6">
+    <h2 class="text-lg font-semibold mb-2">Published images</h2>
+    <p class="text-sm text-muted mb-2">
+      Registry references this run pushed or assembled.
+    </p>
+    <ul class="rounded border border-border bg-surface p-3 space-y-1">
+      {% for path in registry_paths %}
+      <li class="font-mono text-xs text-fg wrap-break-word">{{ path }}</li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
   <h2 class="text-lg font-semibold mb-2">{{ job_heading }}</h2>
   {% if jobs.is_empty() %}
     <p class="text-muted">{{ empty_jobs_msg }}</p>

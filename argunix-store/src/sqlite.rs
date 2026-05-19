@@ -1349,6 +1349,24 @@ impl EffectRunStore for SqlxStore {
         .await?;
         rows.iter().map(map_effect_run).collect()
     }
+
+    async fn list_effect_runs_by_eval(
+        &self,
+        eval_id: EvalId,
+    ) -> Result<Vec<EffectRunRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT er.id, er.job_id, er.kind, er.target, er.status, er.detail,
+                    er.started_at, er.finished_at
+             FROM effect_runs er
+             JOIN jobs j ON er.job_id = j.id
+             WHERE j.eval_id = ?1
+             ORDER BY er.id",
+        )
+        .bind(eval_id.get())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_effect_run).collect()
+    }
 }
 
 fn map_sbom(row: &SqliteRow) -> Result<SbomRecord, StoreError> {

@@ -458,6 +458,14 @@ pub trait EffectRunStore: Send + Sync {
         &self,
         job_id: JobId,
     ) -> Result<Vec<EffectRunRecord>, StoreError>;
+
+    /// Every effect-run row across all of an eval's jobs, oldest
+    /// first. Used by the eval page to summarise the registry paths
+    /// the run published.
+    async fn list_effect_runs_by_eval(
+        &self,
+        eval_id: EvalId,
+    ) -> Result<Vec<EffectRunRecord>, StoreError>;
 }
 
 #[async_trait]

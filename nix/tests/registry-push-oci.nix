@@ -462,5 +462,19 @@ in
     assert '"bomFormat": "CycloneDX"' in sbom_api, (
         f"the SBOM route did not return CycloneDX JSON{envelope}\n{sbom_api}"
     )
+
+    # The eval page lists every registry reference the run published —
+    # gathered from its jobs' `registry-push` / `registry-index`
+    # effects. The immutable sha-<short> tag must appear there.
+    eval_html = machine.succeed(
+        "curl -fsS http://127.0.0.1:${toString argunixPort}/r/gh/myorg/myrepo/eval/1"
+    )
+    print(f"--- eval page ---\n{eval_html}")
+    assert "Published images" in eval_html, (
+        f"eval page is missing the published-images section{envelope}"
+    )
+    assert "${registryHost}/myorg/oci-image:sha-" in eval_html, (
+        f"eval page does not list the pushed registry reference{envelope}"
+    )
   '';
 }

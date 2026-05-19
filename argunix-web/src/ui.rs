@@ -361,6 +361,11 @@ struct EvalTemplate {
     /// green jobs (the synthetic-flake endpoint would 404 — surface that
     /// here by hiding the snippet rather than showing a broken command).
     nix_run_snippet: Option<String>,
+    /// Every registry reference this eval published — the deduplicated
+    /// `host/ns/image:tag` strings from its successful `registry-push`
+    /// and `registry-index` effects. Empty when the eval pushed no
+    /// images; the template hides the section then.
+    registry_paths: Vec<String>,
 }
 
 struct JobRow {
@@ -1544,6 +1549,25 @@ async fn eval_page(
         })
         .collect();
 
+    // Registry references this eval published — gathered from its
+    // jobs' successful `registry-push` / `registry-index` effects,
+    // deduplicated.
+    let effect_runs = <argunix_store::SqlxStore as EffectRunStore>::list_effect_runs_by_eval(
+        &state.store,
+        eval_id,
+    )
+    .await?;
+    let mut registry_paths: Vec<String> = effect_runs
+        .iter()
+        .filter(|e| {
+            matches!(e.kind.as_str(), "registry-push" | "registry-index") && e.status == "success"
+        })
+        .filter_map(|e| e.detail.as_deref())
+        .flat_map(registry_refs)
+        .collect();
+    registry_paths.sort();
+    registry_paths.dedup();
+
     let snap = state.current.load_full();
     let forge_cfg = snap.config.forges.get(&forge);
     let repo = state.store.find(&forge, &slug).await?;
@@ -1602,6 +1626,7 @@ async fn eval_page(
         ref_link,
         commit_link,
         nix_run_snippet,
+        registry_paths,
     })?;
     Ok(Html(html).into_response())
 }
@@ -2113,54 +2138,64 @@ fn render<T: Template>(t: &T) -> Result<String, UiError> {
     t.render().map_err(UiError::Render)
 }
 
-/// Extract a `docker run` line from a `registry-push` *or*
-/// `registry-index` effect's detail.
+/// Every registry reference a `registry-push` *or* `registry-index`
+/// effect detail names — full `host/ns/image:tag` strings.
 ///
 /// - `registry-push` detail is `"pushed <ref>, <ref>, … to <target>"`
 ///   (see `argunix-effects::registry`) — a list of full references.
 /// - `registry-index` detail (the multi-arch fan-in) ends
-///   `"… → <base>:<tag>, <tag>, …"` — one base, then the tag list.
+///   `"… → <base>:<tag>, <tag>, …"` — one base, then the tag list,
+///   optionally followed by `" (missing arch: …)"`.
 ///
-/// Either way: pick the friendliest tag — `:latest` when present
-/// (default-branch builds produce it), else the first — and build the
-/// `docker run` line. `None` if the detail matches neither shape.
-fn registry_run_command(detail: &str) -> Option<String> {
+/// An empty `Vec` if the detail matches neither shape.
+fn registry_refs(detail: &str) -> Vec<String> {
     // `registry-push`: "pushed <ref>, <ref>, … to <target>"
     if let Some(body) = detail.strip_prefix("pushed ") {
         let refs_part = body.rsplit_once(" to ").map_or(body, |(left, _)| left);
-        let refs: Vec<&str> = refs_part
+        return refs_part
             .split(", ")
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .map(String::from)
             .collect();
-        let chosen = refs
-            .iter()
-            .find(|r| r.ends_with(":latest"))
-            .or_else(|| refs.first())?;
-        return Some(format!("docker run --rm {chosen}"));
     }
 
     // `registry-index`: "assembled … → <base>:<tag>, <tag>, …"
     if let Some((_, refs_part)) = detail.split_once(" → ") {
-        // A trailing "(missing arch: …)" rides on the last tag — keep
-        // only each entry's first whitespace-delimited token.
-        let mut parts = refs_part
+        // A partial index appends " (missing arch: …)" — drop it.
+        let refs_part = refs_part
+            .split(" (missing arch:")
+            .next()
+            .unwrap_or(refs_part);
+        let mut tags = refs_part
             .split(", ")
-            .filter_map(|p| p.split_whitespace().next())
+            .map(str::trim)
             .filter(|s| !s.is_empty());
-        let first = parts.next()?; // "<base>:<tag1>"
-        let (base, tag1) = first.rsplit_once(':')?;
-        let mut tags = vec![tag1];
-        tags.extend(parts);
-        let tag = tags
-            .iter()
-            .find(|t| **t == "latest")
-            .copied()
-            .unwrap_or(tags[0]);
-        return Some(format!("docker run --rm {base}:{tag}"));
+        let Some(first) = tags.next() else {
+            return Vec::new();
+        };
+        let Some((base, tag1)) = first.rsplit_once(':') else {
+            return Vec::new();
+        };
+        let mut out = vec![format!("{base}:{tag1}")];
+        out.extend(tags.map(|t| format!("{base}:{t}")));
+        return out;
     }
 
-    None
+    Vec::new()
+}
+
+/// A `docker run` line for an image effect's detail: pick the
+/// friendliest reference — `:latest` when present (default-branch
+/// builds produce it), else the first. `None` if the detail names no
+/// references.
+fn registry_run_command(detail: &str) -> Option<String> {
+    let refs = registry_refs(detail);
+    let chosen = refs
+        .iter()
+        .find(|r| r.ends_with(":latest"))
+        .or_else(|| refs.first())?;
+    Some(format!("docker run --rm {chosen}"))
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -2838,6 +2873,37 @@ mod tests {
             registry_run_command(partial).as_deref(),
             Some("docker run --rm reg.io/o/img:main"),
         );
+    }
+
+    #[test]
+    fn registry_refs_extracts_every_reference() {
+        // `registry-push`: a list of full references.
+        assert_eq!(
+            registry_refs("pushed reg.io/o/img:main, reg.io/o/img:latest to ghcr"),
+            vec!["reg.io/o/img:main", "reg.io/o/img:latest"],
+        );
+        // `registry-index`: one base reconstructed against every tag.
+        assert_eq!(
+            registry_refs(
+                "assembled 2-arch index (amd64+arm64) → reg.io/o/img:main, latest, sha-abc",
+            ),
+            vec![
+                "reg.io/o/img:main",
+                "reg.io/o/img:latest",
+                "reg.io/o/img:sha-abc",
+            ],
+        );
+        // A partial index's "(missing arch: a, b)" tail is dropped, not
+        // parsed as bogus tags.
+        assert_eq!(
+            registry_refs(
+                "assembled 1-arch index (amd64) → reg.io/o/img:main, sha-abc \
+                 (missing arch: aarch64-linux, riscv64-linux)",
+            ),
+            vec!["reg.io/o/img:main", "reg.io/o/img:sha-abc"],
+        );
+        // Neither shape — nothing.
+        assert!(registry_refs("something else entirely").is_empty());
     }
 
     #[test]
