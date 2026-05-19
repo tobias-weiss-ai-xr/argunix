@@ -1882,20 +1882,32 @@ async fn build_one(
                 }
             }
             None => {
-                // No (more) matching connected builder: fall back to a
-                // local `nix-store --realise` (no `--builders`). The
-                // host's `nix.buildMachines`, if any, is honoured
-                // natively; if not, the build runs locally. Local
-                // builds have no remote-transport phases, so we record
-                // empty metrics.
+                // Eligible pool builders existed but every one hit a
+                // transport failure mid-build — a builder restart or
+                // network blip, not a build problem. Forcing the local
+                // fallback here would, for a job whose `system` the
+                // coordinator cannot build (e.g. an aarch64 job on an
+                // x86_64 host), run a doomed `nix-store --realise` and
+                // record a misleading `Failure`. Mark the job
+                // `Interrupted` instead: honest about the missing
+                // verdict, it drops out of "building right now", and
+                // it is eligible for retry on the next eval resume
+                // rather than recorded as a real build failure.
                 if !excluded.is_empty() {
                     tracing::warn!(
                         job_id = job_id.get(),
                         tried = excluded.len(),
-                        "every eligible pool builder hit a transport failure; \
-                         falling back to a local build",
+                        "every eligible pool builder hit a transport failure mid-build; \
+                         marking job interrupted for retry instead of failing it locally",
                     );
+                    <SqlxStore as JobStore>::interrupt_if_running(&ctx.store, job_id).await?;
+                    return Ok(JobStatus::Interrupted);
                 }
+                // No eligible pool builder at all: fall back to a local
+                // `nix-store --realise` (no `--builders`). The host's
+                // `nix.buildMachines`, if any, is honoured natively; if
+                // not, the build runs locally. Local builds have no
+                // remote-transport phases, so we record empty metrics.
                 let request = argunix_build::BuildRequest {
                     drv_path: drv_path.clone(),
                     log_path: log_path.clone(),
