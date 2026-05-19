@@ -61,17 +61,24 @@
   ) %}
   {% endif %}
 
-  {% if !registry_paths.is_empty() %}
+  {% if !published_images.is_empty() %}
   <section class="mb-6">
     <h2 class="text-lg font-semibold mb-2">Published images</h2>
     <p class="text-sm text-muted mb-2">
       Registry references this run pushed or assembled.
     </p>
-    <ul class="rounded border border-border bg-surface p-3 space-y-1">
-      {% for path in registry_paths %}
-      <li class="font-mono text-xs text-fg wrap-break-word">{{ path }}</li>
+    <div class="rounded border border-border bg-surface p-3 flex flex-col gap-2">
+      {% for img in published_images %}
+      <div class="flex flex-row flex-wrap gap-2">
+        <div class="font-mono text-xs text-fg">{{ img.base }}</div>
+        <div class="flex flex-row flex-wrap gap-1">
+        {% for tag in img.tags %}
+          <div class="whitespace-nowrap px-1 rounded bg-chip text-chip-fg text-xs">{{ tag }}</div>
+        {% endfor %}
+        </div>
+      </div>
       {% endfor %}
-    </ul>
+    </div>
   </section>
   {% endif %}
 

@@ -361,11 +361,22 @@ struct EvalTemplate {
     /// green jobs (the synthetic-flake endpoint would 404 — surface that
     /// here by hiding the snippet rather than showing a broken command).
     nix_run_snippet: Option<String>,
-    /// Every registry reference this eval published — the deduplicated
-    /// `host/ns/image:tag` strings from its successful `registry-push`
-    /// and `registry-index` effects. Empty when the eval pushed no
-    /// images; the template hides the section then.
-    registry_paths: Vec<String>,
+    /// Images this eval published — one entry per repository path,
+    /// each carrying the tags it landed under, from the eval's
+    /// successful `registry-push` / `registry-index` effects. Empty
+    /// when the eval pushed no images; the template hides the section.
+    published_images: Vec<PublishedImage>,
+}
+
+/// One image repository an eval published, plus the tags it landed
+/// under — rendered on the eval page as the base path followed by a
+/// row of tag badges.
+struct PublishedImage {
+    /// Registry path without the tag, e.g. `host/ns/image`.
+    base: String,
+    /// Tags published under that path (`latest`, `main`, `sha-…`),
+    /// sorted.
+    tags: Vec<String>,
 }
 
 struct JobRow {
@@ -1567,6 +1578,27 @@ async fn eval_page(
         .collect();
     registry_paths.sort();
     registry_paths.dedup();
+    // Group references by repository path, so each repo renders once
+    // with its tags as badges rather than one row per tag.
+    let mut by_base: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for path in registry_paths {
+        match path.rsplit_once(':') {
+            Some((base, tag)) => {
+                by_base
+                    .entry(base.to_string())
+                    .or_default()
+                    .push(tag.to_string());
+            }
+            None => {
+                by_base.entry(path).or_default();
+            }
+        }
+    }
+    let published_images: Vec<PublishedImage> = by_base
+        .into_iter()
+        .map(|(base, tags)| PublishedImage { base, tags })
+        .collect();
 
     let snap = state.current.load_full();
     let forge_cfg = snap.config.forges.get(&forge);
@@ -1626,7 +1658,7 @@ async fn eval_page(
         ref_link,
         commit_link,
         nix_run_snippet,
-        registry_paths,
+        published_images,
     })?;
     Ok(Html(html).into_response())
 }

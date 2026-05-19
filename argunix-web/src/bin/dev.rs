@@ -29,8 +29,8 @@ use argunix_domain::{
     JobId, JobStatus, RepoId, Sha, Slug,
 };
 use argunix_store::{
-    BuilderStore, EvalStore, JobPhaseMetrics, JobStore, NewBuilder, NewEvaluation, NewJob,
-    RepoStore, SqlxStore,
+    BuilderStore, EffectRunStore, EvalStore, JobPhaseMetrics, JobStore, NewBuilder, NewEvaluation,
+    NewJob, RepoStore, SbomStore, SqlxStore,
 };
 use argunix_web::{
     AppStateInner, CancelRegistry, CoalescePool, ConfigSnapshot, HostStatsRing, LiveLogRegistry,
@@ -590,6 +590,18 @@ async fn seed_widgets_evals(
     let e8 = create_eval(store, repo_id, "push", "main", sha("88"), None).await?;
     let started = t0 - chrono::Duration::seconds(45);
     <SqlxStore as EvalStore>::start(store, e8, started, EvalStatus::Evaluating).await?;
+
+    // e9: a done `main` build that published container images — gives
+    // the eval page's "Published images" section, the job effects
+    // panel, and the SBOM browser fixture data.
+    let e9 = create_eval(store, repo_id, "push", "main", sha("c9"), None).await?;
+    let started = t0 - chrono::Duration::hours(2);
+    let building = started + chrono::Duration::seconds(30);
+    let finished = started + chrono::Duration::minutes(7);
+    <SqlxStore as EvalStore>::start(store, e9, started, EvalStatus::Evaluating).await?;
+    <SqlxStore as EvalStore>::mark_building(store, e9, building).await?;
+    <SqlxStore as EvalStore>::finish(store, e9, EvalStatus::Done, finished).await?;
+    seed_image_jobs(store, e9, started, finished).await?;
     Ok(())
 }
 
@@ -760,6 +772,140 @@ async fn seed_jobs_for_in_flight_eval(
     .await?;
     Ok(())
 }
+
+/// Seed a done eval with container-image jobs and their post-build
+/// effects — a single-arch `oci` push and a multi-arch `docker` index
+/// — so the eval page's "Published images" section, the job effects
+/// panel, the image-size row, and the SBOM browser all have data.
+async fn seed_image_jobs(
+    store: &SqlxStore,
+    eval_id: EvalId,
+    started: DateTime<Utc>,
+    finished: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let pushed = started + chrono::Duration::minutes(6);
+
+    // A single-arch `oci` image: one job, pushed whole to `ghcr`, with
+    // a CycloneDX SBOM attached as a referrer.
+    let api = finish_job(
+        store,
+        eval_id,
+        "packages.x86_64-linux.widget-api",
+        "x86_64-linux",
+        JobStatus::Success,
+        Some("/nix/store/h1h1-widget-api-image.tar"),
+        true,
+        Some(default_phase_metrics()),
+        finished,
+    )
+    .await?;
+    <SqlxStore as JobStore>::record_image_size(store, api, 41_287_544).await?;
+    effect_run(
+        store,
+        api,
+        "registry-push",
+        "ghcr",
+        pushed,
+        finished,
+        "pushed ghcr.io/acme/widget-api:main, ghcr.io/acme/widget-api:latest, \
+         ghcr.io/acme/widget-api:sha-c90000000000 to ghcr",
+    )
+    .await?;
+    effect_run(
+        store,
+        api,
+        "sbom-attach",
+        "ghcr",
+        pushed,
+        finished,
+        "attached SBOM (5 components) to ghcr.io/acme/widget-api:sha-c90000000000",
+    )
+    .await?;
+    <SqlxStore as SbomStore>::upsert_sbom(store, api, "cyclonedx", FIXTURE_SBOM_JSON, 5, finished)
+        .await?;
+
+    // A multi-arch `docker` image: two per-arch jobs assembled into one
+    // OCI index — each per-arch job carries a `registry-index` row.
+    for (attr, system) in [
+        ("packages.x86_64-linux.widget-worker", "x86_64-linux"),
+        ("packages.aarch64-linux.widget-worker", "aarch64-linux"),
+    ] {
+        let job = finish_job(
+            store,
+            eval_id,
+            attr,
+            system,
+            JobStatus::Success,
+            Some("/nix/store/h2h2-widget-worker-image.tar"),
+            true,
+            Some(default_phase_metrics()),
+            finished,
+        )
+        .await?;
+        <SqlxStore as JobStore>::record_image_size(store, job, 9_842_113).await?;
+        effect_run(
+            store,
+            job,
+            "registry-index",
+            "ghcr",
+            pushed,
+            finished,
+            "assembled 2-arch index (amd64+arm64, 2 per-arch SBOMs) → \
+             ghcr.io/acme/widget-worker:main, latest, sha-c90000000000",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Record one finished (`success`) post-build effect against a job.
+async fn effect_run(
+    store: &SqlxStore,
+    job: JobId,
+    kind: &str,
+    target: &str,
+    started: DateTime<Utc>,
+    finished: DateTime<Utc>,
+    detail: &str,
+) -> anyhow::Result<()> {
+    let id =
+        <SqlxStore as EffectRunStore>::create_effect_run(store, job, kind, target, started).await?;
+    <SqlxStore as EffectRunStore>::finish_effect_run(store, id, "success", Some(detail), finished)
+        .await?;
+    Ok(())
+}
+
+/// A small CycloneDX document for the dev fixture's SBOM browser —
+/// same shape `argunix-effects::sbom` emits (components carry a
+/// `nix:store_path` property).
+const FIXTURE_SBOM_JSON: &str = r#"{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "metadata": { "component": { "type": "container", "name": "widget-api" } },
+  "components": [
+    { "type": "library", "name": "glibc", "version": "2.40-66",
+      "purl": "pkg:nix/glibc@2.40-66",
+      "properties": [{ "name": "nix:store_path",
+        "value": "/nix/store/3p1wq8m6xyk0r2hn4v7zd9c5jf8lb0sg-glibc-2.40-66" }] },
+    { "type": "library", "name": "openssl", "version": "3.4.1",
+      "purl": "pkg:nix/openssl@3.4.1",
+      "properties": [{ "name": "nix:store_path",
+        "value": "/nix/store/k7m2n9p4xq1wr8t3yv6zd0c5jf8lb0sg-openssl-3.4.1" }] },
+    { "type": "library", "name": "zlib", "version": "1.3.1",
+      "purl": "pkg:nix/zlib@1.3.1",
+      "properties": [{ "name": "nix:store_path",
+        "value": "/nix/store/9w2e4r6t8y0u1i3o5p7a9s1d3f5g7h9j-zlib-1.3.1" }] },
+    { "type": "library", "name": "libxcrypt", "version": "4.4.38",
+      "purl": "pkg:nix/libxcrypt@4.4.38",
+      "properties": [{ "name": "nix:store_path",
+        "value": "/nix/store/0ksa3i39aqkwdrh2q0s1svwymhc1w3dm-libxcrypt-4.4.38" }] },
+    { "type": "application", "name": "busybox", "version": "1.37.0",
+      "purl": "pkg:nix/busybox@1.37.0",
+      "properties": [{ "name": "nix:store_path",
+        "value": "/nix/store/2b4d6f8h0j2l4n6p8r0t2v4x6z8a0c2e-busybox-1.37.0" }] }
+  ]
+}"#;
 
 // ---------- helpers ----------
 
