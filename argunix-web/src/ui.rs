@@ -2085,23 +2085,32 @@ pub async fn job_log_stream(
 
     let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
 
-    // Each structured `NomEvent` goes out as a `nom` SSE event whose
-    // payload is the event's JSON; the browser switches on the `kind`
-    // tag to colour a log line or update the "currently building"
-    // view. (argunix-nom owns both ends, so serialisation never fails;
-    // a hypothetical failure just skips that event.)
-    let nom_event = |ev: &argunix_nom::NomEvent| -> Option<Event> {
-        serde_json::to_string(ev)
-            .ok()
-            .map(|json| Event::default().event("nom").data(json))
-    };
-
-    for ev in &initial {
-        if let Some(e) = nom_event(ev) {
-            let _ = tx.send(Ok(e)).await;
-        }
-    }
+    // The buffered-prefix replay and the live stream both run *inside*
+    // the spawned task. Replaying before returning the `Sse` response
+    // would deadlock: `tx` is bounded (64) and `out_rx` is not drained
+    // until axum starts polling the returned stream, so a job whose
+    // buffered prefix exceeds 64 events would fill `tx` and block the
+    // handler forever — it would never return a response at all.
     tokio::spawn(async move {
+        // Each structured `NomEvent` goes out as a `nom` SSE event
+        // whose payload is the event's JSON; the browser switches on
+        // the `kind` tag to colour a log line or update the "currently
+        // building" view. (argunix-nom owns both ends, so serialisation
+        // never fails; a hypothetical failure just skips that event.)
+        let nom_event = |ev: &argunix_nom::NomEvent| -> Option<Event> {
+            serde_json::to_string(ev)
+                .ok()
+                .map(|json| Event::default().event("nom").data(json))
+        };
+
+        // Replay the buffered prefix, then fall through to live events.
+        for ev in &initial {
+            if let Some(e) = nom_event(ev) {
+                if tx.send(Ok(e)).await.is_err() {
+                    return;
+                }
+            }
+        }
         loop {
             match rx.recv().await {
                 Ok(ev) => {

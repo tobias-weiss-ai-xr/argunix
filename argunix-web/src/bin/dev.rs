@@ -231,6 +231,17 @@ fn set_pdeathsig(_cmd: &mut tokio::process::Command) {}
 /// render without a daemon or real builder pushing chunks.
 fn spawn_fixture_build_log(registry: Arc<LiveLogRegistry>, job_id: i64) {
     let live = registry.open(job_id);
+    // Pre-load a buffered prefix *larger than the SSE channel bound (64)*
+    // before any client connects, so the first `/log/stream` request
+    // exercises the buffered-prefix replay at scale — the exact case
+    // that once deadlocked `job_log_stream`. A regression there shows
+    // up immediately as a dev job page that never streams.
+    for ev in std::iter::repeat_with(fixture_nom_script)
+        .flatten()
+        .take(80)
+    {
+        live.push(ev);
+    }
     tokio::spawn(async move {
         loop {
             for ev in fixture_nom_script() {
