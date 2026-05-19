@@ -740,6 +740,11 @@ async fn run_build_phase(
     let mut set: tokio::task::JoinSet<BuildResult> = tokio::task::JoinSet::new();
 
     'outer: loop {
+        // True iff the spawn pass below ran out of dispatchable work
+        // (`dispatch()` returned None) *while still holding a build
+        // permit* — as opposed to stopping because permits were
+        // exhausted. Drives the spin-proof wait further down.
+        let mut strategy_drained_with_permit = false;
         // Spawn while we have permits and the strategy has Ready Steps.
         if !cancel.is_cancelled() {
             loop {
@@ -749,6 +754,7 @@ async fn run_build_phase(
                 };
                 let Some(d) = strategy.dispatch() else {
                     drop(permit);
+                    strategy_drained_with_permit = true;
                     break;
                 };
                 let job_id = d
@@ -800,6 +806,43 @@ async fn run_build_phase(
         // to the cancelled-finish below.
         if cancel.is_cancelled() && set.is_empty() {
             break 'outer;
+        }
+
+        // Spin guard. With nothing in flight, falling into the
+        // `select!` below would poll `set.join_next()` on an empty
+        // `JoinSet` — which resolves to `Ready(None)` *immediately* —
+        // turning this loop into a 100%-CPU busy-spin that starves the
+        // async runtime and wedges the whole daemon.
+        //
+        // The checks above already proved the strategy still has
+        // dispatchable work and we are not cancelled, so the spawn
+        // pass added nothing for exactly one of two reasons:
+        //
+        //  * `strategy_drained_with_permit` — `dispatch()` yielded
+        //    nothing although a build permit was free. The strategy is
+        //    wedged: a drained strategy must report
+        //    `pending_count() == 0`, so this is a scheduler bug. Fail
+        //    this eval's build phase loudly rather than pin a core
+        //    forever.
+        //  * otherwise — the global build semaphore is fully held by
+        //    other evals. Block on a permit (raced with cancel) so the
+        //    loop sleeps instead of spinning, then retry.
+        if set.is_empty() {
+            if strategy_drained_with_permit {
+                tracing::error!(
+                    eval_id = eval_id.get(),
+                    pending = strategy.pending_count(),
+                    "build scheduler wedged — dispatchable work remains but \
+                     dispatch() yielded nothing; aborting this eval's build phase",
+                );
+                break 'outer;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {}
+                _ = global_sem.acquire() => {}
+            }
+            continue 'outer;
         }
 
         // Wait for either a build to finish or a cancel signal. On

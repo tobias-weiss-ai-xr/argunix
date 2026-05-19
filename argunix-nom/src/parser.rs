@@ -51,9 +51,20 @@ impl NomParser {
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<NomEvent> {
         let mut out = Vec::new();
         self.pending.extend_from_slice(chunk);
-        while let Some(nl) = self.pending.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=nl).collect();
-            self.parse_line(&line[..line.len() - 1], &mut out);
+        // Scan the buffer once for complete lines, then drop the whole
+        // consumed prefix in a single `drain`. A per-line
+        // `drain(..=nl)` is O(n²) — quadratic in the line count of a
+        // chunk — and `internal-json` is chatty enough (a flood of
+        // `resProgress` ticks) for that to dominate CPU on a big build.
+        let mut start = 0;
+        while let Some(rel) = self.pending[start..].iter().position(|&b| b == b'\n') {
+            let end = start + rel;
+            let line = self.pending[start..end].to_vec();
+            self.parse_line(&line, &mut out);
+            start = end + 1;
+        }
+        if start > 0 {
+            self.pending.drain(..start);
         }
         out
     }
