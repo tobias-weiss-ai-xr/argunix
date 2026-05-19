@@ -12,8 +12,11 @@
 //! Scope:
 //! - synchronous build per job (the daemon's offline `argunix build`
 //!   subcommand iterates jobs sequentially);
-//! - log capture: stream nix-store stderr to memory (capped at the
-//!   configured size), write a single zstd-compressed file at the end;
+//! - log capture: nix-store runs with `--log-format internal-json`;
+//!   `argunix-nom` parses that stream and the stored zstd log is flat
+//!   text with a per-derivation `name> ` prefix on each line (no
+//!   longer raw nix stderr — anything grepping stored logs for nix's
+//!   exact wording will now see the prefix);
 //! - GC root: post-success `nix-store --add-root <root> --indirect <output>`;
 //! - post-success cache publish via `nix copy --to <store-uri>`.
 

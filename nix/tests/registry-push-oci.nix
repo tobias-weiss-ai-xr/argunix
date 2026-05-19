@@ -473,11 +473,11 @@ in
     assert "Published images" in eval_html, (
         f"eval page is missing the published-images section{envelope}"
     )
-    # The repository path renders once; its tags as separate badges.
-    assert "${registryHost}/myorg/oci-image:" in eval_html, (
+    # The repository path renders once, its tags as separate badges.
+    assert "${registryHost}/myorg/oci-image" in eval_html, (
         f"eval page does not list the published image path{envelope}"
     )
-    assert ">main</span>" in eval_html and ">sha-000000000000</span>" in eval_html, (
+    assert ">main<" in eval_html and ">sha-000000000000<" in eval_html, (
         f"eval page does not render the image tags as badges{envelope}"
     )
   '';

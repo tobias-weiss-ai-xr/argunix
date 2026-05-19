@@ -61,6 +61,7 @@ let
     while [ $# -gt 0 ]; do
       case "$1" in
         -L) shift ;;
+        --log-format) shift 2 ;;
         --add-root) root="$2"; shift 2 ;;
         --indirect) shift ;;
         *) drv="$1"; shift ;;
@@ -84,9 +85,16 @@ let
         ;;
       /nix/store/dddd-succeed.drv)
         echo "/nix/store/dddd-succeed"
-        echo "[fake-build] building succeed" >&2
-        echo "[fake-build] step 1/2" >&2
-        echo "[fake-build] step 2/2" >&2
+        # Emit `internal-json` like real `nix-store --log-format
+        # internal-json` does: an `actBuild` activity (type 105, field
+        # 0 = drv path) and `resBuildLogLine` results (type 101) tagged
+        # with the activity id. argunix's nom parser turns these into
+        # per-derivation-prefixed log lines.
+        echo '@nix {"action":"start","id":1,"level":3,"parent":0,"text":"building","type":105,"fields":["/nix/store/dddd-succeed.drv","",1,1]}' >&2
+        echo '@nix {"action":"result","id":1,"type":101,"fields":["building succeed"]}' >&2
+        echo '@nix {"action":"result","id":1,"type":101,"fields":["step 1/2"]}' >&2
+        echo '@nix {"action":"result","id":1,"type":101,"fields":["step 2/2"]}' >&2
+        echo '@nix {"action":"stop","id":1}' >&2
         install_root /nix/store/dddd-succeed
         exit 0
         ;;
@@ -202,7 +210,10 @@ runCommand "argunix-build-smoke"
       "SELECT log_path FROM jobs WHERE attr_path LIKE '%.succeed';")
     echo "succeed_log=[$succeed_log]"
     test -f "$succeed_log"
-    zstd -d -c "$succeed_log" | grep -q '\[fake-build\] step 2/2'
+    # The build emitted internal-json; argunix parsed it and stored the
+    # log with a per-derivation `name> ` prefix (the drv is
+    # `dddd-succeed`, so lines read `dddd-succeed> …`).
+    zstd -d -c "$succeed_log" | grep -q 'succeed> step 2/2'
 
     fail_log=$(sqlite3 db.sqlite \
       "SELECT log_path FROM jobs WHERE attr_path LIKE '%.fail';")

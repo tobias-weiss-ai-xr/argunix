@@ -184,6 +184,7 @@ name = "argunix-build"
 version = "0.0.1"
 dependencies = [
  "argunix-domain",
+ "argunix-nom",
  "chrono",
  "serde",
  "tempfile",
@@ -278,6 +279,7 @@ dependencies = [
  "argunix-effects",
  "argunix-eval",
  "argunix-forge",
+ "argunix-nom",
  "argunix-registry",
  "argunix-sched",
  "argunix-store",
@@ -354,6 +356,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "argunix-nom"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "argunix-registry"
 version = "0.0.1"
 dependencies = [
@@ -408,6 +418,7 @@ dependencies = [
  "argunix-config",
  "argunix-domain",
  "argunix-forge",
+ "argunix-nom",
  "argunix-store",
  "askama",
  "async-trait",

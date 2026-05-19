@@ -17,6 +17,7 @@ argunix-domain = { workspace = true }
 argunix-effects = { workspace = true }
 argunix-eval = { path = "../argunix-eval" }
 argunix-forge = { path = "../argunix-forge" }
+argunix-nom = { workspace = true }
 argunix-registry = { workspace = true }
 argunix-sched = { path = "../argunix-sched" }
 argunix-store = { workspace = true }

@@ -83,6 +83,16 @@
 </section>
 
 <section class="mb-6">
+  <h2 class="text-lg font-semibold mb-2">building now</h2>
+  <div
+    id="nom-tree"
+    class="bg-surface border border-border rounded p-3 text-xs font-mono text-muted"
+  >
+    waiting for the builder…
+  </div>
+</section>
+
+<section class="mb-6">
   <h2 class="text-lg font-semibold mb-2">live log</h2>
   <pre id="live-log" data-job-id="{{ job_id }}" class="bg-code text-code-fg text-xs font-mono p-3 rounded h-96 overflow-auto whitespace-pre-wrap"></pre>
 </section>
@@ -244,21 +254,115 @@
     setInterval(refresh, 5000);
 
     if (log && jobId) {
-      const es = new EventSource(`/api/jobs/${jobId}/log/stream`);
-      const append = (s) => {
-        const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
-        log.appendChild(document.createTextNode(s));
+      const tree = document.getElementById("nom-tree");
+      const acts = new Map(); // activity id -> { act, label }
+      let prog = null; // last Progress event
+
+      // Stable per-derivation hue so a package keeps its colour for
+      // the whole build — light enough to read on the dark log.
+      const labelColor = (s) => {
+        let h = 0;
+        for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+        return `hsl(${((h % 360) + 360) % 360} 65% 70%)`;
+      };
+      const esc = (s) =>
+        s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+
+      const appendLine = (label, text, lineColor) => {
+        const stick =
+          log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+        const div = document.createElement("div");
+        if (lineColor) div.style.color = lineColor;
+        if (label) {
+          const tag = document.createElement("span");
+          tag.textContent = label + "> ";
+          tag.style.color = labelColor(label);
+          div.appendChild(tag);
+        }
+        div.appendChild(document.createTextNode(text));
+        log.appendChild(div);
         if (stick) log.scrollTop = log.scrollHeight;
       };
-      es.onmessage = (e) => append(e.data);
-      es.addEventListener("end", () => es.close());
+
+      const renderTree = () => {
+        if (!tree) return;
+        const builds = [];
+        let dl = 0, sub = 0, cp = 0;
+        for (const a of acts.values()) {
+          if (a.act === "build") builds.push(a.label);
+          else if (a.act === "download") dl++;
+          else if (a.act === "substitute") sub++;
+          else if (a.act === "copy_path") cp++;
+        }
+        const rows = [];
+        if (prog) {
+          let p = `▸ ${prog.done}/${prog.expected} built · ${prog.running} running`;
+          if (prog.failed) p += ` · ${prog.failed} failed`;
+          rows.push(`<div class="text-fg mb-1">${esc(p)}</div>`);
+        }
+        for (const label of builds) {
+          rows.push(
+            `<div>● <span style="color:${labelColor(label)}">${esc(label)}</span></div>`,
+          );
+        }
+        const extra = [];
+        if (dl) extra.push(`${dl} downloading`);
+        if (sub) extra.push(`${sub} substituting`);
+        if (cp) extra.push(`${cp} copying`);
+        if (extra.length)
+          rows.push(`<div class="text-muted">↓ ${esc(extra.join(" · "))}</div>`);
+        tree.innerHTML = rows.length
+          ? rows.join("")
+          : '<span class="text-muted">no derivations building right now</span>';
+      };
+
+      const es = new EventSource(`/api/jobs/${jobId}/log/stream`);
+      es.addEventListener("nom", (e) => {
+        let ev;
+        try { ev = JSON.parse(e.data); } catch (_) { return; }
+        switch (ev.kind) {
+          case "line":
+            appendLine(ev.label, ev.text);
+            break;
+          case "raw":
+            appendLine(null, ev.text);
+            break;
+          case "message":
+            appendLine(
+              null,
+              ev.text,
+              ev.level === 0
+                ? "hsl(0 70% 72%)"
+                : ev.level === 1
+                  ? "hsl(38 90% 65%)"
+                  : "",
+            );
+            break;
+          case "act_start":
+            acts.set(ev.id, { act: ev.act, label: ev.label });
+            renderTree();
+            break;
+          case "act_stop":
+            acts.delete(ev.id);
+            renderTree();
+            break;
+          case "progress":
+            prog = ev;
+            renderTree();
+            break;
+        }
+      });
+      es.addEventListener("end", () => {
+        acts.clear();
+        renderTree();
+        es.close();
+      });
       es.addEventListener("lag", (e) =>
-        append(`\n[argunix: ${e.data}]\n`),
+        appendLine(null, `[argunix: ${e.data}]`),
       );
       es.onerror = () => {
-        // Browser will auto-reconnect on transient errors; close
-        // explicitly only when the build is finished and the server
-        // has dropped the registry entry (404).
+        // Browser auto-reconnects on transient errors; an explicit
+        // close happens only on the `end` event above.
       };
     }
   })();

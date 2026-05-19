@@ -482,6 +482,10 @@ async fn handle_build(
     }
     let mut cmd = Command::new(nix_store_bin);
     cmd.arg("--realise");
+    // Structured `@nix {…}` build events on stderr — the coordinator
+    // parses them (`argunix-nom`) into per-derivation log lines. The
+    // chunk transport is byte-transparent; stdout is unaffected.
+    cmd.arg("--log-format").arg("internal-json");
     if let Some(ref g) = gc_root {
         cmd.arg("--add-root").arg(g);
     }

@@ -2341,6 +2341,27 @@ async fn dispatch_build_via_pool(
     }
 }
 
+/// Render one parsed build event into the stored log buffer,
+/// honouring the raw-size cap. `log_truncated` is set once the cap is
+/// reached; rendering overshoots the cap by at most one line, which is
+/// fine for a 100 MB cap.
+fn append_log_event(
+    log_buf: &mut Vec<u8>,
+    ev: &argunix_nom::NomEvent,
+    cap: usize,
+    log_truncated: &mut bool,
+) {
+    let Some(line) = argunix_nom::render_storage_line(ev) else {
+        return;
+    };
+    if log_buf.len() >= cap {
+        *log_truncated = true;
+        return;
+    }
+    log_buf.extend_from_slice(line.as_bytes());
+    log_buf.push(b'\n');
+}
+
 /// Daemon-side build orchestration for the dynamic builder pool.
 ///
 /// Drives one derivation through the pool: push the drv's input
@@ -2398,6 +2419,9 @@ pub async fn dispatch_pool_build(
 
     let mut log_buf: Vec<u8> = Vec::new();
     let mut log_truncated = false;
+    // Parses the agent's raw `internal-json` stderr into structured
+    // build events — one instance per build, fed each log chunk.
+    let mut nom = argunix_nom::NomParser::new();
 
     // A pre-verdict transport failure (push-closure / dispatch). The
     // derivation never reached the builder's `nix-store --realise`, so
@@ -2522,19 +2546,15 @@ pub async fn dispatch_pool_build(
                         tracing::info!(job_id = build_id, ?pid, builder = %builder_name, "agent started build");
                     }
                     Some(BuildLifecycle::LogChunk { bytes }) => {
-                        if let Some(ref tap) = live_log {
-                            tap.push(&bytes);
-                        }
-                        if log_buf.len() < cap {
-                            let remaining = cap - log_buf.len();
-                            if bytes.len() <= remaining {
-                                log_buf.extend_from_slice(&bytes);
-                            } else {
-                                log_buf.extend_from_slice(&bytes[..remaining]);
-                                log_truncated = true;
+                        // Parse the raw internal-json chunk into events:
+                        // stream them to the live tap and render
+                        // per-derivation-prefixed text into the stored
+                        // log.
+                        for ev in nom.feed(&bytes) {
+                            if let Some(ref tap) = live_log {
+                                tap.push(ev.clone());
                             }
-                        } else {
-                            log_truncated = true;
+                            append_log_event(&mut log_buf, &ev, cap, &mut log_truncated);
                         }
                     }
                     Some(BuildLifecycle::Finished {
@@ -2603,6 +2623,13 @@ pub async fn dispatch_pool_build(
                 break;
             }
         }
+    }
+    // Flush any partial final line the parser buffered.
+    for ev in nom.finish() {
+        if let Some(ref tap) = live_log {
+            tap.push(ev.clone());
+        }
+        append_log_event(&mut log_buf, &ev, cap, &mut log_truncated);
     }
     registry.unregister_in_flight_build(builder_name, build_id);
     drop(live_log);

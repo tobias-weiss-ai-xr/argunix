@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "argunix-domain",
+  "argunix-nom",
   "argunix-config",
   "argunix-store",
   "argunix-forge",
@@ -25,6 +26,7 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 argunix-domain = { path = "argunix-domain" }
+argunix-nom = { path = "argunix-nom" }
 argunix-config = { path = "argunix-config" }
 argunix-store = { path = "argunix-store" }
 argunix-registry = { path = "argunix-registry" }

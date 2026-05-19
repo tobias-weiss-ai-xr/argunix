@@ -61,6 +61,10 @@ pub async fn run_build(request: &BuildRequest) -> Result<BuildOutcome, BuildErro
 
     let mut cmd = Command::new("nix-store");
     cmd.arg("--realise");
+    // `internal-json` makes nix emit structured `@nix {…}` activity
+    // events on stderr — `argunix-nom` parses them into per-derivation
+    // log lines. Output paths still go to stdout, unaffected.
+    cmd.arg("--log-format").arg("internal-json");
     if let Some(root) = &request.gc_root {
         cmd.arg("--add-root").arg(root);
     }
@@ -122,7 +126,7 @@ pub async fn run_build(request: &BuildRequest) -> Result<BuildOutcome, BuildErro
             .await
             .unwrap_or_else(|| no_log_placeholder(&request.drv_path).into_bytes())
     } else {
-        stderr_buf
+        render_internal_json(&stderr_buf)
     };
     write_zstd_log(&request.log_path, log_bytes).await?;
 
@@ -139,6 +143,25 @@ pub async fn run_build(request: &BuildRequest) -> Result<BuildOutcome, BuildErro
         log_path: request.log_path.clone(),
         log_truncated,
     })
+}
+
+/// Render a captured `nix-store --realise --log-format internal-json`
+/// stderr buffer into the flat, per-derivation-prefixed text argunix
+/// stores. Plain (non-`internal-json`) input passes through unchanged
+/// via the parser's `Raw` fallback, so an old builder or a fake one
+/// in a test still produces a readable log.
+fn render_internal_json(raw: &[u8]) -> Vec<u8> {
+    let mut parser = argunix_nom::NomParser::new();
+    let mut events = parser.feed(raw);
+    events.extend(parser.finish());
+    let mut out = Vec::new();
+    for ev in &events {
+        if let Some(line) = argunix_nom::render_storage_line(ev) {
+            out.extend_from_slice(line.as_bytes());
+            out.push(b'\n');
+        }
+    }
+    out
 }
 
 /// `nix-store --read-log <drv>` — local `/nix/var/log/nix/drvs/...` only.

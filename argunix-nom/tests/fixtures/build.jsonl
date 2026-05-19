@@ -1,0 +1,63 @@
+@nix {"action":"start","id":9051076640636928,"level":4,"parent":0,"text":"evaluating derivation 'path:/tmp/nomcap#packages.x86_64-linux.nomfix'","type":0}
+@nix {"action":"start","id":9051076640636929,"level":4,"parent":0,"text":"copying \"/tmp/nomcap\" to the store","type":0}
+@nix {"action":"stop","id":9051076640636929}
+@nix {"action":"stop","id":9051076640636928}
+@nix {"action":"start","id":9051153950048256,"level":6,"parent":0,"text":"querying info about missing paths","type":0}
+@nix {"action":"stop","id":9051153950048256}
+@nix {"action":"msg","level":3,"msg":"this derivation will be built:"}
+@nix {"action":"msg","level":3,"msg":"  /nix/store/6mggkdmgi32wq9dwfkh6cj2iw7988b8d-nom-fixture.drv"}
+@nix {"action":"start","id":9051153950048257,"level":0,"parent":0,"text":"","type":102}
+@nix {"action":"start","id":9051153950048258,"level":0,"parent":0,"text":"","type":104}
+@nix {"action":"start","id":9051153950048259,"level":0,"parent":0,"text":"","type":103}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048258,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048259,"type":105}
+@nix {"action":"result","fields":[101,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[100,0],"id":9051153950048257,"type":106}
+@nix {"action":"start","id":9051153950048260,"level":6,"parent":0,"text":"querying info about missing paths","type":0}
+@nix {"action":"stop","id":9051153950048260}
+@nix {"action":"result","fields":[0,1,0,0],"id":9051153950048258,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048259,"type":105}
+@nix {"action":"result","fields":[101,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[100,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[0,1,0,0],"id":9051153950048258,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048259,"type":105}
+@nix {"action":"result","fields":[101,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[100,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[0,1,0,0],"id":9051153950048258,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048259,"type":105}
+@nix {"action":"result","fields":[101,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[100,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[0,2,0,0],"id":9051153950048258,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048259,"type":105}
+@nix {"action":"result","fields":[101,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[100,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[0,3,0,0],"id":9051153950048258,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048259,"type":105}
+@nix {"action":"result","fields":[101,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[100,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[0,2,0,0],"id":9051153950048258,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048259,"type":105}
+@nix {"action":"result","fields":[101,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[100,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[0,1,0,0],"id":9051153950048258,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048259,"type":105}
+@nix {"action":"result","fields":[101,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[100,0],"id":9051153950048257,"type":106}
+@nix {"action":"start","fields":["/nix/store/6mggkdmgi32wq9dwfkh6cj2iw7988b8d-nom-fixture.drv","",1,1],"id":9051153950048261,"level":3,"parent":0,"text":"building '/nix/store/6mggkdmgi32wq9dwfkh6cj2iw7988b8d-nom-fixture.drv'","type":105}
+@nix {"action":"result","fields":[0,1,1,0],"id":9051153950048258,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048259,"type":105}
+@nix {"action":"result","fields":[101,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[100,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":["building the nom fixture derivation"],"id":9051153950048261,"type":101}
+@nix {"action":"result","fields":["a second line of output"],"id":9051153950048261,"type":101}
+@nix {"action":"result","fields":["step 1 of 3"],"id":9051153950048261,"type":101}
+@nix {"action":"result","fields":["step 2 of 3"],"id":9051153950048261,"type":101}
+@nix {"action":"result","fields":["step 3 of 3"],"id":9051153950048261,"type":101}
+@nix {"action":"result","fields":[1,2,0,0],"id":9051153950048258,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":9051153950048259,"type":105}
+@nix {"action":"result","fields":[101,0],"id":9051153950048257,"type":106}
+@nix {"action":"result","fields":[100,0],"id":9051153950048257,"type":106}
+@nix {"action":"stop","id":9051153950048261}
+@nix {"action":"stop","id":9051153950048259}
+@nix {"action":"stop","id":9051153950048258}
+@nix {"action":"stop","id":9051153950048257}

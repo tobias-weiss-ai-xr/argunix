@@ -2085,32 +2085,40 @@ pub async fn job_log_stream(
 
     let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
 
-    if !initial.is_empty() {
-        let _ = tx
-            .send(Ok(Event::default().data(String::from_utf8_lossy(&initial))))
-            .await;
+    // Each structured `NomEvent` goes out as a `nom` SSE event whose
+    // payload is the event's JSON; the browser switches on the `kind`
+    // tag to colour a log line or update the "currently building"
+    // view. (argunix-nom owns both ends, so serialisation never fails;
+    // a hypothetical failure just skips that event.)
+    let nom_event = |ev: &argunix_nom::NomEvent| -> Option<Event> {
+        serde_json::to_string(ev)
+            .ok()
+            .map(|json| Event::default().event("nom").data(json))
+    };
+
+    for ev in &initial {
+        if let Some(e) = nom_event(ev) {
+            let _ = tx.send(Ok(e)).await;
+        }
     }
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(bytes) => {
-                    if tx
-                        .send(Ok(Event::default().data(String::from_utf8_lossy(&bytes))))
-                        .await
-                        .is_err()
-                    {
+                Ok(ev) => {
+                    let Some(e) = nom_event(&ev) else { continue };
+                    if tx.send(Ok(e)).await.is_err() {
                         break;
                     }
                 }
-                // Lagged: tell the client we lost some bytes rather
-                // than silently skipping. The buffer is unbounded
-                // server-side; lag here is purely the broadcast
-                // channel's depth, hit only by very slow clients.
+                // Lagged: tell the client we lost some events rather
+                // than silently skipping. Lag here is purely the
+                // broadcast channel's depth, hit only by very slow
+                // clients.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     let _ = tx
                         .send(Ok(Event::default()
                             .event("lag")
-                            .data(format!("dropped {n} chunks"))))
+                            .data(format!("dropped {n} events"))))
                         .await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {

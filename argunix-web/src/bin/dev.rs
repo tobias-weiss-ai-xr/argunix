@@ -22,12 +22,13 @@ use std::time::Duration;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use argunix_builders::{BuilderRegistry, ConnState, ConnectedBuilder};
+use argunix_builders::{BuildPhase, BuilderRegistry, ConnState, ConnectedBuilder};
 use argunix_config::Config;
 use argunix_domain::{
     AttrPath, BuilderCapabilities, BuilderId, BuilderName, BuilderPubkey, EvalId, EvalStatus,
     JobId, JobStatus, RepoId, Sha, Slug,
 };
+use argunix_nom::{ActivityKind, NomEvent};
 use argunix_store::{
     BuilderStore, EffectRunStore, EvalStore, JobPhaseMetrics, JobStore, NewBuilder, NewEvaluation,
     NewJob, RepoStore, SbomStore, SqlxStore,
@@ -115,6 +116,16 @@ async fn main() -> anyhow::Result<()> {
     let current = Arc::new(ArcSwap::from(snapshot));
 
     let live_logs = LiveLogRegistry::new();
+    // Make one running fixture job fully "live": register a build
+    // phase (so its job page renders the live sections) and replay a
+    // scripted nom build log onto its tap — previewable without a
+    // daemon or builder pushing real chunks.
+    if let Some(jwc) = <SqlxStore as JobStore>::list_running(&store).await?.first() {
+        let job_id = jwc.job.id.get();
+        let alpha = BuilderName::new("alpha".to_string()).expect("valid builder name");
+        builder_registry.set_phase(&alpha, job_id, BuildPhase::Build);
+        spawn_fixture_build_log(live_logs.clone(), job_id);
+    }
     let pauses = Arc::new(PauseRegistry::new());
     let cancellations = Arc::new(CancelRegistry::new());
     let coalesce = Arc::new(CoalescePool::new(Duration::from_secs(5)));
@@ -213,6 +224,77 @@ fn set_pdeathsig(cmd: &mut tokio::process::Command) {
 
 #[cfg(not(target_os = "linux"))]
 fn set_pdeathsig(_cmd: &mut tokio::process::Command) {}
+
+/// Spawn a background task that replays a scripted `nix-output-monitor`
+/// build log onto `job_id`'s live tap, on a loop — purely so the dev
+/// UI's colored live log and "building now" view have something to
+/// render without a daemon or real builder pushing chunks.
+fn spawn_fixture_build_log(registry: Arc<LiveLogRegistry>, job_id: i64) {
+    let live = registry.open(job_id);
+    tokio::spawn(async move {
+        loop {
+            for ev in fixture_nom_script() {
+                live.push(ev);
+                tokio::time::sleep(Duration::from_millis(650)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    });
+}
+
+/// A canned, nom-style build: two derivations building (interleaved),
+/// a download and a substitute alongside, per-derivation log lines,
+/// and progress counters.
+fn fixture_nom_script() -> Vec<NomEvent> {
+    let line = |activity, label: &str, text: &str| NomEvent::Line {
+        activity,
+        label: label.into(),
+        text: text.into(),
+    };
+    let start = |id, act, label: &str| NomEvent::ActStart {
+        id,
+        parent: 0,
+        act,
+        label: label.into(),
+    };
+    let progress = |done, running| NomEvent::Progress {
+        done,
+        expected: 3,
+        running,
+        failed: 0,
+    };
+    vec![
+        progress(0, 0),
+        start(
+            10,
+            ActivityKind::Download,
+            "cache.example.com/redis.narinfo",
+        ),
+        NomEvent::ActStop { id: 10 },
+        start(1, ActivityKind::Build, "hello-2.12.1"),
+        progress(0, 1),
+        line(1, "hello-2.12.1", "unpacking sources"),
+        line(1, "hello-2.12.1", "configuring build system"),
+        start(2, ActivityKind::Build, "libwidget-1.4.0"),
+        progress(0, 2),
+        line(2, "libwidget-1.4.0", "compiling widget.c"),
+        line(1, "hello-2.12.1", "compiling hello.c"),
+        line(2, "libwidget-1.4.0", "compiling render.c"),
+        start(11, ActivityKind::Substitute, "glibc-2.40-66"),
+        line(1, "hello-2.12.1", "installing into $out"),
+        NomEvent::ActStop { id: 11 },
+        NomEvent::ActStop { id: 1 },
+        progress(1, 1),
+        line(2, "libwidget-1.4.0", "running 42 tests"),
+        line(2, "libwidget-1.4.0", "all tests passed"),
+        NomEvent::ActStop { id: 2 },
+        progress(3, 0),
+        NomEvent::Message {
+            level: 2,
+            text: "build of 'widget-app' completed".into(),
+        },
+    ]
+}
 
 /// Spawn `tailwindcss --watch` so CSS edits (and template edits that
 /// add new utility classes) get picked up without a server restart.

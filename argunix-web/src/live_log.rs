@@ -1,30 +1,37 @@
-//! In-memory tap on a build's stderr stream so the web UI can SSE-tail
-//! a running build. The worker pushes raw chunks here as it receives
-//! them from the agent's `BuildLogChunk` frames; each SSE subscriber
-//! atomically snapshots the buffered prefix and subscribes to a
-//! tokio broadcast for everything that arrives after.
+//! In-memory tap on a build's structured log stream so the web UI can
+//! SSE-tail a running build. The worker parses the agent's raw
+//! `internal-json` chunks into [`NomEvent`]s (`argunix-nom`) and pushes
+//! them here; each SSE subscriber atomically snapshots the buffered
+//! prefix and subscribes to a tokio broadcast for everything after.
 //!
 //! Strictly in-memory — no persistence. Coordinator restart wipes
 //! every running tail, which is intentional: post-build the static
 //! log endpoint serves the zstd-compressed final log from disk.
 
-use bytes::Bytes;
+use argunix_nom::NomEvent;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 const BROADCAST_CAPACITY: usize = 256;
 
+/// Cap on the replayed prefix a late-joining subscriber receives. A
+/// runaway build does not grow this without bound; live subscribers
+/// still see every event via the broadcast — only the catch-up buffer
+/// stops at the cap, with one sentinel event marking the gap.
+const MAX_BUFFERED_EVENTS: usize = 50_000;
+
 /// Per-build state. Buffer + broadcaster are coupled under one mutex
 /// so a subscriber's snapshot-then-subscribe is atomic relative to
-/// pushes — no chunk can land in the gap and be missed or replayed.
+/// pushes — no event can land in the gap and be missed or replayed.
 pub struct LiveLog {
     inner: Mutex<Inner>,
 }
 
 struct Inner {
-    buf: Vec<u8>,
-    tx: broadcast::Sender<Bytes>,
+    buf: Vec<NomEvent>,
+    truncated: bool,
+    tx: broadcast::Sender<NomEvent>,
 }
 
 impl LiveLog {
@@ -33,32 +40,40 @@ impl LiveLog {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 buf: Vec::new(),
+                truncated: false,
                 tx,
             }),
         })
     }
 
-    /// Append a chunk and fan it out to live subscribers. `send`
+    /// Append an event and fan it out to live subscribers. `send`
     /// errors are ignored — they only mean no subscribers, which is
     /// the common case (most builds finish without anyone watching).
-    pub fn push(&self, bytes: &[u8]) {
+    pub fn push(&self, event: NomEvent) {
         let mut g = self.inner.lock().unwrap();
-        g.buf.extend_from_slice(bytes);
-        let _ = g.tx.send(Bytes::copy_from_slice(bytes));
+        if g.buf.len() < MAX_BUFFERED_EVENTS {
+            g.buf.push(event.clone());
+        } else if !g.truncated {
+            g.truncated = true;
+            g.buf.push(NomEvent::Raw {
+                text: "argunix: live log buffer truncated — open the full log".to_string(),
+            });
+        }
+        let _ = g.tx.send(event);
     }
 
     /// Take a snapshot of the buffered prefix and a subscription to
-    /// future chunks. The two are produced under one lock so the
-    /// caller cannot miss bytes (or see them twice) in the gap
+    /// future events. The two are produced under one lock so the
+    /// caller cannot miss an event (or see it twice) in the gap
     /// between snapshot and subscribe.
-    pub fn subscribe(&self) -> (Vec<u8>, broadcast::Receiver<Bytes>) {
+    pub fn subscribe(&self) -> (Vec<NomEvent>, broadcast::Receiver<NomEvent>) {
         let g = self.inner.lock().unwrap();
         (g.buf.clone(), g.tx.subscribe())
     }
 }
 
 /// Coordinator-wide registry of live build logs. Worker calls
-/// [`Self::open`] on `BuildStarted`, [`Self::push`] on each chunk,
+/// [`Self::open`] on `BuildStarted`, [`Self::push`] on each event,
 /// [`Self::close`] on `BuildFinished` (or any exit path). Web SSE
 /// handlers call [`Self::get`] to subscribe.
 #[derive(Default)]
@@ -97,16 +112,22 @@ impl LiveLogRegistry {
 mod tests {
     use super::*;
 
+    fn raw(text: &str) -> NomEvent {
+        NomEvent::Raw {
+            text: text.to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn snapshot_and_subscribe_are_atomic() {
         let log = LiveLog::new();
-        log.push(b"hello ");
+        log.push(raw("hello"));
         let (snap, mut rx) = log.subscribe();
-        assert_eq!(snap, b"hello ");
+        assert_eq!(snap, [raw("hello")]);
 
-        log.push(b"world");
-        let chunk = rx.recv().await.unwrap();
-        assert_eq!(&chunk[..], b"world");
+        log.push(raw("world"));
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event, raw("world"));
     }
 
     #[tokio::test]
@@ -125,10 +146,10 @@ mod tests {
     async fn open_is_idempotent() {
         let reg = LiveLogRegistry::new();
         let a = reg.open(1);
-        a.push(b"first ");
+        a.push(raw("first"));
         let b = reg.open(1);
-        b.push(b"second");
+        b.push(raw("second"));
         let (snap, _rx) = a.subscribe();
-        assert_eq!(snap, b"first second");
+        assert_eq!(snap, [raw("first"), raw("second")]);
     }
 }

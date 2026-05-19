@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 argunix-domain = { workspace = true }
+argunix-nom = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
