@@ -318,6 +318,26 @@ impl Provider for GitlabProvider {
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            // GitLab commit statuses are a strict state machine — it
+            // 400s any transition that isn't legal from the current
+            // state. The common case is re-posting `pending` for a
+            // status that is already `pending`/`running` (an eval
+            // resumed after a coordinator restart, or the rolling
+            // collapsed-mode check), or re-posting a state behind a
+            // terminal one. The commit already shows an
+            // equal-or-newer status, there is nothing argunix can do,
+            // and it is not an argunix-side failure — so swallow it
+            // rather than logging a WARN per occurrence. (GitHub and
+            // Forgejo have no such state machine and accept every
+            // post idempotently.)
+            if status.as_u16() == 400 && body.contains("Cannot transition status") {
+                tracing::debug!(
+                    url = %url,
+                    body = %body,
+                    "gitlab rejected a no-op status transition; commit already shows it",
+                );
+                return Ok(CheckHandle(url));
+            }
             return Err(ForgeError::Api {
                 status: status.as_u16(),
                 url,

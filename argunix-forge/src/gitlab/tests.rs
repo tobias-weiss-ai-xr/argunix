@@ -360,6 +360,42 @@ async fn post_check_succeeds_for_subgroup_slug() {
     assert_eq!(handle.0, "99");
 }
 
+#[tokio::test]
+async fn post_check_swallows_gitlab_no_op_transition() {
+    // GitLab's commit-status state machine 400s a no-op transition
+    // (e.g. re-posting `pending` for an already-`pending` status, as
+    // happens when an eval resumes after a coordinator restart). That
+    // is not an argunix-side failure — `post_check` must treat it as
+    // success rather than surfacing a `ForgeError`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/projects/myorg%2Fmyrepo/statuses/0123456789abcdef0123456789abcdef01234567",
+        ))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "message": "Cannot transition status via :enqueue from :pending \
+                        (Reason(s): Status cannot transition via \"enqueue\")"
+        })))
+        .mount(&server)
+        .await;
+
+    let p = GitlabProvider::new(server.uri(), "tok".into(), "https://m".into());
+    let result = p
+        .post_check(CheckPost {
+            slug: Slug::new("myorg/myrepo").unwrap(),
+            sha: Sha::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            context: "argunix: evaluation".to_string(),
+            state: CheckState::Pending,
+            description: None,
+            target_url: None,
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "a GitLab no-op status transition must not surface as an error: {result:?}",
+    );
+}
+
 #[test]
 fn clone_url_uses_oauth2_prefix() {
     let p = GitlabProvider::new(
