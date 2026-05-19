@@ -184,27 +184,41 @@ async fn serve_one_connection(
         close_signals: Arc::new(StdMutex::new(HashMap::new())),
     };
 
-    // TCP keepalive on the underlying socket: catches the
-    // suspend/resume "half-open" case where the laptop wakes up on a
-    // different network and the original 4-tuple is no longer
-    // reachable. Without SO_KEEPALIVE the kernel never probes an idle
-    // socket, so a connection can sit wedged for the duration of
-    // `tcp_retries2` (~15min) — or indefinitely if the heartbeat
-    // payload is too small to fill the send buffer and trigger
-    // retransmits. 30s idle + 10s × 3 probes ⇒ dead in ~60s.
+    // Dead-peer detection. The agent writes a heartbeat every 5s, so
+    // the connection is *never idle* — which means SO_KEEPALIVE never
+    // fires (its timer only runs on an idle socket). A coordinator
+    // that vanishes (process restart, host gone) leaves the socket in
+    // TCP retransmit, governed by `tcp_retries2` (~15min) before a
+    // write finally errors — far too long to notice a restart.
+    //
+    // TCP_USER_TIMEOUT is the real fix: it caps how long *sent* data
+    // may sit unacknowledged before the kernel forcibly closes the
+    // connection, overriding `tcp_retries2`. With a 5s heartbeat and a
+    // 30s cap, a dead coordinator is detected within ~30s — the next
+    // heartbeat write errors and the agent reconnects. SO_KEEPALIVE is
+    // kept for the genuinely-idle case; TCP_USER_TIMEOUT also bounds
+    // its probe window.
     let tcp = tokio::net::TcpStream::connect(cfg.argunix)
         .await
         .map_err(|e| AgentError::Connect {
             addr: cfg.argunix,
             source: russh::Error::IO(e),
         })?;
+    let sock = SockRef::from(&tcp);
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(30))
         .with_interval(Duration::from_secs(10))
         .with_retries(3);
-    if let Err(e) = SockRef::from(&tcp).set_tcp_keepalive(&keepalive) {
-        tracing::warn!(error = %e, "set_tcp_keepalive() failed; suspend/resume detection may be slow");
+    if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
+        tracing::warn!(error = %e, "set_tcp_keepalive() failed; idle dead-peer detection may be slow");
     }
+    if let Err(e) = sock.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
+        tracing::warn!(
+            error = %e,
+            "set_tcp_user_timeout() failed; a dead coordinator may take ~15min to detect",
+        );
+    }
+    drop(sock);
     let mut session = client::connect_stream(client_cfg, tcp, handler)
         .await
         .map_err(|source| AgentError::Connect {
