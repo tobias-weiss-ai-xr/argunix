@@ -96,6 +96,49 @@ impl Drop for PhaseGuard {
     }
 }
 
+/// RAII backstop that guarantees a job marked `Running` cannot linger
+/// in that state if `build_one` unwinds before writing a terminal
+/// status — a `?` error out of dispatch, or the whole build-phase
+/// task being dropped on cancellation. On drop it spawns a task that
+/// calls [`JobStore::interrupt_if_running`]; the conditional
+/// `WHERE status = 'running'` makes that a no-op once a real verdict
+/// (`finish`) has landed, so the guard never needs disarming. Process
+/// death is the one case it cannot cover — the boot-time
+/// `mark_running_interrupted` pass handles that. Together they keep
+/// the read-only UI's "building right now" honest across a restart.
+struct RunningJobGuard {
+    store: argunix_store::SqlxStore,
+    job_id: JobId,
+}
+
+impl RunningJobGuard {
+    fn arm(store: argunix_store::SqlxStore, job_id: JobId) -> Self {
+        Self { store, job_id }
+    }
+}
+
+impl Drop for RunningJobGuard {
+    fn drop(&mut self) {
+        let store = self.store.clone();
+        let job_id = self.job_id;
+        tokio::spawn(async move {
+            match <argunix_store::SqlxStore as JobStore>::interrupt_if_running(&store, job_id).await
+            {
+                Ok(true) => tracing::warn!(
+                    job_id = job_id.get(),
+                    "build_one exited without a verdict; job flipped running -> interrupted",
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    job_id = job_id.get(),
+                    "failed to interrupt an abandoned running job",
+                ),
+            }
+        });
+    }
+}
+
 /// State the worker needs to process evaluations end-to-end.
 #[derive(Clone)]
 pub struct WorkerContext {
@@ -1746,6 +1789,11 @@ async fn build_one(
     }
 
     <SqlxStore as JobStore>::start(&ctx.store, job_id, Utc::now()).await?;
+    // From here until a terminal `finish`, this job is `running` in
+    // the DB. Arm a backstop so that any abandonment — a `?` error out
+    // of dispatch, the build-phase task dropped on cancellation — can
+    // never leave a stale `running` row behind the UI's "building now".
+    let _running_guard = RunningJobGuard::arm(ctx.store.clone(), job_id);
 
     // Pre-create the gcroot parent dir so `nix-store --add-root` can drop
     // the symlink atomically with the build (otherwise it ENOENTs and the

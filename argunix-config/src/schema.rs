@@ -126,6 +126,13 @@ pub struct Schedule {
     /// at use.
     #[serde(default = "default_build_concurrency")]
     pub build_concurrency: u32,
+    /// Wall-clock seconds before a single `nix-store --realise` is
+    /// abandoned. The coordinator arms a deadline at `build_timeout +
+    /// grace` and the builder passes the same value to nix as
+    /// `--option build-timeout`. Default 18000 (5h); raise it for
+    /// repos with very long builds. Read once at startup.
+    #[serde(default = "default_build_timeout_seconds")]
+    pub build_timeout_seconds: u32,
 }
 
 fn default_collapsed_threshold() -> u32 {
@@ -140,12 +147,17 @@ fn default_build_concurrency() -> u32 {
     4
 }
 
+fn default_build_timeout_seconds() -> u32 {
+    18000
+}
+
 impl Default for Schedule {
     fn default() -> Self {
         Self {
             collapsed_check_threshold: default_collapsed_threshold(),
             webhook_coalesce_seconds: default_webhook_coalesce_seconds(),
             build_concurrency: default_build_concurrency(),
+            build_timeout_seconds: default_build_timeout_seconds(),
         }
     }
 }
@@ -674,6 +686,7 @@ forges:
         assert_eq!(c.listen, "127.0.0.1:8080");
         assert_eq!(c.schedule.collapsed_check_threshold, 100);
         assert_eq!(c.schedule.build_concurrency, 4);
+        assert_eq!(c.schedule.build_timeout_seconds, 18000);
         assert!(!c.dry_run);
         assert_eq!(c.repos.len(), 1);
         assert_eq!(c.repos[0].forge, "github-myorg");

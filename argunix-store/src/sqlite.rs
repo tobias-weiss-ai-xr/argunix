@@ -873,6 +873,16 @@ impl JobStore for SqlxStore {
         Ok(r.rows_affected())
     }
 
+    async fn interrupt_if_running(&self, id: JobId) -> Result<bool, StoreError> {
+        let r = sqlx::query("UPDATE jobs SET status = ?1 WHERE id = ?2 AND status = ?3")
+            .bind(JobStatus::Interrupted.as_str())
+            .bind(id.get())
+            .bind(JobStatus::Running.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
     async fn requeue_interrupted_for_eval(&self, eval_id: EvalId) -> Result<u64, StoreError> {
         let r = sqlx::query(
             "UPDATE jobs
@@ -2729,6 +2739,46 @@ mod tests {
             .unwrap();
         assert_eq!(j.status, JobStatus::Interrupted);
         assert_eq!(j.interrupt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn interrupt_if_running_only_touches_running_jobs() {
+        let s = store().await;
+        let (_builder_id, job_id) = fixture_job(&s).await;
+
+        // A not-yet-running job is left alone — the conditional
+        // `WHERE status = 'running'` cannot clobber a queued verdict.
+        assert!(
+            !<SqlxStore as JobStore>::interrupt_if_running(&s, job_id)
+                .await
+                .unwrap(),
+            "interrupt_if_running must be a no-op on a non-running job",
+        );
+
+        // Once running, it flips exactly once.
+        <SqlxStore as JobStore>::start(&s, job_id, Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            <SqlxStore as JobStore>::interrupt_if_running(&s, job_id)
+                .await
+                .unwrap(),
+            "a running job must flip to interrupted",
+        );
+        let j = <SqlxStore as JobStore>::get(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(j.status, JobStatus::Interrupted);
+        // Abandonment is argunix's fault — the retry cap is untouched.
+        assert_eq!(j.interrupt_count, 0);
+
+        // Idempotent: a second call on the now-interrupted job no-ops.
+        assert!(
+            !<SqlxStore as JobStore>::interrupt_if_running(&s, job_id)
+                .await
+                .unwrap(),
+        );
     }
 
     #[tokio::test]

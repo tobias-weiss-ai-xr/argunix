@@ -131,9 +131,6 @@ struct BuildArgs {
     /// Wall-clock seconds for each `nix-eval-jobs` subprocess.
     #[arg(long, default_value_t = 600, value_name = "SECONDS")]
     eval_timeout_seconds: u64,
-    /// Wall-clock seconds for each `nix-store --realise` (default 5h).
-    #[arg(long, default_value_t = 18000, value_name = "SECONDS")]
-    build_timeout_seconds: u64,
     /// Override the GC root base directory (for tests).
     #[arg(long, value_name = "PATH")]
     gc_root_dir: Option<PathBuf>,
@@ -248,6 +245,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // in-flight builds. Operators tune this via the YAML
     // `schedule.build_concurrency` key (default 4).
     let build_concurrency: usize = current.load().config.schedule.build_concurrency as usize;
+    // Per-build wall-clock timeout, from the YAML
+    // `schedule.build_timeout_seconds` key (default 5h). Read once at
+    // startup, like `build_concurrency`.
+    let build_timeout =
+        Duration::from_secs(current.load().config.schedule.build_timeout_seconds as u64);
     // Single global build cap shared across all in-flight evals. With
     // build dispatch now spawned per-eval (see `worker::process`),
     // this prevents two concurrent evals from each getting their own
@@ -285,7 +287,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         log_dir: log_dir.clone(),
         gc_root_dir: gc_root_dir.clone(),
         eval_timeout: Duration::from_secs(600),
-        build_timeout: Duration::from_secs(18000),
+        build_timeout,
         clone_timeout: Duration::from_secs(300),
         systems,
         pauses: pauses.clone(),
@@ -451,7 +453,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         builder_registry,
         nix_store_bin: args.nix_store_bin.clone(),
         nix_bin: args.nix_bin.clone(),
-        build_timeout: Duration::from_secs(18000),
+        build_timeout,
     });
 
     // Tell systemd we're ready (so `Type=notify-reload` can sequence
@@ -762,7 +764,7 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("/nix/var/nix/gcroots/per-user/argunix"));
 
-    let build_timeout = Duration::from_secs(args.build_timeout_seconds);
+    let build_timeout = Duration::from_secs(config.schedule.build_timeout_seconds as u64);
     let push_timeout = Duration::from_secs(300);
 
     // Single-shot mode shares the registry-state convention with the

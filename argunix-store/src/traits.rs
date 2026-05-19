@@ -278,6 +278,15 @@ pub trait JobStore: Send + Sync {
     /// shouldn't push the job toward the per-job retry cap.
     async fn mark_running_interrupted(&self) -> Result<u64, StoreError>;
 
+    /// Single-job companion to [`Self::mark_running_interrupted`]:
+    /// flip `id` to `interrupted` **only if it is still `running`**.
+    /// Returns `true` if a row changed. Used as a backstop when the
+    /// worker's `build_one` abandons a job mid-flight (a `?` error or a
+    /// dropped build-phase task) without writing a terminal status —
+    /// the conditional `WHERE status = 'running'` makes it a no-op on
+    /// every clean path, so it cannot clobber a real verdict.
+    async fn interrupt_if_running(&self, id: JobId) -> Result<bool, StoreError>;
+
     /// Crash-recovery companion to `mark_running_interrupted`. Flips
     /// every `Interrupted` job belonging to `eval_id` back to `Queued`
     /// and clears its `started_at` so a resumed worker can dispatch it

@@ -64,6 +64,12 @@ in
         listen = "[::]:45678";
         token_path = "/var/lib/argunix-credentials/builder-enrollment-token";
       };
+
+      schedule = {
+        build_concurrency = 6;
+        build_timeout_seconds = 10 * 60 * 60;
+      };
+
       binary_caches = [
         {
           push_url = cacheUrl;

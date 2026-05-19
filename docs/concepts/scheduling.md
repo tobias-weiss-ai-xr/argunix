@@ -35,6 +35,13 @@ N's still-running builds. The global cap (`build_concurrency`,
 default 4) is enforced by a single `Semaphore` shared across all
 evals' build tasks — _not_ per-eval.
 
+Each individual build also has a wall-clock timeout
+(`schedule.build_timeout_seconds`, default 18000 = 5h): the
+coordinator abandons a `nix-store --realise` that runs past
+`build_timeout + grace`, and the builder passes the same value to nix
+as `--option build-timeout`. Both `schedule` keys are read once at
+startup.
+
 ## The DAG: top-level → top-level gating
 
 After persisting the eval's Jobs, the worker calls
