@@ -131,8 +131,8 @@ struct BuildArgs {
     /// Wall-clock seconds for each `nix-eval-jobs` subprocess.
     #[arg(long, default_value_t = 600, value_name = "SECONDS")]
     eval_timeout_seconds: u64,
-    /// Wall-clock seconds for each `nix-store --realise`.
-    #[arg(long, default_value_t = 7200, value_name = "SECONDS")]
+    /// Wall-clock seconds for each `nix-store --realise` (default 5h).
+    #[arg(long, default_value_t = 18000, value_name = "SECONDS")]
     build_timeout_seconds: u64,
     /// Override the GC root base directory (for tests).
     #[arg(long, value_name = "PATH")]
@@ -285,7 +285,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         log_dir: log_dir.clone(),
         gc_root_dir: gc_root_dir.clone(),
         eval_timeout: Duration::from_secs(600),
-        build_timeout: Duration::from_secs(7200),
+        build_timeout: Duration::from_secs(18000),
         clone_timeout: Duration::from_secs(300),
         systems,
         pauses: pauses.clone(),
@@ -451,7 +451,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         builder_registry,
         nix_store_bin: args.nix_store_bin.clone(),
         nix_bin: args.nix_bin.clone(),
-        build_timeout: Duration::from_secs(7200),
+        build_timeout: Duration::from_secs(18000),
     });
 
     // Tell systemd we're ready (so `Type=notify-reload` can sequence
