@@ -586,15 +586,13 @@ async fn handle_build(
     // drops the read-ends of the pipes; the orphaned grandchildren's
     // writes go to a closed pipe (no impact on the daemon, and the
     // grandchildren reap themselves when they finish).
-    let (log_truncated, mut output_paths) = if aborted {
+    let (stderr_bytes_sent, log_truncated, mut output_paths) = if aborted {
         stderr_task.abort();
         stdout_task.abort();
-        (false, Vec::<String>::new())
+        (0u64, false, Vec::<String>::new())
     } else {
-        (
-            stderr_task.await.unwrap_or(false),
-            stdout_task.await.unwrap_or_default(),
-        )
+        let (sent, trunc) = stderr_task.await.unwrap_or((0, false));
+        (sent, trunc, stdout_task.await.unwrap_or_default())
     };
 
     // When the agent owns the gcroot, `nix-store --realise --add-root
@@ -633,6 +631,23 @@ async fn handle_build(
             (BuildOutcomeStatus::Failure, None)
         }
     };
+
+    // Recovery: `nix-store --realise` succeeded but produced no
+    // captured stderr. The realise was satisfied by substitution, or
+    // this client was a silent waiter on another in-progress build of
+    // the same drv (nix-daemon streams the live log only to the
+    // client that *triggered* the build). Either way the coordinator
+    // would otherwise record an empty stored log. Recover the drv's
+    // archived log from the local `nix-daemon` log archive — these
+    // frames flow through the same chunk pipeline as live stderr.
+    if !aborted && status == BuildOutcomeStatus::Success && stderr_bytes_sent == 0 {
+        tracing::debug!(
+            build_id,
+            drv = %drv_path,
+            "build finished with empty stderr; trying nix-store --read-log fallback",
+        );
+        try_send_archived_log(&nix_store_bin, build_id, &drv_path, &out_tx).await;
+    }
 
     tracing::info!(
         build_id,
@@ -711,12 +726,17 @@ fn spawn_retrying_etxtbsy(cmd: &mut Command) -> std::io::Result<tokio::process::
 /// every chunk read. Stops emitting (but keeps draining the pipe so the
 /// child doesn't block) once `max_log_bytes` raw bytes have been sent;
 /// the caller surfaces this in `BuildFinished{log_truncated: true}`.
+/// Returns `(bytes_sent, truncated)` — `bytes_sent == 0` on a clean
+/// success means the realise was satisfied entirely by substitution
+/// (or the client was a silent waiter on another in-progress build),
+/// so the caller can fall back to `nix-store --read-log` for the
+/// drv's archived log instead of recording a blank stored log.
 async fn pump_stderr_as_chunks<R>(
     build_id: i64,
     mut stderr: R,
     max_log_bytes: u64,
     out_tx: mpsc::UnboundedSender<Vec<u8>>,
-) -> bool
+) -> (u64, bool)
 where
     R: AsyncReadExt + Unpin,
 {
@@ -754,7 +774,50 @@ where
             sent += take as u64;
         }
     }
-    truncated
+    (sent, truncated)
+}
+
+/// Run `nix-store --read-log <drv>` and stream its stdout to the
+/// coordinator as one or more `BuildLogChunk` frames. Used as a
+/// recovery path when `nix-store --realise` succeeded but produced no
+/// stderr — substitution, or this client was a silent waiter on
+/// another in-progress build of the same drv. Best-effort: any
+/// failure (binary missing, drv not in the archive, non-zero exit)
+/// returns silently and the coordinator ends up with whatever
+/// chunks it has (possibly none).
+async fn try_send_archived_log(
+    nix_store_bin: &std::path::Path,
+    build_id: i64,
+    drv_path: &str,
+    out_tx: &mpsc::UnboundedSender<Vec<u8>>,
+) {
+    let output = match tokio::process::Command::new(nix_store_bin)
+        .arg("--read-log")
+        .arg(drv_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    if !output.status.success() || output.stdout.is_empty() {
+        return;
+    }
+    // Chunk to match the live stream's 16 KiB framing.
+    for chunk in output.stdout.chunks(16 * 1024) {
+        let bytes_b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
+        let frame = ControlMessage::BuildLogChunk {
+            build_id,
+            bytes_b64,
+        }
+        .encode_line();
+        if out_tx.send(frame).is_err() {
+            return;
+        }
+    }
 }
 
 /// russh client Handler. Every inbound session channel is a

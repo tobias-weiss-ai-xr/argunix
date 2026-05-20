@@ -66,6 +66,12 @@ in
       description = ''
         Hostname or IP of the argunix daemon. Resolved once at
         startup; if DNS changes, restart the unit.
+
+        Set to `"127.0.0.1"` to run this agent as a *loopback* builder
+        on the same host as the coordinator — the coordinator builds
+        nothing locally itself, so this is the way to give it build
+        capacity. The agent enrolls and is picked by the dispatcher
+        like any other builder.
       '';
     };
 

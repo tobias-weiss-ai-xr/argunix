@@ -1788,17 +1788,19 @@ async fn build_one(
         }
     }
 
-    <SqlxStore as JobStore>::start(&ctx.store, job_id, Utc::now()).await?;
-    // From here until a terminal `finish`, this job is `running` in
-    // the DB. Arm a backstop so that any abandonment — a `?` error out
-    // of dispatch, the build-phase task dropped on cancellation — can
-    // never leave a stale `running` row behind the UI's "building now".
+    // Backstop: the only way a job becomes `running` from here is via
+    // `JobStore::dispatch` inside the loop below. If `dispatch_pool_build`
+    // then unwinds before a terminal `finish` — a `?` error, the build
+    // phase task dropped on cancellation — this guard's conditional
+    // `interrupt_if_running` flips the row out of `running` so the UI's
+    // "building now" never carries a phantom entry. The guard is safe
+    // to arm pre-`dispatch`: its UPDATE is gated on `status = 'running'`
+    // and is a no-op on queued / terminal rows.
     let _running_guard = RunningJobGuard::arm(ctx.store.clone(), job_id);
 
-    // Pre-create the gcroot parent dir so `nix-store --add-root` can drop
-    // the symlink atomically with the build (otherwise it ENOENTs and the
-    // realise call fails before any building happens). Done once, before
-    // any dispatch attempt.
+    // Pre-create the gcroot parent dir so `nix-store --add-root` (run
+    // by the agent on the picked builder) can drop the symlink
+    // atomically with the build.
     let gc_root = argunix_build::gc_root_path(&ctx.gc_root_dir, repo_id, eval_id, job_id);
     if let Some(parent) = gc_root.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -1809,25 +1811,21 @@ async fn build_one(
     // Dispatch loop. `pick_builder_for_spec` returns the least-loaded
     // eligible builder not in `excluded`; `eligible()` already filters
     // by (system, requiredSystemFeatures, max_jobs cap). On a transport
-    // failure — the builder disconnected before producing a verdict —
-    // we add it to `excluded` and pick the next one. A genuine build
-    // verdict (success / failure / timeout) ends the loop.
-    //
-    // When `pick_builder_for_spec` returns None — no connected builder
-    // matches at all, or every eligible one already hit a transport
-    // failure — we fall back to a local `nix-store --realise` (no
-    // `--builders`), which honours the host's `nix.buildMachines` if
-    // any. Pre-flight for required-feature jobs already short-circuits
-    // the "connected pool exists but nothing matches" case above.
+    // failure — the builder disconnected before a verdict — we add it
+    // to `excluded` and pick the next one. A genuine verdict ends the
+    // loop. When no eligible builder remains, the job is marked
+    // `Interrupted` and `build_one` returns: the coordinator has no
+    // local build path, so any execution must go through the pool. If
+    // the operator wants the coordinator host to also build, they
+    // enrol `argunix-builder` on it as a loopback builder — it then
+    // appears in the pool like any other and is picked here normally.
     //
     // The loop is bounded by the pool size (each builder is excluded
     // after at most one attempt), so it always terminates.
     //
-    // Cancellation: `biased;` in the local arm polls the build first so
-    // a build that resolved in the same tick as cancel is honoured; the
-    // pool path's `dispatch_build_via_pool` handles cancel internally
-    // (it sends `Abort` and drains `BuildFinished{Killed}`).
-    // See [docs/concepts/cancel-on-push.md].
+    // Cancellation: `dispatch_build_via_pool` handles cancel internally
+    // (it sends `Abort` and drains `BuildFinished{Killed}`). See
+    // [docs/concepts/cancel-on-push.md].
     let mut excluded: std::collections::HashSet<argunix_domain::BuilderName> =
         std::collections::HashSet::new();
     let (outcome, phase_metrics) = loop {
@@ -1882,56 +1880,34 @@ async fn build_one(
                 }
             }
             None => {
-                // Eligible pool builders existed but every one hit a
-                // transport failure mid-build — a builder restart or
-                // network blip, not a build problem. Forcing the local
-                // fallback here would, for a job whose `system` the
-                // coordinator cannot build (e.g. an aarch64 job on an
-                // x86_64 host), run a doomed `nix-store --realise` and
-                // record a misleading `Failure`. Mark the job
-                // `Interrupted` instead: honest about the missing
-                // verdict, it drops out of "building right now", and
-                // it is eligible for retry on the next eval resume
-                // rather than recorded as a real build failure.
-                if !excluded.is_empty() {
-                    tracing::warn!(
-                        job_id = job_id.get(),
-                        tried = excluded.len(),
-                        "every eligible pool builder hit a transport failure mid-build; \
-                         marking job interrupted for retry instead of failing it locally",
-                    );
-                    <SqlxStore as JobStore>::interrupt_if_running(&ctx.store, job_id).await?;
-                    return Ok(JobStatus::Interrupted);
-                }
-                // No eligible pool builder at all: fall back to a local
-                // `nix-store --realise` (no `--builders`). The host's
-                // `nix.buildMachines`, if any, is honoured natively; if
-                // not, the build runs locally. Local builds have no
-                // remote-transport phases, so we record empty metrics.
-                let request = argunix_build::BuildRequest {
-                    drv_path: drv_path.clone(),
-                    log_path: log_path.clone(),
-                    timeout: ctx.build_timeout,
-                    log_limit: argunix_build::LogCaptureLimit::default(),
-                    gc_root: Some(gc_root.clone()),
-                };
-                let local_outcome = tokio::select! {
-                    biased;
-                    res = argunix_build::run_build(&request) => res?,
-                    _ = cancel.cancelled() => {
-                        tracing::info!(
-                            job_id = job_id.get(),
-                            attr = %spec.attr_path,
-                            "build cancelled by new push; killing nix-store",
-                        );
-                        <SqlxStore as JobStore>::finish(
-                            &ctx.store, job_id, JobStatus::Cancelled, Utc::now(), None, None,
-                            &JobPhaseMetrics::default(),
-                        ).await?;
-                        return Ok(JobStatus::Cancelled);
-                    }
-                };
-                break (local_outcome, JobPhaseMetrics::default());
+                // No eligible pool builder remains — either none ever
+                // matched (wrong system / required-feature combination
+                // the pool can't satisfy right now) or every one that
+                // did has been excluded by a transport failure during
+                // this dispatch. The coordinator does not build
+                // locally: there is no second code path that could
+                // satisfy this. Mark the job `Interrupted` (honest:
+                // attempted, no verdict, eligible for retry on the
+                // next eval resume) and return.
+                tracing::warn!(
+                    job_id = job_id.get(),
+                    tried = excluded.len(),
+                    spec_system = ?spec.system,
+                    "no eligible pool builder; marking job interrupted for retry \
+                     (enrol a builder on this host as a loopback if the coordinator \
+                     should also build)",
+                );
+                <SqlxStore as JobStore>::finish(
+                    &ctx.store,
+                    job_id,
+                    JobStatus::Interrupted,
+                    Utc::now(),
+                    None,
+                    None,
+                    &JobPhaseMetrics::default(),
+                )
+                .await?;
+                return Ok(JobStatus::Interrupted);
             }
         }
     };
@@ -2620,8 +2596,7 @@ pub async fn dispatch_pool_build(
     //    would wait on `lifecycle.recv()` forever. We give the build
     //    `build_timeout + grace` (grace = 60s for the agent's SIGKILL
     //    + final stderr drain), then synthesize a Killed outcome and
-    //    move on. Mirrors the local fallback's `tokio::time::timeout`
-    //    around `argunix_build::run_build`.
+    //    move on.
     let grace = Duration::from_secs(60);
     let timeout_deadline = tokio::time::Instant::now() + build_timeout + grace;
     let mut output_paths: Vec<String> = Vec::new();
