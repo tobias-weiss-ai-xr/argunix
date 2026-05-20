@@ -2138,8 +2138,23 @@ pub async fn job_log_stream(
         }
     });
 
-    Ok(Sse::new(ReceiverStream::new(out_rx))
-        .keep_alive(KeepAlive::default())
+    let sse = Sse::new(ReceiverStream::new(out_rx)).keep_alive(KeepAlive::default());
+    // `X-Accel-Buffering: no` opts this response out of nginx's
+    // response buffering; without it nginx holds the SSE stream in
+    // its ~32 KB proxy buffers and the browser appears to stall mid-
+    // build. The header is nginx's documented per-response toggle and
+    // is also respected by other proxies that emulate its behaviour;
+    // proxies that don't recognise it ignore it harmlessly.
+    Ok((
+        [
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+            (
+                axum::http::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
+        ],
+        sse,
+    )
         .into_response())
 }
 
