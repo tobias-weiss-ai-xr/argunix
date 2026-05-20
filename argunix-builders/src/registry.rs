@@ -385,16 +385,24 @@ impl BuilderRegistry {
     ///  3. call [`Self::unregister_in_flight_build`] on completion or
     ///     cancellation so the map doesn't leak.
     ///
-    /// `capacity` is small on purpose — back-pressure on a stuck
-    /// receiver keeps log frames from buffering without bound. The
-    /// connection-handler-side forward path uses `try_send` and drops
-    /// frames on full, so a slow worker mainly forfeits log fidelity.
+    /// Capacity sized for an LLVM-class internal-json firehose: a
+    /// single 16 KiB `BuildLogChunk` carries dozens of events, and a
+    /// busy compile easily pushes hundreds of events per second. The
+    /// 64-slot version dropped on the slightest scheduler hiccup,
+    /// taking out `actStart`/`actStop`/`resProgress` along with log
+    /// lines and freezing the nom tree at whatever was building when
+    /// the drops began. 4096 entries × ~16 KiB = ~64 MiB worst-case
+    /// per build — bounded and acceptable, while leaving multi-second
+    /// headroom before pressure even matters. The forward path still
+    /// uses `try_send` (so a hard-stuck consumer cannot grow agent
+    /// memory unboundedly via SSH back-pressure), but drops now
+    /// require the consumer to be genuinely wedged, not just slow.
     pub fn register_in_flight_build(
         &self,
         name: BuilderName,
         build_id: i64,
     ) -> mpsc::Receiver<BuildLifecycle> {
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(4096);
         self.in_flight_builds
             .lock()
             .unwrap()
@@ -417,7 +425,9 @@ impl BuilderRegistry {
     /// unregistered, or the agent is sending bogus build_ids). Drops
     /// the event silently if the worker's channel is full — the
     /// per-build mpsc is bounded so a stuck consumer can't grow memory
-    /// without bound; log fidelity is the only casualty.
+    /// without bound; log fidelity is the only casualty. A drop is
+    /// logged at `warn` so the operator sees that the live and stored
+    /// log for this build will have a gap.
     pub fn forward_build_event(
         &self,
         name: &BuilderName,
@@ -428,7 +438,14 @@ impl BuilderRegistry {
         let Some(tx) = map.get(&(name.clone(), build_id)) else {
             return false;
         };
-        let _ = tx.try_send(event);
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(event) {
+            tracing::warn!(
+                builder = %name,
+                build_id,
+                "worker lifecycle channel full; dropping a log/activity event \
+                 — live view and stored log will have a gap (consumer is wedged)",
+            );
+        }
         true
     }
 
