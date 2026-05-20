@@ -250,6 +250,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // startup, like `build_concurrency`.
     let build_timeout =
         Duration::from_secs(current.load().config.schedule.build_timeout_seconds as u64);
+    // How long the dispatcher waits for an eligible builder before
+    // giving up and marking a job `Interrupted`. Default 0 (immediate)
+    // — operators set a modest value (e.g. 30s) when a builder
+    // restarts in lockstep with the coordinator and needs a few
+    // seconds to re-enrol after the resume pass dispatches the eval.
+    let builder_wait =
+        Duration::from_secs(current.load().config.schedule.builder_wait_seconds as u64);
     // Single global build cap shared across all in-flight evals. With
     // build dispatch now spawned per-eval (see `worker::process`),
     // this prevents two concurrent evals from each getting their own
@@ -288,6 +295,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         gc_root_dir: gc_root_dir.clone(),
         eval_timeout: Duration::from_secs(600),
         build_timeout,
+        builder_wait,
         clone_timeout: Duration::from_secs(300),
         systems,
         pauses: pauses.clone(),

@@ -422,31 +422,42 @@ impl BuilderRegistry {
     /// Forward a lifecycle event from the connection handler to the
     /// matching worker. Returns `false` if no entry was registered for
     /// `(name, build_id)` (most likely the worker already gave up and
-    /// unregistered, or the agent is sending bogus build_ids). Drops
-    /// the event silently if the worker's channel is full — the
-    /// per-build mpsc is bounded so a stuck consumer can't grow memory
-    /// without bound; log fidelity is the only casualty. A drop is
-    /// logged at `warn` so the operator sees that the live and stored
-    /// log for this build will have a gap.
-    pub fn forward_build_event(
+    /// unregistered, or the agent is sending bogus build_ids).
+    ///
+    /// Blocking send: when the worker's lifecycle channel is full this
+    /// awaits a slot rather than dropping the event. With the agent's
+    /// outbound queue also bounded, the resulting back-pressure walks
+    /// all the way back to `nix-store --realise`'s stderr writer on
+    /// the builder, briefly stalling the build instead of corrupting
+    /// the live view or the stored log. Memory at every hop is
+    /// bounded by the channel capacities; no event is ever lost.
+    ///
+    /// `try_send`-first fast-path so the common (non-contended) case
+    /// is non-blocking and the `.await` is reached only under
+    /// pressure. The sender is cloned out from under the std `Mutex`
+    /// before awaiting — never hold a sync mutex across `.await`.
+    pub async fn forward_build_event(
         &self,
         name: &BuilderName,
         build_id: i64,
         event: BuildLifecycle,
     ) -> bool {
-        let map = self.in_flight_builds.lock().unwrap();
-        let Some(tx) = map.get(&(name.clone(), build_id)) else {
-            return false;
+        let sender = {
+            let map = self.in_flight_builds.lock().unwrap();
+            match map.get(&(name.clone(), build_id)) {
+                Some(tx) => tx.clone(),
+                None => return false,
+            }
         };
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(event) {
-            tracing::warn!(
-                builder = %name,
-                build_id,
-                "worker lifecycle channel full; dropping a log/activity event \
-                 — live view and stored log will have a gap (consumer is wedged)",
-            );
+        match sender.try_send(event) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                // Slow consumer: wait for a slot. Back-pressure propagates
+                // through the russh receive task into the agent.
+                sender.send(event).await.is_ok()
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
         }
-        true
     }
 
     /// Set the current build phase for `(name, build_id)`. Called by
@@ -658,8 +669,9 @@ mod tests {
             conn(&reg, 2, caps(&["x86_64-linux"], &[], 1)),
         );
         let mut rx_dead = reg.register_in_flight_build(dead.clone(), 100);
-        let tx_alive_present_before =
-            reg.forward_build_event(&alive, 200, BuildLifecycle::Started { pid: Some(1) });
+        let tx_alive_present_before = reg
+            .forward_build_event(&alive, 200, BuildLifecycle::Started { pid: Some(1) })
+            .await;
         // No registered receiver for build 200 yet.
         assert!(!tx_alive_present_before);
         let _rx_alive = reg.register_in_flight_build(alive.clone(), 200);
@@ -669,7 +681,10 @@ mod tests {
         assert!(rx_dead.recv().await.is_none());
         // The alive builder's sender must still be live: forward_build_event
         // succeeds (returns true) because the receiver is registered.
-        assert!(reg.forward_build_event(&alive, 200, BuildLifecycle::Started { pid: Some(2) }));
+        assert!(
+            reg.forward_build_event(&alive, 200, BuildLifecycle::Started { pid: Some(2) })
+                .await
+        );
     }
 
     #[test]
@@ -780,8 +795,9 @@ mod tests {
         let name = BuilderName::new("a").unwrap();
         let mut rx = reg.register_in_flight_build(name.clone(), 7);
 
-        let delivered =
-            reg.forward_build_event(&name, 7, BuildLifecycle::Started { pid: Some(123) });
+        let delivered = reg
+            .forward_build_event(&name, 7, BuildLifecycle::Started { pid: Some(123) })
+            .await;
         assert!(delivered);
         let ev = rx.recv().await.expect("event must arrive");
         assert_eq!(ev, BuildLifecycle::Started { pid: Some(123) });
@@ -792,16 +808,18 @@ mod tests {
         let reg = BuilderRegistry::new();
         let name = BuilderName::new("a").unwrap();
         // Nothing registered.
-        let delivered = reg.forward_build_event(
-            &name,
-            999,
-            BuildLifecycle::Finished {
-                status: BuildOutcomeStatus::Success,
-                exit_code: Some(0),
-                output_paths: vec![],
-                log_truncated: false,
-            },
-        );
+        let delivered = reg
+            .forward_build_event(
+                &name,
+                999,
+                BuildLifecycle::Finished {
+                    status: BuildOutcomeStatus::Success,
+                    exit_code: Some(0),
+                    output_paths: vec![],
+                    log_truncated: false,
+                },
+            )
+            .await;
         assert!(!delivered);
     }
 
@@ -830,7 +848,8 @@ mod tests {
         let mut rx_alpha = reg.register_in_flight_build(alpha.clone(), 42);
         let mut rx_beta = reg.register_in_flight_build(beta.clone(), 42);
 
-        reg.forward_build_event(&alpha, 42, BuildLifecycle::Started { pid: Some(1) });
+        reg.forward_build_event(&alpha, 42, BuildLifecycle::Started { pid: Some(1) })
+            .await;
         let on_alpha = tokio::time::timeout(std::time::Duration::from_millis(100), rx_alpha.recv())
             .await
             .unwrap()

@@ -152,6 +152,10 @@ pub struct WorkerContext {
     pub gc_root_dir: PathBuf,
     pub eval_timeout: Duration,
     pub build_timeout: Duration,
+    /// How long `build_one` waits for an eligible pool builder before
+    /// giving up on a job and marking it `Interrupted`. See
+    /// [`argunix_config::schema::Schedule::builder_wait_seconds`].
+    pub builder_wait: Duration,
     pub clone_timeout: Duration,
     pub systems: Vec<String>,
     pub pauses: Arc<PauseRegistry>,
@@ -1828,6 +1832,7 @@ async fn build_one(
     // [docs/concepts/cancel-on-push.md].
     let mut excluded: std::collections::HashSet<argunix_domain::BuilderName> =
         std::collections::HashSet::new();
+    let mut builder_wait_used = false;
     let (outcome, phase_metrics) = loop {
         match pick_builder_for_spec(&ctx.builder_registry, spec, &excluded) {
             Some(b) => {
@@ -1886,9 +1891,63 @@ async fn build_one(
                 // did has been excluded by a transport failure during
                 // this dispatch. The coordinator does not build
                 // locally: there is no second code path that could
-                // satisfy this. Mark the job `Interrupted` (honest:
-                // attempted, no verdict, eligible for retry on the
-                // next eval resume) and return.
+                // satisfy this.
+                //
+                // Before giving up, optionally wait briefly for an
+                // eligible builder to (re)enrol. This bridges the
+                // canonical race where the daemon's resume pass
+                // re-dispatches a job microseconds after startup, but
+                // the (loopback or remote) agent has not yet
+                // reconnected. Opt-in via
+                // `schedule.builder_wait_seconds`; default 0 keeps
+                // existing behaviour and the sandbox tests fast.
+                if !builder_wait_used && excluded.is_empty() && !ctx.builder_wait.is_zero() {
+                    builder_wait_used = true;
+                    let deadline = tokio::time::Instant::now() + ctx.builder_wait;
+                    tracing::info!(
+                        job_id = job_id.get(),
+                        spec_system = ?spec.system,
+                        wait_secs = ctx.builder_wait.as_secs(),
+                        "no eligible builder yet; waiting for one to enrol",
+                    );
+                    let arrived = loop {
+                        if !ctx
+                            .builder_registry
+                            .eligible(
+                                spec.system.as_deref().unwrap_or(""),
+                                &spec.required_system_features,
+                                &excluded,
+                            )
+                            .is_empty()
+                        {
+                            break true;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            break false;
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                // Cancelled mid-wait — fall through to
+                                // the post-loop cancel handling via a
+                                // synthesised verdict.
+                                tracing::info!(
+                                    job_id = job_id.get(),
+                                    "cancelled while waiting for a builder",
+                                );
+                                <SqlxStore as JobStore>::finish(
+                                    &ctx.store, job_id, JobStatus::Cancelled,
+                                    Utc::now(), None, None, &JobPhaseMetrics::default(),
+                                ).await?;
+                                return Ok(JobStatus::Cancelled);
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        }
+                    };
+                    if arrived {
+                        continue;
+                    }
+                }
                 tracing::warn!(
                     job_id = job_id.get(),
                     tried = excluded.len(),

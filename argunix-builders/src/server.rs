@@ -355,7 +355,10 @@ impl ConnectionHandler {
             tracing::warn!(build_id, "build-lifecycle message before hello; dropping",);
             return;
         };
-        let delivered = self.registry.forward_build_event(&name, build_id, event);
+        let delivered = self
+            .registry
+            .forward_build_event(&name, build_id, event)
+            .await;
         if !delivered {
             tracing::debug!(
                 builder = %name,

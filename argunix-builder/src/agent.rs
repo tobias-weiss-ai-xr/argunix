@@ -308,7 +308,21 @@ async fn serve_one_connection(
     // BuildLogChunk / BuildFinished` here; the main loop drains the
     // queue and writes to the SSH channel (which only one task can hold
     // a `&mut` to at a time).
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    //
+    // Bounded on purpose. Pairs with the coordinator-side lifecycle
+    // channel (also bounded) to give end-to-end back-pressure with no
+    // silent log loss: if the coordinator is slow to drain its end,
+    // the russh send window stalls, the main loop's `channel.data()`
+    // blocks, this queue fills, and `pump_stderr_as_chunks` blocks on
+    // send → the `nix-store --realise` stderr pipe fills → the build
+    // briefly pauses. Memory at both ends is bounded by the queue
+    // capacities; nothing grows without limit, nothing is dropped.
+    //
+    // Heartbeats bypass this queue (the main loop writes them
+    // directly to the SSH channel), so a saturated log queue cannot
+    // starve the heartbeats the coordinator uses to detect dead
+    // builders.
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(4096);
     // In-flight build map. `Abort` looks up the oneshot for the
     // matching `build_id` and signals the build task to SIGKILL its
     // `nix-store --realise` child.
@@ -476,7 +490,7 @@ async fn handle_build(
     timeout_secs: u64,
     max_log_bytes: u64,
     nix_store_bin: &Path,
-    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    out_tx: mpsc::Sender<Vec<u8>>,
     abort_rx: oneshot::Receiver<()>,
 ) {
     if agent_owns_gcroot {
@@ -525,21 +539,25 @@ async fn handle_build(
                 error = %e,
                 "spawning nix-store --realise failed",
             );
-            let _ = out_tx.send(
-                ControlMessage::BuildFinished {
-                    build_id,
-                    status: BuildOutcomeStatus::SpawnFailed,
-                    exit_code: None,
-                    output_paths: Vec::new(),
-                    log_truncated: false,
-                }
-                .encode_line(),
-            );
+            let _ = out_tx
+                .send(
+                    ControlMessage::BuildFinished {
+                        build_id,
+                        status: BuildOutcomeStatus::SpawnFailed,
+                        exit_code: None,
+                        output_paths: Vec::new(),
+                        log_truncated: false,
+                    }
+                    .encode_line(),
+                )
+                .await;
             return;
         }
     };
     let pid = child.id();
-    let _ = out_tx.send(ControlMessage::BuildStarted { build_id, pid }.encode_line());
+    let _ = out_tx
+        .send(ControlMessage::BuildStarted { build_id, pid }.encode_line())
+        .await;
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
@@ -657,22 +675,24 @@ async fn handle_build(
         log_truncated,
         "build finished",
     );
-    let _ = out_tx.send(
-        ControlMessage::BuildFinished {
-            build_id,
-            status,
-            exit_code,
-            // Empty output list on non-success: the daemon shouldn't
-            // try to pull a closure that wasn't built.
-            output_paths: if status == BuildOutcomeStatus::Success {
-                output_paths
-            } else {
-                Vec::new()
-            },
-            log_truncated,
-        }
-        .encode_line(),
-    );
+    let _ = out_tx
+        .send(
+            ControlMessage::BuildFinished {
+                build_id,
+                status,
+                exit_code,
+                // Empty output list on non-success: the daemon shouldn't
+                // try to pull a closure that wasn't built.
+                output_paths: if status == BuildOutcomeStatus::Success {
+                    output_paths
+                } else {
+                    Vec::new()
+                },
+                log_truncated,
+            }
+            .encode_line(),
+        )
+        .await;
 
     // Best-effort cleanup of the throwaway gcroot symlink(s). For a
     // multi-output drv `nix-store --realise --add-root <root>` may
@@ -735,7 +755,7 @@ async fn pump_stderr_as_chunks<R>(
     build_id: i64,
     mut stderr: R,
     max_log_bytes: u64,
-    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    out_tx: mpsc::Sender<Vec<u8>>,
 ) -> (u64, bool)
 where
     R: AsyncReadExt + Unpin,
@@ -767,8 +787,12 @@ where
                 bytes_b64,
             }
             .encode_line();
-            if out_tx.send(frame).is_err() {
-                // Receiver gone — control channel torn down. Bail.
+            // Blocking send: when the queue is full we back-pressure
+            // into this read loop, which lets the `nix-store --realise`
+            // stderr pipe fill up and stalls the build briefly rather
+            // than dropping log frames. The receiver going away (e.g.
+            // the SSH session tore down) returns `Err` and we exit.
+            if out_tx.send(frame).await.is_err() {
                 break;
             }
             sent += take as u64;
@@ -789,7 +813,7 @@ async fn try_send_archived_log(
     nix_store_bin: &std::path::Path,
     build_id: i64,
     drv_path: &str,
-    out_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    out_tx: &mpsc::Sender<Vec<u8>>,
 ) {
     let output = match tokio::process::Command::new(nix_store_bin)
         .arg("--read-log")
@@ -814,7 +838,7 @@ async fn try_send_archived_log(
             bytes_b64,
         }
         .encode_line();
-        if out_tx.send(frame).is_err() {
+        if out_tx.send(frame).await.is_err() {
             return;
         }
     }
@@ -1132,7 +1156,7 @@ mod build_handler_tests {
 
     /// Drain `out_rx` until a `BuildFinished` frame arrives. Returns
     /// the `(BuildStarted, BuildLogChunk*, BuildFinished)` triple.
-    async fn collect_messages(mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<ControlMessage> {
+    async fn collect_messages(mut out_rx: mpsc::Receiver<Vec<u8>>) -> Vec<ControlMessage> {
         let mut framer = LineFramer::new();
         let mut messages = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -1191,7 +1215,7 @@ exit 0
 "#,
         );
 
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(4096);
         let (_abort_tx, abort_rx) = oneshot::channel::<()>();
 
         handle_build(
@@ -1264,7 +1288,7 @@ exit 7
 "#,
         );
 
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(4096);
         let (_abort_tx, abort_rx) = oneshot::channel::<()>();
         handle_build(
             1,
@@ -1301,7 +1325,7 @@ exit 7
     async fn missing_nix_store_binary_emits_spawn_failed() {
         let dir = tempdir().unwrap();
         let bin = dir.path().join("does-not-exist");
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(4096);
         let (_abort_tx, abort_rx) = oneshot::channel::<()>();
         handle_build(
             9,
@@ -1339,7 +1363,7 @@ exit 0
 "#,
         );
 
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(4096);
         let (abort_tx, abort_rx) = oneshot::channel::<()>();
 
         let bin_owned = bin.clone();
@@ -1423,7 +1447,7 @@ exit 0
         );
 
         let cap: u64 = 512;
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(4096);
         let (_abort_tx, abort_rx) = oneshot::channel::<()>();
         handle_build(
             5,

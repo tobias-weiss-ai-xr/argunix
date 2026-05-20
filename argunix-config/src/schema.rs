@@ -133,6 +133,17 @@ pub struct Schedule {
     /// repos with very long builds. Read once at startup.
     #[serde(default = "default_build_timeout_seconds")]
     pub build_timeout_seconds: u32,
+    /// How long the dispatcher waits for an eligible pool builder
+    /// before giving up on a job and marking it `Interrupted`. Default
+    /// 0 (immediate). Useful when builders briefly drop and reconnect
+    /// — including the canonical case of the coordinator host
+    /// restarting in lockstep with a loopback `argunix-builder`,
+    /// where the daemon's eval-resume pass runs before the agent has
+    /// re-enrolled. A modest value (e.g. 30s) bridges the reconnect
+    /// gap without delaying genuinely no-builder dispatches for long.
+    /// Read once at startup.
+    #[serde(default = "default_builder_wait_seconds")]
+    pub builder_wait_seconds: u32,
 }
 
 fn default_collapsed_threshold() -> u32 {
@@ -151,6 +162,10 @@ fn default_build_timeout_seconds() -> u32 {
     18000
 }
 
+fn default_builder_wait_seconds() -> u32 {
+    0
+}
+
 impl Default for Schedule {
     fn default() -> Self {
         Self {
@@ -158,6 +173,7 @@ impl Default for Schedule {
             webhook_coalesce_seconds: default_webhook_coalesce_seconds(),
             build_concurrency: default_build_concurrency(),
             build_timeout_seconds: default_build_timeout_seconds(),
+            builder_wait_seconds: default_builder_wait_seconds(),
         }
     }
 }
@@ -687,6 +703,7 @@ forges:
         assert_eq!(c.schedule.collapsed_check_threshold, 100);
         assert_eq!(c.schedule.build_concurrency, 4);
         assert_eq!(c.schedule.build_timeout_seconds, 18000);
+        assert_eq!(c.schedule.builder_wait_seconds, 0);
         assert!(!c.dry_run);
         assert_eq!(c.repos.len(), 1);
         assert_eq!(c.repos[0].forge, "github-myorg");

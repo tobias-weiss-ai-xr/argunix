@@ -1,8 +1,14 @@
-# End-to-end test: webhook → worker → eval+build → DB.
+# Fast smoke of the eval pipeline: webhook → worker clones → evals →
+# persists jobs → tries to dispatch → DB reflects the outcome.
 #
-# `argunix serve` runs in the background. Stand-in `git`, `nix-eval-jobs`,
-# `nix-store`, and `nix` (path-info) replace the real binaries so we can
-# exercise the worker pipeline inside a sealed `runCommand` sandbox.
+# `argunix serve` runs in the background with stand-in `git`,
+# `nix-eval-jobs`, and `nix` (`path-info`) inside a sealed `runCommand`
+# sandbox. The daemon's build path is pool-only — there is no local
+# fallback — and a sandbox cannot enrol a real `argunix-builder`, so
+# every dispatched job lands as `Interrupted` (no eligible builder). The
+# test validates the *eval-side* of the pipeline; the build-side is
+# covered end-to-end by the VM tests (`builder-build-dispatch`,
+# `live-log-stream`, `builders-parallel`, `registry-push-oci`).
 {
   runCommand,
   writeShellScriptBin,
@@ -89,49 +95,10 @@ let
     esac
   '';
 
-  fakeNixStore = writeShellScriptBin "nix-store" ''
-    set -eu
-    # argunix-build uses a combined invocation:
-    #   nix-store --realise [--add-root <root>] [-L] <drv>
-    # Parse all args into (root, drv) and dispatch on drv. Install the
-    # GC root symlink on success when --add-root was given.
-    case "$1" in
-      --realise) shift ;;
-      *) exit 2 ;;
-    esac
-    root=""
-    drv=""
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        -L) shift ;;
-        --add-root) root="$2"; shift 2 ;;
-        --indirect) shift ;;
-        *) drv="$1"; shift ;;
-      esac
-    done
-    install_root() {
-      if [ -n "$root" ]; then
-        mkdir -p "$(dirname "$root")"
-        ln -sfn "$1" "$root"
-      fi
-    }
-    case "$drv" in
-      /nix/store/aaaa-hello.drv)
-        echo "/nix/store/aaaa-hello"
-        echo "[fake-build] hello: line 1" >&2
-        echo "[fake-build] hello: line 2" >&2
-        install_root /nix/store/aaaa-hello
-        exit 0
-        ;;
-      /nix/store/bbbb-goodbye.drv)
-        echo "[fake-build] goodbye: failing" >&2
-        exit 1
-        ;;
-      *)
-        exit 3
-        ;;
-    esac
-  '';
+  # No fake `nix-store` is needed: the coordinator never invokes
+  # `nix-store --realise` itself (build path is pool-only), and with no
+  # builder enrolled in this sandbox the dispatcher's `--add-root`
+  # call after a pull is unreachable too.
 
   fakeNix = writeShellScriptBin "nix" ''
     set -eu
@@ -172,7 +139,6 @@ runCommand "argunix-serve-pipeline-smoke"
       argunix
       fakeGit
       fakeNixEvalJobs
-      fakeNixStore
       fakeNix
       curl
       openssl
@@ -262,19 +228,21 @@ runCommand "argunix-serve-pipeline-smoke"
     sqlite3 db.sqlite '.headers on' \
       'SELECT attr_path, status FROM jobs ORDER BY id;'
 
+    # Both jobs reached the dispatch loop and exited via the pool-only
+    # `None`-branch — no eligible builder, mark `Interrupted`. We just
+    # assert both jobs landed there; the build-side is covered by the
+    # VM tests.
     job_statuses=$(sqlite3 db.sqlite \
       "SELECT status FROM jobs ORDER BY attr_path;" | tr '\n' ',')
     echo "$job_statuses"
-    test "$job_statuses" = "failure,success,"
+    test "$job_statuses" = "interrupted,interrupted,"
 
-    # The successful build's log must exist and contain the fake build output.
-    succeed_log=$(sqlite3 db.sqlite \
-      "SELECT log_path FROM jobs WHERE attr_path LIKE '%.hello';")
-    test -f "$succeed_log"
-
-    # GC root only for the success.
-    succeed_root=$(find "$workdir/gcroots" -type l -lname '/nix/store/aaaa-hello' | head -n1)
-    test -n "$succeed_root"
+    # Sanity: the persisted jobs carry the attr paths the fake
+    # `nix-eval-jobs` emitted — proves the eval phase ran and stored
+    # them before the dispatch loop interrupted them.
+    attr_paths=$(sqlite3 db.sqlite \
+      "SELECT attr_path FROM jobs ORDER BY attr_path;" | tr '\n' ',')
+    test "$attr_paths" = "packages.x86_64-linux.goodbye,packages.x86_64-linux.hello,"
 
     kill -KILL $daemon_pid 2>/dev/null || true
     kill -KILL $forge_pid 2>/dev/null || true
