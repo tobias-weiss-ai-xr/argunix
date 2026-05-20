@@ -297,6 +297,25 @@ fn fixture_nom_script() -> Vec<NomEvent> {
         NomEvent::ActStop { id: 1 },
         progress(1, 1),
         line(2, "libwidget-1.4.0", "running 42 tests"),
+        // Pytest-style coloured progress: each `.` wrapped in
+        // `\x1b[32m…\x1b[0m`. Exercises the live view's SGR parser —
+        // the dots should render in green, with no `␛[…` artefacts.
+        line(
+            2,
+            "libwidget-1.4.0",
+            concat!(
+                "\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m",
+                "\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m",
+                "\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m \x1b[1m[ 100%]\x1b[0m",
+            ),
+        ),
+        // A line mixing several SGR codes (bold, red, reset, green)
+        // so the dev preview shows colour + weight combinations.
+        line(
+            2,
+            "libwidget-1.4.0",
+            "\x1b[1m\x1b[31mFAIL\x1b[0m one flaky test (\x1b[32mretry succeeded\x1b[0m)",
+        ),
         line(2, "libwidget-1.4.0", "all tests passed"),
         NomEvent::ActStop { id: 2 },
         progress(3, 0),

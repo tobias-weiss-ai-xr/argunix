@@ -1824,11 +1824,17 @@ async fn build_one(
     // enrol `argunix-builder` on it as a loopback builder — it then
     // appears in the pool like any other and is picked here normally.
     //
-    // The loop is bounded by the pool size (each builder is excluded
-    // after at most one attempt), so it always terminates.
+    // Transport-exhaustion: each transport-failed builder is excluded
+    // after at most one attempt, so the loop terminates once the
+    // matching set is exhausted via that path. The `None` branch
+    // distinguishes two cases: matching builders are at `max_jobs`
+    // (normal queueing — wait), versus no matching builder exists at
+    // all (interrupt, with an opt-in enrolment grace via
+    // `schedule.builder_wait_seconds`).
     //
     // Cancellation: `dispatch_build_via_pool` handles cancel internally
-    // (it sends `Abort` and drains `BuildFinished{Killed}`). See
+    // (it sends `Abort` and drains `BuildFinished{Killed}`); the wait
+    // loops in the `None` branch also honour the cancel token. See
     // [docs/concepts/cancel-on-push.md].
     let mut excluded: std::collections::HashSet<argunix_domain::BuilderName> =
         std::collections::HashSet::new();
@@ -1901,25 +1907,75 @@ async fn build_one(
                 // reconnected. Opt-in via
                 // `schedule.builder_wait_seconds`; default 0 keeps
                 // existing behaviour and the sandbox tests fast.
-                if !builder_wait_used && excluded.is_empty() && !ctx.builder_wait.is_zero() {
+                let spec_system = spec.system.as_deref().unwrap_or("");
+                let has_match = ctx.builder_registry.any_matching_builder(
+                    spec_system,
+                    &spec.required_system_features,
+                    &excluded,
+                );
+                if has_match {
+                    // Capacity wait: matching builders exist but every
+                    // one is at `max_jobs`. This is normal queueing,
+                    // not a failure — sit on the cancel/poll loop until
+                    // a slot opens. If the last matching builder
+                    // disconnects mid-wait we fall through to the
+                    // no-match path on the next iteration.
+                    tracing::debug!(
+                        job_id = job_id.get(),
+                        spec_system = ?spec.system,
+                        "all matching builders at capacity; waiting for a slot",
+                    );
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                tracing::info!(
+                                    job_id = job_id.get(),
+                                    "cancelled while waiting for builder capacity",
+                                );
+                                <SqlxStore as JobStore>::finish(
+                                    &ctx.store, job_id, JobStatus::Cancelled,
+                                    Utc::now(), None, None, &JobPhaseMetrics::default(),
+                                ).await?;
+                                return Ok(JobStatus::Cancelled);
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        }
+                        if !ctx
+                            .builder_registry
+                            .eligible(spec_system, &spec.required_system_features, &excluded)
+                            .is_empty()
+                        {
+                            break;
+                        }
+                        if !ctx.builder_registry.any_matching_builder(
+                            spec_system,
+                            &spec.required_system_features,
+                            &excluded,
+                        ) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // No matching builder at all. Optionally wait briefly
+                // for one to enrol — opt-in via builder_wait_seconds,
+                // useful for the post-restart reconnect race.
+                if !builder_wait_used && !ctx.builder_wait.is_zero() {
                     builder_wait_used = true;
                     let deadline = tokio::time::Instant::now() + ctx.builder_wait;
                     tracing::info!(
                         job_id = job_id.get(),
                         spec_system = ?spec.system,
                         wait_secs = ctx.builder_wait.as_secs(),
-                        "no eligible builder yet; waiting for one to enrol",
+                        "no matching builder yet; waiting for one to enrol",
                     );
                     let arrived = loop {
-                        if !ctx
-                            .builder_registry
-                            .eligible(
-                                spec.system.as_deref().unwrap_or(""),
-                                &spec.required_system_features,
-                                &excluded,
-                            )
-                            .is_empty()
-                        {
+                        if ctx.builder_registry.any_matching_builder(
+                            spec_system,
+                            &spec.required_system_features,
+                            &excluded,
+                        ) {
                             break true;
                         }
                         if tokio::time::Instant::now() >= deadline {
@@ -1928,12 +1984,9 @@ async fn build_one(
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => {
-                                // Cancelled mid-wait — fall through to
-                                // the post-loop cancel handling via a
-                                // synthesised verdict.
                                 tracing::info!(
                                     job_id = job_id.get(),
-                                    "cancelled while waiting for a builder",
+                                    "cancelled while waiting for a matching builder",
                                 );
                                 <SqlxStore as JobStore>::finish(
                                     &ctx.store, job_id, JobStatus::Cancelled,
@@ -1952,7 +2005,7 @@ async fn build_one(
                     job_id = job_id.get(),
                     tried = excluded.len(),
                     spec_system = ?spec.system,
-                    "no eligible pool builder; marking job interrupted for retry \
+                    "no matching pool builder; marking job interrupted for retry \
                      (enrol a builder on this host as a loopback if the coordinator \
                      should also build)",
                 );

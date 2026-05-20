@@ -337,6 +337,25 @@ impl BuilderRegistry {
         found
     }
 
+    /// Like [`Self::eligible`] but ignores the `max_jobs` filter — used
+    /// by the dispatcher to tell "no matching builder exists" (interrupt
+    /// the job) from "matching builders exist but are at capacity"
+    /// (wait for a slot). Capacity contention is normal queueing, not
+    /// a failure; "no match at all" is a real config / pool problem.
+    pub fn any_matching_builder(
+        &self,
+        system: &str,
+        features: &[String],
+        exclude: &HashSet<BuilderName>,
+    ) -> bool {
+        self.list()
+            .into_iter()
+            .filter(|b| b.state == ConnState::Active)
+            .filter(|b| !exclude.contains(&b.name))
+            .filter(|b| b.capabilities.systems.iter().any(|s| s == system))
+            .any(|b| features.iter().all(|f| b.capabilities.features.contains(f)))
+    }
+
     /// Look up the SSH-side details for a registered builder. Used by
     /// PR #7 to open new build channels into the chosen builder.
     pub fn session(&self, name: &BuilderName) -> Option<RusshSession> {

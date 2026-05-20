@@ -276,6 +276,122 @@
       const esc = (s) =>
         s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 
+      // SGR foreground palette — covers `\x1b[30..37m` (standard) and
+      // `\x1b[90..97m` (bright). Hues tuned for the dark log
+      // background; intentionally close to the level colours
+      // `message` uses elsewhere so the live view feels consistent.
+      const ANSI_FG = {
+        30: "hsl(0 0% 50%)",     // "black" — visible on dark bg as grey
+        31: "hsl(0 70% 70%)",    // red
+        32: "hsl(140 55% 65%)",  // green
+        33: "hsl(45 85% 65%)",   // yellow
+        34: "hsl(210 70% 75%)",  // blue
+        35: "hsl(295 60% 75%)",  // magenta
+        36: "hsl(180 55% 65%)",  // cyan
+        37: "hsl(0 0% 88%)",     // white
+        90: "hsl(0 0% 65%)",
+        91: "hsl(0 80% 78%)",
+        92: "hsl(140 65% 75%)",
+        93: "hsl(45 90% 72%)",
+        94: "hsl(210 80% 82%)",
+        95: "hsl(295 70% 82%)",
+        96: "hsl(180 65% 75%)",
+        97: "hsl(0 0% 96%)",
+      };
+
+      // Walk `text` once, splitting on ANSI escapes. SGR (`\x1b[…m`)
+      // updates a small style state and emits a `<span>` per run with
+      // the active style applied. Any other CSI / OSC / single-byte
+      // escape is *dropped* — cursor moves and OSC titles have no
+      // useful rendering in a scrolling log view. State is per-line:
+      // each new line gets a fresh `makeLineDiv` call and a fresh
+      // state object, matching the fact that nix emits one
+      // `resBuildLogLine` per line of build stderr.
+      const appendAnsiSpans = (parent, text) => {
+        let state = { fg: null, bold: false, italic: false, underline: false };
+        let i = 0;
+        const flush = (run) => {
+          if (!run) return;
+          if (!state.fg && !state.bold && !state.italic && !state.underline) {
+            parent.appendChild(document.createTextNode(run));
+            return;
+          }
+          const span = document.createElement("span");
+          if (state.fg) span.style.color = state.fg;
+          if (state.bold) span.style.fontWeight = "bold";
+          if (state.italic) span.style.fontStyle = "italic";
+          if (state.underline) span.style.textDecoration = "underline";
+          span.appendChild(document.createTextNode(run));
+          parent.appendChild(span);
+        };
+        const applySgr = (params) => {
+          // Params is the `…` of `\x1b[…m`, e.g. "0", "1;31", "".
+          // Empty == "0" per the spec.
+          const codes = (params === "" ? [0] : params.split(";").map(Number));
+          for (const c of codes) {
+            if (c === 0) {
+              state = { fg: null, bold: false, italic: false, underline: false };
+            } else if (c === 1) state.bold = true;
+            else if (c === 3) state.italic = true;
+            else if (c === 4) state.underline = true;
+            else if (c === 22) state.bold = false;
+            else if (c === 23) state.italic = false;
+            else if (c === 24) state.underline = false;
+            else if (c === 39) state.fg = null;
+            else if (ANSI_FG[c]) state.fg = ANSI_FG[c];
+            // Unknown codes (256/truecolour args, bg, etc.) silently
+            // ignored — keeps the parser forward-compatible with
+            // unfamiliar output without aborting the line.
+          }
+        };
+        let run = "";
+        while (i < text.length) {
+          const ch = text.charCodeAt(i);
+          if (ch !== 0x1b) {
+            run += text[i];
+            i++;
+            continue;
+          }
+          // ESC: flush whatever plain run we accumulated, then
+          // consume the escape sequence.
+          flush(run);
+          run = "";
+          if (i + 1 >= text.length) break; // trailing lone ESC — drop
+          const next = text[i + 1];
+          if (next === "[") {
+            // CSI: read params + final byte in 0x40..0x7e.
+            let j = i + 2;
+            let params = "";
+            while (j < text.length) {
+              const c = text.charCodeAt(j);
+              if (c >= 0x40 && c <= 0x7e) {
+                if (text[j] === "m") applySgr(params);
+                // Non-`m` CSI (cursor / erase / …): silently dropped.
+                j++;
+                break;
+              }
+              params += text[j];
+              j++;
+            }
+            i = j;
+          } else if (next === "]") {
+            // OSC: skip until BEL (0x07) or ST (`ESC \`).
+            let j = i + 2;
+            while (j < text.length) {
+              const c = text.charCodeAt(j);
+              if (c === 0x07) { j++; break; }
+              if (c === 0x1b && text[j + 1] === "\\") { j += 2; break; }
+              j++;
+            }
+            i = j;
+          } else {
+            // One-byte escape: drop both bytes.
+            i += 2;
+          }
+        }
+        flush(run);
+      };
+
       const makeLineDiv = ({ label, text, color }) => {
         const div = document.createElement("div");
         if (color) div.style.color = color;
@@ -285,7 +401,7 @@
           tag.style.color = labelColor(label);
           div.appendChild(tag);
         }
-        div.appendChild(document.createTextNode(text));
+        appendAnsiSpans(div, text);
         return div;
       };
 
