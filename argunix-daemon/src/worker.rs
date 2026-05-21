@@ -1847,14 +1847,22 @@ async fn build_one(
     // scheduler silently retries internally for many minutes before
     // printing "Failed to find a machine" — visible to the operator
     // only when the build finally gives up.
+    //
+    // This tests *capability*, not capacity: `any_matching_builder`
+    // ignores `max_jobs`, so a build whose only obstacle is that every
+    // capable builder is momentarily busy is NOT failed here — it falls
+    // through to the dispatch loop, which queues on the capacity-wait
+    // path. Using the capacity-sensitive `eligible` here would fail
+    // such a job fast the instant all (often single-slot) builders are
+    // occupied, even though they advertise every required feature.
     if !spec.required_system_features.is_empty() {
         if let Some(system) = spec.system.as_deref() {
-            let eligible = ctx.builder_registry.eligible(
+            let has_capable_builder = ctx.builder_registry.any_matching_builder(
                 system,
                 &spec.required_system_features,
                 &std::collections::HashSet::new(),
             );
-            if eligible.is_empty() {
+            if !has_capable_builder {
                 let log = synthesize_no_eligible_builder_log(
                     &spec.attr_path.as_str().to_string(),
                     &drv_path,

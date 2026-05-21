@@ -945,6 +945,48 @@ mod tests {
     }
 
     #[test]
+    fn any_matching_builder_ignores_capacity() {
+        // The pre-flight uses `any_matching_builder` to ask "does a
+        // capable builder *exist*", separately from "is one free now".
+        // A capable builder at max_jobs must still count as a match —
+        // otherwise the pre-flight fails a job fast (e.g. a nixos-test
+        // needing kvm) the instant every single-slot builder is busy,
+        // even though they all advertise the required features. The job
+        // should instead queue on the dispatch loop's capacity wait.
+        let reg = BuilderRegistry::new();
+        let name = BuilderName::new("kvm").unwrap();
+        let _ = reg.register(
+            name.clone(),
+            conn(&reg, 1, caps(&["x86_64-linux"], &["kvm"], 1)),
+        );
+        reg.inc_in_flight(&name); // now at capacity
+
+        let req = vec!["kvm".to_string()];
+        assert!(
+            reg.eligible("x86_64-linux", &req, &HashSet::new())
+                .is_empty(),
+            "at-capacity builder must not be eligible() (no free slot)",
+        );
+        assert!(
+            reg.any_matching_builder("x86_64-linux", &req, &HashSet::new()),
+            "at-capacity builder must still count as a capability match",
+        );
+    }
+
+    #[test]
+    fn any_matching_builder_false_when_feature_absent() {
+        let reg = BuilderRegistry::new();
+        let _ = reg.register(
+            BuilderName::new("plain").unwrap(),
+            conn(&reg, 1, caps(&["x86_64-linux"], &[], 1)),
+        );
+        assert!(
+            !reg.any_matching_builder("x86_64-linux", &["kvm".to_string()], &HashSet::new()),
+            "no builder advertises kvm — this is the genuine fail-fast case",
+        );
+    }
+
+    #[test]
     fn eligible_orders_by_least_loaded() {
         let reg = BuilderRegistry::new();
         let big = BuilderName::new("big").unwrap();
