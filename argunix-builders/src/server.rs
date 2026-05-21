@@ -12,8 +12,9 @@ use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet};
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
+use tokio::task::AbortHandle;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -115,8 +116,14 @@ impl BuilderServer {
                 tracing::warn!(error = %e, %peer, "set_tcp_keepalive() on builder socket failed");
             }
             let handler = server.new_client(Some(peer));
+            // Capture the slot before the handler is moved into the
+            // session task; we publish the task's AbortHandle into it
+            // once spawned so the registry (watchdog / takeover) can
+            // force this connection's socket closed even when the
+            // session loop is wedged on a blocked outbound flush.
+            let abort_slot = handler.abort_slot.clone();
             let russh_cfg = russh_cfg.clone();
-            tokio::spawn(async move {
+            let join = tokio::spawn(async move {
                 match russh::server::run_stream(russh_cfg, socket, handler).await {
                     Ok(session) => {
                         if let Err(e) = session.await {
@@ -128,6 +135,7 @@ impl BuilderServer {
                     }
                 }
             });
+            let _ = abort_slot.set(join.abort_handle());
         }
     }
 }
@@ -153,6 +161,7 @@ impl Server for ServerInner {
             framers: Arc::new(Mutex::new(HashMap::new())),
             control_channel: Arc::new(Mutex::new(None)),
             registered_name: Arc::new(std::sync::Mutex::new(None)),
+            abort_slot: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -185,6 +194,13 @@ pub(crate) struct ConnectionHandler {
     /// Name we registered under, if `hello` succeeded. `Drop` reads
     /// this synchronously (so it can't be a tokio Mutex).
     registered_name: Arc<std::sync::Mutex<Option<BuilderName>>>,
+    /// The session task's `AbortHandle`, published by
+    /// [`BuilderServer::run`] right after it spawns the task. Stored in
+    /// the [`ConnectedBuilder`] on `hello` so the registry can abort a
+    /// wedged session (watchdog eviction / takeover). A `OnceLock`
+    /// because the handle only exists after the spawn, which is after
+    /// `new_client` builds this handler.
+    abort_slot: Arc<OnceLock<AbortHandle>>,
 }
 
 impl ConnectionHandler {
@@ -507,16 +523,18 @@ impl ConnectionHandler {
                         handle: session_handle.clone(),
                         control_channel: channel,
                     }),
+                    last_heartbeat: std::time::Instant::now(),
+                    abort: self.abort_slot.get().cloned(),
                 };
                 let displaced = self.registry.register(record.name.clone(), connected);
                 *self.registered_name.lock().unwrap() = Some(record.name.clone());
                 if let Some(prev) = displaced {
-                    if let Some(prev_session) = prev.session {
-                        let name = prev.name.clone();
-                        tokio::spawn(async move {
-                            kick_displaced(name, prev_session).await;
-                        });
-                    }
+                    let name = prev.name.clone();
+                    let prev_session = prev.session;
+                    let prev_abort = prev.abort;
+                    tokio::spawn(async move {
+                        kick_displaced(name, prev_session, prev_abort).await;
+                    });
                 }
 
                 *self.state.lock().await = AuthState::Established(record);
@@ -531,6 +549,8 @@ impl ConnectionHandler {
                 if let Err(e) = self.store.mark_seen(record.id, now).await {
                     tracing::warn!(error = %e, "mark_seen failed");
                 }
+                // Refresh the in-memory liveness clock the watchdog reads.
+                self.registry.touch_heartbeat(&record.name);
                 if let Some(stats) = stats {
                     self.registry.push_stats(&record.name, now, stats);
                 }
@@ -644,22 +664,43 @@ fn signing_key_to_russh(host_key: &HostKey) -> Result<PrivateKey, russh::keys::E
 }
 
 /// Send a Kick on the displaced builder's control channel and
-/// disconnect its session. Best-effort: russh may have already torn
-/// the connection down, in which case both calls are no-ops.
-async fn kick_displaced(name: BuilderName, session: RusshSession) {
-    let kick = ControlMessage::Kick {
-        reason: "another connection registered under the same name".into(),
-    };
-    let bytes: bytes::Bytes = kick.encode_line().into();
-    let _ = session.handle.data(session.control_channel, bytes).await;
-    let _ = session
-        .handle
-        .disconnect(
-            Disconnect::ByApplication,
-            "displaced by a new connection".into(),
-            "en".into(),
-        )
-        .await;
+/// disconnect its session, then abort its session task as a backstop.
+///
+/// The graceful `kick` + `disconnect` is best-effort: it routes through
+/// the old session's run loop, which may be wedged on a blocked
+/// outbound flush (the classic slept-laptop-mid-transfer case is
+/// exactly why this connection got displaced). The `abort` is the
+/// reliable lever — it drops the session task, closing its socket so
+/// any side-channel transfer still bridged onto the old connection
+/// errors out instead of hanging on the kernel's TCP retransmit budget.
+async fn kick_displaced(
+    name: BuilderName,
+    session: Option<RusshSession>,
+    abort: Option<AbortHandle>,
+) {
+    if let Some(session) = session {
+        let kick = ControlMessage::Kick {
+            reason: "another connection registered under the same name".into(),
+        };
+        let bytes: bytes::Bytes = kick.encode_line().into();
+        // Bound the graceful path so a wedged loop can't delay the
+        // abort backstop below indefinitely.
+        let graceful = async {
+            let _ = session.handle.data(session.control_channel, bytes).await;
+            let _ = session
+                .handle
+                .disconnect(
+                    Disconnect::ByApplication,
+                    "displaced by a new connection".into(),
+                    "en".into(),
+                )
+                .await;
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), graceful).await;
+    }
+    if let Some(abort) = abort {
+        abort.abort();
+    }
     tracing::info!(builder = %name, "kicked displaced connection");
 }
 

@@ -69,8 +69,16 @@ let
   '';
 
   # Stub forge: GETs return [], POST returns a created-webhook body.
+  # Notifies systemd READY *after* binding the listening socket so the
+  # service's `Type=notify` declaration in
+  # `systemd.services.fake-forge` reflects port-up, not just "exec'd".
+  # Without this the `After=fake-forge.service` ordering on argunix
+  # would race the bind: argunix's startup-time `ensure_webhooks` pass
+  # would hit connection-refused, log a warning, and leave the repo
+  # row in sqlite with a NULL webhook_secret — surfacing as the
+  # "no webhook secret in db" assertion below.
   fakeForgeScript = pkgs.writeText "argunix-fake-forge.py" ''
-    import http.server, json
+    import http.server, json, subprocess
     PORT = ${toString fakeForgePort}
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -88,6 +96,7 @@ let
         def log_message(self, *_a):
             pass
     srv = http.server.HTTPServer(("127.0.0.1", PORT), H)
+    subprocess.run(["${pkgs.systemd}/bin/systemd-notify", "--ready"], check=False)
     srv.serve_forever()
   '';
 
@@ -169,13 +178,21 @@ in
         };
       };
 
-      # The fake forge must be listening before argunix.service starts,
-      # so `ensure_webhooks` can persist the per-repo webhook secret.
+      # The fake forge must be *listening* before argunix.service
+      # starts, so `ensure_webhooks` can persist the per-repo webhook
+      # secret. `Type=notify` means systemd holds the dependency until
+      # the python script calls `systemd-notify --ready`, which it
+      # does only after `HTTPServer(...)` has bound the port. The
+      # default `Type=simple` would mark the service active the moment
+      # exec returns — a known race that surfaces here as "no webhook
+      # secret in db" on unlucky scheduling.
       systemd.services.fake-forge = {
         description = "argunix test fake forge";
         wantedBy = [ "multi-user.target" ];
         before = [ "argunix.service" ];
         serviceConfig = {
+          Type = "notify";
+          NotifyAccess = "all";
           ExecStart = "${pkgs.lib.getExe pkgs.python3} ${fakeForgeScript}";
           Restart = "on-failure";
           RestartSec = 1;

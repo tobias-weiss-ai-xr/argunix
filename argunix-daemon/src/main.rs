@@ -440,6 +440,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     )
     .await
     .context("starting builder enrollment server")?;
+    // Liveness watchdog: evict builders that go silent past the
+    // heartbeat threshold, freeing their in-flight jobs to retry
+    // elsewhere. Only meaningful alongside the enrollment server, and it
+    // is the backstop for the case russh/TCP keepalive can't catch — a
+    // builder frozen mid-transfer (slept laptop) where our outbound
+    // flush blocks and starves russh's own keepalive timer.
+    let builder_watchdog_handle = builder_server_handle
+        .is_some()
+        .then(|| argunix_builders::spawn_liveness_watchdog(builder_registry.clone()));
     // Retention GC. Background ticker; aborted at shutdown
     // alongside the control + builder tasks. No-op on a config with
     // no `retention.max_age_days` and no `retention.max_size_gb`.
@@ -531,6 +540,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // the agent from logging a spurious error on graceful operator
     // restarts.
     if let Some(h) = builder_server_handle {
+        h.abort();
+        let _ = h.await;
+    }
+    if let Some(h) = builder_watchdog_handle {
         h.abort();
         let _ = h.await;
     }

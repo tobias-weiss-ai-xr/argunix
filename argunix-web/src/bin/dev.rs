@@ -1165,6 +1165,8 @@ fn register_live(
         connection_id: registry.next_connection_id(),
         // Dev mode never opens build channels — no russh handle needed.
         session: None,
+        last_heartbeat: std::time::Instant::now(),
+        abort: None,
     };
     registry.register(n, conn);
 }

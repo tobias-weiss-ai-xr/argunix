@@ -82,8 +82,14 @@ let
       # Listens on a fixed port so the daemon can talk to it on startup
       # (ensure_webhooks). Persists the per-repo webhook secret to sqlite,
       # which we read back to sign our test payloads.
+      #
+      # `systemd-notify --ready` is sent only after `HTTPServer(...)`
+      # has bound the port. Paired with `Type=notify` below, this
+      # closes the race where argunix's startup-time ensure_webhooks
+      # would hit connection-refused and silently leave the repo's
+      # webhook_secret NULL.
       fakeForgeScript = pkgs.writeText "argunix-fake-forge.py" ''
-        import http.server, json
+        import http.server, json, subprocess
         PORT = ${toString fakeForgePort}
         class H(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
@@ -101,6 +107,7 @@ let
             def log_message(self, *_a):
                 pass
         srv = http.server.HTTPServer(("127.0.0.1", PORT), H)
+        subprocess.run(["${pkgs.systemd}/bin/systemd-notify", "--ready"], check=False)
         srv.serve_forever()
       '';
 
@@ -282,11 +289,17 @@ in
       # only if* the forge POST succeeds. The fake forge must be
       # listening before argunix.service starts, otherwise the test's
       # signed webhook is rejected with 503 (WebhookNotProvisioned).
+      # `Type=notify` waits for the python script's post-bind
+      # `systemd-notify --ready` so `After=fake-forge.service` on
+      # argunix actually means "after the port is up", not "after
+      # python was exec'd".
       systemd.services.fake-forge = {
         description = "argunix test fake forge";
         wantedBy = [ "multi-user.target" ];
         before = [ "argunix.service" ];
         serviceConfig = {
+          Type = "notify";
+          NotifyAccess = "all";
           ExecStart = "${lib.getExe pkgs.python3} ${stubs.fakeForgeScript}";
           Restart = "on-failure";
           RestartSec = 1;

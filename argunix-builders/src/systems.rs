@@ -67,6 +67,8 @@ mod tests {
             connected_since: Utc::now(),
             connection_id: reg.next_connection_id(),
             session: None,
+            last_heartbeat: std::time::Instant::now(),
+            abort: None,
         }
     }
 

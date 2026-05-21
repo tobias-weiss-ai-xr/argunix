@@ -136,8 +136,13 @@ let
     esac
   '';
 
+  # Notifies systemd READY *after* binding the listening socket so the
+  # `Type=notify` service below is only considered active once the
+  # port is up — closing the race where argunix's startup
+  # `ensure_webhooks` would hit connection-refused and silently leave
+  # the repo without a webhook secret.
   fakeForgePy = pkgs.writeText "fake-forge.py" ''
-    import http.server, json, sys
+    import http.server, json, sys, subprocess
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
@@ -160,6 +165,7 @@ let
     srv = http.server.HTTPServer(("127.0.0.1", ${toString fakeForgePort}), H)
     print("fake-forge listening on 127.0.0.1:${toString fakeForgePort}", flush=True)
     sys.stdout.flush()
+    subprocess.run(["${pkgs.systemd}/bin/systemd-notify", "--ready"], check=False)
     srv.serve_forever()
   '';
 
@@ -247,6 +253,11 @@ in
         wantedBy = [ "multi-user.target" ];
         before = [ "argunix.service" ];
         serviceConfig = {
+          # Type=notify gates "active" on the python script's
+          # post-bind systemd-notify call, so After=fake-forge.service
+          # on argunix doesn't race the listening socket.
+          Type = "notify";
+          NotifyAccess = "all";
           ExecStart = "${lib.getExe pkgs.python3} ${fakeForgePy}";
           Restart = "on-failure";
           RestartSec = 1;

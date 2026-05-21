@@ -17,7 +17,9 @@ use russh::server::Handle as SessionHandle;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 /// One stats sample with the wall-clock time at which the coordinator
 /// received it. Surfaced to the web UI as the JSON shape under
@@ -69,6 +71,20 @@ pub struct ConnectedBuilder {
     /// drive a real connection. PR #7 will require `Some` to open
     /// build channels.
     pub session: Option<RusshSession>,
+    /// Monotonic timestamp of the last sign of life from this builder
+    /// (its `hello`, then refreshed on every `heartbeat`). Read by the
+    /// liveness watchdog to detect a builder that went silent —
+    /// independent of russh/TCP keepalive, which can be starved when
+    /// the peer freezes mid-transfer and our outbound flush blocks.
+    pub last_heartbeat: Instant,
+    /// `Some` in production: the abort handle for the tokio task
+    /// running this connection's russh session loop. The watchdog and
+    /// the takeover path call `.abort()` on it to force the underlying
+    /// socket closed, so any in-flight side-channel transfer
+    /// (`nix copy` push/pull) wedged on a dead channel errors out
+    /// promptly instead of waiting on the kernel's TCP retransmit
+    /// budget. `None` in unit tests without a real connection.
+    pub abort: Option<AbortHandle>,
 }
 
 /// A snapshot of one builder's runtime state — what `argunixctl builders`
@@ -165,6 +181,12 @@ pub enum BuildLifecycle {
 pub struct DisplacedConnection {
     pub name: BuilderName,
     pub session: Option<RusshSession>,
+    /// Abort handle of the displaced connection's session task. The
+    /// caller aborts it after sending `kick` so a wedged old session
+    /// (e.g. a slept laptop that just reconnected under the same name)
+    /// can't keep a side-channel transfer alive on its half-open
+    /// socket.
+    pub abort: Option<AbortHandle>,
 }
 
 impl BuilderRegistry {
@@ -211,7 +233,64 @@ impl BuilderRegistry {
         prior.map(|p| DisplacedConnection {
             name,
             session: p.session,
+            abort: p.abort,
         })
+    }
+
+    /// Refresh the in-memory liveness timestamp for `name`. Called from
+    /// the SSH server's heartbeat handler. No-op if the builder isn't
+    /// registered (a heartbeat racing a removal).
+    pub fn touch_heartbeat(&self, name: &BuilderName) {
+        if let Some(c) = self.inner.lock().unwrap().get_mut(name) {
+            c.last_heartbeat = Instant::now();
+        }
+    }
+
+    /// Names of registered builders whose last heartbeat is older than
+    /// `max_silence`. The watchdog evicts these — see [`Self::evict_dead`].
+    pub fn stale_builders(&self, max_silence: Duration) -> Vec<BuilderName> {
+        let now = Instant::now();
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| now.duration_since(c.last_heartbeat) > max_silence)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Forcibly evict a builder the watchdog has declared dead.
+    ///
+    /// Removes the registry entry (so the dispatcher stops considering
+    /// it), drains its in-flight build lifecycle senders + phases (so a
+    /// worker blocked on `lifecycle.recv()` wakes and retries), and
+    /// aborts its session task (so its socket closes and any in-flight
+    /// side-channel `nix copy` transfer wedged on the dead channel
+    /// errors out instead of hanging on the kernel's TCP retransmit
+    /// budget). Returns `true` if a builder was actually evicted.
+    pub fn evict_dead(&self, name: &BuilderName) -> bool {
+        let abort = {
+            let mut map = self.inner.lock().unwrap();
+            match map.remove(name) {
+                Some(c) => {
+                    self.in_flight.lock().unwrap().remove(name);
+                    self.stats.lock().unwrap().remove(name);
+                    c.abort
+                }
+                None => return false,
+            }
+        };
+        let drained = self.drain_in_flight_for(name);
+        if let Some(a) = abort {
+            a.abort();
+        }
+        tracing::warn!(
+            builder = %name,
+            build_ids = ?drained,
+            "builder went silent past the liveness threshold; evicted and \
+             aborted its session so in-flight builds fail over to another builder",
+        );
+        true
     }
 
     /// Drop all per-build lifecycle senders and live-phase entries for
@@ -548,6 +627,40 @@ impl BuilderRegistry {
     }
 }
 
+/// Builder heartbeat cadence (the agent sends one every 30s; see
+/// `design/builders.md`). The watchdog threshold is a multiple of this.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a registered builder may go without a heartbeat before the
+/// watchdog declares it dead. Three missed beats (~95s), matching the
+/// russh keepalive intent — but enforced by an independent timer that
+/// a wedged session loop cannot starve.
+pub const LIVENESS_MAX_SILENCE: Duration = Duration::from_secs(95);
+
+/// How often the watchdog scans the registry for silent builders.
+pub const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Spawn the liveness watchdog: every [`WATCHDOG_SCAN_INTERVAL`], evict
+/// any builder that hasn't sent a heartbeat within
+/// [`LIVENESS_MAX_SILENCE`]. This is the backstop that catches a
+/// builder whose connection silently froze (a slept laptop, a NAT
+/// mapping that expired mid-transfer) — cases where russh's own
+/// keepalive is starved because the session loop is parked on a
+/// blocked outbound flush. Eviction frees in-flight builds for retry
+/// (see [`BuilderRegistry::evict_dead`]).
+pub fn spawn_liveness_watchdog(registry: Arc<BuilderRegistry>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(WATCHDOG_SCAN_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            for name in registry.stale_builders(LIVENESS_MAX_SILENCE) {
+                registry.evict_dead(&name);
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,6 +683,8 @@ mod tests {
             connected_since: Utc::now(),
             connection_id: reg.next_connection_id(),
             session: None,
+            last_heartbeat: Instant::now(),
+            abort: None,
         }
     }
 
@@ -704,6 +819,47 @@ mod tests {
             reg.forward_build_event(&alive, 200, BuildLifecycle::Started { pid: Some(2) })
                 .await
         );
+    }
+
+    #[test]
+    fn stale_builders_reports_only_silent_ones() {
+        let reg = BuilderRegistry::new();
+        let fresh = BuilderName::new("fresh").unwrap();
+        let silent = BuilderName::new("silent").unwrap();
+        let _ = reg.register(
+            fresh.clone(),
+            conn(&reg, 1, caps(&["x86_64-linux"], &[], 1)),
+        );
+        let mut old = conn(&reg, 2, caps(&["x86_64-linux"], &[], 1));
+        // Backdate the silent builder's last heartbeat well past the
+        // threshold.
+        old.last_heartbeat = Instant::now() - Duration::from_secs(600);
+        let _ = reg.register(silent.clone(), old);
+
+        let stale = reg.stale_builders(LIVENESS_MAX_SILENCE);
+        assert_eq!(stale, vec![silent.clone()]);
+
+        // A heartbeat refresh clears staleness.
+        reg.touch_heartbeat(&silent);
+        assert!(reg.stale_builders(LIVENESS_MAX_SILENCE).is_empty());
+    }
+
+    #[tokio::test]
+    async fn evict_dead_drains_in_flight_and_removes_entry() {
+        let reg = BuilderRegistry::new();
+        let name = BuilderName::new("zzz").unwrap();
+        let _ = reg.register(name.clone(), conn(&reg, 1, caps(&["x86_64-linux"], &[], 4)));
+        let mut rx = reg.register_in_flight_build(name.clone(), 7);
+        reg.set_phase(&name, 7, BuildPhase::Pull);
+
+        assert!(reg.evict_dead(&name), "evict should report a hit");
+        // Worker blocked on the lifecycle receiver wakes via channel close.
+        assert!(rx.recv().await.is_none(), "lifecycle channel must close");
+        // Entry, phase, and in-flight accounting all gone.
+        assert!(reg.snapshot(&name).is_none());
+        assert!(reg.phase_snapshot().is_empty());
+        // Idempotent: a second evict is a no-op.
+        assert!(!reg.evict_dead(&name));
     }
 
     #[test]

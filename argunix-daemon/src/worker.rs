@@ -2633,18 +2633,20 @@ pub async fn dispatch_pool_build(
     phase_guard.set(BuildPhase::Push);
     let mut phase_metrics = JobPhaseMetrics::default();
     let push_started_at = std::time::Instant::now();
-    let push_metrics = match nix_copy_over_pool(
+    let push_metrics = match nix_copy_phase(
+        &registry,
         &dispatcher,
         builder_name,
         NixCopyDirection::To,
         &[drv_path.to_string()],
         nix_bin,
         build_id,
+        cancel,
     )
     .await
     {
-        Ok(m) => Some(m),
-        Err(e) => {
+        CopyPhaseOutcome::Done(Ok(m)) => Some(m),
+        CopyPhaseOutcome::Done(Err(e)) => {
             tracing::warn!(
                 error = %e,
                 builder = %builder_name,
@@ -2667,6 +2669,37 @@ pub async fn dispatch_pool_build(
             phase_metrics.push_ms = Some(push_started_at.elapsed().as_millis() as u64);
             phase_metrics.push_bytes = Some(0);
             return early_failure(log_buf, log_path.to_path_buf(), phase_metrics).await;
+        }
+        CopyPhaseOutcome::BuilderGone => {
+            // Builder evicted/displaced mid-push: the derivation never
+            // reached its `nix-store --realise`. Treat as a transport
+            // failure so `build_one` re-dispatches elsewhere.
+            tracing::warn!(
+                builder = %builder_name,
+                build_id,
+                drv = drv_path,
+                "builder left the pool during drv-closure push; failing over",
+            );
+            log_buf.extend_from_slice(
+                format!(
+                    "argunix: builder `{builder_name}` disconnected while pushing the \
+                     drv closure; retrying on another builder.\n"
+                )
+                .as_bytes(),
+            );
+            phase_metrics.push_ms = Some(push_started_at.elapsed().as_millis() as u64);
+            phase_metrics.push_bytes = Some(0);
+            return early_failure(log_buf, log_path.to_path_buf(), phase_metrics).await;
+        }
+        CopyPhaseOutcome::Cancelled => {
+            tracing::info!(
+                builder = %builder_name,
+                build_id,
+                "cancel during drv-closure push",
+            );
+            log_buf.extend_from_slice(b"\nargunix: cancelled while pushing drv closure.\n");
+            argunix_build::write_zstd_log(log_path, log_buf).await?;
+            return Ok(PoolDispatchResult::Cancelled);
         }
     };
     if let Some(m) = push_metrics {
@@ -2862,17 +2895,19 @@ pub async fn dispatch_pool_build(
     if final_status == BuildOutcomeStatus::Success && !output_paths.is_empty() {
         phase_guard.set(BuildPhase::Pull);
         let pull_started_at = std::time::Instant::now();
-        match nix_copy_over_pool(
+        match nix_copy_phase(
+            &registry,
             &dispatcher,
             builder_name,
             NixCopyDirection::From,
             &output_paths,
             nix_bin,
             build_id,
+            cancel,
         )
         .await
         {
-            Ok(m) => {
+            CopyPhaseOutcome::Done(Ok(m)) => {
                 phase_metrics.pull_bytes = Some(m.bytes_from_builder);
                 phase_metrics.pull_ms = Some(m.elapsed.as_millis() as u64);
                 // 6. Register gcroot on the first output (matches
@@ -2889,7 +2924,7 @@ pub async fn dispatch_pool_build(
                     }
                 }
             }
-            Err(e) => {
+            CopyPhaseOutcome::Done(Err(e)) => {
                 tracing::warn!(
                     error = %e,
                     build_id,
@@ -2905,6 +2940,41 @@ pub async fn dispatch_pool_build(
                 // output transfer broke. Retry on another builder
                 // rather than reporting a spurious build failure.
                 transport_failed = true;
+            }
+            CopyPhaseOutcome::BuilderGone => {
+                tracing::warn!(
+                    build_id,
+                    builder = %builder_name,
+                    "builder left the pool while pulling output closure; failing over",
+                );
+                log_buf.extend_from_slice(
+                    format!(
+                        "\nargunix: builder `{builder_name}` disconnected while pulling the \
+                         output closure; retrying on another builder.\n"
+                    )
+                    .as_bytes(),
+                );
+                phase_metrics.pull_ms = Some(pull_started_at.elapsed().as_millis() as u64);
+                phase_metrics.pull_bytes = Some(0);
+                final_status = BuildOutcomeStatus::Failure;
+                // Outputs built but never reached us — a transport
+                // failure. Retried elsewhere; the cache-skip check on
+                // retry collapses to a hit if the dead builder had
+                // already pushed to a binary cache.
+                transport_failed = true;
+            }
+            CopyPhaseOutcome::Cancelled => {
+                tracing::info!(
+                    build_id,
+                    builder = %builder_name,
+                    "cancel while pulling output closure",
+                );
+                log_buf.extend_from_slice(b"\nargunix: cancelled while pulling output closure.\n");
+                if log_truncated {
+                    log_buf.extend_from_slice(b"\n--- log truncated by argunix ---\n");
+                }
+                argunix_build::write_zstd_log(log_path, log_buf).await?;
+                return Ok(PoolDispatchResult::Cancelled);
             }
         }
     }
@@ -2935,6 +3005,70 @@ pub async fn dispatch_pool_build(
         },
         phase_metrics,
     })
+}
+
+/// Outcome of a push/pull closure-transfer phase.
+enum CopyPhaseOutcome {
+    /// `nix copy` ran to completion (success or a real error).
+    Done(Result<argunix_builders::NixCopyMetrics, argunix_builders::ClosureXferError>),
+    /// The operator cancelled (cancel-on-push) while the transfer ran.
+    Cancelled,
+    /// The chosen builder left the registry while the transfer ran —
+    /// the watchdog evicted it, or it was displaced by a reconnect.
+    /// The transfer is abandoned (its `nix copy` subprocess is killed
+    /// via `kill_on_drop`) and the job fails over to another builder.
+    BuilderGone,
+}
+
+/// Run one closure-transfer phase (`nix copy --to` push or
+/// `nix copy --from` pull), racing it against the cancel token *and*
+/// the builder's continued presence in the registry.
+///
+/// The build phase already races `lifecycle.recv()` against cancel and
+/// a wall clock, so a vanished builder during the build is caught by
+/// the registry draining the lifecycle channel. The transfer phases had
+/// no such guard: a builder that froze mid-`nix copy` (a slept laptop)
+/// left the worker blocked in `cmd.output().await` indefinitely — the
+/// underlying russh channel only errors once the kernel's TCP
+/// retransmit budget is exhausted (many minutes), and not at all if the
+/// peer later resumes. Polling registry presence lets the liveness
+/// watchdog's eviction unblock us within its scan interval; dropping the
+/// `nix_copy_over_pool` future kills the `nix copy` child (`kill_on_drop`)
+/// and aborts its proxy.
+async fn nix_copy_phase(
+    registry: &Arc<argunix_builders::BuilderRegistry>,
+    dispatcher: &BuilderDispatcher,
+    builder_name: &argunix_domain::BuilderName,
+    direction: NixCopyDirection,
+    paths: &[String],
+    nix_bin: &Path,
+    build_id: i64,
+    cancel: Option<&argunix_web::CancelToken>,
+) -> CopyPhaseOutcome {
+    let copy = nix_copy_over_pool(
+        dispatcher,
+        builder_name,
+        direction,
+        paths,
+        nix_bin,
+        build_id,
+    );
+    tokio::pin!(copy);
+    let gone = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if registry.snapshot(builder_name).is_none() {
+                return;
+            }
+        }
+    };
+    tokio::pin!(gone);
+    tokio::select! {
+        biased;
+        _ = wait_cancelled(cancel) => CopyPhaseOutcome::Cancelled,
+        _ = &mut gone => CopyPhaseOutcome::BuilderGone,
+        r = &mut copy => CopyPhaseOutcome::Done(r),
+    }
 }
 
 /// Wait on an optional cancel token. Returns immediately when fired;
@@ -3086,6 +3220,8 @@ mod tests {
                 connected_since: chrono::Utc::now(),
                 connection_id: reg.next_connection_id(),
                 session: None,
+                last_heartbeat: std::time::Instant::now(),
+                abort: None,
             },
         );
     }

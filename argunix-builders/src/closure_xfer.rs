@@ -187,7 +187,18 @@ pub async fn nix_copy_over_pool(
     let builder = builder_name.clone();
     let bytes_to = bytes_to_builder.clone();
     let bytes_from = bytes_from_builder.clone();
-    let proxy = tokio::spawn(async move {
+    // Abort the accept loop on every exit path — including when this
+    // whole future is dropped mid-transfer (the worker races us against
+    // cancel / builder-gone). Without this, a dropped `nix_copy_over_pool`
+    // would leak its accept-loop task. Pairs with `cmd.kill_on_drop`
+    // below so a dropped transfer leaves nothing running.
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let proxy = AbortOnDrop(tokio::spawn(async move {
         loop {
             let (sock, _) = match listener.accept().await {
                 Ok(s) => s,
@@ -220,7 +231,7 @@ pub async fn nix_copy_over_pool(
                 }
             });
         }
-    });
+    }));
 
     // remote-program is a `Setting<Strings>` (whitespace-split), so
     // we pass two tokens: the wrapper path and the socket path.
@@ -243,7 +254,7 @@ pub async fn nix_copy_over_pool(
         .kill_on_drop(true);
     let output = cmd.output().await.map_err(ClosureXferError::NixCopySpawn)?;
 
-    proxy.abort();
+    drop(proxy); // AbortOnDrop: stops the accept loop
     drop(sock_dir); // removes the wrapper + temp socket file
 
     if !output.status.success() {

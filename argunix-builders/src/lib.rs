@@ -24,7 +24,8 @@ pub use host_key::{HostKey, HostKeyError, load_or_generate};
 pub use protocol::{BuildOutcomeStatus, BuilderStats, ControlMessage, LineFramer, ProtocolError};
 pub use registry::{
     BuildLifecycle, BuildPhase, BuilderRegistry, BuilderSnapshot, ConnState, ConnectedBuilder,
-    DisplacedConnection, RusshSession, StatsSample,
+    DisplacedConnection, HEARTBEAT_INTERVAL, LIVENESS_MAX_SILENCE, RusshSession, StatsSample,
+    WATCHDOG_SCAN_INTERVAL, spawn_liveness_watchdog,
 };
 pub use server::{BuilderServer, ServerConfig, ServerError};
 pub use side_channel::{
