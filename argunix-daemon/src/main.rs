@@ -840,9 +840,8 @@ async fn build(args: BuildArgs) -> anyhow::Result<()> {
     <argunix_store::SqlxStore as EvalStore>::finish(&store, eval_id, EvalStatus::Done, Utc::now())
         .await?;
 
-    // Cross-system multi-arch fan-in. The single-shot CLI has no forge
-    // provider, so the returned outcomes (the worker would post them as
-    // forge checks) are dropped — the `effect_runs` rows still land.
+    // Cross-system multi-arch fan-in. Records `effect_runs` rows; no
+    // forge checks are posted for it (neither here nor in the daemon).
     crate::multiarch::run_fan_in(
         &store,
         eval_id,

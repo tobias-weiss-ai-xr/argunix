@@ -1094,16 +1094,7 @@ async fn run_build_phase(
 
     // Cross-system multi-arch fan-in: per-arch `docker` image jobs of
     // one logical name get stitched into a multi-arch OCI index.
-    run_multiarch_fan_in(
-        &ctx,
-        &repo,
-        &eval,
-        eval_id,
-        &provider,
-        collapsed_mode,
-        &specs_by_id,
-    )
-    .await;
+    run_multiarch_fan_in(&ctx, &repo, &eval, eval_id, &specs_by_id).await;
 
     let overall_state = if tally.failure > 0 {
         CheckState::Failure
@@ -1124,6 +1115,14 @@ async fn run_build_phase(
         overall_state,
         &description,
     );
+
+    // Backstop the fire-and-forget per-job posts: re-assert every job's
+    // terminal state from the DB once, now that the build phase is done.
+    // A dropped terminal post would otherwise leave a built job stuck
+    // showing "queued" on the forge.
+    if !collapsed_mode {
+        reconcile_forge_checks(&ctx, &provider, &repo, &eval, eval_id).await;
+    }
 
     // On crash-resume the workdir may not exist (the previous instance
     // already removed it, or never created it). The existence guard
@@ -1476,6 +1475,61 @@ fn post_per_job_check(
     );
 }
 
+/// Re-assert every job's terminal forge check from the database, once,
+/// after the build phase finishes. Per-job posts are fire-and-forget;
+/// if a terminal one is dropped (a network blip, a 429 burst) the job
+/// is left showing "queued"/"pending" on the forge forever even though
+/// it built fine. This sweep reads the authoritative status from the DB
+/// and re-posts it: the forge swallows the no-op transitions for jobs
+/// already correct (GitLab 400s them — see `gitlab.rs`; GitHub/Forgejo
+/// accept them idempotently), and flips the stragglers to their true
+/// state. Only the build/job checks are reconciled — effect outcomes no
+/// longer post forge checks. Caller skips this in collapsed mode, where
+/// per-job checks don't exist.
+async fn reconcile_forge_checks(
+    ctx: &WorkerContext,
+    provider: &Arc<dyn Provider>,
+    repo: &argunix_store::RepoRecord,
+    eval: &argunix_store::EvalRecord,
+    eval_id: EvalId,
+) {
+    let rows = match <SqlxStore as JobStore>::list_by_eval(&ctx.store, eval_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                eval_id = eval_id.get(),
+                "reconcile: list_by_eval failed; skipping forge-check sweep",
+            );
+            return;
+        }
+    };
+    for row in rows {
+        // Only terminal jobs have a settled state to assert. A job still
+        // Queued/Running here (shouldn't happen post-build) has nothing
+        // to reconcile to. `post_per_job_check` itself no-ops on the
+        // non-terminal and SkippedNoBuilder states.
+        if !row.status.is_terminal() {
+            continue;
+        }
+        // Eval-time errors never produced a drv_path (nix-eval-jobs
+        // errored before one existed) — reuse that to label the check
+        // the same way the live completion path does.
+        let had_eval_error = row.drv_path.is_none();
+        post_per_job_check(
+            ctx,
+            provider,
+            &repo.forge,
+            &repo.slug,
+            &eval.sha,
+            eval_id,
+            row.attr_path.as_str(),
+            row.status,
+            had_eval_error,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn post_overall_check(
     ctx: &WorkerContext,
@@ -1509,10 +1563,31 @@ fn post_overall_check(
     );
 }
 
+/// A forge-post error worth retrying: a network blip, or a server-side
+/// status the forge might recover from (429 rate-limit, any 5xx). A 4xx
+/// other than 429 is a request the forge will keep rejecting (and the
+/// one benign 4xx — GitLab's "Cannot transition" 400 — is already
+/// swallowed inside `post_check`, returning `Ok`), so retrying it just
+/// wastes calls. `Unauthorised` is handled separately (it pauses the
+/// forge), so it never reaches here.
+fn is_transient_forge_error(e: &ForgeError) -> bool {
+    match e {
+        ForgeError::Http(_) => true,
+        ForgeError::Api { status, .. } => *status == 429 || *status >= 500,
+        _ => false,
+    }
+}
+
 /// Skip post_check entirely if the forge is paused; mark the forge
-/// healthy on a successful post and pause it on 401. Other errors leave
-/// the registry alone — those are transient and don't indicate a broken
-/// credential. See [docs/concepts/forge-pause.md].
+/// healthy on a successful post and pause it on 401. See
+/// [docs/concepts/forge-pause.md].
+///
+/// Transient failures (network, 429, 5xx) are retried with exponential
+/// backoff before giving up. A status post is otherwise pure
+/// fire-and-forget, so a single dropped *terminal* post leaves a job
+/// stuck showing "queued" on the forge even though it built fine. Retry
+/// shrinks that window; the end-of-eval `reconcile_forge_checks` sweep
+/// is the backstop when every retry here is exhausted.
 fn spawn_post_check(
     provider: Arc<dyn Provider>,
     post: CheckPost,
@@ -1527,13 +1602,32 @@ fn spawn_post_check(
         return;
     }
     tokio::spawn(async move {
-        match provider.post_check(post).await {
-            Ok(_) => pauses.mark_healthy(&forge_name),
-            Err(ForgeError::Unauthorised) => {
-                pauses.pause(&forge_name, "401 from post_check");
-            }
-            Err(e) => {
-                tracing::warn!(forge = %forge_name, error = %e, "forge post_check failed");
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut backoff = Duration::from_millis(500);
+        for attempt in 1..=MAX_ATTEMPTS {
+            match provider.post_check(post.clone()).await {
+                Ok(_) => {
+                    pauses.mark_healthy(&forge_name);
+                    return;
+                }
+                Err(ForgeError::Unauthorised) => {
+                    pauses.pause(&forge_name, "401 from post_check");
+                    return;
+                }
+                Err(e) if is_transient_forge_error(&e) && attempt < MAX_ATTEMPTS => {
+                    tracing::debug!(
+                        forge = %forge_name,
+                        error = %e,
+                        attempt,
+                        "forge post_check transient error; retrying after backoff",
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                Err(e) => {
+                    tracing::warn!(forge = %forge_name, error = %e, "forge post_check failed");
+                    return;
+                }
             }
         }
     });
@@ -2226,10 +2320,15 @@ fn spawn_post_build_effects(
                 };
                 let reports =
                     crate::effects::run_effects(&store, job_id, &reg_effects, &octx).await;
-                // `Reported` effects (registry-push, sbom-attach) post
-                // their own forge check, so a contributor sees the
-                // published image / SBOM in their PR checks. Suppressed
-                // in collapsed-check mode, like per-job checks.
+                // Only `Severity::Reported` effects post a forge check.
+                // No effect uses that today — registry-push and
+                // sbom-attach are `Advisory`, so their outcome lives in
+                // `effect_runs`/the argunix UI and never reaches the
+                // forge (a degraded push is not a property of the repo's
+                // commit). This block is the seam for a future effect
+                // whose result *is* meant to gate the commit (e.g. a
+                // deploy). Suppressed in collapsed-check mode, like
+                // per-job checks.
                 if !collapsed_mode {
                     if let Some(provider) = &provider {
                         for r in &reports {
@@ -2283,20 +2382,23 @@ fn effect_check_label(kind: &str) -> &str {
 
 /// Cross-system multi-arch fan-in. After the build phase, stitch the
 /// per-arch `docker` image jobs of one logical name into a multi-arch
-/// OCI index (the work lives in `multiarch::run_fan_in`); post each
-/// outcome as an `argunix: multi-arch · …` forge check. Best-effort —
-/// a failed push never fails the eval. See `design/multi-arch.md`.
+/// OCI index (the work lives in `multiarch::run_fan_in`). Each outcome
+/// is recorded as a `registry-index` row in `effect_runs` (visible in
+/// the argunix UI) — it is *not* posted as a forge check. Distribution
+/// is best-effort: a failed index push is not a property of the repo's
+/// commit and must not redden an otherwise-green build. See
+/// `design/multi-arch.md`.
 async fn run_multiarch_fan_in(
     ctx: &WorkerContext,
     repo: &argunix_store::RepoRecord,
     eval: &argunix_store::EvalRecord,
     eval_id: EvalId,
-    provider: &Arc<dyn Provider>,
-    collapsed_mode: bool,
     specs_by_id: &std::collections::HashMap<JobId, argunix_eval::JobSpec>,
 ) {
     let config = ctx.current.load().config.clone();
-    let outcomes = crate::multiarch::run_fan_in(
+    // Outcomes are recorded inside `run_fan_in` as `effect_runs` rows;
+    // we deliberately don't surface them on the forge.
+    crate::multiarch::run_fan_in(
         &ctx.store,
         eval_id,
         specs_by_id,
@@ -2308,62 +2410,6 @@ async fn run_multiarch_fan_in(
         eval.sha.as_str(),
     )
     .await;
-    if collapsed_mode {
-        return;
-    }
-    for outcome in outcomes {
-        let state = if outcome.ok {
-            CheckState::Success
-        } else {
-            CheckState::Failure
-        };
-        post_multiarch_check(
-            ctx,
-            provider,
-            repo,
-            &eval.sha,
-            eval_id,
-            &config.external_url,
-            &outcome.label,
-            state,
-            &outcome.detail,
-        );
-    }
-}
-
-/// Post the `argunix: multi-arch · <label>` forge check for one fan-in
-/// outcome. Mirrors `post_overall_check`.
-#[allow(clippy::too_many_arguments)]
-fn post_multiarch_check(
-    ctx: &WorkerContext,
-    provider: &Arc<dyn Provider>,
-    repo: &argunix_store::RepoRecord,
-    sha: &Sha,
-    eval_id: EvalId,
-    external_url: &str,
-    label: &str,
-    state: CheckState,
-    description: &str,
-) {
-    let post = CheckPost {
-        slug: repo.slug.clone(),
-        sha: sha.clone(),
-        context: format!("argunix: multi-arch · {label}"),
-        state,
-        description: Some(summarise_for_check(description, 140)),
-        target_url: Some(eval_target_url(
-            external_url,
-            &repo.forge,
-            &repo.slug,
-            eval_id,
-        )),
-    };
-    spawn_post_check(
-        provider.clone(),
-        post,
-        repo.forge.clone(),
-        ctx.pauses.clone(),
-    );
 }
 
 /// Best-effort docker registry publish. Any error is logged at `warn`

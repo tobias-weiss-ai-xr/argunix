@@ -187,24 +187,14 @@ pub fn multiarch_targets(
         .collect()
 }
 
-/// One fan-in outcome — what the caller turns into a forge check.
-pub struct FanInOutcome {
-    /// Forge-check label: `<image>` for a clash, `<image> (<registry>)`
-    /// for an assembled index.
-    pub label: String,
-    /// Whether the assembly (or, for a clash, nothing) succeeded.
-    pub ok: bool,
-    /// One-line human summary, mirrored into the `effect_runs` row.
-    pub detail: String,
-}
-
 /// The cross-system multi-arch fan-in. Classifies the eval's image
 /// jobs, and for each multi-arch `docker` group assembles + pushes a
 /// multi-arch OCI index on every bound registry; for an `oci` clash
-/// records an errored effect. Each outcome is an `effect_runs` row and
-/// a returned [`FanInOutcome`] (the daemon worker additionally posts a
-/// forge check from it; the `argunix build` CLI does not). Shared by
-/// both build paths.
+/// records an errored effect. Each outcome is recorded as a
+/// `registry-index` row in `effect_runs` (visible in the argunix UI).
+/// Distribution is best-effort and intentionally not surfaced as a
+/// forge check — a failed index push is not a property of the repo's
+/// commit. Shared by both build paths.
 pub async fn run_fan_in(
     store: &SqlxStore,
     eval_id: EvalId,
@@ -215,23 +205,22 @@ pub async fn run_fan_in(
     default_branch: Option<&str>,
     git_ref: &str,
     sha: &str,
-) -> Vec<FanInOutcome> {
+) {
     let records = match <SqlxStore as JobStore>::list_by_eval(store, eval_id).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "multi-arch: list_by_eval failed; fan-in skipped");
-            return Vec::new();
+            return;
         }
     };
     let groups = classify(specs_by_id, &records);
     if groups.is_empty() {
-        return Vec::new();
+        return;
     }
     let targets = multiarch_targets(config, repo_forge, repo_slug);
     let short_sha = sha.get(..12).unwrap_or(sha);
     let tags = argunix_effects::multiarch::image_tags(git_ref, short_sha, default_branch);
 
-    let mut outcomes = Vec::new();
     for group in groups {
         match group {
             ImageGroup::MultiArch {
@@ -305,16 +294,16 @@ pub async fn run_fan_in(
                     let result = target
                         .assemble(repo_slug, &name, short_sha, &arch_slices, &tags)
                         .await;
-                    let (status, detail, ok) = match &result {
+                    let (status, detail) = match &result {
                         Ok(summary) => {
                             let detail = if missing.is_empty() {
                                 summary.clone()
                             } else {
                                 format!("{summary} (missing arch: {})", missing.join(", "))
                             };
-                            ("success", detail, true)
+                            ("success", detail)
                         }
-                        Err(e) => ("failure", e.clone(), false),
+                        Err(e) => ("failure", e.clone()),
                     };
                     for run_id in runs.into_iter().flatten() {
                         if let Err(e) = <SqlxStore as EffectRunStore>::finish_effect_run(
@@ -335,11 +324,6 @@ pub async fn run_fan_in(
                         detail = %detail,
                         "multi-arch fan-in",
                     );
-                    outcomes.push(FanInOutcome {
-                        label: format!("{name} ({})", target.target),
-                        ok,
-                        detail,
-                    });
                 }
             }
             ImageGroup::Clash {
@@ -367,15 +351,9 @@ pub async fn run_fan_in(
                     .await;
                 }
                 tracing::warn!(image = %name, detail = %detail, "multi-arch: oci clash");
-                outcomes.push(FanInOutcome {
-                    label: name,
-                    ok: false,
-                    detail,
-                });
             }
         }
     }
-    outcomes
 }
 
 #[cfg(test)]

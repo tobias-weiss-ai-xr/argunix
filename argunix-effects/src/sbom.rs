@@ -111,10 +111,10 @@ impl Effect for SbomAttach {
     }
 
     fn severity(&self) -> Severity {
-        // The SBOM attach gets its own forge check so contributors see
-        // it was published. A failure does not fail the job — same
-        // policy as `registry-push`.
-        Severity::Reported
+        // Recorded in `effect_runs` only, no forge check — same policy
+        // as `registry-push`. A failed SBOM attach is not a property of
+        // the repo's commit and must not redden its forge status.
+        Severity::Advisory
     }
 
     async fn run(&self, ctx: &OutputContext<'_>) -> EffectOutcome {

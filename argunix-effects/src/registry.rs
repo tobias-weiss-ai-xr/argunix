@@ -100,11 +100,13 @@ impl Effect for RegistryPush {
     }
 
     fn severity(&self) -> Severity {
-        // A push gets its own forge check so contributors see the
-        // published image (and its pull reference) in their PR checks.
-        // A rejected push still does not fail the job — the artifact is
-        // realised, only distribution degraded.
-        Severity::Reported
+        // The push outcome lives in `effect_runs` (and the argunix UI),
+        // not on a forge check. The forge status reflects whether the
+        // *build* succeeded; a degraded registry push is real but is not
+        // a property of the repo's commit, so it must not redden it.
+        // The artifact is realised regardless — only distribution
+        // degraded.
+        Severity::Advisory
     }
 
     async fn run(&self, ctx: &OutputContext<'_>) -> EffectOutcome {

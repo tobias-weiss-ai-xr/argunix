@@ -132,14 +132,18 @@ impl OutputContext<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     /// The outcome lives only in `effect_runs` and the daemon log — no
-    /// forge check of its own. A failure never fails the job. The seam
-    /// for a future purely-internal effect; no effect uses it today.
-    #[allow(dead_code)]
+    /// forge check of its own. A failure never fails the job. This is
+    /// what `registry-push` and `sbom-attach` use: their outcome is
+    /// real and visible in the argunix UI, but it is not a property of
+    /// the repo's commit, so it must not appear as a forge status that
+    /// could redden an otherwise-green build.
     Advisory,
     /// The effect posts its **own** forge check — success or failure —
     /// so a contributor sees it in their PR / commit checks alongside
-    /// the build. A failure still does *not* fail the job: a degraded
-    /// push is not a broken build; only the effect's own check goes red.
+    /// the build. A failure still does *not* fail the job. The seam for
+    /// a future effect whose outcome *is* meant to gate the commit
+    /// (e.g. a deploy); no effect uses it today.
+    #[allow(dead_code)]
     Reported,
 }
 
