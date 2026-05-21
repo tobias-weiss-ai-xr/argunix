@@ -329,7 +329,7 @@ async fn serve_one_connection(
     let in_flight: Arc<StdMutex<HashMap<i64, oneshot::Sender<()>>>> =
         Arc::new(StdMutex::new(HashMap::new()));
 
-    loop {
+    let outcome = 'session: loop {
         tokio::select! {
             _ = &mut *shutdown => {
                 // Best-effort goodbye, bounded by a short timeout. Over
@@ -362,7 +362,7 @@ async fn serve_one_connection(
                         "graceful shutdown timed out (connection likely half-open); exiting anyway",
                     );
                 }
-                return Ok(true);
+                break 'session Ok(true);
             }
             _ = hb_interval.tick() => {
                 let hb = ControlMessage::Heartbeat {
@@ -370,13 +370,13 @@ async fn serve_one_connection(
                     stats: stats_sampler.sample(),
                 };
                 if channel.data(&hb.encode_line()[..]).await.is_err() {
-                    return Ok(false);
+                    break 'session Ok(false);
                 }
             }
             // Outbound from build tasks → SSH channel.
             Some(bytes) = out_rx.recv() => {
                 if channel.data(&bytes[..]).await.is_err() {
-                    return Ok(false);
+                    break 'session Ok(false);
                 }
             }
             ev = channel.wait() => match ev {
@@ -385,7 +385,7 @@ async fn serve_one_connection(
                         match parsed {
                             Ok(ControlMessage::Kick { reason }) => {
                                 tracing::warn!(reason = %reason, "kicked by argunix; reconnect after backoff");
-                                return Ok(false);
+                                break 'session Ok(false);
                             }
                             Ok(ControlMessage::Build {
                                 build_id,
@@ -460,10 +460,50 @@ async fn serve_one_connection(
                         }
                     }
                 }
-                Some(ChannelMsg::Close) | None => return Ok(false),
+                Some(ChannelMsg::Close) | None => break 'session Ok(false),
                 Some(_) => continue,
             }
         }
+    };
+
+    // The control connection is going away — either we're shutting
+    // down (Ok(true)) or we're about to reconnect (Ok(false)). Either
+    // way the coordinator can no longer receive results for these
+    // build_ids: after a reconnect the agent sends a fresh `hello` and
+    // the coordinator re-dispatches via its own Q79 re-queue, with no
+    // memory of the old per-connection build_id mapping. So a build we
+    // leave running here is orphaned work that nothing will ever
+    // collect. Kill every in-flight `nix-store --realise` so a
+    // stopped/restarted coordinator actually quiesces this builder
+    // instead of leaving zombie builds churning. `handle_build`
+    // observes the fired oneshot, SIGKILLs its child, and exits.
+    abort_all_in_flight(&in_flight);
+
+    outcome
+}
+
+/// Fire the abort oneshot for every build still tracked in `in_flight`,
+/// draining the map. Each send wakes `handle_build`'s `abort_rx` arm,
+/// which SIGKILLs the `nix-store --realise` child and reports `Killed`.
+/// Called when the control connection is torn down so the agent doesn't
+/// leave orphaned builds running across a reconnect.
+fn abort_all_in_flight(in_flight: &Arc<StdMutex<HashMap<i64, oneshot::Sender<()>>>>) {
+    let pending: Vec<(i64, oneshot::Sender<()>)> = {
+        let mut map = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        map.drain().collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let build_ids: Vec<i64> = pending.iter().map(|(id, _)| *id).collect();
+    tracing::warn!(
+        ?build_ids,
+        "control connection closed with in-flight builds; killing local nix-store --realise so the coordinator quiesces this builder",
+    );
+    for (_, abort_tx) in pending {
+        // Err only if the build task already finished and dropped its
+        // receiver between our drain and now — nothing to cancel.
+        let _ = abort_tx.send(());
     }
 }
 
@@ -1425,6 +1465,35 @@ exit 0
             "abort path must surface as Killed, not Failure",
         );
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_all_in_flight_fires_every_pending_build_and_drains_map() {
+        // Mirrors what serve_one_connection does when the control
+        // connection drops: every tracked build's abort oneshot must
+        // fire, and the map must be emptied so a subsequent reconnect
+        // starts clean.
+        let in_flight: Arc<StdMutex<HashMap<i64, oneshot::Sender<()>>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+        let (tx_a, rx_a) = oneshot::channel::<()>();
+        let (tx_b, rx_b) = oneshot::channel::<()>();
+        {
+            let mut map = in_flight.lock().unwrap();
+            map.insert(1, tx_a);
+            map.insert(2, tx_b);
+        }
+
+        abort_all_in_flight(&in_flight);
+
+        assert!(rx_a.await.is_ok(), "build 1 must receive the abort signal");
+        assert!(rx_b.await.is_ok(), "build 2 must receive the abort signal");
+        assert!(
+            in_flight.lock().unwrap().is_empty(),
+            "map must be drained after aborting all in-flight builds",
+        );
+
+        // Idempotent: a second call on the now-empty map is a no-op.
+        abort_all_in_flight(&in_flight);
     }
 
     #[tokio::test]
