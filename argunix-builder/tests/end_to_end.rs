@@ -55,6 +55,7 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SqlxStore>, Arc<BuilderReg
 fn caps() -> BuilderCapabilities {
     BuilderCapabilities {
         systems: vec!["x86_64-linux".into()],
+        native_system: "x86_64-linux".into(),
         features: vec![],
         max_jobs: 2,
         nix_version: "2.18.1".into(),

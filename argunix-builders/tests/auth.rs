@@ -82,6 +82,7 @@ fn fresh_client_key() -> (PrivateKey, BuilderPubkey) {
 fn caps() -> BuilderCapabilities {
     BuilderCapabilities {
         systems: vec!["x86_64-linux".into()],
+        native_system: "x86_64-linux".into(),
         features: vec![],
         max_jobs: 1,
         nix_version: "test".into(),

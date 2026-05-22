@@ -77,6 +77,7 @@ fn fresh_client_key() -> (PrivateKey, BuilderPubkey) {
 fn caps(systems: &[&str], features: &[&str], max_jobs: u32) -> BuilderCapabilities {
     BuilderCapabilities {
         systems: systems.iter().map(|s| s.to_string()).collect(),
+        native_system: systems.first().map(|s| s.to_string()).unwrap_or_default(),
         features: features.iter().map(|s| s.to_string()).collect(),
         max_jobs,
         nix_version: "test".into(),
@@ -175,6 +176,7 @@ async fn hello_registers_builder_as_active() {
     let hello = ControlMessage::Hello {
         name: BuilderName::new("alice").unwrap(),
         systems: vec!["x86_64-linux".into()],
+        native_system: "x86_64-linux".into(),
         features: vec![],
         max_jobs: 1,
         nix_version: "2.18.1".into(),
@@ -215,6 +217,7 @@ async fn shutdown_message_flips_state_to_disconnecting() {
     let hello = ControlMessage::Hello {
         name: BuilderName::new("bob").unwrap(),
         systems: vec!["x86_64-linux".into()],
+        native_system: "x86_64-linux".into(),
         features: vec![],
         max_jobs: 1,
         nix_version: "2.18.1".into(),
@@ -262,6 +265,7 @@ async fn connection_drop_removes_entry() {
         let hello = ControlMessage::Hello {
             name: BuilderName::new("ephemeral").unwrap(),
             systems: vec!["x86_64-linux".into()],
+            native_system: "x86_64-linux".into(),
             features: vec![],
             max_jobs: 1,
             nix_version: "2.18.1".into(),
@@ -315,6 +319,7 @@ async fn duplicate_name_displaces_old_connection() {
     let hello = ControlMessage::Hello {
         name: BuilderName::new("dup").unwrap(),
         systems: vec!["x86_64-linux".into()],
+        native_system: "x86_64-linux".into(),
         features: vec![],
         max_jobs: 1,
         nix_version: "2.18.1".into(),

@@ -75,6 +75,7 @@ fn fresh_client_key() -> (PrivateKey, BuilderPubkey) {
 fn caps(systems: &[&str], features: &[&str], max_jobs: u32) -> BuilderCapabilities {
     BuilderCapabilities {
         systems: systems.iter().map(|s| s.to_string()).collect(),
+        native_system: systems.first().map(|s| s.to_string()).unwrap_or_default(),
         features: features.iter().map(|s| s.to_string()).collect(),
         max_jobs,
         nix_version: "2.18.1".into(),
@@ -138,6 +139,7 @@ async fn hello_after_token_auth_creates_row_and_returns_welcome() {
     let hello = ControlMessage::Hello {
         name: BuilderName::new("bobs-mini").unwrap(),
         systems: vec!["aarch64-darwin".into(), "aarch64-linux".into()],
+        native_system: "aarch64-darwin".into(),
         features: vec!["big-parallel".into()],
         max_jobs: 2,
         nix_version: "2.18.1".into(),
@@ -195,6 +197,7 @@ async fn hello_after_pubkey_auth_refreshes_capabilities() {
     let hello = ControlMessage::Hello {
         name: BuilderName::new("mac01").unwrap(),
         systems: vec!["aarch64-darwin".into(), "x86_64-darwin".into()],
+        native_system: "aarch64-darwin".into(),
         features: vec!["big-parallel".into(), "kvm".into()],
         max_jobs: 4,
         nix_version: "2.20.0".into(),
@@ -244,6 +247,7 @@ async fn heartbeat_advances_last_seen() {
     let hello = ControlMessage::Hello {
         name: BuilderName::new("watcher").unwrap(),
         systems: vec!["x86_64-linux".into()],
+        native_system: "x86_64-linux".into(),
         features: vec![],
         max_jobs: 1,
         nix_version: "2.18.1".into(),
@@ -309,6 +313,7 @@ async fn hello_with_mismatched_name_uses_existing_row() {
     let hello = ControlMessage::Hello {
         name: BuilderName::new("agent-renamed-itself").unwrap(),
         systems: vec!["x86_64-linux".into()],
+        native_system: "x86_64-linux".into(),
         features: vec![],
         max_jobs: 2,
         nix_version: "2.18.1".into(),

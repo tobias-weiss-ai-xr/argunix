@@ -394,12 +394,14 @@ impl ConnectionHandler {
             ControlMessage::Hello {
                 name,
                 systems,
+                native_system,
                 features,
                 max_jobs,
                 nix_version,
             } => {
                 let caps = BuilderCapabilities {
                     systems,
+                    native_system,
                     features,
                     max_jobs,
                     nix_version,

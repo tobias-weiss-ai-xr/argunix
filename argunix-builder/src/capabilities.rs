@@ -149,7 +149,8 @@ pub fn parse_show_config(json: &[u8]) -> Result<Capabilities, CapabilitiesError>
         nix_version: Option<StringField>,
     }
     let cfg: ShowConfig = serde_json::from_slice(json)?;
-    let mut systems = vec![cfg.system.value];
+    let native_system = cfg.system.value;
+    let mut systems = vec![native_system.clone()];
     if let Some(extra) = cfg.extra_platforms {
         systems.extend(extra.value);
     }
@@ -170,6 +171,7 @@ pub fn parse_show_config(json: &[u8]) -> Result<Capabilities, CapabilitiesError>
     Ok(Capabilities {
         inner: BuilderCapabilities {
             systems,
+            native_system,
             features,
             max_jobs: max_jobs.max(1),
             nix_version,
@@ -204,6 +206,8 @@ mod tests {
         }"#;
         let caps = parse_show_config(json).unwrap();
         assert_eq!(caps.inner.systems, vec!["x86_64-linux", "i686-linux"]);
+        // The native system is the scalar `system`, never an extra-platform.
+        assert_eq!(caps.inner.native_system, "x86_64-linux");
         assert_eq!(caps.inner.features, vec!["kvm", "big-parallel"]);
         assert_eq!(caps.inner.max_jobs, 4);
         assert_eq!(caps.inner.nix_version, "2.18.1");

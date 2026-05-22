@@ -259,6 +259,7 @@ async fn serve_one_connection(
     let hello = ControlMessage::Hello {
         name: cfg.name.clone(),
         systems: cfg.capabilities.systems.clone(),
+        native_system: cfg.capabilities.native_system.clone(),
         features: cfg.capabilities.features.clone(),
         max_jobs: cfg.capabilities.max_jobs,
         nix_version: cfg.capabilities.nix_version.clone(),

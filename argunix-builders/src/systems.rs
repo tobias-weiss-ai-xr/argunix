@@ -53,6 +53,7 @@ mod tests {
     fn caps(systems: &[&str]) -> BuilderCapabilities {
         BuilderCapabilities {
             systems: systems.iter().map(|s| s.to_string()).collect(),
+            native_system: systems.first().map(|s| s.to_string()).unwrap_or_default(),
             features: vec![],
             max_jobs: 1,
             nix_version: "test".into(),

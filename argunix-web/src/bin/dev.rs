@@ -441,6 +441,7 @@ async fn seed_builders(
         &[1; 32],
         BuilderCapabilities {
             systems: vec!["x86_64-linux".into(), "aarch64-linux".into()],
+            native_system: "x86_64-linux".into(),
             features: vec!["big-parallel".into(), "kvm".into(), "nixos-test".into()],
             max_jobs: 8,
             nix_version: "2.24.10".into(),
@@ -454,6 +455,7 @@ async fn seed_builders(
         &[2; 32],
         BuilderCapabilities {
             systems: vec!["x86_64-linux".into()],
+            native_system: "x86_64-linux".into(),
             features: vec!["big-parallel".into(), "kvm".into()],
             max_jobs: 4,
             nix_version: "2.24.10".into(),
@@ -467,6 +469,7 @@ async fn seed_builders(
         &[3; 32],
         BuilderCapabilities {
             systems: vec!["aarch64-linux".into(), "aarch64-darwin".into()],
+            native_system: "aarch64-linux".into(),
             features: vec![],
             max_jobs: 2,
             nix_version: "2.24.10".into(),
@@ -483,6 +486,7 @@ async fn seed_builders(
         &[4; 32],
         BuilderCapabilities {
             systems: vec!["x86_64-linux".into()],
+            native_system: "x86_64-linux".into(),
             features: vec!["big-parallel".into()],
             max_jobs: 4,
             nix_version: "2.22.1".into(),
@@ -496,6 +500,7 @@ async fn seed_builders(
         &[5; 32],
         BuilderCapabilities {
             systems: vec!["x86_64-linux".into()],
+            native_system: "x86_64-linux".into(),
             features: vec![],
             max_jobs: 2,
             nix_version: "2.18.0".into(),
@@ -518,6 +523,7 @@ async fn seed_builders(
         ConnState::Active,
         BuilderCapabilities {
             systems: vec!["x86_64-linux".into(), "aarch64-linux".into()],
+            native_system: "x86_64-linux".into(),
             features: vec!["big-parallel".into(), "kvm".into(), "nixos-test".into()],
             max_jobs: 8,
             nix_version: "2.24.10".into(),
@@ -531,6 +537,7 @@ async fn seed_builders(
         ConnState::Active,
         BuilderCapabilities {
             systems: vec!["x86_64-linux".into()],
+            native_system: "x86_64-linux".into(),
             features: vec!["big-parallel".into(), "kvm".into()],
             max_jobs: 4,
             nix_version: "2.24.10".into(),
@@ -544,6 +551,7 @@ async fn seed_builders(
         ConnState::Disconnecting,
         BuilderCapabilities {
             systems: vec!["aarch64-linux".into(), "aarch64-darwin".into()],
+            native_system: "aarch64-linux".into(),
             features: vec![],
             max_jobs: 2,
             nix_version: "2.24.10".into(),

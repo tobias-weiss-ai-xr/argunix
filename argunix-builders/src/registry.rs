@@ -394,8 +394,53 @@ impl BuilderRegistry {
         out
     }
 
+    /// Active, non-excluded builders that can run `system`, after
+    /// applying the **native tier**. This is the shared candidate set
+    /// behind both [`Self::eligible`] and [`Self::any_matching_builder`].
+    ///
+    /// Native preference is absolute and capacity-blind: if *any*
+    /// connected builder runs `system` natively (its
+    /// `capabilities.native_system`), the emulated ones (which list
+    /// `system` only via `extra-platforms`/binfmt) are dropped from the
+    /// candidate set entirely — regardless of how loaded the native
+    /// builders are. Routing both functions through this is what makes a
+    /// job *wait* for a busy native builder rather than spill onto
+    /// emulation: `eligible` comes back empty (no native slot) while
+    /// `any_matching_builder` stays true (a native builder exists), which
+    /// the worker reads as a capacity wait.
+    ///
+    /// Only when no native builder for `system` is connected at all do
+    /// emulated builders become candidates. So if the lone native
+    /// builder disconnects mid-wait, the next call admits emulation and
+    /// the job proceeds there.
+    fn system_candidates(
+        &self,
+        system: &str,
+        exclude: &HashSet<BuilderName>,
+    ) -> Vec<BuilderSnapshot> {
+        let supporting: Vec<BuilderSnapshot> = self
+            .list()
+            .into_iter()
+            .filter(|b| b.state == ConnState::Active)
+            .filter(|b| !exclude.contains(&b.name))
+            .filter(|b| b.capabilities.systems.iter().any(|s| s == system))
+            .collect();
+        let native_exists = supporting
+            .iter()
+            .any(|b| b.capabilities.native_system == system);
+        if native_exists {
+            supporting
+                .into_iter()
+                .filter(|b| b.capabilities.native_system == system)
+                .collect()
+        } else {
+            supporting
+        }
+    }
+
     /// Builders that match `(system, features)`, are `Active`, aren't at
-    /// `max_jobs`, and aren't in `exclude`. Sorted by `in_flight` ascending
+    /// `max_jobs`, aren't in `exclude`, and pass the native-tier gate
+    /// (see [`Self::system_candidates`]). Sorted by `in_flight` ascending
     /// so callers can pick the least-loaded eligible builder.
     pub fn eligible(
         &self,
@@ -404,11 +449,8 @@ impl BuilderRegistry {
         exclude: &HashSet<BuilderName>,
     ) -> Vec<BuilderSnapshot> {
         let mut found: Vec<BuilderSnapshot> = self
-            .list()
+            .system_candidates(system, exclude)
             .into_iter()
-            .filter(|b| b.state == ConnState::Active)
-            .filter(|b| !exclude.contains(&b.name))
-            .filter(|b| b.capabilities.systems.iter().any(|s| s == system))
             .filter(|b| features.iter().all(|f| b.capabilities.features.contains(f)))
             .filter(|b| b.in_flight < b.capabilities.max_jobs)
             .collect();
@@ -421,17 +463,18 @@ impl BuilderRegistry {
     /// the job) from "matching builders exist but are at capacity"
     /// (wait for a slot). Capacity contention is normal queueing, not
     /// a failure; "no match at all" is a real config / pool problem.
+    ///
+    /// Applies the same native-tier gate as [`Self::eligible`], so a job
+    /// for a `system` with a connected-but-busy native builder reports
+    /// `true` here (→ wait) even though `eligible` is empty.
     pub fn any_matching_builder(
         &self,
         system: &str,
         features: &[String],
         exclude: &HashSet<BuilderName>,
     ) -> bool {
-        self.list()
+        self.system_candidates(system, exclude)
             .into_iter()
-            .filter(|b| b.state == ConnState::Active)
-            .filter(|b| !exclude.contains(&b.name))
-            .filter(|b| b.capabilities.systems.iter().any(|s| s == system))
             .any(|b| features.iter().all(|f| b.capabilities.features.contains(f)))
     }
 
@@ -667,8 +710,11 @@ mod tests {
     use argunix_domain::BuilderId;
 
     fn caps(systems: &[&str], features: &[&str], max_jobs: u32) -> BuilderCapabilities {
+        // Mirror the agent: the first entry is the native `system`, the
+        // rest are emulated `extra-platforms`. Tiering tests rely on this.
         BuilderCapabilities {
             systems: systems.iter().map(|s| s.to_string()).collect(),
+            native_system: systems.first().map(|s| s.to_string()).unwrap_or_default(),
             features: features.iter().map(|s| s.to_string()).collect(),
             max_jobs,
             nix_version: "test".into(),
@@ -1002,6 +1048,114 @@ mod tests {
         assert_eq!(lst.len(), 2);
         assert_eq!(lst[0].name.as_str(), "small"); // 0 in flight beats 2
         assert_eq!(lst[1].name.as_str(), "big");
+    }
+
+    // ---------- native-tier preference (binfmt emulation) ----------
+
+    #[test]
+    fn eligible_prefers_native_over_emulated() {
+        // One native aarch64 builder + one x86 builder offering aarch64
+        // via binfmt. An aarch64 job must only see the native one.
+        let reg = BuilderRegistry::new();
+        let native = BuilderName::new("arm").unwrap();
+        let emu = BuilderName::new("x86-binfmt").unwrap();
+        let _ = reg.register(
+            native.clone(),
+            conn(&reg, 1, caps(&["aarch64-linux"], &[], 4)),
+        );
+        let _ = reg.register(
+            emu.clone(),
+            conn(&reg, 2, caps(&["x86_64-linux", "aarch64-linux"], &[], 4)),
+        );
+        let lst = reg.eligible("aarch64-linux", &[], &HashSet::new());
+        assert_eq!(lst.len(), 1);
+        assert_eq!(lst[0].name.as_str(), "arm");
+    }
+
+    #[test]
+    fn busy_native_holds_back_emulated_for_capacity_wait() {
+        // The native builder is saturated. The job must NOT spill to the
+        // emulated x86 builder: `eligible` is empty (no native slot) but
+        // `any_matching_builder` stays true (native exists) → the worker
+        // treats this as a capacity wait, not a no-match interrupt.
+        let reg = BuilderRegistry::new();
+        let native = BuilderName::new("arm").unwrap();
+        let emu = BuilderName::new("x86-binfmt").unwrap();
+        let _ = reg.register(
+            native.clone(),
+            conn(&reg, 1, caps(&["aarch64-linux"], &[], 1)),
+        );
+        let _ = reg.register(
+            emu.clone(),
+            conn(&reg, 2, caps(&["x86_64-linux", "aarch64-linux"], &[], 4)),
+        );
+        reg.inc_in_flight(&native); // now at max_jobs
+
+        assert!(
+            reg.eligible("aarch64-linux", &[], &HashSet::new())
+                .is_empty(),
+            "no native slot ⇒ nothing eligible (must not fall to emulation)",
+        );
+        assert!(
+            reg.any_matching_builder("aarch64-linux", &[], &HashSet::new()),
+            "native builder still exists ⇒ wait for a slot, don't interrupt",
+        );
+    }
+
+    #[test]
+    fn emulated_used_when_no_native_present() {
+        // No native aarch64 builder connected at all — emulation is the
+        // only option, so the x86 binfmt builder becomes eligible. This
+        // is also the native-disconnects-mid-wait fallback.
+        let reg = BuilderRegistry::new();
+        let emu = BuilderName::new("x86-binfmt").unwrap();
+        let _ = reg.register(
+            emu.clone(),
+            conn(&reg, 1, caps(&["x86_64-linux", "aarch64-linux"], &[], 4)),
+        );
+        let lst = reg.eligible("aarch64-linux", &[], &HashSet::new());
+        assert_eq!(lst.len(), 1);
+        assert_eq!(lst[0].name.as_str(), "x86-binfmt");
+        assert!(reg.any_matching_builder("aarch64-linux", &[], &HashSet::new()));
+    }
+
+    #[test]
+    fn excluded_native_unblocks_emulated() {
+        // If the only native builder is excluded (e.g. transport failure
+        // this dispatch), the tier opens up to emulation rather than
+        // wedging the job — `exclude` is applied before the native check.
+        let reg = BuilderRegistry::new();
+        let native = BuilderName::new("arm").unwrap();
+        let emu = BuilderName::new("x86-binfmt").unwrap();
+        let _ = reg.register(
+            native.clone(),
+            conn(&reg, 1, caps(&["aarch64-linux"], &[], 4)),
+        );
+        let _ = reg.register(
+            emu.clone(),
+            conn(&reg, 2, caps(&["x86_64-linux", "aarch64-linux"], &[], 4)),
+        );
+        let mut excluded = HashSet::new();
+        excluded.insert(native.clone());
+        let lst = reg.eligible("aarch64-linux", &[], &excluded);
+        assert_eq!(lst.len(), 1);
+        assert_eq!(lst[0].name.as_str(), "x86-binfmt");
+    }
+
+    #[test]
+    fn native_x86_unaffected_by_aarch64_tiering() {
+        // x86 jobs still see every x86-native builder; the aarch64 tier
+        // logic doesn't perturb the common case.
+        let reg = BuilderRegistry::new();
+        let a = BuilderName::new("a").unwrap();
+        let b = BuilderName::new("b").unwrap();
+        let _ = reg.register(
+            a.clone(),
+            conn(&reg, 1, caps(&["x86_64-linux", "aarch64-linux"], &[], 4)),
+        );
+        let _ = reg.register(b.clone(), conn(&reg, 2, caps(&["x86_64-linux"], &[], 4)));
+        let lst = reg.eligible("x86_64-linux", &[], &HashSet::new());
+        assert_eq!(lst.len(), 2);
     }
 
     // ---------- in-flight build routing ----------

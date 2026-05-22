@@ -104,7 +104,19 @@ impl fmt::Debug for BuilderPubkey {
 /// snapshot in the `builders` sqlite row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuilderCapabilities {
+    /// Every `<system>` the builder can realise: its native `system`
+    /// plus any `extra-platforms` (e.g. binfmt-emulated targets). The
+    /// native one is always also present here; see [`Self::native_system`].
     pub systems: Vec<String>,
+    /// The builder's own `system` from `nix show-config` — the platform
+    /// it runs *natively* rather than under emulation. Used by the
+    /// scheduler to prefer native builders absolutely: an emulated
+    /// builder is only considered for a `<system>` when no native
+    /// builder for it is connected. Empty string means "unknown"
+    /// (e.g. a pre-native-system agent); such a builder is treated as
+    /// non-native for every system.
+    #[serde(default)]
+    pub native_system: String,
     pub features: Vec<String>,
     pub max_jobs: u32,
     pub nix_version: String,

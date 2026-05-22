@@ -48,6 +48,12 @@ pub enum ControlMessage {
     Hello {
         name: BuilderName,
         systems: Vec<String>,
+        /// The builder's native `system` (vs. emulated `extra-platforms`
+        /// also listed in `systems`). `#[serde(default)]` keeps
+        /// pre-native-system agents wire-compatible: they send no field
+        /// and the coordinator treats them as non-native everywhere.
+        #[serde(default)]
+        native_system: String,
         #[serde(default)]
         features: Vec<String>,
         #[serde(default = "default_max_jobs")]
@@ -259,6 +265,7 @@ mod tests {
         let msg = ControlMessage::Hello {
             name: BuilderName::new("bobs-mini").unwrap(),
             systems: vec!["aarch64-darwin".into(), "aarch64-linux".into()],
+            native_system: "aarch64-darwin".into(),
             features: vec!["big-parallel".into()],
             max_jobs: 2,
             nix_version: "2.18.1".into(),

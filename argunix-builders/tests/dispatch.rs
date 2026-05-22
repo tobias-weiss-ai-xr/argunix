@@ -126,6 +126,7 @@ async fn enroll_stub_agent(
     let hello = ControlMessage::Hello {
         name: BuilderName::new(name).unwrap(),
         systems: vec!["x86_64-linux".into()],
+        native_system: "x86_64-linux".into(),
         features: vec![],
         max_jobs: 4,
         nix_version: "2.18.1".into(),

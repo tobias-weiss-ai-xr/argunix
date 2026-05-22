@@ -101,6 +101,7 @@ fn map_builder(row: &SqliteRow) -> Result<BuilderRecord, StoreError> {
     let name_s: String = row.try_get("name")?;
     let pubkey_blob: Vec<u8> = row.try_get("pubkey")?;
     let systems_s: String = row.try_get("systems")?;
+    let native_system: String = row.try_get("native_system")?;
     let features_s: String = row.try_get("features")?;
     let max_jobs: i64 = row.try_get("max_jobs")?;
     let nix_version: String = row.try_get("nix_version")?;
@@ -122,6 +123,7 @@ fn map_builder(row: &SqliteRow) -> Result<BuilderRecord, StoreError> {
         pubkey,
         capabilities: BuilderCapabilities {
             systems,
+            native_system,
             features,
             max_jobs: max_jobs.max(0) as u32,
             nix_version,
@@ -976,6 +978,7 @@ impl BuilderStore for SqlxStore {
     async fn upsert(&self, new: NewBuilder, now: DateTime<Utc>) -> Result<BuilderId, StoreError> {
         let systems_json =
             serde_json::to_string(&new.capabilities.systems).expect("Vec<String> serialises");
+        let native_system = new.capabilities.native_system;
         let features_json =
             serde_json::to_string(&new.capabilities.features).expect("Vec<String> serialises");
         // ON CONFLICT(name): the row is the latest snapshot, so we overwrite
@@ -985,22 +988,24 @@ impl BuilderStore for SqlxStore {
         // with the right token after revocation is treated as a fresh enroll.
         let row = sqlx::query(
             "INSERT INTO builders
-                 (name, pubkey, systems, features, max_jobs, nix_version,
+                 (name, pubkey, systems, native_system, features, max_jobs, nix_version,
                   enrolled_at, last_seen, revoked_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, NULL)
              ON CONFLICT(name) DO UPDATE SET
-                 pubkey       = excluded.pubkey,
-                 systems      = excluded.systems,
-                 features     = excluded.features,
-                 max_jobs     = excluded.max_jobs,
-                 nix_version  = excluded.nix_version,
-                 last_seen    = excluded.last_seen,
-                 revoked_at   = NULL
+                 pubkey        = excluded.pubkey,
+                 systems       = excluded.systems,
+                 native_system = excluded.native_system,
+                 features      = excluded.features,
+                 max_jobs      = excluded.max_jobs,
+                 nix_version   = excluded.nix_version,
+                 last_seen     = excluded.last_seen,
+                 revoked_at    = NULL
              RETURNING id",
         )
         .bind(new.name.as_str())
         .bind(new.pubkey.as_bytes().as_slice())
         .bind(systems_json)
+        .bind(native_system)
         .bind(features_json)
         .bind(new.capabilities.max_jobs as i64)
         .bind(new.capabilities.nix_version)
@@ -1013,7 +1018,7 @@ impl BuilderStore for SqlxStore {
 
     async fn get(&self, id: BuilderId) -> Result<Option<BuilderRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, name, pubkey, systems, features, max_jobs, nix_version,
+            "SELECT id, name, pubkey, systems, native_system, features, max_jobs, nix_version,
                     enrolled_at, last_seen, revoked_at
              FROM builders WHERE id = ?1",
         )
@@ -1025,7 +1030,7 @@ impl BuilderStore for SqlxStore {
 
     async fn find_by_name(&self, name: &str) -> Result<Option<BuilderRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, name, pubkey, systems, features, max_jobs, nix_version,
+            "SELECT id, name, pubkey, systems, native_system, features, max_jobs, nix_version,
                     enrolled_at, last_seen, revoked_at
              FROM builders WHERE name = ?1",
         )
@@ -1040,7 +1045,7 @@ impl BuilderStore for SqlxStore {
         pubkey: &BuilderPubkey,
     ) -> Result<Option<BuilderRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, name, pubkey, systems, features, max_jobs, nix_version,
+            "SELECT id, name, pubkey, systems, native_system, features, max_jobs, nix_version,
                     enrolled_at, last_seen, revoked_at
              FROM builders WHERE pubkey = ?1 AND revoked_at IS NULL",
         )
@@ -1088,7 +1093,7 @@ impl BuilderStore for SqlxStore {
 
     async fn list_all(&self) -> Result<Vec<BuilderRecord>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, name, pubkey, systems, features, max_jobs, nix_version,
+            "SELECT id, name, pubkey, systems, native_system, features, max_jobs, nix_version,
                     enrolled_at, last_seen, revoked_at
              FROM builders ORDER BY enrolled_at ASC",
         )
@@ -2336,6 +2341,7 @@ mod tests {
     fn caps(systems: &[&str], features: &[&str], max_jobs: u32) -> BuilderCapabilities {
         BuilderCapabilities {
             systems: systems.iter().map(|s| s.to_string()).collect(),
+            native_system: systems.first().map(|s| s.to_string()).unwrap_or_default(),
             features: features.iter().map(|s| s.to_string()).collect(),
             max_jobs,
             nix_version: "2.18.1".into(),
