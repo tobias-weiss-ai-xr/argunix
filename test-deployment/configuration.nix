@@ -65,6 +65,11 @@ in
         token_path = "/var/lib/argunix-credentials/builder-enrollment-token";
       };
 
+      retention = {
+        max_age_days = 14;       # drop eval roots + logs older than 14 days
+        interval_minutes = 60;   # hourly (default)
+      };
+
       schedule = {
         build_concurrency = 6;
         build_timeout_seconds = 10 * 60 * 60;
@@ -155,6 +160,15 @@ in
   systemd.services.argunix.environment = {
     AWS_SHARED_CREDENTIALS_FILE = "/var/lib/argunix-credentials/s3-credentials";
   };
+
+  nix.gc = {
+    automatic = true;
+    dates = "daily";
+    options = "--delete-older-than 14d";
+  };
+  nix.settings.min-free = 5  * 1024 * 1024 * 1024;   # start GC below 5 GiB free
+  nix.settings.max-free = 20 * 1024 * 1024 * 1024;   # reclaim up to 20 GiB free
+
 
   security.acme = {
     acceptTerms = true;
