@@ -257,6 +257,15 @@
       const tree = document.getElementById("nom-tree");
       const acts = new Map(); // activity id -> { act, label }
       let prog = null; // last Progress event
+      // Whether the build stream has produced anything yet, and whether
+      // it has ended. Single-derivation pool builds (`nix-store
+      // --realise`) stream build-log lines but don't report nix's
+      // aggregate activity tree, so `acts`/`prog` can stay empty for the
+      // whole build. These flags let the "building now" box say
+      // something true ("building…") instead of forever showing the
+      // pre-dispatch placeholder.
+      let streamStarted = false;
+      let streamEnded = false;
 
       // Keep the live view bounded: a long verbose build streams far
       // more lines than a browser can hold as DOM nodes, and one
@@ -478,15 +487,27 @@
         if (cp) extra.push(`${cp} copying`);
         if (extra.length)
           rows.push(`<div class="text-muted">↓ ${esc(extra.join(" · "))}</div>`);
+        const emptyMsg = streamEnded
+          ? "build finished"
+          : streamStarted
+            ? "building… (nix reported no per-derivation breakdown)"
+            : "waiting for the builder…";
         tree.innerHTML = rows.length
           ? rows.join("")
-          : '<span class="text-muted">no derivations building right now</span>';
+          : `<span class="text-muted">${esc(emptyMsg)}</span>`;
       };
 
       const es = new EventSource(`/api/jobs/${jobId}/log/stream`);
       es.addEventListener("nom", (e) => {
         let ev;
         try { ev = JSON.parse(e.data); } catch (_) { return; }
+        // First sign of life from the builder: flip the box out of its
+        // "waiting for the builder…" placeholder even if this event is a
+        // plain log line that contributes no activity row.
+        if (!streamStarted) {
+          streamStarted = true;
+          renderTree();
+        }
         switch (ev.kind) {
           case "line":
             appendLine(ev.label, ev.text);
@@ -520,6 +541,7 @@
         }
       });
       es.addEventListener("end", () => {
+        streamEnded = true;
         acts.clear();
         renderTree();
         es.close();
