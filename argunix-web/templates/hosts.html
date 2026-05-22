@@ -141,7 +141,13 @@
       <div class="flex flex-wrap items-baseline gap-1">
         <span class="text-muted">systems</span>
         {% for s in b.systems %}
-        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-chip text-chip-fg font-mono">{{ s }}</span>
+        {% if s.is_native() %}
+        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-ok-soft text-ok-strong font-mono" title="native">{{ s.name }}</span>
+        {% else if s.is_emulated() %}
+        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-chip text-chip-fg font-mono opacity-70" title="emulated via extra-platforms / binfmt">{{ s.name }} <span class="text-subtle">~emu</span></span>
+        {% else %}
+        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-chip text-chip-fg font-mono">{{ s.name }}</span>
+        {% endif %}
         {% endfor %}
       </div>
       <div class="flex flex-wrap items-baseline gap-1">
@@ -185,7 +191,13 @@
       <div class="flex flex-wrap items-baseline gap-1">
         <span class="text-muted">systems</span>
         {% for s in b.systems %}
-        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-chip text-chip-fg font-mono">{{ s }}</span>
+        {% if s.is_native() %}
+        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-ok-soft text-ok-strong font-mono" title="native">{{ s.name }}</span>
+        {% else if s.is_emulated() %}
+        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-chip text-chip-fg font-mono opacity-70" title="emulated via extra-platforms / binfmt">{{ s.name }} <span class="text-subtle">~emu</span></span>
+        {% else %}
+        <span class="inline-block whitespace-nowrap px-1.5 rounded bg-chip text-chip-fg font-mono">{{ s.name }}</span>
+        {% endif %}
         {% endfor %}
       </div>
       <div class="flex flex-wrap items-baseline gap-1">

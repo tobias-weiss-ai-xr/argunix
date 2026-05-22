@@ -154,10 +154,14 @@ struct BuilderRow {
     is_online: bool,
     in_flight: u32,
     max_jobs: u32,
-    /// Rendered as small pill badges in templates. Stored as
-    /// `Vec<String>` rather than a comma-joined string so the template
-    /// can iterate.
-    systems: Vec<String>,
+    /// Rendered as small pill badges in templates, each tagged
+    /// native-vs-emulated so the card can distinguish the builder's own
+    /// `system` from platforms it only runs under emulation
+    /// (extra-platforms / binfmt). See [`SystemBadge`].
+    systems: Vec<SystemBadge>,
+    /// The builder's native `system`, surfaced separately in the JSON
+    /// view. Empty for builders that predate native-system reporting.
+    native_system: String,
     features: Vec<String>,
     nix_version: String,
     /// Suppressed in the template when `is_online` is true (we already
@@ -168,6 +172,39 @@ struct BuilderRow {
     /// empty list. Cards render the head as a "now building" line and
     /// a count for the rest.
     current_jobs: Vec<CurrentJob>,
+}
+
+/// How a builder runs a given `<system>`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SystemKind {
+    /// The builder's own `system` — runs natively.
+    Native,
+    /// Listed only via `extra-platforms` (binfmt) — runs emulated.
+    Emulated,
+    /// The builder predates native-system reporting (`native_system`
+    /// empty), so we can't classify it. Renders as a plain pill, exactly
+    /// as before this distinction existed.
+    Unknown,
+}
+
+/// One platform pill on a builder card, tagged with [`SystemKind`] so the
+/// template can style native vs. emulated differently. The kind is a
+/// single tri-state value, not two independent bools — there is no
+/// "native *and* emulated" or "neither" to misrepresent.
+struct SystemBadge {
+    name: String,
+    kind: SystemKind,
+}
+
+impl SystemBadge {
+    // Predicates for the template (Askama matches on method calls more
+    // cleanly than on bare enum variants).
+    fn is_native(&self) -> bool {
+        self.kind == SystemKind::Native
+    }
+    fn is_emulated(&self) -> bool {
+        self.kind == SystemKind::Emulated
+    }
 }
 
 /// One in-flight job on a builder, as carried by [`BuilderRow`].
@@ -869,7 +906,8 @@ pub async fn hosts_json(State(state): State<AppState>) -> Result<Response, UiErr
                 "is_online": b.is_online,
                 "in_flight": b.in_flight,
                 "max_jobs": b.max_jobs,
-                "systems": b.systems,
+                "systems": b.systems.iter().map(|s| &s.name).collect::<Vec<_>>(),
+                "native_system": b.native_system,
                 "features": b.features,
                 "nix_version": b.nix_version,
                 "last_seen": b.last_seen,
@@ -1236,7 +1274,22 @@ fn build_builder_row(
         is_online,
         in_flight,
         max_jobs: caps.max_jobs,
-        systems: caps.systems.clone(),
+        systems: caps
+            .systems
+            .iter()
+            .map(|s| SystemBadge {
+                name: s.clone(),
+                kind: if caps.native_system.is_empty() {
+                    // Legacy agent: no native_system reported.
+                    SystemKind::Unknown
+                } else if *s == caps.native_system {
+                    SystemKind::Native
+                } else {
+                    SystemKind::Emulated
+                },
+            })
+            .collect(),
+        native_system: caps.native_system.clone(),
         features: caps.features.clone(),
         nix_version: caps.nix_version.clone(),
         last_seen: humanize_last_seen(row.last_seen, now),
@@ -2652,7 +2705,11 @@ mod tests {
             is_online: online,
             in_flight: jobs.len() as u32,
             max_jobs: 4,
-            systems: vec!["x86_64-linux".into()],
+            systems: vec![SystemBadge {
+                name: "x86_64-linux".into(),
+                kind: SystemKind::Native,
+            }],
+            native_system: "x86_64-linux".into(),
             features: vec!["big-parallel".into()],
             nix_version: "2.18.1".into(),
             last_seen: "5m ago".into(),
@@ -2782,6 +2839,39 @@ mod tests {
             header < beta,
             "offline section header must precede the beta card",
         );
+    }
+
+    #[test]
+    fn hosts_template_distinguishes_native_from_emulated_systems() {
+        // An x86 builder running aarch64 under binfmt: x86 native, aarch64
+        // emulated. The card must mark them differently so operators can
+        // see at a glance which platforms are first-class on a box.
+        let mut row = make_builder_row("binfmt-box", true, vec![]);
+        row.systems = vec![
+            SystemBadge {
+                name: "x86_64-linux".into(),
+                kind: SystemKind::Native,
+            },
+            SystemBadge {
+                name: "aarch64-linux".into(),
+                kind: SystemKind::Emulated,
+            },
+        ];
+        let html = HostsTemplate {
+            cluster_active: true,
+            coordinator: fixture_coordinator(),
+            online_rows: vec![row],
+            offline_rows: vec![],
+            online: 1,
+            known: 1,
+        }
+        .render()
+        .unwrap();
+        // Native pill carries the native title; emulated pill carries the
+        // emulation note and the `~emu` marker.
+        assert!(html.contains(r#"title="native">x86_64-linux"#));
+        assert!(html.contains(r#"title="emulated via extra-platforms / binfmt">aarch64-linux"#));
+        assert!(html.contains("~emu"));
     }
 
     #[test]
