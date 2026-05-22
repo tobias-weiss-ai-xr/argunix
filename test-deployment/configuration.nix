@@ -66,8 +66,8 @@ in
       };
 
       retention = {
-        max_age_days = 14;       # drop eval roots + logs older than 14 days
-        interval_minutes = 60;   # hourly (default)
+        max_age_days = 14; # drop eval roots + logs older than 14 days
+        interval_minutes = 60; # hourly (default)
       };
 
       schedule = {
@@ -166,9 +166,8 @@ in
     dates = "daily";
     options = "--delete-older-than 14d";
   };
-  nix.settings.min-free = 5  * 1024 * 1024 * 1024;   # start GC below 5 GiB free
-  nix.settings.max-free = 20 * 1024 * 1024 * 1024;   # reclaim up to 20 GiB free
-
+  nix.settings.min-free = 5 * 1024 * 1024 * 1024; # start GC below 5 GiB free
+  nix.settings.max-free = 20 * 1024 * 1024 * 1024; # reclaim up to 20 GiB free
 
   security.acme = {
     acceptTerms = true;
