@@ -551,6 +551,12 @@ async fn handle_build(
     }
     let mut cmd = Command::new(nix_store_bin);
     cmd.arg("--realise");
+    // If a substituter download fails mid-stream (e.g. S3-style cache
+    // returning HTTP/2 stream errors or 504 on a range-resume), build
+    // from source instead of failing the job. Without this nix bails
+    // with "no substituter that can build it" and points the user at
+    // `--fallback` anyway.
+    cmd.arg("--fallback");
     // Structured `@nix {…}` build events on stderr — the coordinator
     // parses them (`argunix-nom`) into per-derivation log lines. The
     // chunk transport is byte-transparent; stdout is unaffected.

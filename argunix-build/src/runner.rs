@@ -61,6 +61,11 @@ pub async fn run_build(request: &BuildRequest) -> Result<BuildOutcome, BuildErro
 
     let mut cmd = Command::new("nix-store");
     cmd.arg("--realise");
+    // If a substituter download fails mid-stream (e.g. S3-style cache
+    // returning HTTP/2 stream errors or 504 on a range-resume), build
+    // from source rather than failing the job — nix itself points users
+    // at `--fallback` in that error.
+    cmd.arg("--fallback");
     // `internal-json` makes nix emit structured `@nix {…}` activity
     // events on stderr — `argunix-nom` parses them into per-derivation
     // log lines. Output paths still go to stdout, unaffected.
