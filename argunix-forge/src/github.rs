@@ -13,6 +13,7 @@
 
 use crate::errors::ForgeError;
 use crate::events::{NormalizedEvent, PullRequestAction, PullRequestEvent, PushEvent};
+use crate::http_retry::send_with_retry;
 use crate::permission::Permission;
 use crate::{CheckHandle, CheckPost, CheckState, HookId, Provider};
 use argunix_domain::{Sha, Slug};
@@ -138,14 +139,14 @@ impl Provider for GithubProvider {
             slug.as_str(),
             pr_number
         );
-        let response = self
-            .client
-            .get(&url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/vnd.github+json")
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .send()
-            .await?;
+        let response = send_with_retry(|| {
+            self.client
+                .get(&url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/vnd.github+json")
+                .header(AUTHORIZATION, format!("Bearer {}", self.token))
+        })
+        .await?;
         let status = response.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -183,14 +184,14 @@ impl Provider for GithubProvider {
             slug.as_str(),
             user,
         );
-        let response = self
-            .client
-            .get(&url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/vnd.github+json")
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .send()
-            .await?;
+        let response = send_with_retry(|| {
+            self.client
+                .get(&url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/vnd.github+json")
+                .header(AUTHORIZATION, format!("Bearer {}", self.token))
+        })
+        .await?;
         let status = response.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -239,15 +240,16 @@ impl Provider for GithubProvider {
             payload.insert("target_url".into(), serde_json::Value::String(t));
         }
 
-        let response = self
-            .client
-            .post(&url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/vnd.github+json")
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .json(&serde_json::Value::Object(payload))
-            .send()
-            .await?;
+        let payload = serde_json::Value::Object(payload);
+        let response = send_with_retry(|| {
+            self.client
+                .post(&url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/vnd.github+json")
+                .header(AUTHORIZATION, format!("Bearer {}", self.token))
+                .json(&payload)
+        })
+        .await?;
         let status = response.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -279,14 +281,14 @@ impl Provider for GithubProvider {
     ) -> Result<HookId, ForgeError> {
         // GET existing hooks; find one whose `config.url` matches.
         let list_url = format!("{}/repos/{}/hooks", self.api_url, slug.as_str());
-        let list_resp = self
-            .client
-            .get(&list_url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/vnd.github+json")
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .send()
-            .await?;
+        let list_resp = send_with_retry(|| {
+            self.client
+                .get(&list_url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/vnd.github+json")
+                .header(AUTHORIZATION, format!("Bearer {}", self.token))
+        })
+        .await?;
         let status = list_resp.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -341,15 +343,15 @@ impl Provider for GithubProvider {
             ),
             None => (reqwest::Method::POST, list_url.clone()),
         };
-        let resp = self
-            .client
-            .request(method, &url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/vnd.github+json")
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .json(&payload)
-            .send()
-            .await?;
+        let resp = send_with_retry(|| {
+            self.client
+                .request(method.clone(), &url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/vnd.github+json")
+                .header(AUTHORIZATION, format!("Bearer {}", self.token))
+                .json(&payload)
+        })
+        .await?;
         let status = resp.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);

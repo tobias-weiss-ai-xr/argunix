@@ -15,6 +15,7 @@
 
 use crate::errors::ForgeError;
 use crate::events::{NormalizedEvent, PullRequestAction, PullRequestEvent, PushEvent};
+use crate::http_retry::send_with_retry;
 use crate::permission::Permission;
 use crate::{CheckHandle, CheckPost, CheckState, HookId, Provider};
 use argunix_domain::{Sha, Slug};
@@ -163,14 +164,14 @@ impl Provider for GitlabProvider {
             Self::project_path(slug),
             pr_number,
         );
-        let response = self
-            .client
-            .get(&url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(PRIVATE_TOKEN, &self.token)
-            .send()
-            .await?;
+        let response = send_with_retry(|| {
+            self.client
+                .get(&url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(PRIVATE_TOKEN, &self.token)
+        })
+        .await?;
         let status = response.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -212,14 +213,14 @@ impl Provider for GitlabProvider {
             self.api_url,
             url_encode_segment(user),
         );
-        let users_resp = self
-            .client
-            .get(&users_url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(PRIVATE_TOKEN, &self.token)
-            .send()
-            .await?;
+        let users_resp = send_with_retry(|| {
+            self.client
+                .get(&users_url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(PRIVATE_TOKEN, &self.token)
+        })
+        .await?;
         let status = users_resp.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -248,14 +249,14 @@ impl Provider for GitlabProvider {
             Self::project_path(slug),
             user_id,
         );
-        let members_resp = self
-            .client
-            .get(&members_url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(PRIVATE_TOKEN, &self.token)
-            .send()
-            .await?;
+        let members_resp = send_with_retry(|| {
+            self.client
+                .get(&members_url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(PRIVATE_TOKEN, &self.token)
+        })
+        .await?;
         let status = members_resp.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -303,15 +304,16 @@ impl Provider for GitlabProvider {
             payload.insert("target_url".into(), serde_json::Value::String(t));
         }
 
-        let response = self
-            .client
-            .post(&url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(PRIVATE_TOKEN, &self.token)
-            .json(&serde_json::Value::Object(payload))
-            .send()
-            .await?;
+        let payload = serde_json::Value::Object(payload);
+        let response = send_with_retry(|| {
+            self.client
+                .post(&url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(PRIVATE_TOKEN, &self.token)
+                .json(&payload)
+        })
+        .await?;
         let status = response.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -364,14 +366,14 @@ impl Provider for GitlabProvider {
     ) -> Result<HookId, ForgeError> {
         let project = Self::project_path(slug);
         let list_url = format!("{}/projects/{}/hooks", self.api_url, project);
-        let list_resp = self
-            .client
-            .get(&list_url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(PRIVATE_TOKEN, &self.token)
-            .send()
-            .await?;
+        let list_resp = send_with_retry(|| {
+            self.client
+                .get(&list_url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(PRIVATE_TOKEN, &self.token)
+        })
+        .await?;
         let status = list_resp.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -420,15 +422,15 @@ impl Provider for GitlabProvider {
             ),
             None => (reqwest::Method::POST, list_url.clone()),
         };
-        let resp = self
-            .client
-            .request(method, &url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(PRIVATE_TOKEN, &self.token)
-            .json(&payload)
-            .send()
-            .await?;
+        let resp = send_with_retry(|| {
+            self.client
+                .request(method.clone(), &url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(PRIVATE_TOKEN, &self.token)
+                .json(&payload)
+        })
+        .await?;
         let status = resp.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);

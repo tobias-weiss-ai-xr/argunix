@@ -20,6 +20,7 @@ pub mod gitlab;
 
 mod errors;
 mod events;
+mod http_retry;
 mod permission;
 
 pub use errors::ForgeError;

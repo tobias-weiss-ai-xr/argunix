@@ -17,6 +17,7 @@
 
 use crate::errors::ForgeError;
 use crate::events::{NormalizedEvent, PullRequestAction, PullRequestEvent, PushEvent};
+use crate::http_retry::send_with_retry;
 use crate::permission::Permission;
 use crate::{CheckHandle, CheckPost, CheckState, HookId, Provider};
 use argunix_domain::{Sha, Slug};
@@ -141,14 +142,14 @@ impl Provider for ForgejoProvider {
             slug.as_str(),
             pr_number,
         );
-        let response = self
-            .client
-            .get(&url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, format!("token {}", self.token))
-            .send()
-            .await?;
+        let response = send_with_retry(|| {
+            self.client
+                .get(&url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(AUTHORIZATION, format!("token {}", self.token))
+        })
+        .await?;
         let status = response.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -188,14 +189,14 @@ impl Provider for ForgejoProvider {
             slug.as_str(),
             user,
         );
-        let response = self
-            .client
-            .get(&url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, format!("token {}", self.token))
-            .send()
-            .await?;
+        let response = send_with_retry(|| {
+            self.client
+                .get(&url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(AUTHORIZATION, format!("token {}", self.token))
+        })
+        .await?;
         let status = response.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -243,15 +244,16 @@ impl Provider for ForgejoProvider {
             payload.insert("target_url".into(), serde_json::Value::String(t));
         }
 
-        let response = self
-            .client
-            .post(&url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, format!("token {}", self.token))
-            .json(&serde_json::Value::Object(payload))
-            .send()
-            .await?;
+        let payload = serde_json::Value::Object(payload);
+        let response = send_with_retry(|| {
+            self.client
+                .post(&url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(AUTHORIZATION, format!("token {}", self.token))
+                .json(&payload)
+        })
+        .await?;
         let status = response.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -287,14 +289,14 @@ impl Provider for ForgejoProvider {
     ) -> Result<HookId, ForgeError> {
         // Gitea/Forgejo: shape mirrors GitHub's REST surface.
         let list_url = format!("{}/repos/{}/hooks", self.api_url, slug.as_str());
-        let list_resp = self
-            .client
-            .get(&list_url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, format!("token {}", self.token))
-            .send()
-            .await?;
+        let list_resp = send_with_retry(|| {
+            self.client
+                .get(&list_url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(AUTHORIZATION, format!("token {}", self.token))
+        })
+        .await?;
         let status = list_resp.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
@@ -355,14 +357,14 @@ impl Provider for ForgejoProvider {
         // pushes are equally rare, the practical exposure is small.
         if let Some(h) = &existing {
             let delete_url = format!("{}/repos/{}/hooks/{}", self.api_url, slug.as_str(), h.id);
-            let del_resp = self
-                .client
-                .delete(&delete_url)
-                .header(USER_AGENT, &self.user_agent)
-                .header(ACCEPT, "application/json")
-                .header(AUTHORIZATION, format!("token {}", self.token))
-                .send()
-                .await?;
+            let del_resp = send_with_retry(|| {
+                self.client
+                    .delete(&delete_url)
+                    .header(USER_AGENT, &self.user_agent)
+                    .header(ACCEPT, "application/json")
+                    .header(AUTHORIZATION, format!("token {}", self.token))
+            })
+            .await?;
             let del_status = del_resp.status();
             if del_status.as_u16() == 401 {
                 return Err(ForgeError::Unauthorised);
@@ -378,15 +380,15 @@ impl Provider for ForgejoProvider {
                 });
             }
         }
-        let resp = self
-            .client
-            .post(&list_url)
-            .header(USER_AGENT, &self.user_agent)
-            .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, format!("token {}", self.token))
-            .json(&payload)
-            .send()
-            .await?;
+        let resp = send_with_retry(|| {
+            self.client
+                .post(&list_url)
+                .header(USER_AGENT, &self.user_agent)
+                .header(ACCEPT, "application/json")
+                .header(AUTHORIZATION, format!("token {}", self.token))
+                .json(&payload)
+        })
+        .await?;
         let status = resp.status();
         if status.as_u16() == 401 {
             return Err(ForgeError::Unauthorised);
