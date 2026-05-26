@@ -37,6 +37,14 @@ in
     routes = [ { Gateway = "fe80::1"; } ];
   };
 
+  # we were sometimes unable to resolve gitlab.opencode.de without this
+  networking.nameservers = [
+    "1.1.1.1"
+    "9.9.9.9"
+    "2606:4700:4700::1111"
+    "2620:fe::fe"
+  ];
+
   networking.firewall.allowedTCPPorts = [
     80
     443
