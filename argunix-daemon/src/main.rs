@@ -457,6 +457,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         store: store.clone(),
         log_dir: log_dir.clone(),
         gc_root_dir: gc_root_dir.clone(),
+        sizer: std::sync::Arc::new(gc::NixStoreSizer {
+            nix_store_bin: args.nix_store_bin.clone(),
+        }),
     });
 
     let control_handle = control::spawn(control::ControlContext {

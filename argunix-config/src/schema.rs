@@ -183,6 +183,13 @@ impl Default for Schedule {
 /// sizing across repos is the budget operators actually care about,
 /// and one ticker fits all. Per-repo override is a separate
 /// [`RepoRetention`] carried on each [`Repo`].
+///
+/// `max_size_gb` is measured against the **store closure** that
+/// argunix's gcroots pin (i.e. the bytes the operator sees in
+/// `/nix/store` because of CI), not the log directory. Logs are
+/// zstd-compressed text — typically << the build outputs they
+/// describe. Sum is taken via `nix-store --query --size` over the
+/// union closure of all rooted paths under `gc_root_dir`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Retention {

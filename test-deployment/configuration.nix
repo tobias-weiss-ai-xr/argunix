@@ -75,6 +75,7 @@ in
 
       retention = {
         max_age_days = 14; # drop eval roots + logs older than 14 days
+        max_size_gb = 40;
         interval_minutes = 60; # hourly (default)
       };
 

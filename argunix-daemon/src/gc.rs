@@ -6,8 +6,12 @@
 //!
 //! 1. **Age**: per-repo, drop terminal evals whose `finished_at` is older
 //!    than `effective_max_age_days(repo, global)`.
-//! 2. **Size**: global, while the log directory exceeds `max_size_gb`,
-//!    drop the oldest terminal evals across all repos until under budget.
+//! 2. **Size**: global, while the store closure pinned by argunix's
+//!    gcroots exceeds `max_size_gb`, drop the oldest terminal evals
+//!    across all repos until under budget. The closure footprint —
+//!    not the log directory — is what matters for disk: log files
+//!    are zstd-compressed log lines, build outputs are sometimes
+//!    gigabytes of OCI image layers.
 //!
 //! Non-terminal evals (queued / evaluating / building) are never deleted
 //! — those are the redrive bug's territory, not retention's. GC roots
@@ -19,16 +23,41 @@
 //! of `prune_orphan_state` at startup.
 //!
 //! `tick` is split out from `run` so unit tests can drive a single pass
-//! against a synthetic store + log tree with an injected clock.
+//! against a synthetic store + log tree with an injected clock and a
+//! stubbed [`RootedStoreSizer`].
 
 use argunix_config::Config;
 use argunix_domain::{EvalId, RepoId};
 use argunix_store::{EvalStore, RepoStore, SqlxStore};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::process::Command;
 use tokio::task::JoinHandle;
+
+/// Source of "how many bytes is argunix pinning?" measurements.
+/// Pluggable so tests can drive the size pass deterministically
+/// without needing a real /nix/store. Production is [`NixStoreSizer`].
+#[async_trait]
+pub trait RootedStoreSizer: Send + Sync {
+    /// Sum of NAR sizes of the unique store paths reachable through
+    /// gcroot symlinks planted under `gc_root_dir`. Returns 0 on any
+    /// hard failure (missing nix binary, permission error, etc.) so
+    /// the retention loop stays best-effort.
+    async fn rooted_bytes(&self, gc_root_dir: &Path) -> u64;
+}
+
+/// Production sizer. Shells out to `nix-store --query` twice:
+/// first to expand each gcroot target into its closure, then to ask
+/// for per-path NAR sizes. Both invocations are chunked so a wide
+/// gcroot tree doesn't exceed `ARG_MAX`.
+pub struct NixStoreSizer {
+    pub nix_store_bin: PathBuf,
+}
 
 /// Wiring for the retention task. Cloned out of `serve()`'s state next
 /// to the worker / control / builder spawns.
@@ -37,6 +66,7 @@ pub struct GcContext {
     pub store: SqlxStore,
     pub log_dir: PathBuf,
     pub gc_root_dir: PathBuf,
+    pub sizer: Arc<dyn RootedStoreSizer>,
 }
 
 /// One pass's outcome. Returned for tests; the run loop logs it.
@@ -44,7 +74,12 @@ pub struct GcContext {
 pub struct TickStats {
     pub age_deleted: u64,
     pub size_deleted: u64,
+    /// Bytes of rooted store closure that became unreachable across
+    /// this pass. Computed as `rooted_bytes(pre) - rooted_bytes(post)`
+    /// around each size-pass batch, so closures shared across evals
+    /// don't double-count.
     pub bytes_freed: u64,
+    /// Rooted store bytes still pinned at end of pass.
     pub bytes_remaining: u64,
 }
 
@@ -69,6 +104,7 @@ async fn run(ctx: GcContext) {
             &ctx.store,
             &ctx.log_dir,
             &ctx.gc_root_dir,
+            ctx.sizer.as_ref(),
             Utc::now(),
         )
         .await;
@@ -96,6 +132,7 @@ pub async fn tick(
     store: &SqlxStore,
     log_dir: &Path,
     gc_root_dir: &Path,
+    sizer: &dyn RootedStoreSizer,
     now: DateTime<Utc>,
 ) -> TickStats {
     let mut stats = TickStats::default();
@@ -126,19 +163,23 @@ pub async fn tick(
             }
         };
         for eval in stale {
-            let freed = delete_eval(eval.id, eval.repo_id, store, log_dir, gc_root_dir).await;
+            let _ = delete_eval(eval.id, eval.repo_id, store, log_dir, gc_root_dir).await;
             stats.age_deleted += 1;
-            stats.bytes_freed += freed;
         }
     }
 
-    // ── 2. Size pass. Global cap on the log dir on disk.
-    let mut current_bytes = dir_size(log_dir).await.unwrap_or(0);
+    // ── 2. Size pass. Global cap on the rooted store closure. We measure
+    // once at the start, again after each batch of deletions, and use
+    // the difference for `bytes_freed` so closures shared across evals
+    // don't double-count.
+    let mut current_bytes = sizer.rooted_bytes(gc_root_dir).await;
     if let Some(max_gb) = config.retention.max_size_gb {
         let cap = max_gb.saturating_mul(1024 * 1024 * 1024);
-        // Pull oldest-first in batches so a tick over a deeply oversized
-        // tree doesn't have to load every eval into memory at once.
-        const BATCH: u32 = 64;
+        // Batches are small so we don't over-evict by much between
+        // remeasurements: deleting ~8 evals' worth of gcroots reclaims
+        // a meaningful chunk without skipping the cap by a week of
+        // builds.
+        const BATCH: u32 = 8;
         while current_bytes > cap {
             let batch = match <SqlxStore as EvalStore>::list_terminal_evals_oldest_first(
                 store, BATCH,
@@ -152,26 +193,26 @@ pub async fn tick(
                     break;
                 }
             };
-            let mut deleted_in_batch = 0;
+            let mut deleted_in_batch: u64 = 0;
             for eval in batch {
-                if current_bytes <= cap {
-                    break;
-                }
-                let freed = delete_eval(eval.id, eval.repo_id, store, log_dir, gc_root_dir).await;
+                let _ = delete_eval(eval.id, eval.repo_id, store, log_dir, gc_root_dir).await;
                 stats.size_deleted += 1;
-                stats.bytes_freed += freed;
-                current_bytes = current_bytes.saturating_sub(freed);
                 deleted_in_batch += 1;
             }
-            // No progress (e.g. every eval's log dir is already missing
-            // and the on-disk size is dominated by orphan files we can't
-            // attribute) → don't loop forever. Bail with a warning so the
-            // operator notices.
-            if deleted_in_batch == 0 {
+            let after = sizer.rooted_bytes(gc_root_dir).await;
+            let freed = current_bytes.saturating_sub(after);
+            stats.bytes_freed = stats.bytes_freed.saturating_add(freed);
+            current_bytes = after;
+            // No progress (eval rows exist but their gcroots were
+            // already missing, or the sizer is broken) → don't loop
+            // forever. Bail with a warning so the operator notices.
+            if freed == 0 && deleted_in_batch > 0 {
                 tracing::warn!(
                     bytes = current_bytes,
                     cap,
-                    "retention: size pass made no progress despite remaining evals; manual cleanup likely needed",
+                    deleted_in_batch,
+                    "retention: size pass deleted evals but freed no rooted bytes; \
+                     gcroots may already be gone or sizer is misconfigured",
                 );
                 break;
             }
@@ -181,17 +222,16 @@ pub async fn tick(
     stats
 }
 
-/// Cascade-delete one eval's DB rows + on-disk state. Returns the
-/// number of bytes freed from the log directory (best-effort — 0 on
-/// any error or missing path). Failures of either step are logged but
-/// non-fatal: the goal is "make as much progress as we can per tick".
+/// Cascade-delete one eval's DB rows + on-disk state. Failures of
+/// either step are logged but non-fatal: the goal is "make as much
+/// progress as we can per tick".
 async fn delete_eval(
     eval_id: EvalId,
     repo_id: RepoId,
     store: &SqlxStore,
     log_dir: &Path,
     gc_root_dir: &Path,
-) -> u64 {
+) {
     let log_path = log_dir
         .join(repo_id.get().to_string())
         .join(eval_id.get().to_string());
@@ -199,16 +239,12 @@ async fn delete_eval(
         .join(repo_id.get().to_string())
         .join(eval_id.get().to_string());
 
-    // Measure before removing so we can return bytes freed without
-    // re-walking the whole tree.
-    let bytes = dir_size(&log_path).await.unwrap_or(0);
-
     // DB first. If this fails we keep the files: a future tick will
     // try again. The opposite ordering would risk surfacing a 404 for
     // a still-listed eval.
     if let Err(e) = <SqlxStore as EvalStore>::delete_eval_cascade(store, eval_id).await {
         tracing::warn!(error = %e, eval_id = eval_id.get(), "retention: cascade-delete failed");
-        return 0;
+        return;
     }
 
     if let Err(e) = tokio::fs::remove_dir_all(&log_path).await {
@@ -221,13 +257,14 @@ async fn delete_eval(
             tracing::warn!(error = %e, dir = %gc_path.display(), "retention: gcroot dir removal failed");
         }
     }
-    bytes
 }
 
 /// Recursive on-disk size. Returns 0 if the path doesn't exist (the
 /// log dir is created lazily on first build, so a fresh deployment
 /// won't have one yet). Walked iteratively to avoid stack growth on
-/// deep trees.
+/// deep trees. Kept around because the test infrastructure still uses
+/// it to drive a synthetic [`FakeSizer`].
+#[cfg(test)]
 async fn dir_size(root: &Path) -> std::io::Result<u64> {
     let mut total: u64 = 0;
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -247,6 +284,134 @@ async fn dir_size(root: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// Walk `gc_root_dir` and resolve every symlink it contains to its
+/// store-path target. Non-symlinks (intermediate `<repo>/<eval>/`
+/// directories) recurse; dangling symlinks are skipped silently.
+async fn collect_gcroot_targets(gc_root_dir: &Path) -> Vec<PathBuf> {
+    let mut targets: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![gc_root_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    dir = %dir.display(),
+                    "rooted_bytes: read_dir failed",
+                );
+                continue;
+            }
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let ft = match entry.file_type().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                if let Ok(target) = tokio::fs::canonicalize(entry.path()).await {
+                    if target.starts_with("/nix/store") {
+                        targets.push(target);
+                    }
+                }
+            } else if ft.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    targets
+}
+
+/// Spawn `nix-store <args> <chunk>` and capture stdout. Hard failures
+/// (binary missing, non-zero exit) log a warning and return None.
+async fn run_nix_store(bin: &Path, args: &[&str], chunk: &[&str]) -> Option<Vec<u8>> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    cmd.args(chunk);
+    cmd.stdin(Stdio::null()).stderr(Stdio::piped());
+    let out = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(error = %e, bin = %bin.display(), "rooted_bytes: spawn failed");
+            return None;
+        }
+    };
+    if !out.status.success() {
+        tracing::warn!(
+            bin = %bin.display(),
+            args = ?args,
+            status = ?out.status.code(),
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            "rooted_bytes: nix-store returned non-zero",
+        );
+        return None;
+    }
+    Some(out.stdout)
+}
+
+/// Chunk size for nix-store arg lists. Picked so a chunk's total argv
+/// stays well under typical `ARG_MAX` (2 MiB on Linux): 200 store paths
+/// × ~120 chars each ≈ 24 KiB.
+const NIX_CHUNK: usize = 200;
+
+#[async_trait]
+impl RootedStoreSizer for NixStoreSizer {
+    async fn rooted_bytes(&self, gc_root_dir: &Path) -> u64 {
+        let targets = collect_gcroot_targets(gc_root_dir).await;
+        if targets.is_empty() {
+            return 0;
+        }
+        let target_strs: Vec<String> = targets
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+
+        // Step 1: expand each gcroot target's transitive closure. The
+        // output is naturally deduplicated within one invocation; we
+        // dedupe across chunks ourselves.
+        let mut closure: HashSet<String> = HashSet::new();
+        for chunk in target_strs.chunks(NIX_CHUNK) {
+            let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            let Some(stdout) =
+                run_nix_store(&self.nix_store_bin, &["--query", "--requisites"], &refs).await
+            else {
+                return 0;
+            };
+            for line in String::from_utf8_lossy(&stdout).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    closure.insert(trimmed.to_string());
+                }
+            }
+        }
+        if closure.is_empty() {
+            return 0;
+        }
+
+        // Step 2: ask nix for each closure-path's NAR size and sum.
+        let closure_vec: Vec<String> = closure.into_iter().collect();
+        let mut total: u64 = 0;
+        for chunk in closure_vec.chunks(NIX_CHUNK) {
+            let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            let Some(stdout) =
+                run_nix_store(&self.nix_store_bin, &["--query", "--size"], &refs).await
+            else {
+                return 0;
+            };
+            for line in String::from_utf8_lossy(&stdout).lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(b) = trimmed.parse::<u64>() {
+                    total = total.saturating_add(b);
+                }
+            }
+        }
+        total
+    }
 }
 
 #[cfg(test)]
@@ -316,13 +481,69 @@ mod tests {
         )
     }
 
+    /// Test sizer that returns `bytes_per_eval × (number of `<repo>/<eval>`
+    /// subdirs present under `gc_root_dir`). Drives the size pass
+    /// deterministically: each eval represents a constant chunk of
+    /// "rooted store bytes", and `delete_eval` removing the subdir
+    /// decreases the next measurement by exactly one chunk.
+    struct FakeSizer {
+        bytes_per_eval: u64,
+    }
+
+    #[async_trait]
+    impl RootedStoreSizer for FakeSizer {
+        async fn rooted_bytes(&self, gc_root_dir: &Path) -> u64 {
+            let mut count: u64 = 0;
+            let Ok(mut repos) = tokio::fs::read_dir(gc_root_dir).await else {
+                return 0;
+            };
+            while let Ok(Some(repo_ent)) = repos.next_entry().await {
+                if !repo_ent
+                    .file_type()
+                    .await
+                    .map(|t| t.is_dir())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Ok(mut evals) = tokio::fs::read_dir(repo_ent.path()).await else {
+                    continue;
+                };
+                while let Ok(Some(eval_ent)) = evals.next_entry().await {
+                    if eval_ent
+                        .file_type()
+                        .await
+                        .map(|t| t.is_dir())
+                        .unwrap_or(false)
+                    {
+                        count = count.saturating_add(1);
+                    }
+                }
+            }
+            count.saturating_mul(self.bytes_per_eval)
+        }
+    }
+
+    /// Convenience: tests that don't exercise the size pass pass this so
+    /// the sizer never trips the cap. Equivalent to "no gcroots planted".
+    struct ZeroSizer;
+
+    #[async_trait]
+    impl RootedStoreSizer for ZeroSizer {
+        async fn rooted_bytes(&self, _: &Path) -> u64 {
+            0
+        }
+    }
+
     /// Create a finished eval *and* drop a fake log file at the
     /// expected path so size measurement is exercised end-to-end. Pads
     /// the file out to `payload_bytes` so size-pass ordering can be
-    /// asserted deterministically.
+    /// asserted deterministically. Also plants an empty `gc_dir/<repo>/<eval>`
+    /// directory so the [`FakeSizer`] can attribute rooted bytes to it.
     async fn finished_eval_with_log(
         store: &SqlxStore,
         log_dir: &Path,
+        gc_dir: &Path,
         repo_id: RepoId,
         sha_pad: char,
         status: EvalStatus,
@@ -367,6 +588,16 @@ mod tests {
         tokio::fs::write(&path, vec![0u8; payload_bytes])
             .await
             .unwrap();
+        // Stand-in for `gc_root::add_gc_root`: an empty directory under
+        // `<gc_dir>/<repo>/<eval>` that the FakeSizer counts and that
+        // `delete_eval` cleans up.
+        tokio::fs::create_dir_all(
+            gc_dir
+                .join(repo_id.get().to_string())
+                .join(eval_id.get().to_string()),
+        )
+        .await
+        .unwrap();
         eval_id
     }
 
@@ -399,6 +630,7 @@ mod tests {
         let stale = finished_eval_with_log(
             &s,
             &log_dir,
+            &gc_dir,
             repo_id,
             '1',
             EvalStatus::Done,
@@ -409,6 +641,7 @@ mod tests {
         let recent = finished_eval_with_log(
             &s,
             &log_dir,
+            &gc_dir,
             repo_id,
             '2',
             EvalStatus::Done,
@@ -433,7 +666,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stats = tick(&config, &s, &log_dir, &gc_dir, now).await;
+        let stats = tick(&config, &s, &log_dir, &gc_dir, &ZeroSizer, now).await;
         assert_eq!(stats.age_deleted, 1);
         assert_eq!(stats.size_deleted, 0);
 
@@ -508,6 +741,7 @@ mod tests {
         let lenient_eval = finished_eval_with_log(
             &s,
             &log_dir,
+            &gc_dir,
             lenient,
             '1',
             EvalStatus::Done,
@@ -518,6 +752,7 @@ mod tests {
         let strict_eval = finished_eval_with_log(
             &s,
             &log_dir,
+            &gc_dir,
             strict,
             '2',
             EvalStatus::Done,
@@ -526,7 +761,7 @@ mod tests {
         )
         .await;
 
-        let stats = tick(&config, &s, &log_dir, &gc_dir, now).await;
+        let stats = tick(&config, &s, &log_dir, &gc_dir, &ZeroSizer, now).await;
         assert_eq!(stats.age_deleted, 1);
         assert!(
             <SqlxStore as EvalStore>::get(&s, lenient_eval)
@@ -573,10 +808,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Three terminal evals at increasing finish times.
+        // Three terminal evals at increasing finish times. The
+        // FakeSizer attributes 2 GiB of rooted store bytes to each
+        // eval gcroot dir, so the initial measurement is 6 GiB and
+        // the size pass evicts oldest-first until 0.
+        let two_gib: u64 = 2 * 1024 * 1024 * 1024;
+        let sizer = FakeSizer {
+            bytes_per_eval: two_gib,
+        };
         let oldest = finished_eval_with_log(
             &s,
             &log_dir,
+            &gc_dir,
             repo_id,
             '1',
             EvalStatus::Done,
@@ -587,6 +830,7 @@ mod tests {
         let middle = finished_eval_with_log(
             &s,
             &log_dir,
+            &gc_dir,
             repo_id,
             '2',
             EvalStatus::Done,
@@ -597,6 +841,7 @@ mod tests {
         let newest = finished_eval_with_log(
             &s,
             &log_dir,
+            &gc_dir,
             repo_id,
             '3',
             EvalStatus::Done,
@@ -605,7 +850,7 @@ mod tests {
         )
         .await;
 
-        let stats = tick(&config, &s, &log_dir, &gc_dir, now).await;
+        let stats = tick(&config, &s, &log_dir, &gc_dir, &sizer, now).await;
         assert_eq!(stats.size_deleted, 3);
         for id in [oldest, middle, newest] {
             assert!(
@@ -615,10 +860,10 @@ mod tests {
                     .is_none()
             );
         }
-        // bytes_remaining is what `dir_size` saw at the start of the
-        // pass minus what we attributed to deleted evals. With
-        // payload-only files the residual should be near zero.
+        // All three eval gcroot subdirs gone → sizer now returns 0,
+        // and bytes_freed equals the initial 6 GiB.
         assert_eq!(stats.bytes_remaining, 0);
+        assert_eq!(stats.bytes_freed, 3 * two_gib);
     }
 
     #[tokio::test]
@@ -641,6 +886,7 @@ mod tests {
         let eval = finished_eval_with_log(
             &s,
             &log_dir,
+            &gc_dir,
             repo_id,
             '1',
             EvalStatus::Done,
@@ -649,7 +895,7 @@ mod tests {
         )
         .await;
 
-        let stats = tick(&config, &s, &log_dir, &gc_dir, now).await;
+        let stats = tick(&config, &s, &log_dir, &gc_dir, &ZeroSizer, now).await;
         assert_eq!(stats.age_deleted, 0);
         assert_eq!(stats.size_deleted, 0);
         assert!(

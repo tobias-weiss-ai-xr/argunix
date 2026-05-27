@@ -23,6 +23,7 @@ argunix-sched = { path = "../argunix-sched" }
 argunix-store = { workspace = true }
 argunix-web = { path = "../argunix-web" }
 arc-swap = { workspace = true }
+async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }

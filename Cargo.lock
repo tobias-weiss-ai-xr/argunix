@@ -284,6 +284,7 @@ dependencies = [
  "argunix-sched",
  "argunix-store",
  "argunix-web",
+ "async-trait",
  "axum",
  "bytes",
  "chrono",

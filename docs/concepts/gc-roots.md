@@ -34,3 +34,16 @@ against the database, finds **terminal** evaluations to drop
 subtrees, and deletes the corresponding rows. Defaults are
 keep-everything; operators set `retention.max_size_gb` and/or a
 max age to bound disk use.
+
+`max_size_gb` is the **store closure** budget — the union NAR size
+of every store path pinned by an argunix gcroot, computed by
+`nix-store --query --requisites` followed by `nix-store --query
+--size`. This is the variable that actually shows up in `df`. When
+the budget is exceeded the size pass drops oldest-first, then
+re-measures; this catches closures shared between evals (so it
+doesn't over-evict on a single batch).
+
+The size pass cleans up gcroot symlinks but does not invoke
+`nix-store --gc`. Nix's automatic GC (or the operator's
+`nix-collect-garbage`) does the actual store reclaim — usually
+triggered by `nix.settings.min-free` on NixOS.
