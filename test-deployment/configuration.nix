@@ -118,6 +118,7 @@ in
           web_url = "https://github.com";
           token_path = "/var/lib/argunix-credentials/gh-token";
           repos = {
+            "applicative-systems/gcan" = { };
             "applicative-systems/mkdocs-flake" = { };
             "applicative-systems/nixos-appliance-ota-update" = { };
             "applicative-systems/nixos-test-driver-manual" = { };
