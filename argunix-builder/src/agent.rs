@@ -23,6 +23,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -107,6 +108,80 @@ impl AgentConfig {
     }
 }
 
+/// How long the agent tolerates *zero* connection progress — no
+/// heartbeat sent, no control frame received, no log chunk written —
+/// before it concludes the control session is wedged and tears it down
+/// to reconnect. The failure this guards against does not surface as an
+/// error: a stalled outbound flush against a back-pressured or silently
+/// half-open coordinator just *blocks forever* (TCP raises nothing for a
+/// slow-but-alive peer, and russh's own keepalive is starved on the same
+/// wedged task). Set equal to the coordinator's
+/// [`argunix_builders::LIVENESS_MAX_SILENCE`]: past that point the
+/// coordinator has already evicted us, so clinging to the dead socket is
+/// pointless — reconnecting re-enrols us and refills the pool.
+const SELF_LIVENESS_TIMEOUT: Duration = argunix_builders::LIVENESS_MAX_SILENCE;
+
+/// Upper bound on a single outbound `channel.data()` write. A write that
+/// neither completes nor errors within this window is wedged on a full
+/// send window the peer will never drain; time out and reconnect rather
+/// than park the session loop indefinitely. This is the load-bearing
+/// fix — the incident where builders silently vanished from the pool was
+/// a write that blocked here forever without ever erroring.
+const WRITE_STALL_TIMEOUT: Duration = argunix_builders::LIVENESS_MAX_SILENCE;
+
+/// How often the self-liveness watchdog re-checks the progress clock.
+const PROGRESS_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Monotonic "last progress" clock shared by the session loop and the
+/// self-liveness watchdog. Any byte that moves on the control channel —
+/// a heartbeat we managed to send, a control frame we received, or a
+/// build lifecycle/log chunk we wrote — bumps it. The watchdog
+/// reconnects when nothing has moved for [`SELF_LIVENESS_TIMEOUT`]. On a
+/// healthy link the 5s heartbeat keeps bumping it (heartbeats interleave
+/// even during a large side-channel transfer); only a genuinely wedged
+/// session, where even the heartbeat write blocks, lets it go stale.
+struct ProgressClock {
+    base: tokio::time::Instant,
+    last_ms: AtomicU64,
+}
+
+impl ProgressClock {
+    fn new() -> Self {
+        Self {
+            base: tokio::time::Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Record that the connection just made progress.
+    fn bump(&self) {
+        self.last_ms
+            .store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Time since the last [`Self::bump`].
+    fn idle(&self) -> Duration {
+        let now = self.base.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.last_ms.load(Ordering::Relaxed)))
+    }
+}
+
+/// Resolves once `clock` has shown no progress for `timeout`. Driven as a
+/// *sibling* of the session loop in an outer `select!`, so its timer is
+/// still serviced while the session loop is parked inside a wedged
+/// `channel.data().await` — the one situation neither a write error nor
+/// russh's own keepalive can surface.
+async fn liveness_watchdog(clock: Arc<ProgressClock>, timeout: Duration, scan: Duration) {
+    let mut tick = tokio::time::interval(scan);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if clock.idle() >= timeout {
+            return;
+        }
+    }
+}
+
 /// The agent's main loop. Returns `Ok(())` on clean shutdown.
 /// Reconnects with exponential backoff on transport / auth failures
 /// (auth failure that's clearly fatal — no token configured — bails
@@ -176,6 +251,13 @@ async fn serve_one_connection(
     let client_cfg = Arc::new(client::Config {
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
+        // Enlarge the per-channel flow-control window (russh's 2 MiB
+        // default deadlocks the bidirectional nix-daemon tunnel on a
+        // large closure push). This governs the coordinator→builder
+        // (request/NAR) direction. See
+        // `argunix_builders::BUILDER_SESSION_WINDOW_SIZE`.
+        window_size: argunix_builders::BUILDER_SESSION_WINDOW_SIZE,
+        maximum_packet_size: argunix_builders::BUILDER_SESSION_MAX_PACKET,
         ..client::Config::default()
     });
     let handler = AgentClient {
@@ -330,140 +412,200 @@ async fn serve_one_connection(
     let in_flight: Arc<StdMutex<HashMap<i64, oneshot::Sender<()>>>> =
         Arc::new(StdMutex::new(HashMap::new()));
 
-    let outcome = 'session: loop {
-        tokio::select! {
-            _ = &mut *shutdown => {
-                // Best-effort goodbye, bounded by a short timeout. Over
-                // a half-open connection an un-timeouted
-                // `channel.data().await` blocks until russh's keepalive
-                // tears the session down (~90s), which makes
-                // `systemctl stop`/`restart` of the agent unit hang
-                // until systemd escalates to SIGKILL. We're exiting
-                // regardless — a dropped `Shutdown` message just means
-                // argunix reaps us via its own keepalive instead of
-                // seeing a clean drain.
-                let bye = ControlMessage::Shutdown {
-                    reason: "agent stopping".into(),
-                    drain: false,
-                };
-                let goodbye = async {
-                    let _ = channel.data(&bye.encode_line()[..]).await;
-                    let _ = channel.close().await;
-                    let _ = session.disconnect(
-                        russh::Disconnect::ByApplication,
-                        "agent shutdown",
-                        "en",
-                    ).await;
-                };
-                if tokio::time::timeout(Duration::from_secs(3), goodbye)
+    // Progress clock for the self-liveness watchdog (below). The session
+    // loop runs as the inner future of an outer `select!` against the
+    // watchdog; the watchdog is a sibling future, so it is still polled
+    // even while this loop is parked inside a wedged `channel.data()`.
+    let progress = Arc::new(ProgressClock::new());
+    let session_loop = async {
+        'session: loop {
+            tokio::select! {
+                _ = &mut *shutdown => {
+                    // Best-effort goodbye, bounded by a short timeout. Over
+                    // a half-open connection an un-timeouted
+                    // `channel.data().await` blocks until russh's keepalive
+                    // tears the session down (~90s), which makes
+                    // `systemctl stop`/`restart` of the agent unit hang
+                    // until systemd escalates to SIGKILL. We're exiting
+                    // regardless — a dropped `Shutdown` message just means
+                    // argunix reaps us via its own keepalive instead of
+                    // seeing a clean drain.
+                    let bye = ControlMessage::Shutdown {
+                        reason: "agent stopping".into(),
+                        drain: false,
+                    };
+                    let goodbye = async {
+                        let _ = channel.data(&bye.encode_line()[..]).await;
+                        let _ = channel.close().await;
+                        let _ = session.disconnect(
+                            russh::Disconnect::ByApplication,
+                            "agent shutdown",
+                            "en",
+                        ).await;
+                    };
+                    if tokio::time::timeout(Duration::from_secs(3), goodbye)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "graceful shutdown timed out (connection likely half-open); exiting anyway",
+                        );
+                    }
+                    break 'session Ok(true);
+                }
+                _ = hb_interval.tick() => {
+                    let hb = ControlMessage::Heartbeat {
+                        ts: chrono::Utc::now().timestamp(),
+                        stats: stats_sampler.sample(),
+                    };
+                    // Bounded write: a heartbeat that neither completes nor
+                    // errors within the window means the session is wedged
+                    // (full send window against a peer that never drains).
+                    // Treat it as a disconnect and reconnect.
+                    match tokio::time::timeout(
+                        WRITE_STALL_TIMEOUT,
+                        channel.data(&hb.encode_line()[..]),
+                    )
                     .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        "graceful shutdown timed out (connection likely half-open); exiting anyway",
-                    );
-                }
-                break 'session Ok(true);
-            }
-            _ = hb_interval.tick() => {
-                let hb = ControlMessage::Heartbeat {
-                    ts: chrono::Utc::now().timestamp(),
-                    stats: stats_sampler.sample(),
-                };
-                if channel.data(&hb.encode_line()[..]).await.is_err() {
-                    break 'session Ok(false);
-                }
-            }
-            // Outbound from build tasks → SSH channel.
-            Some(bytes) = out_rx.recv() => {
-                if channel.data(&bytes[..]).await.is_err() {
-                    break 'session Ok(false);
-                }
-            }
-            ev = channel.wait() => match ev {
-                Some(ChannelMsg::Data { data }) => {
-                    for parsed in framer.extend(&data) {
-                        match parsed {
-                            Ok(ControlMessage::Kick { reason }) => {
-                                tracing::warn!(reason = %reason, "kicked by argunix; reconnect after backoff");
-                                break 'session Ok(false);
-                            }
-                            Ok(ControlMessage::Build {
-                                build_id,
-                                drv_path,
-                                gc_root,
-                                timeout_secs,
-                                max_log_bytes,
-                            }) => {
-                                let (abort_tx, abort_rx) = oneshot::channel::<()>();
-                                in_flight
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .insert(build_id, abort_tx);
-                                let nix_store_bin = cfg.nix_store_bin.clone();
-                                let out_tx = out_tx.clone();
-                                let in_flight_for_task = in_flight.clone();
-                                // If the daemon supplied a gcroot path it
-                                // owns the lifetime; otherwise we plant a
-                                // throwaway under our state dir solely to
-                                // silence `nix-store`'s "you did not
-                                // specify '--add-root'…" warning. Either
-                                // way we hand the agent path to handle_build
-                                // and `agent_owns_gcroot` tells it whether
-                                // to clean up after the build.
-                                let (effective_gcroot, agent_owns_gcroot) = match gc_root {
-                                    Some(p) => (Some(p), false),
-                                    None => (
-                                        Some(
-                                            cfg.build_gcroot_dir
-                                                .join(build_id.to_string())
-                                                .to_string_lossy()
-                                                .into_owned(),
-                                        ),
-                                        true,
-                                    ),
-                                };
-                                tokio::spawn(async move {
-                                    handle_build(
-                                        build_id,
-                                        drv_path,
-                                        effective_gcroot,
-                                        agent_owns_gcroot,
-                                        timeout_secs,
-                                        max_log_bytes,
-                                        &nix_store_bin,
-                                        out_tx,
-                                        abort_rx,
-                                    ).await;
-                                    in_flight_for_task
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .remove(&build_id);
-                                });
-                            }
-                            Ok(ControlMessage::Abort { build_id }) => {
-                                let tx = in_flight
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .remove(&build_id);
-                                if let Some(tx) = tx {
-                                    let _ = tx.send(());
-                                } else {
-                                    tracing::debug!(build_id, "abort for unknown build_id; ignoring");
-                                }
-                            }
-                            Ok(other) => {
-                                tracing::warn!(?other, "ignoring unexpected server-to-builder message");
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "control line dropped");
-                            }
+                    {
+                        Ok(Ok(())) => progress.bump(),
+                        Ok(Err(_)) => break 'session Ok(false),
+                        Err(_) => {
+                            tracing::warn!(
+                                "heartbeat write stalled past the liveness timeout; reconnecting",
+                            );
+                            break 'session Ok(false);
                         }
                     }
                 }
-                Some(ChannelMsg::Close) | None => break 'session Ok(false),
-                Some(_) => continue,
+                // Outbound from build tasks → SSH channel.
+                Some(bytes) = out_rx.recv() => {
+                    match tokio::time::timeout(
+                        WRITE_STALL_TIMEOUT,
+                        channel.data(&bytes[..]),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => progress.bump(),
+                        Ok(Err(_)) => break 'session Ok(false),
+                        Err(_) => {
+                            tracing::warn!(
+                                "build log/lifecycle write stalled past the liveness timeout; reconnecting",
+                            );
+                            break 'session Ok(false);
+                        }
+                    }
+                }
+                ev = channel.wait() => match ev {
+                    Some(ChannelMsg::Data { data }) => {
+                        progress.bump();
+                        for parsed in framer.extend(&data) {
+                            match parsed {
+                                Ok(ControlMessage::Kick { reason }) => {
+                                    tracing::warn!(reason = %reason, "kicked by argunix; reconnect after backoff");
+                                    break 'session Ok(false);
+                                }
+                                Ok(ControlMessage::Build {
+                                    build_id,
+                                    drv_path,
+                                    gc_root,
+                                    timeout_secs,
+                                    max_log_bytes,
+                                }) => {
+                                    let (abort_tx, abort_rx) = oneshot::channel::<()>();
+                                    in_flight
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .insert(build_id, abort_tx);
+                                    let nix_store_bin = cfg.nix_store_bin.clone();
+                                    let out_tx = out_tx.clone();
+                                    let in_flight_for_task = in_flight.clone();
+                                    // If the daemon supplied a gcroot path it
+                                    // owns the lifetime; otherwise we plant a
+                                    // throwaway under our state dir solely to
+                                    // silence `nix-store`'s "you did not
+                                    // specify '--add-root'…" warning. Either
+                                    // way we hand the agent path to handle_build
+                                    // and `agent_owns_gcroot` tells it whether
+                                    // to clean up after the build.
+                                    let (effective_gcroot, agent_owns_gcroot) = match gc_root {
+                                        Some(p) => (Some(p), false),
+                                        None => (
+                                            Some(
+                                                cfg.build_gcroot_dir
+                                                    .join(build_id.to_string())
+                                                    .to_string_lossy()
+                                                    .into_owned(),
+                                            ),
+                                            true,
+                                        ),
+                                    };
+                                    tokio::spawn(async move {
+                                        handle_build(
+                                            build_id,
+                                            drv_path,
+                                            effective_gcroot,
+                                            agent_owns_gcroot,
+                                            timeout_secs,
+                                            max_log_bytes,
+                                            &nix_store_bin,
+                                            out_tx,
+                                            abort_rx,
+                                        ).await;
+                                        in_flight_for_task
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .remove(&build_id);
+                                    });
+                                }
+                                Ok(ControlMessage::Abort { build_id }) => {
+                                    let tx = in_flight
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .remove(&build_id);
+                                    if let Some(tx) = tx {
+                                        let _ = tx.send(());
+                                    } else {
+                                        tracing::debug!(build_id, "abort for unknown build_id; ignoring");
+                                    }
+                                }
+                                Ok(other) => {
+                                    tracing::warn!(?other, "ignoring unexpected server-to-builder message");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "control line dropped");
+                                }
+                            }
+                        }
+                    }
+                    Some(ChannelMsg::Close) | None => break 'session Ok(false),
+                    Some(_) => continue,
+                }
             }
+        }
+    };
+
+    // Run the session loop against the self-liveness watchdog. The
+    // watchdog wins only if the loop made no progress for
+    // `SELF_LIVENESS_TIMEOUT` — i.e. it is wedged on a flush that will
+    // never complete. Returning `Ok(false)` drops `session`/`channel`
+    // when this function returns, closing the dead socket, and `run`
+    // reconnects with backoff; the fresh `Hello` displaces our stale
+    // registry entry on the coordinator.
+    let outcome = tokio::select! {
+        o = session_loop => o,
+        _ = liveness_watchdog(
+            progress.clone(),
+            SELF_LIVENESS_TIMEOUT,
+            PROGRESS_SCAN_INTERVAL,
+        ) => {
+            tracing::warn!(
+                idle_ms = progress.idle().as_millis() as u64,
+                timeout_ms = SELF_LIVENESS_TIMEOUT.as_millis() as u64,
+                "self-liveness watchdog fired: no connection progress within \
+                 the timeout; tearing down the wedged session to reconnect",
+            );
+            Ok(false)
         }
     };
 
@@ -1559,5 +1701,69 @@ exit 0
             "log bytes must be capped: got {total_log_bytes}, cap {cap}",
         );
         assert_eq!(log_truncated, Some(true), "truncation flag must be set");
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    //! The self-liveness watchdog: it must fire when the connection
+    //! stops making progress, and stay quiet while progress continues.
+    //! Uses short real-time windows (the workspace tokio build does not
+    //! enable `test-util`, so paused-clock tests are unavailable).
+    use super::*;
+
+    #[tokio::test]
+    async fn fires_after_no_progress() {
+        let clock = Arc::new(ProgressClock::new());
+        clock.bump();
+        // The watchdog must resolve once `idle` exceeds the 150ms window.
+        let fired = tokio::time::timeout(
+            Duration::from_secs(2),
+            liveness_watchdog(clock, Duration::from_millis(150), Duration::from_millis(20)),
+        )
+        .await;
+        assert!(
+            fired.is_ok(),
+            "watchdog should fire after the no-progress window elapses",
+        );
+    }
+
+    #[tokio::test]
+    async fn held_off_by_ongoing_progress() {
+        let clock = Arc::new(ProgressClock::new());
+        clock.bump();
+        let wd = liveness_watchdog(
+            clock.clone(),
+            Duration::from_millis(150),
+            Duration::from_millis(20),
+        );
+        tokio::pin!(wd);
+        // Bump every 50ms (well within the 150ms window) for ~500ms; the
+        // watchdog must never fire while progress keeps coming.
+        for _ in 0..10 {
+            tokio::select! {
+                biased;
+                _ = &mut wd => panic!("watchdog fired despite ongoing progress"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => clock.bump(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_reports_elapsed_since_bump() {
+        let clock = ProgressClock::new();
+        clock.bump();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            clock.idle() >= Duration::from_millis(50),
+            "idle must reflect time since the last bump, got {:?}",
+            clock.idle(),
+        );
+        clock.bump();
+        assert!(
+            clock.idle() < Duration::from_millis(40),
+            "a fresh bump must reset idle, got {:?}",
+            clock.idle(),
+        );
     }
 }

@@ -23,6 +23,34 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::oneshot;
 
+/// russh per-channel flow-control window for builder sessions.
+///
+/// russh's 2 MiB default is too small for the bidirectional nix-daemon
+/// protocol tunneled over a side channel. During a large
+/// `nix copy --to` push the request fills the coordinator→builder
+/// window while the daemon's interleaved progress output fills the
+/// builder→coordinator window; because each endpoint (`nix copy` and
+/// `nix-daemon`) can be blocked *writing* while the other is also
+/// blocked *writing*, the exchange deadlocks. Observed in production:
+/// a push froze at ~3.4 MB with both directions stalled (TCP fully
+/// acked, zero send-queue) until the liveness watchdog evicted the
+/// builder.
+///
+/// Sizing the window well above the daemon's total in-flight progress
+/// (a few MB even for a many-thousand-derivation closure) guarantees
+/// the daemon never blocks writing progress, so it keeps draining the
+/// request and the deadlock cycle cannot form. The window is a
+/// flow-control ceiling, not a preallocation, so the memory cost is
+/// bounded by actual in-flight bytes. Applied to BOTH the coordinator's
+/// `server::Config` and the agent's `client::Config` so both the
+/// request and response directions are covered.
+pub const BUILDER_SESSION_WINDOW_SIZE: u32 = 32 * 1024 * 1024;
+
+/// Maximum SSH packet size for builder sessions. Raised from russh's
+/// 32 KiB default to cut per-packet overhead on the bulk closure
+/// transfer. Must stay ≤ [`BUILDER_SESSION_WINDOW_SIZE`].
+pub const BUILDER_SESSION_MAX_PACKET: u32 = 256 * 1024;
+
 /// Inbound pump: russh channel → `pump_writer` (which the user reads
 /// via the other end of the duplex). Runs until the peer signals
 /// EOF/close either inline (via `channel.wait()` returning Eof/Close)

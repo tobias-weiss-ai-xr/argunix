@@ -340,7 +340,7 @@ good trade; for "we are nixpkgs," Hydra is still the right tool.
 
 |                       | Botanix                                            | argunix                                                                                                                 |
 | --------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Builder transport     | gRPC (tonic) coordinator ↔ worker                 | Closure transfer over SSH (russh) from coordinator to enrolled builders + local trusted-user dispatch                   |
+| Builder transport     | gRPC (tonic) coordinator ↔ worker                  | Closure transfer over SSH (russh) from coordinator to enrolled builders + local trusted-user dispatch                   |
 | Builder enrollment    | Worker registers via HTTP, receives a token        | Builder enrolls via a token + listen socket on the builder host; see [`nix/builder-module.nix`](nix/builder-module.nix) |
 | Configuration surface | Environment variables                              | YAML / NixOS module options                                                                                             |
 | Eval target           | `hydraJobs`                                        | flake `packages` / `checks` / `devShells` / `nixosConfigurations`                                                       |

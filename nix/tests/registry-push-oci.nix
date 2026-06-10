@@ -141,10 +141,18 @@ in
       };
 
       # Daemonless podman for the pull+run side.
-      virtualisation.containers = {
-        enable = true;
-        registries.insecure = [ registryHost ];
-      };
+      virtualisation.containers.enable = true;
+      # Newer skopeo/podman only read a v2 `/etc/containers/registries.conf`;
+      # the `virtualisation.containers.registries.insecure` option emits v1,
+      # now rejected ("must be in v2 format but is in v1"). Override just
+      # that one file — policy.json/storage.conf from the module stay intact.
+      environment.etc."containers/registries.conf".source = pkgs.lib.mkForce (
+        pkgs.writeText "registries.conf" ''
+          [[registry]]
+          location = "${registryHost}"
+          insecure = true
+        ''
+      );
 
       environment.systemPackages = [
         pkgs.argunix
