@@ -40,6 +40,12 @@
 #   6. Assert: the daemon logged the watchdog eviction; the eval reaches
 #      `done` with the job `success`; and the job's final `builder_id`
 #      is the *other* builder, proving "rescheduled elsewhere".
+#   7. Heal the partition (remove the iptables drop) and assert the
+#      evicted builder re-enrols *unaided* — the pool returns to two.
+#      Regression for the field incident where evicted builders stayed
+#      wedged with a dead socket and never reconnected, draining the pool
+#      to zero until an operator restarted them (see the agent-side
+#      self-liveness watchdog in `argunix-builder/src/agent.rs`).
 { pkgs, ... }:
 
 let
@@ -381,5 +387,40 @@ in
     assert final_builder == survivor, (
         f"job should have been rescheduled onto {survivor!r}, ran on {final_builder!r}"
     )
+
+    # --- Regression: the evicted builder must rejoin the pool on its own
+    # once connectivity is restored. Before the agent-side self-liveness
+    # fix, a builder the coordinator had evicted stayed wedged with a dead
+    # socket and never re-enrolled — silently shrinking the pool to zero
+    # until an operator restarted it. (Field incident 2026-06-10.)
+
+    # While still partitioned, the victim is gone from the connected set.
+    retry_attempts = 0
+    while victim in connected_names():
+        retry_attempts += 1
+        assert retry_attempts < 60, (
+            f"victim {victim!r} still shown connected after eviction: {connected_names()!r}"
+        )
+        time.sleep(1)
+
+    # Heal the partition. The agent must tear down its wedged session,
+    # reconnect with backoff, and re-enrol — no operator action.
+    print(f"healing the partition on {victim!r}; expecting it to re-enrol unaided")
+    victim_node.succeed(
+        "iptables -D OUTPUT -p tcp --dport ${toString builderEnrollmentPort} -j DROP"
+    )
+    victim_node.execute(
+        "ip6tables -D OUTPUT -p tcp --dport ${toString builderEnrollmentPort} -j DROP"
+    )
+
+    retry_attempts = 0
+    while connected_names() != {"builder-a", "builder-b"}:
+        retry_attempts += 1
+        assert retry_attempts < 180, (
+            f"victim {victim!r} never re-enrolled after the partition healed: "
+            f"{connected_names()!r}"
+        )
+        time.sleep(1)
+    print("both builders reconnected; pool is whole again")
   '';
 }

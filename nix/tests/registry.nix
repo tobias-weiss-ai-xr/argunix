@@ -121,12 +121,20 @@ in
       # to signal 9"). Podman has the same OCI-distribution
       # semantics for the assertions we care about (pull a real
       # image, run it, capture stdout) without persistent daemon
-      # overhead. `registries.insecure` lets it accept the plain-
-      # HTTP registry argunix serves.
-      virtualisation.containers = {
-        enable = true;
-        registries.insecure = [ registryHost ];
-      };
+      # overhead. The v2 `[[registry]] insecure = true` lets it accept the
+      # plain-HTTP registry argunix serves.
+      virtualisation.containers.enable = true;
+      # Newer skopeo/podman only read a v2 `/etc/containers/registries.conf`;
+      # the `virtualisation.containers.registries.insecure` option emits v1,
+      # now rejected ("must be in v2 format but is in v1"). Override just
+      # that one file — policy.json/storage.conf from the module stay intact.
+      environment.etc."containers/registries.conf".source = pkgs.lib.mkForce (
+        pkgs.writeText "registries.conf" ''
+          [[registry]]
+          location = "${registryHost}"
+          insecure = true
+        ''
+      );
 
       environment.systemPackages = [
         pkgs.argunix

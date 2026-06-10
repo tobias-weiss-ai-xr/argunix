@@ -139,10 +139,19 @@ in
         enableDelete = true;
       };
 
-      virtualisation.containers = {
-        enable = true;
-        registries.insecure = [ registryHost ];
-      };
+      virtualisation.containers.enable = true;
+      # Newer skopeo/podman only read a v2 `/etc/containers/registries.conf`;
+      # the `virtualisation.containers.registries.insecure` option emits v1,
+      # now rejected ("must be in v2 format but is in v1"). Override just
+      # that one file with a v2 equivalent — policy.json/storage.conf from
+      # the module stay intact, so the podman pull+run side still works.
+      environment.etc."containers/registries.conf".source = pkgs.lib.mkForce (
+        pkgs.writeText "registries.conf" ''
+          [[registry]]
+          location = "${registryHost}"
+          insecure = true
+        ''
+      );
 
       environment.systemPackages = [
         pkgs.argunix
