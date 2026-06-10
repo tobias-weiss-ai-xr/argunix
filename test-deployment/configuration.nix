@@ -7,6 +7,7 @@
 let
   fqdn = "argunix.nix-consulting.net";
   cacheUrl = "s3://test-cache?endpoint=nbg1.your-objectstorage.com&region=nbg1&addressing-style=virtual";
+  cachePublicUrl = "https://nbg1.your-objectstorage.com/test-cache";
 in
 {
   imports = [
@@ -87,7 +88,7 @@ in
       binary_caches = [
         {
           push_url = cacheUrl;
-          public_url = "https://nbg1.your-objectstorage.com/test-cache";
+          public_url = cachePublicUrl;
           public_key = "test-cache:vUfGsNg1GFZRW1wHSFsjcklY2fpzGkPntpdOoW3mhTA=";
           signing_key_path = "/var/lib/argunix-credentials/cache/test-cache-priv.key";
         }
@@ -213,7 +214,7 @@ in
   nix.settings = {
     substituters = [
       "https://cache.nixos.org"
-      cacheUrl
+      cachePublicUrl
     ];
     trusted-public-keys = [
       "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
