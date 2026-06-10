@@ -76,6 +76,13 @@ impl BuilderServer {
             keepalive_interval: Some(std::time::Duration::from_secs(30)),
             keepalive_max: 3,
             nodelay: true,
+            // Enlarge the per-channel flow-control window (russh's 2 MiB
+            // default is too small for the bidirectional nix-daemon
+            // tunnel and deadlocks a large closure push). This governs
+            // the builder→coordinator (response/progress) direction.
+            // See `channel_io::BUILDER_SESSION_WINDOW_SIZE`.
+            window_size: crate::channel_io::BUILDER_SESSION_WINDOW_SIZE,
+            maximum_packet_size: crate::channel_io::BUILDER_SESSION_MAX_PACKET,
             ..Default::default()
         };
         let russh_cfg = Arc::new(russh_cfg);

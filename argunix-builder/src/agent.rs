@@ -251,6 +251,13 @@ async fn serve_one_connection(
     let client_cfg = Arc::new(client::Config {
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
+        // Enlarge the per-channel flow-control window (russh's 2 MiB
+        // default deadlocks the bidirectional nix-daemon tunnel on a
+        // large closure push). This governs the coordinator→builder
+        // (request/NAR) direction. See
+        // `argunix_builders::BUILDER_SESSION_WINDOW_SIZE`.
+        window_size: argunix_builders::BUILDER_SESSION_WINDOW_SIZE,
+        maximum_packet_size: argunix_builders::BUILDER_SESSION_MAX_PACKET,
         ..client::Config::default()
     });
     let handler = AgentClient {
