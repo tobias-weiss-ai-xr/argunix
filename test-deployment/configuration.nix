@@ -147,6 +147,7 @@ in
               watched_branches = [ "master" ];
             };
             "tfc/tulonix" = { };
+            "tfc/traynixd" = { };
           };
         };
         opencode = {
