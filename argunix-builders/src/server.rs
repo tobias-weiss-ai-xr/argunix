@@ -1,7 +1,9 @@
 use crate::auth::AuthState;
 use crate::host_key::HostKey;
 use crate::protocol::{ControlMessage, LineFramer};
-use crate::registry::{BuildLifecycle, BuilderRegistry, ConnState, ConnectedBuilder, RusshSession};
+use crate::registry::{
+    BuildLifecycle, BuilderRegistry, ConnState, ConnectedBuilder, RusshSession, TryForward,
+};
 use argunix_domain::{BuilderCapabilities, BuilderName, BuilderPubkey};
 use argunix_store::{BuilderStore, NewBuilder, SqlxStore};
 use base64::Engine as _;
@@ -10,7 +12,7 @@ use russh::keys::ssh_key;
 use russh::server::{Auth, Handle as SessionHandle, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet};
 use socket2::{SockRef, TcpKeepalive};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
@@ -169,6 +171,7 @@ impl Server for ServerInner {
             control_channel: Arc::new(Mutex::new(None)),
             registered_name: Arc::new(std::sync::Mutex::new(None)),
             abort_slot: Arc::new(OnceLock::new()),
+            log_drops: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 }
@@ -208,6 +211,14 @@ pub(crate) struct ConnectionHandler {
     /// because the handle only exists after the spawn, which is after
     /// `new_client` builds this handler.
     abort_slot: Arc<OnceLock<AbortHandle>>,
+    /// Build ids that have had at least one `BuildLogChunk` dropped
+    /// because the worker's lifecycle channel was full. The session
+    /// read loop never blocks on worker back-pressure (that coupling
+    /// reaped healthy builders under load); instead it drops the chunk
+    /// and records the build here so the terminal `BuildFinished` can
+    /// mark the stored log truncated. Entries are removed when the
+    /// `BuildFinished` is forwarded.
+    log_drops: Arc<std::sync::Mutex<HashSet<i64>>>,
 }
 
 impl ConnectionHandler {
@@ -372,22 +383,65 @@ impl ConnectionHandler {
     /// most likely the worker already gave up (cancel / disconnect)
     /// and unregistered, or a misbehaving agent is sending build_ids
     /// it never received a `Build` for.
-    async fn forward_lifecycle(&self, build_id: i64, event: BuildLifecycle) {
+    /// Non-blocking forward of a non-terminal lifecycle event
+    /// (`Started` / `LogChunk`) to the worker. **Never awaits** — this
+    /// runs in russh's single session read loop, where a blocking send
+    /// stalls every channel on the connection (heartbeats included) and
+    /// gets the builder reaped under load. Returns `true` if the chunk
+    /// was dropped because the worker's channel was full, so the caller
+    /// can remember to mark the stored log truncated.
+    fn forward_nonblocking(&self, build_id: i64, event: BuildLifecycle) -> bool {
         let name = self.registered_name.lock().unwrap().clone();
         let Some(name) = name else {
             tracing::warn!(build_id, "build-lifecycle message before hello; dropping",);
+            return false;
+        };
+        match self
+            .registry
+            .try_forward_build_event(&name, build_id, event)
+        {
+            TryForward::Delivered => false,
+            TryForward::NoReceiver => {
+                tracing::debug!(
+                    builder = %name,
+                    build_id,
+                    "build-lifecycle message for unregistered build; dropping",
+                );
+                false
+            }
+            TryForward::Full(_) => true,
+        }
+    }
+
+    /// Deliver the terminal `BuildFinished` event reliably without
+    /// blocking the session read loop. Fast-path `try_send`; if the
+    /// worker is behind, hand the event to a detached task that does the
+    /// bounded-blocking send. Nothing follows `Finished` for a build, so
+    /// off-loading it cannot reorder events.
+    fn forward_finished(&self, build_id: i64, event: BuildLifecycle) {
+        let name = self.registered_name.lock().unwrap().clone();
+        let Some(name) = name else {
+            tracing::warn!(build_id, "build-finished before hello; dropping",);
             return;
         };
-        let delivered = self
+        match self
             .registry
-            .forward_build_event(&name, build_id, event)
-            .await;
-        if !delivered {
-            tracing::debug!(
-                builder = %name,
-                build_id,
-                "build-lifecycle message for unregistered build; dropping",
-            );
+            .try_forward_build_event(&name, build_id, event)
+        {
+            TryForward::Delivered => {}
+            TryForward::NoReceiver => {
+                tracing::debug!(
+                    builder = %name,
+                    build_id,
+                    "build-finished for unregistered build; dropping",
+                );
+            }
+            TryForward::Full(event) => {
+                let registry = self.registry.clone();
+                tokio::spawn(async move {
+                    registry.forward_build_event(&name, build_id, event).await;
+                });
+            }
         }
     }
 
@@ -555,13 +609,16 @@ impl ConnectionHandler {
                     return Ok(());
                 };
                 let now = chrono::Utc::now();
-                if let Err(e) = self.store.mark_seen(record.id, now).await {
-                    tracing::warn!(error = %e, "mark_seen failed");
-                }
-                // Refresh the in-memory liveness clock the watchdog reads.
+                // Refresh the in-memory liveness clock the watchdog reads
+                // *first*, before any `.await` — this is the whole point
+                // of the heartbeat, and it must not be gated behind a DB
+                // write that could momentarily stall the read loop.
                 self.registry.touch_heartbeat(&record.name);
                 if let Some(stats) = stats {
                     self.registry.push_stats(&record.name, now, stats);
+                }
+                if let Err(e) = self.store.mark_seen(record.id, now).await {
+                    tracing::warn!(error = %e, "mark_seen failed");
                 }
                 tracing::trace!(
                     builder = %record.name,
@@ -605,16 +662,23 @@ impl ConnectionHandler {
                 );
             }
             ControlMessage::BuildStarted { build_id, pid } => {
-                self.forward_lifecycle(build_id, BuildLifecycle::Started { pid })
-                    .await;
+                // Non-terminal; best-effort. This is the first event, so
+                // the worker channel is empty — a drop here would only
+                // lose the pid, never liveness.
+                self.forward_nonblocking(build_id, BuildLifecycle::Started { pid });
             }
             ControlMessage::BuildLogChunk {
                 build_id,
                 bytes_b64,
             } => match base64::engine::general_purpose::STANDARD.decode(&bytes_b64) {
                 Ok(bytes) => {
-                    self.forward_lifecycle(build_id, BuildLifecycle::LogChunk { bytes })
-                        .await;
+                    if self.forward_nonblocking(build_id, BuildLifecycle::LogChunk { bytes }) {
+                        // Worker is behind. Drop the chunk rather than
+                        // stall the read loop (which would starve
+                        // heartbeats and get this builder evicted), and
+                        // remember to mark the log truncated at Finished.
+                        self.log_drops.lock().unwrap().insert(build_id);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -631,16 +695,16 @@ impl ConnectionHandler {
                 output_paths,
                 log_truncated,
             } => {
-                self.forward_lifecycle(
+                let dropped = self.log_drops.lock().unwrap().remove(&build_id);
+                self.forward_finished(
                     build_id,
                     BuildLifecycle::Finished {
                         status,
                         exit_code,
                         output_paths,
-                        log_truncated,
+                        log_truncated: log_truncated || dropped,
                     },
-                )
-                .await;
+                );
             }
         }
         Ok(())

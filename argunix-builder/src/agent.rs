@@ -378,33 +378,24 @@ async fn serve_one_connection(
         return Ok(false);
     }
 
-    // Heartbeat + shutdown loop. 5s cadence so the web UI's stats
-    // sparkline feels live; payload is ~50 bytes so the bandwidth
-    // cost over a 30s baseline is negligible.
-    let mut hb_interval = tokio::time::interval(Duration::from_secs(5));
-    hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Skip the immediate first tick.
-    hb_interval.tick().await;
-    let mut stats_sampler = argunix_builders::StatsSampler::new();
-
     // Outbound control queue. Build tasks send `BuildStarted /
-    // BuildLogChunk / BuildFinished` here; the main loop drains the
-    // queue and writes to the SSH channel (which only one task can hold
-    // a `&mut` to at a time).
+    // BuildLogChunk / BuildFinished` here; the session loop drains the
+    // queue and writes them to the SSH channel.
     //
-    // Bounded on purpose. Pairs with the coordinator-side lifecycle
-    // channel (also bounded) to give end-to-end back-pressure with no
-    // silent log loss: if the coordinator is slow to drain its end,
-    // the russh send window stalls, the main loop's `channel.data()`
-    // blocks, this queue fills, and `pump_stderr_as_chunks` blocks on
-    // send → the `nix-store --realise` stderr pipe fills → the build
-    // briefly pauses. Memory at both ends is bounded by the queue
-    // capacities; nothing grows without limit, nothing is dropped.
+    // Bounded on purpose: pairs with the coordinator-side lifecycle
+    // channel to give end-to-end back-pressure. If the coordinator is
+    // slow to drain its end, the russh send window stalls, the session
+    // loop's write blocks, this queue fills, and `pump_stderr_as_chunks`
+    // blocks on send → the `nix-store --realise` stderr pipe fills → the
+    // build briefly pauses. Memory at both ends is bounded by the queue
+    // capacities.
     //
-    // Heartbeats bypass this queue (the main loop writes them
-    // directly to the SSH channel), so a saturated log queue cannot
-    // starve the heartbeats the coordinator uses to detect dead
-    // builders.
+    // Heartbeats no longer ride this loop at all — they are written from
+    // a dedicated task (below) holding its own clone of the channel
+    // write half, so a stalled log/lifecycle write can never park the
+    // heartbeat. That coupling (one `select!` serving both heartbeat and
+    // log writes) is what let a log burst starve the heartbeat and get
+    // this builder reaped under load.
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(4096);
     // In-flight build map. `Abort` looks up the oneshot for the
     // matching `build_id` and signals the build task to SIGKILL its
@@ -415,8 +406,55 @@ async fn serve_one_connection(
     // Progress clock for the self-liveness watchdog (below). The session
     // loop runs as the inner future of an outer `select!` against the
     // watchdog; the watchdog is a sibling future, so it is still polled
-    // even while this loop is parked inside a wedged `channel.data()`.
+    // even while this loop is parked inside a wedged write.
     let progress = Arc::new(ProgressClock::new());
+
+    // Split the control channel so the heartbeat task and the session
+    // loop hold independent write handles. russh's `ChannelWriteHalf` is
+    // `Send + Sync` and serialises concurrent `data()` calls internally,
+    // so two tasks writing the same channel is safe.
+    let (mut read_half, write_half) = channel.split();
+    let write_half = Arc::new(write_half);
+
+    // Dedicated heartbeat task. Writes a heartbeat every 5s on its own
+    // clone of the write half; a stalled or failed write fires
+    // `hb_fail_tx` so the session loop tears down and reconnects. Bumps
+    // the progress clock on every success, keeping the self-liveness
+    // watchdog fed independently of build traffic.
+    let (hb_fail_tx, mut hb_fail_rx) = oneshot::channel::<()>();
+    let hb_write = write_half.clone();
+    let hb_progress = progress.clone();
+    let hb_task = tokio::spawn(async move {
+        let mut hb_interval = tokio::time::interval(Duration::from_secs(5));
+        hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first tick.
+        hb_interval.tick().await;
+        let mut stats_sampler = argunix_builders::StatsSampler::new();
+        loop {
+            hb_interval.tick().await;
+            let hb = ControlMessage::Heartbeat {
+                ts: chrono::Utc::now().timestamp(),
+                stats: stats_sampler.sample(),
+            };
+            match tokio::time::timeout(WRITE_STALL_TIMEOUT, hb_write.data(&hb.encode_line()[..]))
+                .await
+            {
+                Ok(Ok(())) => hb_progress.bump(),
+                Ok(Err(_)) => {
+                    let _ = hb_fail_tx.send(());
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "heartbeat write stalled past the liveness timeout; reconnecting",
+                    );
+                    let _ = hb_fail_tx.send(());
+                    return;
+                }
+            }
+        }
+    });
+
     let session_loop = async {
         'session: loop {
             tokio::select! {
@@ -435,8 +473,8 @@ async fn serve_one_connection(
                         drain: false,
                     };
                     let goodbye = async {
-                        let _ = channel.data(&bye.encode_line()[..]).await;
-                        let _ = channel.close().await;
+                        let _ = write_half.data(&bye.encode_line()[..]).await;
+                        let _ = write_half.close().await;
                         let _ = session.disconnect(
                             russh::Disconnect::ByApplication,
                             "agent shutdown",
@@ -453,36 +491,16 @@ async fn serve_one_connection(
                     }
                     break 'session Ok(true);
                 }
-                _ = hb_interval.tick() => {
-                    let hb = ControlMessage::Heartbeat {
-                        ts: chrono::Utc::now().timestamp(),
-                        stats: stats_sampler.sample(),
-                    };
-                    // Bounded write: a heartbeat that neither completes nor
-                    // errors within the window means the session is wedged
-                    // (full send window against a peer that never drains).
-                    // Treat it as a disconnect and reconnect.
-                    match tokio::time::timeout(
-                        WRITE_STALL_TIMEOUT,
-                        channel.data(&hb.encode_line()[..]),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => progress.bump(),
-                        Ok(Err(_)) => break 'session Ok(false),
-                        Err(_) => {
-                            tracing::warn!(
-                                "heartbeat write stalled past the liveness timeout; reconnecting",
-                            );
-                            break 'session Ok(false);
-                        }
-                    }
+                // The dedicated heartbeat task hit a stalled or failed
+                // write — the session is wedged. Tear it down to reconnect.
+                _ = &mut hb_fail_rx => {
+                    break 'session Ok(false);
                 }
                 // Outbound from build tasks → SSH channel.
                 Some(bytes) = out_rx.recv() => {
                     match tokio::time::timeout(
                         WRITE_STALL_TIMEOUT,
-                        channel.data(&bytes[..]),
+                        write_half.data(&bytes[..]),
                     )
                     .await
                     {
@@ -496,7 +514,7 @@ async fn serve_one_connection(
                         }
                     }
                 }
-                ev = channel.wait() => match ev {
+                ev = read_half.wait() => match ev {
                     Some(ChannelMsg::Data { data }) => {
                         progress.bump();
                         for parsed in framer.extend(&data) {
@@ -608,6 +626,11 @@ async fn serve_one_connection(
             Ok(false)
         }
     };
+
+    // The session is ending; stop the heartbeat task so it can't write
+    // onto a channel we're about to drop (or keep ticking after a clean
+    // shutdown).
+    hb_task.abort();
 
     // The control connection is going away — either we're shutting
     // down (Ok(true)) or we're about to reconnect (Ok(false)). Either

@@ -175,6 +175,21 @@ pub enum BuildLifecycle {
     },
 }
 
+/// Outcome of a non-blocking [`BuilderRegistry::try_forward_build_event`].
+#[derive(Debug)]
+pub enum TryForward {
+    /// Event was queued to the worker's lifecycle channel.
+    Delivered,
+    /// No worker is registered for this `(builder, build_id)` — the
+    /// worker already gave up (cancel / disconnect) and unregistered,
+    /// or the agent sent a bogus `build_id`.
+    NoReceiver,
+    /// The worker's channel is full. The event is returned so the
+    /// caller can drop it (log chunks) or re-deliver it out-of-band
+    /// (the terminal `Finished`).
+    Full(BuildLifecycle),
+}
+
 /// What a takeover surfaces about the connection it just displaced. The
 /// caller — running on a tokio task — uses these to send a `kick`
 /// message and disconnect the old SSH session.
@@ -598,6 +613,38 @@ impl BuilderRegistry {
                 sender.send(event).await.is_ok()
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Non-blocking forward. Unlike [`Self::forward_build_event`] this
+    /// **never awaits** — it is called from the SSH server's single
+    /// session read loop (`Handler::data`), where a blocking send on a
+    /// full worker channel would stall *every* channel on the
+    /// connection, including the heartbeats the liveness watchdog reads.
+    /// That coupling is what reaped healthy builders under sudden load.
+    ///
+    /// On a full channel the event is handed back in [`TryForward::Full`]
+    /// so the caller decides: log chunks get dropped (and the build's
+    /// stored log marked truncated), while the terminal `Finished` event
+    /// is re-delivered out-of-band on a detached task so it is never
+    /// lost. See `server::ConnectionHandler::handle_control`.
+    pub fn try_forward_build_event(
+        &self,
+        name: &BuilderName,
+        build_id: i64,
+        event: BuildLifecycle,
+    ) -> TryForward {
+        let sender = {
+            let map = self.in_flight_builds.lock().unwrap();
+            match map.get(&(name.clone(), build_id)) {
+                Some(tx) => tx.clone(),
+                None => return TryForward::NoReceiver,
+            }
+        };
+        match sender.try_send(event) {
+            Ok(()) => TryForward::Delivered,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => TryForward::Full(event),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => TryForward::NoReceiver,
         }
     }
 
@@ -1192,6 +1239,50 @@ mod tests {
             )
             .await;
         assert!(!delivered);
+    }
+
+    #[tokio::test]
+    async fn try_forward_delivers_and_reports_no_receiver() {
+        let reg = BuilderRegistry::new();
+        let name = BuilderName::new("a").unwrap();
+        let mut rx = reg.register_in_flight_build(name.clone(), 7);
+
+        assert!(matches!(
+            reg.try_forward_build_event(&name, 7, BuildLifecycle::Started { pid: Some(1) }),
+            TryForward::Delivered
+        ));
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            BuildLifecycle::Started { pid: Some(1) }
+        );
+
+        // No entry for this build id.
+        assert!(matches!(
+            reg.try_forward_build_event(&name, 999, BuildLifecycle::Started { pid: None }),
+            TryForward::NoReceiver
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_forward_returns_full_and_hands_event_back_when_channel_saturated() {
+        let reg = BuilderRegistry::new();
+        let name = BuilderName::new("a").unwrap();
+        // Hold the receiver but never drain it, so the channel fills.
+        let _rx = reg.register_in_flight_build(name.clone(), 1);
+        // Fill to capacity (register_in_flight_build uses mpsc::channel(4096)).
+        for _ in 0..4096 {
+            assert!(matches!(
+                reg.try_forward_build_event(&name, 1, BuildLifecycle::LogChunk { bytes: vec![0] }),
+                TryForward::Delivered
+            ));
+        }
+        // The next send must report Full and return the event intact so
+        // the caller can drop it (log chunk) or re-deliver it (Finished)
+        // — never blocking the session read loop.
+        match reg.try_forward_build_event(&name, 1, BuildLifecycle::LogChunk { bytes: vec![9] }) {
+            TryForward::Full(BuildLifecycle::LogChunk { bytes }) => assert_eq!(bytes, vec![9]),
+            other => panic!("expected Full(LogChunk), got {other:?}"),
+        }
     }
 
     #[tokio::test]
