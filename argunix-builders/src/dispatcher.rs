@@ -64,7 +64,7 @@ impl BuilderDispatcher {
         &self,
         system: &str,
         features: &[String],
-        exclude: &HashSet<BuilderName>,
+        exclude: &HashSet<u64>,
     ) -> Result<DispatchedBuild, DispatchError> {
         let eligible = self.registry.eligible(system, features, exclude);
         if eligible.is_empty() {

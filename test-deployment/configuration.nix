@@ -83,6 +83,12 @@ in
       schedule = {
         build_concurrency = 6;
         build_timeout_seconds = 10 * 60 * 60;
+        # Stable remote pool: if a builder briefly drops and reconnects
+        # mid-eval, wait for it (or another eligible builder) rather than
+        # failing the job and cascade-skipping its dependents. The
+        # transport-failed connection is excluded by id, so the same
+        # builder reconnecting is picked up again within this window.
+        builder_wait_seconds = 120;
       };
 
       binary_caches = [

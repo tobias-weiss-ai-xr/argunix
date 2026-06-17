@@ -76,8 +76,11 @@ impl StepState {
             JobStatus::Failure => StepState::Failure,
             JobStatus::Cancelled => StepState::Cancelled,
             JobStatus::SkippedNoBuilder => StepState::Skipped,
-            // Non-terminal statuses are debug_asserted away by the
-            // trait contract; map to Failure as a defensive fallback.
+            // `Interrupted` is the deliberate "exhausted the in-eval
+            // retry budget, no builder ever came back" give-up: treat it
+            // as a failure for the DAG so dependents cascade-skip. The
+            // remaining non-terminal statuses are debug_asserted away by
+            // the `complete` contract; Failure is a defensive fallback.
             JobStatus::Queued | JobStatus::Running | JobStatus::Interrupted => StepState::Failure,
         }
     }
@@ -377,8 +380,16 @@ impl ScheduleStrategy for DagStrategy {
     }
 
     fn complete(&mut self, token: DispatchToken, status: JobStatus) -> CompletionEffects {
+        // `Interrupted` is non-terminal but is a legitimate completion
+        // here: it is what `build_one` returns when it has exhausted its
+        // bounded wait for an eligible builder (see the dispatch loop in
+        // `argunix-daemon`). We treat it as a failure-equivalent for the
+        // DAG — the step produced no output this eval, so its dependents
+        // must cascade-skip — while the job row stays `Interrupted` so a
+        // daemon restart's resume pass can re-queue it. Every *other*
+        // non-terminal status remains a contract violation.
         debug_assert!(
-            status.is_terminal(),
+            status.is_terminal() || status == JobStatus::Interrupted,
             "complete called with non-terminal status: {status:?}",
         );
 

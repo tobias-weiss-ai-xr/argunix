@@ -98,6 +98,12 @@ pub struct BuilderSnapshot {
     pub state: ConnState,
     pub connected_since: DateTime<Utc>,
     pub in_flight: u32,
+    /// Identifies this *connection*, distinct from `builder_id` (the
+    /// persistent row) and `name`. A builder that drops and reconnects
+    /// keeps its name and row id but gets a fresh `connection_id`. The
+    /// dispatch loop excludes transport-failed builders by this, not by
+    /// name, so a reconnected builder is eligible for retry again.
+    pub connection_id: u64,
 }
 
 /// Which transport/build phase a `(builder, build_id)` pair is
@@ -387,6 +393,7 @@ impl BuilderRegistry {
             state: c.state,
             connected_since: c.connected_since,
             in_flight,
+            connection_id: c.connection_id,
         })
     }
 
@@ -403,6 +410,7 @@ impl BuilderRegistry {
                 state: c.state,
                 connected_since: c.connected_since,
                 in_flight: in_flight.get(name).copied().unwrap_or(0),
+                connection_id: c.connection_id,
             })
             .collect();
         out.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
@@ -428,16 +436,12 @@ impl BuilderRegistry {
     /// emulated builders become candidates. So if the lone native
     /// builder disconnects mid-wait, the next call admits emulation and
     /// the job proceeds there.
-    fn system_candidates(
-        &self,
-        system: &str,
-        exclude: &HashSet<BuilderName>,
-    ) -> Vec<BuilderSnapshot> {
+    fn system_candidates(&self, system: &str, exclude: &HashSet<u64>) -> Vec<BuilderSnapshot> {
         let supporting: Vec<BuilderSnapshot> = self
             .list()
             .into_iter()
             .filter(|b| b.state == ConnState::Active)
-            .filter(|b| !exclude.contains(&b.name))
+            .filter(|b| !exclude.contains(&b.connection_id))
             .filter(|b| b.capabilities.systems.iter().any(|s| s == system))
             .collect();
         let native_exists = supporting
@@ -461,7 +465,7 @@ impl BuilderRegistry {
         &self,
         system: &str,
         features: &[String],
-        exclude: &HashSet<BuilderName>,
+        exclude: &HashSet<u64>,
     ) -> Vec<BuilderSnapshot> {
         let mut found: Vec<BuilderSnapshot> = self
             .system_candidates(system, exclude)
@@ -486,7 +490,7 @@ impl BuilderRegistry {
         &self,
         system: &str,
         features: &[String],
-        exclude: &HashSet<BuilderName>,
+        exclude: &HashSet<u64>,
     ) -> bool {
         self.system_candidates(system, exclude)
             .into_iter()
@@ -993,19 +997,50 @@ mod tests {
     #[test]
     fn eligible_respects_exclude_set() {
         let reg = BuilderRegistry::new();
-        let _ = reg.register(
-            BuilderName::new("a").unwrap(),
-            conn(&reg, 1, caps(&["x86_64-linux"], &[], 1)),
-        );
+        let a = conn(&reg, 1, caps(&["x86_64-linux"], &[], 1));
+        let a_conn = a.connection_id;
+        let _ = reg.register(BuilderName::new("a").unwrap(), a);
         let _ = reg.register(
             BuilderName::new("b").unwrap(),
             conn(&reg, 2, caps(&["x86_64-linux"], &[], 1)),
         );
         let mut excl = HashSet::new();
-        excl.insert(BuilderName::new("a").unwrap());
+        excl.insert(a_conn);
         let lst = reg.eligible("x86_64-linux", &[], &excl);
         assert_eq!(lst.len(), 1);
         assert_eq!(lst[0].name.as_str(), "b");
+    }
+
+    #[test]
+    fn reconnected_builder_is_eligible_despite_prior_connection_excluded() {
+        // The transport-failure retry path excludes by connection_id. A
+        // builder that drops and reconnects under the same name gets a
+        // fresh connection_id, so it must become eligible again even
+        // while its prior connection is still in the exclude set — this
+        // is what lets a sole builder's brief reconnect be retried
+        // instead of leaving the job stuck.
+        let reg = BuilderRegistry::new();
+        let name = BuilderName::new("solo").unwrap();
+        let first = conn(&reg, 1, caps(&["x86_64-linux"], &[], 1));
+        let first_conn = first.connection_id;
+        let _ = reg.register(name.clone(), first);
+
+        let mut excluded = HashSet::new();
+        excluded.insert(first_conn);
+        assert!(
+            reg.eligible("x86_64-linux", &[], &excluded).is_empty(),
+            "the failed connection must be excluded",
+        );
+
+        // Same builder reconnects: fresh connection_id displaces the old.
+        let second = conn(&reg, 1, caps(&["x86_64-linux"], &[], 1));
+        let second_conn = second.connection_id;
+        assert_ne!(first_conn, second_conn, "reconnect must mint a new id");
+        let _ = reg.register(name.clone(), second);
+
+        let lst = reg.eligible("x86_64-linux", &[], &excluded);
+        assert_eq!(lst.len(), 1, "the reconnected builder must be eligible");
+        assert_eq!(lst[0].connection_id, second_conn);
     }
 
     #[test]
@@ -1174,16 +1209,15 @@ mod tests {
         let reg = BuilderRegistry::new();
         let native = BuilderName::new("arm").unwrap();
         let emu = BuilderName::new("x86-binfmt").unwrap();
-        let _ = reg.register(
-            native.clone(),
-            conn(&reg, 1, caps(&["aarch64-linux"], &[], 4)),
-        );
+        let native_conn = conn(&reg, 1, caps(&["aarch64-linux"], &[], 4));
+        let native_conn_id = native_conn.connection_id;
+        let _ = reg.register(native.clone(), native_conn);
         let _ = reg.register(
             emu.clone(),
             conn(&reg, 2, caps(&["x86_64-linux", "aarch64-linux"], &[], 4)),
         );
         let mut excluded = HashSet::new();
-        excluded.insert(native.clone());
+        excluded.insert(native_conn_id);
         let lst = reg.eligible("aarch64-linux", &[], &excluded);
         assert_eq!(lst.len(), 1);
         assert_eq!(lst[0].name.as_str(), "x86-binfmt");

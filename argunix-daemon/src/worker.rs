@@ -1320,7 +1320,7 @@ fn summarise_for_check(err: &str, max_chars: usize) -> String {
 fn pick_builder_for_spec(
     registry: &argunix_builders::BuilderRegistry,
     spec: &argunix_eval::JobSpec,
-    exclude: &std::collections::HashSet<argunix_domain::BuilderName>,
+    exclude: &std::collections::HashSet<u64>,
 ) -> Option<argunix_builders::BuilderSnapshot> {
     let system = spec.system.as_deref()?;
     let eligible = registry.eligible(system, &spec.required_system_features, exclude);
@@ -1917,10 +1917,16 @@ async fn build_one(
     // Dispatch loop. `pick_builder_for_spec` returns the least-loaded
     // eligible builder not in `excluded`; `eligible()` already filters
     // by (system, requiredSystemFeatures, max_jobs cap). On a transport
-    // failure — the builder disconnected before a verdict — we add it
-    // to `excluded` and pick the next one. A genuine verdict ends the
-    // loop. When no eligible builder remains, the job is marked
-    // `Interrupted` and `build_one` returns: the coordinator has no
+    // failure — the builder disconnected before a verdict — we add its
+    // *connection_id* to `excluded` and pick the next one. Excluding by
+    // connection (not name) is deliberate: a builder that drops and
+    // reconnects comes back with a fresh connection_id, so it is
+    // eligible for retry again — without this, a sole builder for a
+    // system that briefly reconnected stayed excluded for the rest of
+    // the dispatch and the job was needlessly `Interrupted`. A genuine
+    // verdict ends the loop. When no eligible builder remains, the job
+    // is marked `Interrupted` and `build_one` returns: the coordinator
+    // has no
     // local build path, so any execution must go through the pool. If
     // the operator wants the coordinator host to also build, they
     // enrol `argunix-builder` on it as a loopback builder — it then
@@ -1938,8 +1944,8 @@ async fn build_one(
     // (it sends `Abort` and drains `BuildFinished{Killed}`); the wait
     // loops in the `None` branch also honour the cancel token. See
     // [docs/concepts/cancel-on-push.md].
-    let mut excluded: std::collections::HashSet<argunix_domain::BuilderName> =
-        std::collections::HashSet::new();
+    // Connection ids of builders that transport-failed this dispatch.
+    let mut excluded: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut builder_wait_used = false;
     let (outcome, phase_metrics) = loop {
         match pick_builder_for_spec(&ctx.builder_registry, spec, &excluded) {
@@ -1984,10 +1990,12 @@ async fn build_one(
                         tracing::warn!(
                             job_id = job_id.get(),
                             builder = %b.name,
-                            "pool dispatch hit a transport failure; \
-                             excluding this builder and retrying elsewhere",
+                            connection_id = b.connection_id,
+                            "pool dispatch hit a transport failure; excluding this \
+                             connection and retrying (a reconnect gets a fresh \
+                             connection_id and is eligible again)",
                         );
-                        excluded.insert(b.name.clone());
+                        excluded.insert(b.connection_id);
                         continue;
                     }
                 }
@@ -3391,8 +3399,16 @@ mod tests {
         let reg = BuilderRegistry::new();
         register(&reg, "alpha", 1, caps(&["x86_64-linux"], &[], 4));
         register(&reg, "beta", 2, caps(&["x86_64-linux"], &[], 4));
+        let alpha_conn = reg
+            .snapshot(&BuilderName::new("alpha").unwrap())
+            .unwrap()
+            .connection_id;
+        let beta_conn = reg
+            .snapshot(&BuilderName::new("beta").unwrap())
+            .unwrap()
+            .connection_id;
         let mut excluded = std::collections::HashSet::new();
-        excluded.insert(BuilderName::new("alpha").unwrap());
+        excluded.insert(alpha_conn);
         let chosen = pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]), &excluded)
             .expect("beta is still eligible");
         assert_eq!(
@@ -3402,7 +3418,7 @@ mod tests {
         );
         // Excluding every eligible builder yields None — `build_one`
         // then falls back to a local build.
-        excluded.insert(BuilderName::new("beta").unwrap());
+        excluded.insert(beta_conn);
         assert!(
             pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]), &excluded).is_none(),
             "all eligible builders excluded → caller falls back to local",

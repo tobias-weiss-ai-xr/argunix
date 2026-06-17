@@ -135,13 +135,18 @@ pub struct Schedule {
     pub build_timeout_seconds: u32,
     /// How long the dispatcher waits for an eligible pool builder
     /// before giving up on a job and marking it `Interrupted`. Default
-    /// 0 (immediate). Useful when builders briefly drop and reconnect
-    /// — including the canonical case of the coordinator host
-    /// restarting in lockstep with a loopback `argunix-builder`,
-    /// where the daemon's eval-resume pass runs before the agent has
-    /// re-enrolled. A modest value (e.g. 30s) bridges the reconnect
-    /// gap without delaying genuinely no-builder dispatches for long.
-    /// Read once at startup.
+    /// 0 (fail fast). This is the in-eval retry budget: set it non-zero
+    /// (e.g. 120) on a stable pool so that while a job's builder is
+    /// briefly gone — a reconnect, or the coordinator host restarting in
+    /// lockstep with a loopback `argunix-builder` whose agent hasn't
+    /// re-enrolled yet — the dispatch loop waits here and retries rather
+    /// than failing the job and cascade-skipping its dependents. A
+    /// transport-failed builder is excluded by *connection*, so the same
+    /// builder reconnecting is picked up again within the window. Note
+    /// the job holds a global build-concurrency permit while it waits,
+    /// and a *genuinely* no-builder job (misconfigured system) waits the
+    /// full budget before failing — which is why the default is 0. Read
+    /// once at startup.
     #[serde(default = "default_builder_wait_seconds")]
     pub builder_wait_seconds: u32,
 }
@@ -163,6 +168,15 @@ fn default_build_timeout_seconds() -> u32 {
 }
 
 fn default_builder_wait_seconds() -> u32 {
+    // 0 = fail fast. Kept as the default deliberately: a non-zero value
+    // makes *every* job with no eligible builder wait — including the
+    // genuinely-no-builder case (a misconfigured system, or all builders
+    // for an arch down), which would then hang for the full budget per
+    // job. Operators who run a stable pool and want a brief drop /
+    // reconnect to be retried in-eval set this explicitly (e.g. 120);
+    // the dispatch loop excludes a transport-failed builder by
+    // connection, so the same builder reconnecting is picked up again
+    // within the window.
     0
 }
 
