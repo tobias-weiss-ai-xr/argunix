@@ -290,6 +290,19 @@ pub async fn generate_sbom(
 /// used only when the flake opts in; the roots must be valid in the
 /// local store. Returns the closure as sorted `/nix/store/...` paths.
 async fn closure_from_roots(roots: &[String]) -> Result<Vec<String>, String> {
+    // The roots come straight from the repo's `meta.sbom-runtime-roots`,
+    // so they are untrusted. `nix-store`'s argument parser is
+    // order-independent: a root beginning with `-` would be read as an
+    // option, not a path, injecting flags into a coordinator-side nix
+    // invocation. Reject anything that is not a plain absolute store
+    // path. See bugs.md SEC-2.
+    for root in roots {
+        if !root.starts_with("/nix/store/") {
+            return Err(format!(
+                "sbom-runtime-roots entry is not a /nix/store path: {root:?}"
+            ));
+        }
+    }
     let mut cmd = Command::new("nix-store");
     cmd.arg("--query").arg("--requisites");
     for root in roots {

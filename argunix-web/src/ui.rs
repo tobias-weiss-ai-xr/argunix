@@ -2228,10 +2228,19 @@ async fn log_handler(
 
     let path = log_path.to_string();
     let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+        // Cap the decompressed size: build logs are attacker-influenced
+        // (a build can emit gigabytes of highly-compressible stdout that
+        // stores tiny on disk), and this endpoint is unauthenticated, so
+        // an uncapped decode into one Vec is a decompression-bomb OOM.
+        // The stored log is itself bounded to 100 MiB at capture time;
+        // 128 MiB leaves margin without allowing amplification. See
+        // bugs.md SEC-12.
+        use std::io::Read as _;
+        const MAX_DECOMPRESSED: u64 = 128 * 1024 * 1024;
         let f = std::fs::File::open(&path)?;
-        let mut decoder = zstd::stream::Decoder::new(f)?;
+        let decoder = zstd::stream::Decoder::new(f)?;
         let mut buf = Vec::new();
-        std::io::copy(&mut decoder, &mut buf)?;
+        std::io::copy(&mut decoder.take(MAX_DECOMPRESSED), &mut buf)?;
         Ok(buf)
     })
     .await

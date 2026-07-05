@@ -281,7 +281,7 @@ async fn run_one(
     };
 
     if !status.success() {
-        if stderr_indicates_missing_fragment(attr_prefix, &stderr_buf) {
+        if stderr_indicates_missing_fragment(attr_prefix, status.code(), &stderr_buf) {
             tracing::debug!(
                 attr_prefix,
                 "flake does not provide fragment; treating as no jobs"
@@ -313,9 +313,15 @@ async fn run_one(
 /// - a `does not provide attribute '<fragment>'` line, possibly mixed
 ///   with unrelated warnings like `warning: unknown setting 'allowed-users'`
 ///   that nix prints ahead of the actual error.
-fn stderr_indicates_missing_fragment(fragment: &str, stderr: &str) -> bool {
+///
+/// `code` is the process exit code, or `None` if it was killed by a
+/// signal. A signal kill (e.g. SIGKILL from the systemd memory cap) also
+/// produces empty stderr, but it is a real failure — not an absent
+/// fragment — so the empty-stderr shortcut only applies when the process
+/// exited cleanly with a code. See bugs.md COR-5.
+fn stderr_indicates_missing_fragment(fragment: &str, code: Option<i32>, stderr: &str) -> bool {
     if stderr.trim().is_empty() {
-        return true;
+        return code.is_some();
     }
     let marker = format!("does not provide attribute '{fragment}'");
     stderr.contains(&marker)
@@ -526,16 +532,34 @@ error: worker error: error: flake 'git+file:///var/lib/argunix/work/6?shallow=1'
 ";
         assert!(stderr_indicates_missing_fragment(
             "devShells.x86_64-linux",
+            Some(1),
             stderr
         ));
     }
 
     #[test]
-    fn empty_stderr_is_treated_as_missing_fragment() {
-        assert!(stderr_indicates_missing_fragment("checks.x86_64-linux", ""));
+    fn empty_stderr_with_clean_exit_is_treated_as_missing_fragment() {
         assert!(stderr_indicates_missing_fragment(
             "checks.x86_64-linux",
+            Some(1),
+            ""
+        ));
+        assert!(stderr_indicates_missing_fragment(
+            "checks.x86_64-linux",
+            Some(1),
             "   \n  \t\n"
+        ));
+    }
+
+    #[test]
+    fn signal_kill_with_empty_stderr_is_not_a_missing_fragment() {
+        // A SIGKILL (e.g. the systemd memory cap) yields `code == None`
+        // and empty stderr. That is a real failure, not an absent
+        // fragment, and must surface as an error. See bugs.md COR-5.
+        assert!(!stderr_indicates_missing_fragment(
+            "checks.x86_64-linux",
+            None,
+            ""
         ));
     }
 
@@ -551,6 +575,7 @@ error: undefined variable 'foo'
 ";
         assert!(!stderr_indicates_missing_fragment(
             "packages.x86_64-linux",
+            Some(1),
             stderr
         ));
     }
@@ -565,6 +590,7 @@ error: flake '...' does not provide attribute 'packages.x86_64-linux.tool'
 ";
         assert!(!stderr_indicates_missing_fragment(
             "packages.x86_64-linux",
+            Some(1),
             stderr
         ));
     }

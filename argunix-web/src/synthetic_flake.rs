@@ -327,6 +327,35 @@ impl FlakeEntry {
     }
 }
 
+/// True for a string safe to emit as a bare Nix attribute-name segment.
+/// The synthetic flake interpolates `leaf`/`system` into attr positions
+/// (`packages.<system>.<leaf>`); a value containing `"`, `;`, `=`, `.`,
+/// or whitespace would break out of the attr context and inject Nix.
+/// Restricting to `[A-Za-z0-9_-]` keeps every emitted attr well-formed.
+/// See bugs.md SEC-3.
+fn is_safe_attr_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Escape an arbitrary string for inclusion inside a Nix double-quoted
+/// string literal. Escapes `\`, `"`, and `$` (the last defuses `${…}`
+/// interpolation). Used for repo-controlled values like `meta.mainProgram`
+/// and the flake description. See bugs.md SEC-3.
+fn nix_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Extract `<name>` from `packages.<system>.<name>`. Returns `None` for
 /// any attribute path outside the `packages.<system>.` namespace
 /// (devShells, checks, nixosConfigurations, homeConfigurations, …) so
@@ -338,8 +367,10 @@ fn packages_leaf<'a>(attr_path: &'a str, system: &str) -> Option<&'a str> {
     // `packages.<system>.<name>` is the supported shape; nested
     // (`packages.<system>.foo.bar`) isn't expressible the same way in
     // the synthetic flake, so skip those — they'd collide on the
-    // outermost segment anyway.
-    if rest.is_empty() || rest.contains('.') {
+    // outermost segment anyway. Also require a safe attr segment: a name
+    // carrying Nix metacharacters can't be exposed without injection, so
+    // it's dropped rather than emitted unescaped.
+    if rest.is_empty() || rest.contains('.') || !is_safe_attr_segment(rest) {
         return None;
     }
     Some(rest)
@@ -385,8 +416,15 @@ fn render_flake_nix(description: &str, caches: &[UsableCache], entries: &[FlakeE
     let mut packages_block = String::new();
     let mut apps_block = String::new();
     for (system, attrs) in &by_system {
+        // `system` comes from nix-eval-jobs and is normally `x86_64-linux`
+        // etc., but guard against an attacker-crafted value reaching the
+        // attr position. Skip the whole group if it isn't a safe segment.
+        if !is_safe_attr_segment(system) {
+            continue;
+        }
         packages_block.push_str(&format!("    packages.{system} = {{\n"));
         for (leaf, e) in attrs {
+            // `leaf` is already validated by `packages_leaf`.
             packages_block.push_str(&format!(
                 "      {leaf} = fetch {path};\n",
                 path = e.package_out,
@@ -401,20 +439,25 @@ fn render_flake_nix(description: &str, caches: &[UsableCache], entries: &[FlakeE
         if !with_apps.is_empty() {
             apps_block.push_str(&format!("    apps.{system} = {{\n"));
             for (leaf, e, mp) in with_apps {
-                // String-interpolation around `fetch` propagates the
-                // store path's context, so `nix run` realises the
-                // closure (via the substituter) before exec'ing.
+                // `mp` is repo-controlled (`meta.mainProgram`); escape it
+                // for the Nix string literal. String-interpolation around
+                // `fetch` propagates the store path's context, so `nix run`
+                // realises the closure (via the substituter) before exec'ing.
                 apps_block.push_str(&format!(
                     "      {leaf} = {{\n\
                      \x20       type = \"app\";\n\
                      \x20       program = \"${{fetch {bin}}}/bin/{mp}\";\n\
                      \x20     }};\n",
                     bin = e.bin_output,
+                    mp = nix_escape_string(mp),
                 ));
             }
             apps_block.push_str("    };\n");
         }
     }
+
+    let description = nix_escape_string(description);
+    let fetch_from = nix_escape_string(fetch_from);
 
     format!(
         r#"{{
@@ -443,8 +486,10 @@ fn render_flake_nix(description: &str, caches: &[UsableCache], entries: &[FlakeE
 fn render_string_list<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
     let mut out = String::from("[ ");
     for s in items {
+        // Cache URLs and signing keys are operator config, but escape
+        // them anyway so a stray `"` can't unbalance the emitted list.
         out.push('"');
-        out.push_str(s);
+        out.push_str(&nix_escape_string(s));
         out.push_str("\" ");
     }
     out.push(']');
@@ -800,6 +845,52 @@ mod tests {
         assert!(
             !src.contains("lib-only = {"),
             "apps block must NOT include attrs without a main_program: {src}",
+        );
+    }
+
+    #[test]
+    fn main_program_and_description_are_nix_escaped() {
+        // A malicious `meta.mainProgram` / description must not break out
+        // of its Nix string literal. See bugs.md SEC-3.
+        let caches = vec![UsableCache {
+            url: "https://cache.example.com".into(),
+            key: "argunix-1:abc".into(),
+        }];
+        let entries = vec![FlakeEntry {
+            system: "x86_64-linux".into(),
+            leaf: "evil".into(),
+            package_out: "/nix/store/zzz-evil".into(),
+            bin_output: "/nix/store/zzz-evil".into(),
+            main_program: Some(r#"x"; nixConfig.bad = "y"#.into()),
+        }];
+        let src = render_flake_nix(r#"desc"; x = "#, &caches, &entries);
+        // The injected `"` and `$` must be escaped, so no unescaped
+        // closing quote from the payload appears.
+        assert!(
+            src.contains(r#"\"; nixConfig.bad = \"y"#),
+            "mainProgram must be escaped: {src}",
+        );
+        assert!(
+            src.contains(r#"description = "desc\"; x = ""#),
+            "description must be escaped: {src}",
+        );
+    }
+
+    #[test]
+    fn unsafe_attr_names_are_dropped() {
+        // A package attr carrying Nix metacharacters can't be exposed
+        // without injection, so `packages_leaf` drops it. See SEC-3.
+        assert_eq!(
+            packages_leaf(r#"packages.x86_64-linux.a"b"#, "x86_64-linux"),
+            None,
+        );
+        assert_eq!(
+            packages_leaf("packages.x86_64-linux.a b", "x86_64-linux"),
+            None,
+        );
+        assert_eq!(
+            packages_leaf("packages.x86_64-linux.ok-name_1", "x86_64-linux"),
+            Some("ok-name_1"),
         );
     }
 
