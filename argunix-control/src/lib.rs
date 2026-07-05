@@ -44,6 +44,11 @@ pub enum Request {
     /// existing pubkey fail; the agent has to re-enroll with a fresh
     /// enrollment token.
     BuildersRevoke { name: String },
+    /// Remove a builder by name: deletes the sqlite row entirely and
+    /// kicks it if connected. Frees the name so a *different* key can
+    /// enroll under it (a name is otherwise bound to its first-seen
+    /// pubkey). Fails if the name is unknown.
+    BuildersRemove { name: String },
     /// Rename `old → new`. Fails if `old` doesn't exist or if `new`
     /// already exists.
     BuildersRename { old: String, new: String },

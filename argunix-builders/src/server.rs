@@ -501,7 +501,18 @@ impl ConnectionHandler {
                                 }
                             },
                             Err(e) => {
-                                tracing::error!(error = %e, "fresh enrollment upsert failed");
+                                // A `BuilderNameConflict` here means a
+                                // token-authenticated client tried to
+                                // enroll under a name already bound to a
+                                // different key (or a revoked one) — a
+                                // name-hijack / revocation-bypass attempt.
+                                // Reject the enrollment. See bugs.md
+                                // SEC-4 / SEC-8.
+                                tracing::warn!(
+                                    error = %e,
+                                    builder = %name,
+                                    "rejecting fresh enrollment (name bound to another key or revoked)",
+                                );
                                 None
                             }
                         }

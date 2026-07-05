@@ -67,6 +67,21 @@ async fn run(ctx: ControlContext) -> anyhow::Result<()> {
     }
     let listener = UnixListener::bind(&ctx.socket_path)
         .with_context(|| format!("binding {}", ctx.socket_path.display()))?;
+    // Restrict the socket to its owner (the service user) + root. The
+    // NixOS module runs under UMask=0027 (→ 0750, group-accessible), and
+    // a non-module deployment with a looser umask could expose a group-
+    // or world-writable control socket to an unprivileged local user who
+    // could then `Reload`/`TestDispatchDrv`. 0700 makes filesystem perms
+    // the access control. See bugs.md SEC-9.
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if let Err(e) =
+        std::fs::set_permissions(&ctx.socket_path, std::fs::Permissions::from_mode(0o700))
+    {
+        tracing::warn!(error = %e, "could not tighten control socket permissions to 0700");
+    }
+    // The socket's owner uid is our own; only that uid (or root) may
+    // connect. Defense-in-depth on top of the 0700 mode via SO_PEERCRED.
+    let allowed_uid: Option<u32> = std::fs::metadata(&ctx.socket_path).map(|m| m.uid()).ok();
     tracing::info!(
         path = %ctx.socket_path.display(),
         "control socket listening",
@@ -79,6 +94,25 @@ async fn run(ctx: ControlContext) -> anyhow::Result<()> {
                 continue;
             }
         };
+        // Verify the peer's uid. Filesystem perms already gate this, but
+        // a SO_PEERCRED check is cheap and catches a mis-permissioned
+        // socket. See bugs.md SEC-9.
+        if let Some(owner) = allowed_uid {
+            match stream.peer_cred() {
+                Ok(cred) if cred.uid() == owner || cred.uid() == 0 => {}
+                Ok(cred) => {
+                    tracing::warn!(
+                        peer_uid = cred.uid(),
+                        "rejecting control connection from unauthorized uid",
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not read control peer credentials; rejecting");
+                    continue;
+                }
+            }
+        }
         let ctx = ctx.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, ctx).await {
@@ -114,6 +148,14 @@ async fn handle_connection(stream: UnixStream, ctx: ControlContext) -> anyhow::R
 async fn dispatch(req: Request, ctx: &ControlContext) -> Response {
     match req {
         Request::Reload { config_path } => {
+            // The caller-supplied path is honoured because the NixOS
+            // reload flow needs it: after `nixos-rebuild switch` the new
+            // unit's `ExecReload` passes the new generation's
+            // `/nix/store` config path to the daemon still running the
+            // old one. This is safe only because the control socket is
+            // locked to its owner uid + root (0700 + SO_PEERCRED, see the
+            // listener) — an untrusted local user cannot reach this path
+            // to point the daemon at a malicious config. See bugs.md SEC-9.
             let path = config_path.unwrap_or_else(|| ctx.config_path.clone());
             match handle_reload(path, ctx).await {
                 Ok(details) => Response::ok_with(details),
@@ -126,6 +168,10 @@ async fn dispatch(req: Request, ctx: &ControlContext) -> Response {
             Err(e) => Response::error(format!("{e:#}")),
         },
         Request::BuildersRevoke { name } => match handle_builders_revoke(&name, ctx).await {
+            Ok(v) => Response::ok_with(v),
+            Err(e) => Response::error(format!("{e:#}")),
+        },
+        Request::BuildersRemove { name } => match handle_builders_remove(&name, ctx).await {
             Ok(v) => Response::ok_with(v),
             Err(e) => Response::error(format!("{e:#}")),
         },
@@ -347,6 +393,49 @@ async fn handle_builders_revoke(
         kicked,
         "builder revoked",
     );
+    Ok(serde_json::json!({
+        "name": name,
+        "kicked": kicked,
+    }))
+}
+
+async fn handle_builders_remove(
+    name: &str,
+    ctx: &ControlContext,
+) -> anyhow::Result<serde_json::Value> {
+    // Kick a live session first (same as revoke), then delete the row so
+    // the name is free for a different key to enroll under.
+    let kicked = match argunix_domain::BuilderName::new(name) {
+        Ok(builder_name) => match ctx.builder_registry.session(&builder_name) {
+            Some(session) => {
+                let kick = argunix_builders::ControlMessage::Kick {
+                    reason: "removed by operator".into(),
+                };
+                let bytes: bytes::Bytes = kick.encode_line().into();
+                let _ = session.handle.data(session.control_channel, bytes).await;
+                let _ = session
+                    .handle
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        "removed by operator".into(),
+                        "en".into(),
+                    )
+                    .await;
+                true
+            }
+            None => false,
+        },
+        Err(_) => false,
+    };
+    let removed = ctx
+        .store
+        .remove(name)
+        .await
+        .context("removing builder from sqlite")?;
+    if !removed {
+        anyhow::bail!("no such builder: {name}");
+    }
+    tracing::info!(builder = %name, kicked, "builder removed");
     Ok(serde_json::json!({
         "name": name,
         "kicked": kicked,

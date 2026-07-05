@@ -55,10 +55,15 @@ enum BuildersCommand {
         json: bool,
     },
     /// Revoke a builder. Sets `revoked_at` in sqlite; if currently
-    /// connected, sends a kick + disconnects the SSH session. To
-    /// re-enroll, the agent has to present a valid enrollment token
-    /// (a fresh pubkey-only reconnect will be rejected).
+    /// connected, sends a kick + disconnects the SSH session. The name
+    /// stays bound to its key — a token-authenticated reconnect can no
+    /// longer un-revoke it. Use `remove` to free the name for a new key.
     Revoke { name: String },
+    /// Remove a builder entirely. Deletes the sqlite row (and kicks it if
+    /// connected), freeing the name so a *different* key can enroll under
+    /// it. This is the escape hatch for decommissioning a builder or
+    /// replacing its key.
+    Remove { name: String },
     /// Rename `old` to `new`. Fails if `old` doesn't exist or `new`
     /// already does.
     Rename { old: String, new: String },
@@ -84,6 +89,7 @@ async fn main() -> ExitCode {
         Command::Status => Request::Status,
         Command::Builders(BuildersCommand::List { .. }) => Request::BuildersList,
         Command::Builders(BuildersCommand::Revoke { name }) => Request::BuildersRevoke { name },
+        Command::Builders(BuildersCommand::Remove { name }) => Request::BuildersRemove { name },
         Command::Builders(BuildersCommand::Rename { old, new }) => {
             Request::BuildersRename { old, new }
         }

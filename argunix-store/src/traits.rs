@@ -46,6 +46,15 @@ pub enum StoreError {
         #[source]
         error: serde_json::Error,
     },
+    /// A token-authenticated enrollment tried to (re)bind a builder name
+    /// that is already held by a *different* pubkey, or is revoked. The
+    /// name stays bound to its first-seen key; an operator must
+    /// `argunixctl builders remove <name>` before it can be re-enrolled.
+    /// See bugs.md SEC-4 / SEC-8.
+    #[error(
+        "builder name `{0}` is already bound to a different key (or revoked); refusing to rebind"
+    )]
+    BuilderNameConflict(String),
 }
 
 #[async_trait]
@@ -397,9 +406,17 @@ pub trait BuilderStore: Send + Sync {
     async fn mark_seen(&self, id: BuilderId, now: DateTime<Utc>) -> Result<(), StoreError>;
 
     /// `argunixctl builders revoke <name>`. Sets `revoked_at`; subsequent
-    /// pubkey-auth attempts will fail until the builder re-enrolls with a
-    /// fresh token. Returns false if the name is unknown.
+    /// pubkey-auth attempts will fail, and — unlike before — a
+    /// token-authenticated re-enrollment can no longer un-revoke the row
+    /// (see [`upsert`](Self::upsert)). The name stays bound to its key.
+    /// Returns false if the name is unknown.
     async fn revoke(&self, name: &str, now: DateTime<Utc>) -> Result<bool, StoreError>;
+
+    /// `argunixctl builders remove <name>`. Deletes the builder row
+    /// entirely, freeing the name so a *different* key can enroll under
+    /// it. This is the operator's escape hatch now that a name is bound
+    /// to its first-seen pubkey. Returns false if the name is unknown.
+    async fn remove(&self, name: &str) -> Result<bool, StoreError>;
 
     /// `argunixctl builders rename`. Returns false if `old` doesn't exist or
     /// `new` already exists.

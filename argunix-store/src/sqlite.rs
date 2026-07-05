@@ -1063,25 +1063,33 @@ impl BuilderStore for SqlxStore {
         let native_system = new.capabilities.native_system;
         let features_json =
             serde_json::to_string(&new.capabilities.features).expect("Vec<String> serialises");
-        // ON CONFLICT(name): the row is the latest snapshot, so we overwrite
-        // pubkey + capabilities + last_seen and clear `revoked_at`. Operators
-        // who want to lock a builder out should `argunixctl builders revoke`
-        // *and* not redistribute the enrollment token; a builder showing up
-        // with the right token after revocation is treated as a fresh enroll.
+        // A name is bound to the pubkey that first enrolled it. On
+        // conflict we refresh *only* capabilities/last_seen, and only
+        // when the presented pubkey matches the stored one AND the row is
+        // not revoked (`WHERE` guard). We never overwrite `pubkey` and
+        // never clear `revoked_at`, so:
+        //   - a token holder cannot rebind an existing builder's name to
+        //     their own key (name hijack — SEC-4), and
+        //   - a revoked builder cannot un-revoke itself by re-enrolling
+        //     with the still-valid shared token (SEC-8).
+        // When the guard blocks the update the statement touches no row
+        // and RETURNING is empty; we surface that as a conflict so the
+        // server rejects the enrollment. An operator frees a name for a
+        // new key with `argunixctl builders remove <name>`.
         let row = sqlx::query(
             "INSERT INTO builders
                  (name, pubkey, systems, native_system, features, max_jobs, nix_version,
                   enrolled_at, last_seen, revoked_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, NULL)
              ON CONFLICT(name) DO UPDATE SET
-                 pubkey        = excluded.pubkey,
                  systems       = excluded.systems,
                  native_system = excluded.native_system,
                  features      = excluded.features,
                  max_jobs      = excluded.max_jobs,
                  nix_version   = excluded.nix_version,
-                 last_seen     = excluded.last_seen,
-                 revoked_at    = NULL
+                 last_seen     = excluded.last_seen
+               WHERE builders.pubkey = excluded.pubkey
+                 AND builders.revoked_at IS NULL
              RETURNING id",
         )
         .bind(new.name.as_str())
@@ -1092,10 +1100,14 @@ impl BuilderStore for SqlxStore {
         .bind(new.capabilities.max_jobs as i64)
         .bind(new.capabilities.nix_version)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        let id: i64 = row.try_get("id")?;
-        Ok(BuilderId::new(id))
+        match row {
+            Some(r) => Ok(BuilderId::new(r.try_get("id")?)),
+            None => Err(StoreError::BuilderNameConflict(
+                new.name.as_str().to_string(),
+            )),
+        }
     }
 
     async fn get(&self, id: BuilderId) -> Result<Option<BuilderRecord>, StoreError> {
@@ -1149,6 +1161,14 @@ impl BuilderStore for SqlxStore {
     async fn revoke(&self, name: &str, now: DateTime<Utc>) -> Result<bool, StoreError> {
         let r = sqlx::query("UPDATE builders SET revoked_at = ?1 WHERE name = ?2")
             .bind(now)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    async fn remove(&self, name: &str) -> Result<bool, StoreError> {
+        let r = sqlx::query("DELETE FROM builders WHERE name = ?1")
             .bind(name)
             .execute(&self.pool)
             .await?;
@@ -2479,7 +2499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_reconnect_overwrites_capabilities_and_clears_revocation() {
+    async fn builder_reconnect_refreshes_capabilities_but_keeps_identity() {
         let s = store().await;
         let t0 = Utc::now();
         let id = <SqlxStore as BuilderStore>::upsert(
@@ -2493,26 +2513,15 @@ mod tests {
         )
         .await
         .unwrap();
-        // Operator revokes…
-        assert!(
-            <SqlxStore as BuilderStore>::revoke(&s, "mac01", t0)
-                .await
-                .unwrap()
-        );
-        let r = <SqlxStore as BuilderStore>::get(&s, id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(r.revoked_at.is_some());
 
-        // …then re-enrolls with a new key + updated caps. Same name → upsert
-        // overwrites and clears `revoked_at`.
+        // A reconnect with the *same* key refreshes capabilities +
+        // last_seen (but never rebinds the pubkey). See bugs.md SEC-4.
         let t1 = t0 + chrono::Duration::seconds(60);
         let id2 = <SqlxStore as BuilderStore>::upsert(
             &s,
             NewBuilder {
                 name: BuilderName::new("mac01").unwrap(),
-                pubkey: pubkey(2),
+                pubkey: pubkey(1),
                 capabilities: caps(&["aarch64-darwin", "x86_64-darwin"], &["kvm"], 4),
             },
             t1,
@@ -2524,12 +2533,40 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(r.pubkey, pubkey(2));
+        assert_eq!(r.pubkey, pubkey(1));
         assert_eq!(r.capabilities.systems.len(), 2);
         assert_eq!(r.capabilities.features, vec!["kvm".to_string()]);
         assert_eq!(r.capabilities.max_jobs, 4);
         assert!(r.revoked_at.is_none());
         assert_eq!(r.last_seen, t1);
+
+        // After revocation, even the same key cannot un-revoke via upsert
+        // (SEC-8). The row stays revoked.
+        assert!(
+            <SqlxStore as BuilderStore>::revoke(&s, "mac01", t1)
+                .await
+                .unwrap()
+        );
+        let err = <SqlxStore as BuilderStore>::upsert(
+            &s,
+            NewBuilder {
+                name: BuilderName::new("mac01").unwrap(),
+                pubkey: pubkey(1),
+                capabilities: caps(&["aarch64-darwin"], &[], 1),
+            },
+            t1 + chrono::Duration::seconds(60),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, StoreError::BuilderNameConflict(_)));
+        let r = <SqlxStore as BuilderStore>::get(&s, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            r.revoked_at.is_some(),
+            "revocation must survive re-enrollment"
+        );
     }
 
     #[tokio::test]
@@ -2607,6 +2644,73 @@ mod tests {
         let s = store().await;
         assert!(
             !<SqlxStore as BuilderStore>::revoke(&s, "nope", Utc::now())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_binds_name_to_first_pubkey_and_remove_frees_it() {
+        // SEC-4 / SEC-8: a name is bound to its first pubkey; a different
+        // key can't rebind it, a revoked row can't be un-revoked via
+        // upsert, and only `remove` frees the name.
+        let s = store().await;
+        let now = Utc::now();
+        let mk = |name: &str, key: u8| NewBuilder {
+            name: BuilderName::new(name).unwrap(),
+            pubkey: pubkey(key),
+            capabilities: caps(&["x86_64-linux"], &[], 1),
+        };
+        <SqlxStore as BuilderStore>::upsert(&s, mk("b", 1), now)
+            .await
+            .unwrap();
+
+        // Same key re-enrolls → allowed (metadata refresh).
+        <SqlxStore as BuilderStore>::upsert(&s, mk("b", 1), now)
+            .await
+            .unwrap();
+
+        // Different key under the same name → rejected, row unchanged.
+        let err = <SqlxStore as BuilderStore>::upsert(&s, mk("b", 2), now)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::BuilderNameConflict(_)));
+        let row = <SqlxStore as BuilderStore>::find_by_name(&s, "b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.pubkey, pubkey(1));
+
+        // Revoked → even the same key can't un-revoke via upsert.
+        assert!(
+            <SqlxStore as BuilderStore>::revoke(&s, "b", now)
+                .await
+                .unwrap()
+        );
+        let err = <SqlxStore as BuilderStore>::upsert(&s, mk("b", 1), now)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::BuilderNameConflict(_)));
+
+        // remove() frees the name so a different key can take it.
+        assert!(<SqlxStore as BuilderStore>::remove(&s, "b").await.unwrap());
+        assert!(
+            <SqlxStore as BuilderStore>::find_by_name(&s, "b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        <SqlxStore as BuilderStore>::upsert(&s, mk("b", 2), now)
+            .await
+            .unwrap();
+        let row = <SqlxStore as BuilderStore>::find_by_name(&s, "b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.pubkey, pubkey(2));
+        // remove() of an unknown name returns false.
+        assert!(
+            !<SqlxStore as BuilderStore>::remove(&s, "nope")
                 .await
                 .unwrap()
         );

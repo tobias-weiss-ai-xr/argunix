@@ -288,17 +288,20 @@ async fn connection_drop_removes_entry() {
 }
 
 #[tokio::test]
-async fn duplicate_name_displaces_old_connection() {
+async fn duplicate_name_reconnect_displaces_old_connection() {
     let (addr, store, registry) = spawn_server().await;
 
-    // Two distinct keys: argunix upserts the row by name on hello.
-    let (key_a, pubkey_a) = fresh_client_key();
-    let (key_b, pubkey_b) = fresh_client_key();
+    // One key: a builder reconnecting under the same identity. This is
+    // the legitimate displacement case — the returning session takes over
+    // and the stale one is kicked. (A *different* key trying to take the
+    // name is a hijack and is covered by the next test.)
+    let (key_a_raw, pubkey_a) = fresh_client_key();
+    let key_a = Arc::new(key_a_raw);
     let _ = <SqlxStore as BuilderStore>::upsert(
         &store,
         NewBuilder {
             name: BuilderName::new("dup").unwrap(),
-            pubkey: pubkey_a,
+            pubkey: pubkey_a.clone(),
             capabilities: caps(&["x86_64-linux"], &[], 1),
         },
         Utc::now(),
@@ -306,7 +309,103 @@ async fn duplicate_name_displaces_old_connection() {
     .await
     .unwrap();
 
-    // First connection.
+    let hello = ControlMessage::Hello {
+        name: BuilderName::new("dup").unwrap(),
+        systems: vec!["x86_64-linux".into()],
+        native_system: "x86_64-linux".into(),
+        features: vec![],
+        max_jobs: 1,
+        nix_version: "2.18.1".into(),
+    };
+
+    // First connection (pubkey auth → Established).
+    let mut session_a = connect(addr).await;
+    let _ = session_a
+        .authenticate_publickey(
+            "argunix-builder",
+            PrivateKeyWithHashAlg::new(key_a.clone(), None),
+        )
+        .await
+        .unwrap();
+    let mut channel_a = session_a.channel_open_session().await.unwrap();
+    channel_a.data(&hello.encode_line()[..]).await.unwrap();
+    let _ = await_welcome(&mut channel_a).await.unwrap();
+
+    let snap_a = registry
+        .snapshot(&BuilderName::new("dup").unwrap())
+        .unwrap();
+
+    // Second connection: same key, same name — a reconnect. Auth via
+    // pubkey (Established), hello refreshes capabilities and the registry
+    // entry is displaced.
+    let mut session_b = connect(addr).await;
+    let _ = session_b
+        .authenticate_publickey(
+            "argunix-builder",
+            PrivateKeyWithHashAlg::new(key_a.clone(), None),
+        )
+        .await
+        .unwrap();
+    let mut channel_b = session_b.channel_open_session().await.unwrap();
+    channel_b.data(&hello.encode_line()[..]).await.unwrap();
+    let _ = await_welcome(&mut channel_b).await.unwrap();
+
+    assert!(
+        wait_for(&registry, "dup", |s| s.connected_since
+            > snap_a.connected_since)
+        .await,
+        "registry should reflect the new connection's connected_since",
+    );
+
+    // Row keeps its original key — a reconnect never rebinds the pubkey.
+    let row = <SqlxStore as BuilderStore>::find_by_name(&store, "dup")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.pubkey, pubkey_a);
+
+    // The displaced first session was kicked + disconnected.
+    let hb = ControlMessage::Heartbeat { ts: 1, stats: None };
+    let send = channel_a.data(&hb.encode_line()[..]).await;
+    let recv = tokio::time::timeout(Duration::from_secs(30), channel_a.wait()).await;
+    assert!(
+        send.is_err() || matches!(recv, Ok(None) | Ok(Some(ChannelMsg::Close))),
+        "displaced channel must be closed",
+    );
+}
+
+#[tokio::test]
+async fn token_enrollment_cannot_hijack_existing_name() {
+    // SEC-4 / SEC-8: a name is bound to its first-seen pubkey. A token
+    // holder cannot re-enroll under an existing name with a *different*
+    // key to hijack it. The enrollment is rejected, the stored key is
+    // unchanged, and the incumbent connection keeps running.
+    let (addr, store, registry) = spawn_server().await;
+
+    let (key_a, pubkey_a) = fresh_client_key();
+    let (key_b, _pubkey_b) = fresh_client_key();
+    let _ = <SqlxStore as BuilderStore>::upsert(
+        &store,
+        NewBuilder {
+            name: BuilderName::new("dup").unwrap(),
+            pubkey: pubkey_a.clone(),
+            capabilities: caps(&["x86_64-linux"], &[], 1),
+        },
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let hello = ControlMessage::Hello {
+        name: BuilderName::new("dup").unwrap(),
+        systems: vec!["x86_64-linux".into()],
+        native_system: "x86_64-linux".into(),
+        features: vec![],
+        max_jobs: 1,
+        nix_version: "2.18.1".into(),
+    };
+
+    // Incumbent connection with the real key.
     let mut session_a = connect(addr).await;
     let _ = session_a
         .authenticate_publickey(
@@ -316,25 +415,11 @@ async fn duplicate_name_displaces_old_connection() {
         .await
         .unwrap();
     let mut channel_a = session_a.channel_open_session().await.unwrap();
-    let hello = ControlMessage::Hello {
-        name: BuilderName::new("dup").unwrap(),
-        systems: vec!["x86_64-linux".into()],
-        native_system: "x86_64-linux".into(),
-        features: vec![],
-        max_jobs: 1,
-        nix_version: "2.18.1".into(),
-    };
     channel_a.data(&hello.encode_line()[..]).await.unwrap();
     let _ = await_welcome(&mut channel_a).await.unwrap();
 
-    let snap_a = registry
-        .snapshot(&BuilderName::new("dup").unwrap())
-        .unwrap();
-
-    // Second connection: same name, different pubkey. Auth via token
-    // (so the new pubkey is captured for FreshEnrollment); on hello,
-    // argunix upserts the row with pubkey_b and the registry entry is
-    // displaced.
+    // Attacker: different key, token auth (→ FreshEnrollment with key_b),
+    // hello under the existing name "dup".
     let mut session_b = connect(addr).await;
     let _ = session_b
         .authenticate_publickey(
@@ -352,33 +437,27 @@ async fn duplicate_name_displaces_old_connection() {
         .unwrap();
     let mut channel_b = session_b.channel_open_session().await.unwrap();
     channel_b.data(&hello.encode_line()[..]).await.unwrap();
-    let _ = await_welcome(&mut channel_b).await.unwrap();
 
-    // Wait until the registry's connected_since changes — that's how
-    // we know the takeover landed.
+    // The enrollment is rejected: no Welcome, the server closes the
+    // channel.
     assert!(
-        wait_for(&registry, "dup", |s| s.connected_since
-            > snap_a.connected_since)
-        .await,
-        "registry should reflect the new connection's connected_since",
+        await_welcome(&mut channel_b).await.is_none(),
+        "hijack enrollment must not receive a Welcome",
     );
 
-    // Sqlite row got overwritten with pubkey_b. The first connection's
-    // session was sent a Kick + disconnected; verify we can no longer
-    // exchange data on it (russh's pump returns an error or closes).
+    // The stored key is unchanged.
     let row = <SqlxStore as BuilderStore>::find_by_name(&store, "dup")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.pubkey, pubkey_b);
+    assert_eq!(row.pubkey, pubkey_a, "stored pubkey must not be rebound");
 
-    // Try to send another heartbeat on channel_a; it should fail
-    // because the server disconnected the displaced session.
-    let hb = ControlMessage::Heartbeat { ts: 1, stats: None };
-    let send = channel_a.data(&hb.encode_line()[..]).await;
-    let recv = tokio::time::timeout(Duration::from_secs(30), channel_a.wait()).await;
+    // The incumbent session was not displaced — it's still the registry's
+    // active connection.
     assert!(
-        send.is_err() || matches!(recv, Ok(None) | Ok(Some(ChannelMsg::Close))),
-        "displaced channel must be closed",
+        registry
+            .snapshot(&BuilderName::new("dup").unwrap())
+            .is_some(),
+        "incumbent connection must survive the rejected hijack",
     );
 }
