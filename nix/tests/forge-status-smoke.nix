@@ -39,6 +39,9 @@ let
 
   fakeGit = writeShellScriptBin "git" ''
     set -eu
+    # argunix passes credential config as leading `-c <k=v>` pairs
+    # (SEC-1 credential helper); real git accepts them, so skip them.
+    while [ "$1" = "-c" ]; do shift 2; done
     if [ "$1" = "-C" ]; then
       exit 0
     fi
@@ -295,15 +298,13 @@ runCommand "argunix-forge-status-smoke"
     grep -F '"context":"argunix: packages.x86_64-linux.hello"' forge.log | grep -F '"state":"error"'
     grep -F '"context":"argunix: packages.x86_64-linux.goodbye"' forge.log | grep -F '"state":"error"'
 
-    # Final overall eval check. With every job Interrupted, the tally
-    # counts neither successes nor failures, so the final state is
-    # "success" with empty counts. (Whether Interrupted-only evals
-    # should surface as pending/error instead is a separate design
-    # question outside this test's scope.)
+    # Final overall eval check. Every job Interrupted (no builder in the
+    # sandbox) must NOT read as green: the overall state is "error" and
+    # the description reports the interrupted count. See bugs.md COR-1.
     final=$(grep -F '"context":"argunix: evaluation"' forge.log | tail -n 1)
     echo "final overall check: $final"
-    echo "$final" | grep -F '"state":"success"'
-    echo "$final" | grep -F '0 ok, 0 cached, 0 failed'
+    echo "$final" | grep -F '"state":"error"'
+    echo "$final" | grep -F '0 ok, 0 cached, 0 failed, 2 interrupted'
 
     # Shutdown — see trap above for why SIGKILL.
     kill -KILL $daemon_pid 2>/dev/null || true

@@ -99,6 +99,9 @@ let
 
   fakeGit = pkgs.writeShellScriptBin "git" ''
     set -eu
+    # argunix passes credential config as leading `-c <k=v>` pairs
+    # (SEC-1 credential helper); real git accepts them, so skip them.
+    while [ "$1" = "-c" ]; do shift 2; done
     if [ "$1" = "-C" ]; then exit 0; fi
     case "$1" in
       clone)
