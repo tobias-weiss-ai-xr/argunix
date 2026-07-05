@@ -1,0 +1,14 @@
+-- Full serialized `JobSpec` for crash-resume fidelity.
+--
+-- Before this, a daemon that restarted mid-build reconstructed each
+-- resumed job's `JobSpec` from individual columns, silently dropping
+-- `image_format`, `meta`, `outputs`, and `required_system_features`.
+-- The consequence was severe: resumed image jobs lost their
+-- `image_format`, so registry pushes, SBOM attachment, and the whole
+-- multi-arch fan-in were skipped without any error (see bugs.md COR-4).
+--
+-- We now serialize the entire `JobSpec` to JSON at persist time and
+-- rehydrate it verbatim on resume, making resume behaviour identical to
+-- first-run. NULL for rows written before this migration; the resume
+-- path falls back to the old lossy reconstruction for those.
+ALTER TABLE jobs ADD COLUMN spec_json TEXT;

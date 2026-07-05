@@ -33,7 +33,11 @@ pub struct RawJob {
 
 /// A argunix-side job spec produced by combining a [`RawJob`] with the
 /// fragment prefix it was discovered under.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` is derived so the whole spec can be persisted as JSON on
+/// the job row and rehydrated verbatim on crash-resume, instead of being
+/// lossily reconstructed from individual columns. See bugs.md COR-4.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpec {
     pub attr_path: AttrPath,
     pub drv_path: Option<String>,

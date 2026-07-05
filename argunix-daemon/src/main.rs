@@ -158,7 +158,41 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+/// Acquire an exclusive advisory lock on `./argunix.lock`, held for the
+/// lifetime of the returned `File`. The OS releases an `flock` when the
+/// fd closes or the process dies (even on SIGKILL), so the lock never
+/// goes stale. Any second argunix process sharing this working directory
+/// — a `run`/`build` invocation, or a restart that overlaps the old
+/// instance — is refused before it can run boot recovery (which mutates
+/// job/eval/effect rows) against the live daemon's data. See bugs.md
+/// COR-2 / S1.
+fn acquire_instance_lock() -> anyhow::Result<std::fs::File> {
+    acquire_instance_lock_at(Path::new("./argunix.lock"))
+}
+
+fn acquire_instance_lock_at(path: &Path) -> anyhow::Result<std::fs::File> {
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening instance lock {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow!(
+            "another argunix process already holds the instance lock at {} \
+             (a daemon is running in this directory); refusing to start",
+            path.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(anyhow::Error::from(e).context("locking instance lock"))
+        }
+    }
+}
+
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    // Held for the whole daemon lifetime; released on process exit.
+    let _instance_lock = acquire_instance_lock()?;
     let config = argunix_config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
     if !args.skip_secret_check {
@@ -185,6 +219,23 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .context("recovering interrupted jobs")?;
     if n > 0 {
         tracing::info!(count = n, "marked previously-running jobs as interrupted");
+    }
+
+    // Companion recovery for post-build effects (registry/cache pushes):
+    // a daemon that died mid-effect leaves the `effect_runs` row `running`
+    // forever. Flip those to a terminal `interrupted` state. See
+    // bugs.md COR-7.
+    match <argunix_store::SqlxStore as argunix_store::EffectRunStore>::mark_running_effects_interrupted(
+        &store,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(n) if n > 0 => {
+            tracing::info!(count = n, "marked previously-running effects as interrupted")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "could not recover running effect rows at startup"),
     }
 
     let work_dir = args
@@ -311,6 +362,37 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         registry_state: registry_state.clone(),
     };
     let worker_handle = worker::spawn(worker_ctx, rx);
+
+    // Recover evaluations stranded in `evaluating` by a crash mid-clone
+    // or mid-eval. `mark_building` runs before any job is persisted, so
+    // an `evaluating` row has no jobs — resetting it to `queued` and
+    // redriving re-runs the clone/eval/persist phase cleanly, with no
+    // risk of duplicate job rows. See bugs.md COR-3.
+    match <argunix_store::SqlxStore as EvalStore>::list_evaluating_ids(&store).await {
+        Ok(ids) if !ids.is_empty() => {
+            tracing::info!(
+                count = ids.len(),
+                "requeuing evaluations stranded in 'evaluating' from prior run"
+            );
+            for id in ids {
+                if let Err(e) = <argunix_store::SqlxStore as EvalStore>::set_status(
+                    &store,
+                    id,
+                    argunix_domain::EvalStatus::Queued,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, eval_id = id.get(), "failed to reset evaluating eval to queued");
+                    continue;
+                }
+                if let Err(e) = tx.send(id) {
+                    tracing::warn!(error = %e, "failed to enqueue eval for re-evaluation");
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "could not list evaluating evaluations at startup"),
+    }
 
     // Redrive `Queued` evaluations the previous instance never
     // started processing.
@@ -613,6 +695,9 @@ async fn shutdown_signal() {
 }
 
 async fn run(args: RunArgs) -> anyhow::Result<()> {
+    // Same working directory, same `./db.sqlite`, same boot recovery as
+    // `serve` — must not run concurrently with a live daemon. COR-2 / S1.
+    let _instance_lock = acquire_instance_lock()?;
     let config = argunix_config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
     if !args.skip_secret_check {
@@ -670,6 +755,9 @@ async fn eval(args: EvalArgs) -> anyhow::Result<()> {
 }
 
 async fn build(args: BuildArgs) -> anyhow::Result<()> {
+    // Writes job/eval rows into the shared `./db.sqlite`; must not race a
+    // live daemon in the same directory. COR-2 / S1.
+    let _instance_lock = acquire_instance_lock()?;
     let config = argunix_config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
     if !args.skip_secret_check {
@@ -1359,7 +1447,19 @@ async fn spawn_builder_server_if_configured(
                 enroll.token_path.path().display()
             )
         })?;
-    let token = Arc::new(strip_trailing_newlines(token_bytes));
+    let token_bytes = strip_trailing_newlines(token_bytes);
+    // An empty token would make `constant_time_eq(presented, b"")` accept
+    // any empty password, silently authenticating any client as a fresh
+    // enrollee. Fail closed at startup rather than serving an open port.
+    // See bugs.md SEC-7.
+    if token_bytes.is_empty() {
+        anyhow::bail!(
+            "builder enrollment token at {} is empty (after trimming newlines); \
+             refusing to start with an open enrollment port",
+            enroll.token_path.path().display()
+        );
+    }
+    let token = Arc::new(token_bytes);
 
     let server_cfg = argunix_builders::ServerConfig {
         listen,
@@ -1394,4 +1494,27 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .json()
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_lock_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("argunix.lock");
+        // First holder succeeds.
+        let held = acquire_instance_lock_at(&path).unwrap();
+        // A second acquire while the first is held is refused (a second
+        // daemon / `run` / `build` in the same directory). See COR-2 / S1.
+        let err = acquire_instance_lock_at(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("already holds the instance lock"),
+            "unexpected error: {err}",
+        );
+        // Once the holder is dropped, the lock frees and re-acquire works.
+        drop(held);
+        let _reacquired = acquire_instance_lock_at(&path).unwrap();
+    }
 }

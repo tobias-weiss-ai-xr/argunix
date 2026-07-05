@@ -19,6 +19,18 @@ use sqlx::sqlite::{SqlitePool, SqliteRow};
 use std::collections::HashMap;
 use std::str::FromStr;
 
+/// SQL fragment listing the terminal evaluation statuses, for use in a
+/// `status NOT IN (...)` guard. These are the literal `EvalStatus::as_str`
+/// values (`EvaluationFailed` / `Done` / `Cancelled`); they are compile-time
+/// constants, never user input, so interpolating them is injection-safe.
+const EVAL_TERMINAL_STATUSES: &str = "'evaluation_failed', 'done', 'cancelled'";
+
+/// SQL fragment listing the terminal *job* statuses, for a `status NOT IN
+/// (...)` guard on `JobStore::finish`. Literal `JobStatus::as_str` values,
+/// compile-time constants — injection-safe.
+const JOB_TERMINAL_STATUSES: &str =
+    "'cached', 'success', 'failure', 'cancelled', 'skipped_no_builder'";
+
 #[derive(Clone)]
 pub struct SqlxStore {
     pool: SqlitePool,
@@ -424,12 +436,19 @@ impl EvalStore for SqlxStore {
         started_at: DateTime<Utc>,
         status: EvalStatus,
     ) -> Result<(), StoreError> {
-        sqlx::query("UPDATE evaluations SET status = ?1, started_at = ?2 WHERE id = ?3")
-            .bind(status.as_str())
-            .bind(started_at)
-            .bind(id.get())
-            .execute(&self.pool)
-            .await?;
+        // Guarded: never move an eval out of a terminal state. A
+        // concurrent cancel-on-push (webhook writes `Cancelled`) must not
+        // be clobbered by the worker task still driving the superseded
+        // eval. See bugs.md COR-2.
+        sqlx::query(&format!(
+            "UPDATE evaluations SET status = ?1, started_at = ?2 \
+             WHERE id = ?3 AND status NOT IN ({EVAL_TERMINAL_STATUSES})"
+        ))
+        .bind(status.as_str())
+        .bind(started_at)
+        .bind(id.get())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -439,12 +458,18 @@ impl EvalStore for SqlxStore {
         status: EvalStatus,
         finished_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        sqlx::query("UPDATE evaluations SET status = ?1, finished_at = ?2 WHERE id = ?3")
-            .bind(status.as_str())
-            .bind(finished_at)
-            .bind(id.get())
-            .execute(&self.pool)
-            .await?;
+        // Guarded: the first terminal verdict wins. Prevents the build
+        // loop's `finish(Done)` from overwriting a webhook `Cancelled`
+        // (and vice-versa). See bugs.md COR-2.
+        sqlx::query(&format!(
+            "UPDATE evaluations SET status = ?1, finished_at = ?2 \
+             WHERE id = ?3 AND status NOT IN ({EVAL_TERMINAL_STATUSES})"
+        ))
+        .bind(status.as_str())
+        .bind(finished_at)
+        .bind(id.get())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -454,11 +479,11 @@ impl EvalStore for SqlxStore {
         reason: &str,
         finished_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        sqlx::query(
+        sqlx::query(&format!(
             "UPDATE evaluations
              SET status = ?1, finished_at = ?2, failure_reason = ?3
-             WHERE id = ?4",
-        )
+             WHERE id = ?4 AND status NOT IN ({EVAL_TERMINAL_STATUSES})"
+        ))
         .bind(EvalStatus::EvaluationFailed.as_str())
         .bind(finished_at)
         .bind(reason)
@@ -473,11 +498,11 @@ impl EvalStore for SqlxStore {
         id: EvalId,
         building_started_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        sqlx::query(
+        sqlx::query(&format!(
             "UPDATE evaluations
              SET status = ?1, building_started_at = ?2
-             WHERE id = ?3",
-        )
+             WHERE id = ?3 AND status NOT IN ({EVAL_TERMINAL_STATUSES})"
+        ))
         .bind(EvalStatus::Building.as_str())
         .bind(building_started_at)
         .bind(id.get())
@@ -565,6 +590,17 @@ impl EvalStore for SqlxStore {
         let rows = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM evaluations
              WHERE status = 'building'
+             ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(EvalId::new).collect())
+    }
+
+    async fn list_evaluating_ids(&self) -> Result<Vec<EvalId>, StoreError> {
+        let rows = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM evaluations
+             WHERE status = 'evaluating'
              ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -802,12 +838,19 @@ impl JobStore for SqlxStore {
     }
 
     async fn start(&self, id: JobId, started_at: DateTime<Utc>) -> Result<(), StoreError> {
-        sqlx::query("UPDATE jobs SET status = ?1, started_at = ?2 WHERE id = ?3")
-            .bind(JobStatus::Running.as_str())
-            .bind(started_at)
-            .bind(id.get())
-            .execute(&self.pool)
-            .await?;
+        // Guarded: never revive a terminal job into `running`. Allows
+        // `queued → running` (and a `running → running` re-mark), but a
+        // job that was already cancelled/finished stays put. See bugs.md
+        // COR-2 (job level).
+        sqlx::query(&format!(
+            "UPDATE jobs SET status = ?1, started_at = ?2 \
+             WHERE id = ?3 AND status NOT IN ({JOB_TERMINAL_STATUSES})"
+        ))
+        .bind(JobStatus::Running.as_str())
+        .bind(started_at)
+        .bind(id.get())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -824,13 +867,17 @@ impl JobStore for SqlxStore {
         // i64::MAX defensively — closures over 9 EiB don't happen,
         // but a buggy counter shouldn't blow up the UPDATE.
         let to_i64 = |v: Option<u64>| v.map(|n| n.min(i64::MAX as u64) as i64);
-        sqlx::query(
+        // Guarded: a terminal job row is immutable. The first verdict
+        // wins, so a `Cancelled` write can't be clobbered by a racing
+        // `Failure` (and vice-versa) from the build loop's join arm.
+        // See bugs.md COR-2 / COR-10.
+        sqlx::query(&format!(
             "UPDATE jobs
              SET status = ?1, finished_at = ?2, log_path = ?3, output_path = ?4,
                  push_bytes = ?5, push_ms = ?6, build_ms = ?7,
                  pull_bytes = ?8, pull_ms = ?9
-             WHERE id = ?10",
-        )
+             WHERE id = ?10 AND status NOT IN ({JOB_TERMINAL_STATUSES})"
+        ))
         .bind(status.as_str())
         .bind(finished_at)
         .bind(log_path)
@@ -899,17 +946,52 @@ impl JobStore for SqlxStore {
         Ok(r.rows_affected())
     }
 
+    async fn set_spec_json(&self, id: JobId, spec_json: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE jobs SET spec_json = ?1 WHERE id = ?2")
+            .bind(spec_json)
+            .bind(id.get())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn resume_specs_for_eval(
+        &self,
+        eval_id: EvalId,
+    ) -> Result<Vec<(JobId, String)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, spec_json FROM jobs
+             WHERE eval_id = ?1 AND status = 'queued' AND spec_json IS NOT NULL
+             ORDER BY id ASC",
+        )
+        .bind(eval_id.get())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: i64 = row.try_get("id")?;
+            let spec_json: String = row.try_get("spec_json")?;
+            out.push((JobId::new(id), spec_json));
+        }
+        Ok(out)
+    }
+
     async fn dispatch(
         &self,
         id: JobId,
         builder_id: BuilderId,
         started_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        sqlx::query(
+        // Guarded like `start`: allow `queued → running` and the
+        // `running → running` re-dispatch of the transport-failure retry
+        // loop (which re-calls `dispatch` with a new builder without
+        // re-queuing), but never revive a terminal job. See bugs.md
+        // COR-2 (job level).
+        sqlx::query(&format!(
             "UPDATE jobs
              SET status = ?1, started_at = ?2, builder_id = ?3
-             WHERE id = ?4",
-        )
+             WHERE id = ?4 AND status NOT IN ({JOB_TERMINAL_STATUSES})"
+        ))
         .bind(JobStatus::Running.as_str())
         .bind(started_at)
         .bind(builder_id.get())
@@ -1381,6 +1463,22 @@ impl EffectRunStore for SqlxStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(map_effect_run).collect()
+    }
+
+    async fn mark_running_effects_interrupted(
+        &self,
+        finished_at: DateTime<Utc>,
+    ) -> Result<u64, StoreError> {
+        let r = sqlx::query(
+            "UPDATE effect_runs
+             SET status = 'interrupted', finished_at = ?1,
+                 detail = COALESCE(detail, 'daemon exited before the effect finished')
+             WHERE status = 'running'",
+        )
+        .bind(finished_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
     }
 }
 
@@ -3006,5 +3104,275 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    async fn seed_eval(s: &SqlxStore) -> EvalId {
+        let repo_id = <SqlxStore as RepoStore>::upsert(s, "github", &Slug::new("a/b").unwrap())
+            .await
+            .unwrap();
+        <SqlxStore as EvalStore>::create(
+            s,
+            NewEvaluation {
+                repo_id,
+                trigger: "push".to_string(),
+                git_ref: "refs/heads/main".to_string(),
+                sha: Sha::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                pr_number: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn finish_does_not_clobber_cancelled_eval() {
+        // COR-2: the first terminal verdict wins. A webhook `Cancelled`
+        // must survive the worker's late `finish(Done)` / `mark_building`.
+        let s = store().await;
+        let eval_id = seed_eval(&s).await;
+        <SqlxStore as EvalStore>::finish(&s, eval_id, EvalStatus::Cancelled, Utc::now())
+            .await
+            .unwrap();
+        <SqlxStore as EvalStore>::finish(&s, eval_id, EvalStatus::Done, Utc::now())
+            .await
+            .unwrap();
+        <SqlxStore as EvalStore>::mark_building(&s, eval_id, Utc::now())
+            .await
+            .unwrap();
+        <SqlxStore as EvalStore>::start(&s, eval_id, Utc::now(), EvalStatus::Evaluating)
+            .await
+            .unwrap();
+        let r = <SqlxStore as EvalStore>::get(&s, eval_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.status, EvalStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn list_evaluating_ids_finds_only_stranded_evals() {
+        // COR-3: boot recovery locates evals stuck in `evaluating`.
+        let s = store().await;
+        let stranded = seed_eval(&s).await;
+        <SqlxStore as EvalStore>::set_status(&s, stranded, EvalStatus::Evaluating)
+            .await
+            .unwrap();
+        let other = seed_eval(&s).await;
+        <SqlxStore as EvalStore>::set_status(&s, other, EvalStatus::Building)
+            .await
+            .unwrap();
+        let ids = <SqlxStore as EvalStore>::list_evaluating_ids(&s)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![stranded]);
+    }
+
+    #[tokio::test]
+    async fn spec_json_round_trips_for_resume() {
+        // COR-4: the full spec is persisted and read back for queued jobs.
+        let s = store().await;
+        let eval_id = seed_eval(&s).await;
+        let job_id = <SqlxStore as JobStore>::create(
+            &s,
+            NewJob {
+                eval_id,
+                attr_path: AttrPath::new("packages.x86_64-linux.img"),
+                drv_path: Some("/nix/store/aaa.drv".to_string()),
+                system: "x86_64-linux".to_string(),
+                main_program: None,
+                outputs: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        <SqlxStore as JobStore>::set_spec_json(&s, job_id, r#"{"marker":true}"#)
+            .await
+            .unwrap();
+        let specs = <SqlxStore as JobStore>::resume_specs_for_eval(&s, eval_id)
+            .await
+            .unwrap();
+        assert_eq!(specs, vec![(job_id, r#"{"marker":true}"#.to_string())]);
+
+        // A job without spec_json is omitted (caller falls back).
+        let bare = <SqlxStore as JobStore>::create(
+            &s,
+            NewJob {
+                eval_id,
+                attr_path: AttrPath::new("packages.x86_64-linux.bare"),
+                drv_path: None,
+                system: "x86_64-linux".to_string(),
+                main_program: None,
+                outputs: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let specs = <SqlxStore as JobStore>::resume_specs_for_eval(&s, eval_id)
+            .await
+            .unwrap();
+        assert!(specs.iter().all(|(id, _)| *id != bare));
+    }
+
+    #[tokio::test]
+    async fn job_finish_does_not_clobber_terminal_status() {
+        // COR-2 / COR-10: the first terminal job verdict wins; a racing
+        // `Failure` can't overwrite a `Cancelled`.
+        let s = store().await;
+        let eval_id = seed_eval(&s).await;
+        let job_id = <SqlxStore as JobStore>::create(
+            &s,
+            NewJob {
+                eval_id,
+                attr_path: AttrPath::new("packages.x86_64-linux.x"),
+                drv_path: Some("/nix/store/a.drv".to_string()),
+                system: "x86_64-linux".to_string(),
+                main_program: None,
+                outputs: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let m = crate::records::JobPhaseMetrics::default();
+        <SqlxStore as JobStore>::finish(
+            &s,
+            job_id,
+            JobStatus::Cancelled,
+            Utc::now(),
+            None,
+            None,
+            &m,
+        )
+        .await
+        .unwrap();
+        <SqlxStore as JobStore>::finish(&s, job_id, JobStatus::Failure, Utc::now(), None, None, &m)
+            .await
+            .unwrap();
+        let row = <SqlxStore as JobStore>::get(&s, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, JobStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn dispatch_and_start_guard_terminal_but_allow_retry() {
+        // COR-2 (job level): dispatch/start move a job to running from
+        // queued or running (the transport-failure retry re-dispatches a
+        // still-running job), but must never revive a terminal job.
+        let s = store().await;
+        let eval_id = seed_eval(&s).await;
+        let new_job = |attr: &str| NewJob {
+            eval_id,
+            attr_path: AttrPath::new(attr),
+            drv_path: Some("/nix/store/a.drv".to_string()),
+            system: "x86_64-linux".to_string(),
+            main_program: None,
+            outputs: Default::default(),
+        };
+        // `jobs.builder_id` is an FK, so the builders must exist.
+        let now = Utc::now();
+        let enroll = |name: &str, key: u8| NewBuilder {
+            name: BuilderName::new(name).unwrap(),
+            pubkey: pubkey(key),
+            capabilities: caps(&["x86_64-linux"], &[], 1),
+        };
+        let b1 = <SqlxStore as BuilderStore>::upsert(&s, enroll("b1", 1), now)
+            .await
+            .unwrap();
+        let b2 = <SqlxStore as BuilderStore>::upsert(&s, enroll("b2", 2), now)
+            .await
+            .unwrap();
+        let b3 = <SqlxStore as BuilderStore>::upsert(&s, enroll("b3", 3), now)
+            .await
+            .unwrap();
+
+        // queued -> running (dispatch), then running -> running (retry
+        // with a different builder). Both land.
+        let job = <SqlxStore as JobStore>::create(&s, new_job("packages.x86_64-linux.a"))
+            .await
+            .unwrap();
+        <SqlxStore as JobStore>::dispatch(&s, job, b1, Utc::now())
+            .await
+            .unwrap();
+        <SqlxStore as JobStore>::dispatch(&s, job, b2, Utc::now())
+            .await
+            .unwrap();
+        let row = <SqlxStore as JobStore>::get(&s, job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, JobStatus::Running);
+        assert_eq!(row.builder_id, Some(b2), "retry re-binds builder");
+
+        // A terminal job is never revived by dispatch or start.
+        let done = <SqlxStore as JobStore>::create(&s, new_job("packages.x86_64-linux.b"))
+            .await
+            .unwrap();
+        <SqlxStore as JobStore>::finish(
+            &s,
+            done,
+            JobStatus::Cancelled,
+            Utc::now(),
+            None,
+            None,
+            &crate::records::JobPhaseMetrics::default(),
+        )
+        .await
+        .unwrap();
+        <SqlxStore as JobStore>::dispatch(&s, done, b3, Utc::now())
+            .await
+            .unwrap();
+        <SqlxStore as JobStore>::start(&s, done, Utc::now())
+            .await
+            .unwrap();
+        let row = <SqlxStore as JobStore>::get(&s, done)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Cancelled,
+            "terminal job must not be revived"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_running_effects_interrupted_terminalizes_running_rows() {
+        // COR-7: a running effect row left by a crash is flipped to a
+        // terminal `interrupted` state at boot.
+        let s = store().await;
+        let eval_id = seed_eval(&s).await;
+        let job_id = <SqlxStore as JobStore>::create(
+            &s,
+            NewJob {
+                eval_id,
+                attr_path: AttrPath::new("packages.x86_64-linux.img"),
+                drv_path: Some("/nix/store/aaa.drv".to_string()),
+                system: "x86_64-linux".to_string(),
+                main_program: None,
+                outputs: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        <SqlxStore as EffectRunStore>::create_effect_run(
+            &s,
+            job_id,
+            "registry-push",
+            "ghcr",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let n = <SqlxStore as EffectRunStore>::mark_running_effects_interrupted(&s, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let runs = <SqlxStore as EffectRunStore>::list_effect_runs_by_job(&s, job_id)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "interrupted");
+        assert!(runs[0].finished_at.is_some());
     }
 }

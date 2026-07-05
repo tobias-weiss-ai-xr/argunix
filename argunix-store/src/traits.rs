@@ -187,6 +187,12 @@ pub trait EvalStore: Send + Sync {
     /// which flips this eval's `Interrupted` jobs back to `Queued` so
     /// the resumed worker actually retries them.
     async fn list_building_ids(&self) -> Result<Vec<EvalId>, StoreError>;
+    /// Ids of evaluations left in `status = 'evaluating'` by a prior
+    /// instance that died mid-clone/eval — before any job was persisted
+    /// (`mark_building` runs before the persist loop). Boot recovery
+    /// resets these to `queued` and redrives them for a fresh evaluation.
+    /// See bugs.md COR-3.
+    async fn list_evaluating_ids(&self) -> Result<Vec<EvalId>, StoreError>;
     /// Up to `limit` evaluations whose row sits in `status`, joined
     /// with their repo for UI display. Ordering: oldest started first
     /// (so a stale `Evaluating` row from a crashed worker floats to
@@ -295,6 +301,22 @@ pub trait JobStore: Send + Sync {
     /// — the prior interruption was the daemon dying, not the job
     /// itself misbehaving.
     async fn requeue_interrupted_for_eval(&self, eval_id: EvalId) -> Result<u64, StoreError>;
+
+    /// Persist the full serialized `JobSpec` for `id`. Written by the
+    /// worker just after `create`, so crash-resume can rehydrate the spec
+    /// verbatim rather than reconstructing it lossily from columns. No-op
+    /// if the row is gone. See bugs.md COR-4.
+    async fn set_spec_json(&self, id: JobId, spec_json: &str) -> Result<(), StoreError>;
+
+    /// For a resumed eval, the `(job_id, spec_json)` of every job still in
+    /// `Queued`, where `spec_json` is present. Rows written before the
+    /// `spec_json` column existed (or whose serialization failed) are
+    /// omitted, and the caller falls back to lossy reconstruction for
+    /// those. See bugs.md COR-4.
+    async fn resume_specs_for_eval(
+        &self,
+        eval_id: EvalId,
+    ) -> Result<Vec<(JobId, String)>, StoreError>;
 
     /// Record dispatch of `id` to `builder_id` and stamp `started_at`.
     /// Sets status to `Running` and writes the builder for anti-affinity
@@ -475,6 +497,16 @@ pub trait EffectRunStore: Send + Sync {
         &self,
         eval_id: EvalId,
     ) -> Result<Vec<EffectRunRecord>, StoreError>;
+
+    /// Boot recovery: move every `running` effect-run row to a terminal
+    /// `interrupted` state (the daemon died mid-effect). Returns the
+    /// number of rows flipped. Without this, a crash during a push
+    /// leaves the row `running` forever across restarts. See bugs.md
+    /// COR-7.
+    async fn mark_running_effects_interrupted(
+        &self,
+        finished_at: DateTime<Utc>,
+    ) -> Result<u64, StoreError>;
 }
 
 #[async_trait]

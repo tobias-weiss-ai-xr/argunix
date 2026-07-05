@@ -16,7 +16,7 @@ use argunix_store::BuilderStore;
 use argunix_web::{AppState, ConfigSnapshot};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 /// Everything the control server needs to handle requests. Lives as
@@ -90,7 +90,11 @@ async fn run(ctx: ControlContext) -> anyhow::Result<()> {
 
 async fn handle_connection(stream: UnixStream, ctx: ControlContext) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    // Bound the request: a client streaming one endless line would grow
+    // `line` without limit and OOM the daemon. Requests are small JSON
+    // objects, so cap the whole read at 64 KiB. See bugs.md COR-12.
+    const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+    let mut reader = BufReader::new(read_half.take(MAX_REQUEST_BYTES));
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
     if n == 0 {

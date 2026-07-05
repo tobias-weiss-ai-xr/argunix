@@ -833,20 +833,35 @@ async fn run_build_phase(
                 );
                 set.spawn(async move {
                     let _permit = permit; // released on drop
-                    let res = build_one(
-                        &ctx_c,
-                        &repo_c,
-                        &eval_c,
-                        job_id,
-                        &spec,
-                        &push_caches_c,
-                        &registry_effects_c,
-                        collapsed_mode,
-                        is_multiarch_member,
-                        &cancel_c,
-                    )
-                    .instrument(span)
-                    .await;
+                    // Run `build_one` in a nested task so a panic inside
+                    // it surfaces here as a `JoinError` we convert to an
+                    // `Err` outcome, rather than propagating out and
+                    // destroying *this* task — which would lose `token`
+                    // and orphan the panicked job's DAG dependents
+                    // (they'd never cascade-skip). See bugs.md COR-6.
+                    let spec_for_build = spec.clone();
+                    let inner = tokio::spawn(
+                        async move {
+                            build_one(
+                                &ctx_c,
+                                &repo_c,
+                                &eval_c,
+                                job_id,
+                                &spec_for_build,
+                                &push_caches_c,
+                                &registry_effects_c,
+                                collapsed_mode,
+                                is_multiarch_member,
+                                &cancel_c,
+                            )
+                            .await
+                        }
+                        .instrument(span),
+                    );
+                    let res = match inner.await {
+                        Ok(r) => r,
+                        Err(join_err) => Err(anyhow!("build task panicked: {join_err}")),
+                    };
                     (job_id, spec, res, token)
                 });
             }
@@ -969,16 +984,14 @@ async fn run_build_phase(
         let (primary_job_id, spec, outcome, token) = match joined {
             Ok(t) => t,
             Err(join_err) => {
-                // A spawned task panicked or was cancelled; treat as
-                // a pipeline error so the overall eval still finishes
-                // with a meaningful tally. We can't reach the strategy
-                // to call `complete` for the lost token (we don't have
-                // it), but the strategy's pending_count was already
-                // decremented when dispatch handed it out, so the
-                // termination check still works — it just leaves a
-                // dangling in_flight slot until the strategy is
-                // dropped at end-of-function.
-                tracing::error!(error = %join_err, "build task panicked");
+                // Panics in `build_one` are now caught by the nested task
+                // (see the spawn site) and surface as an `Err` outcome
+                // with the token preserved, so this arm is only reached
+                // if the *outer* task itself is aborted (e.g. runtime
+                // teardown). We can't recover the token here, but the
+                // strategy is dropped at end-of-function anyway; record a
+                // failure so the tally stays meaningful.
+                tracing::error!(error = %join_err, "build wrapper task failed to join");
                 tally.record(JobStatus::Failure);
                 continue;
             }
@@ -1103,15 +1116,28 @@ async fn run_build_phase(
     // one logical name get stitched into a multi-arch OCI index.
     run_multiarch_fan_in(&ctx, &repo, &eval, eval_id, &specs_by_id).await;
 
+    // An eval whose jobs could not be built (no matching builder, or a
+    // builder that never returned within the retry budget) must not read
+    // as green. `failure` maps to a red Failure; interruptions that were
+    // never resolved map to Error so the commit does not show Success for
+    // work that never ran. See bugs.md COR-1.
     let overall_state = if tally.failure > 0 {
         CheckState::Failure
+    } else if tally.interrupted > 0 {
+        CheckState::Error
     } else {
         CheckState::Success
     };
-    let description = format!(
+    let mut description = format!(
         "{} ok, {} cached, {} failed",
         tally.success, tally.cached, tally.failure,
     );
+    if tally.interrupted > 0 {
+        description.push_str(&format!(", {} interrupted", tally.interrupted));
+    }
+    if tally.cancelled > 0 {
+        description.push_str(&format!(", {} cancelled", tally.cancelled));
+    }
     post_overall_check(
         &ctx,
         &provider,
@@ -1382,6 +1408,8 @@ struct JobTally {
     success: usize,
     cached: usize,
     failure: usize,
+    interrupted: usize,
+    cancelled: usize,
 }
 
 impl JobTally {
@@ -1390,7 +1418,9 @@ impl JobTally {
             JobStatus::Success => self.success += 1,
             JobStatus::Cached => self.cached += 1,
             JobStatus::Failure => self.failure += 1,
-            _ => {}
+            JobStatus::Interrupted => self.interrupted += 1,
+            JobStatus::Cancelled => self.cancelled += 1,
+            JobStatus::SkippedNoBuilder | JobStatus::Queued | JobStatus::Running => {}
         }
     }
 }
@@ -1648,19 +1678,42 @@ fn spawn_post_check(
 /// flipped back to `Queued` by `main.rs`'s resume pass before this is
 /// reached.
 ///
-/// The reconstructed `JobSpec` loses the original `outputs` map and
-/// `required_system_features` — those weren't persisted to the jobs
-/// table. The consequence: the resumed build will miss the cache-skip
-/// shortcut (no `primary_output` to query a binary cache for) and
-/// won't see required-feature pre-flight. Both are acceptable on
-/// crash recovery: cache-miss costs a re-build (correct result, just
-/// slower), and a feature mismatch surfaces as a normal nix build
-/// failure rather than a fast-fail.
+/// Jobs whose full spec was persisted (`spec_json`, see bugs.md COR-4)
+/// rehydrate verbatim — preserving `image_format`, `meta`, `outputs`, and
+/// `required_system_features`, so resumed image jobs still push to the
+/// registry, attach SBOMs, and participate in the multi-arch fan-in.
+///
+/// Rows written before the `spec_json` column existed fall back to a
+/// lossy reconstruction that loses `outputs` / `required_system_features`
+/// (cache-skip and feature pre-flight are then missed — acceptable on
+/// crash recovery: a cache-miss just re-builds, a feature mismatch
+/// surfaces as a normal build failure).
 async fn load_jobs_for_resume(
     store: &SqlxStore,
     eval_id: EvalId,
 ) -> anyhow::Result<Vec<(argunix_eval::JobSpec, JobId)>> {
     use argunix_domain::AttrPath;
+    // Primary path: rehydrate the full spec from the persisted JSON.
+    let specs = <SqlxStore as JobStore>::resume_specs_for_eval(store, eval_id)
+        .await
+        .with_context(|| format!("loading job specs for resumed eval {}", eval_id.get()))?;
+    let mut by_id: std::collections::HashMap<JobId, argunix_eval::JobSpec> =
+        std::collections::HashMap::with_capacity(specs.len());
+    for (id, json) in specs {
+        match serde_json::from_str::<argunix_eval::JobSpec>(&json) {
+            Ok(spec) => {
+                by_id.insert(id, spec);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    job_id = id.get(),
+                    "persisted job spec failed to deserialize; falling back to lossy reconstruction",
+                );
+            }
+        }
+    }
+
     let rows = <SqlxStore as JobStore>::list_by_eval(store, eval_id)
         .await
         .with_context(|| format!("loading jobs for resumed eval {}", eval_id.get()))?;
@@ -1669,17 +1722,19 @@ async fn load_jobs_for_resume(
         if row.status != JobStatus::Queued {
             continue;
         }
-        let spec = argunix_eval::JobSpec {
-            attr_path: AttrPath::new(row.attr_path.as_str().to_string()),
-            drv_path: row.drv_path.clone(),
-            system: Some(row.system.clone()),
-            error: None,
-            outputs: std::collections::BTreeMap::new(),
-            meta: serde_json::Value::Null,
-            is_cached: false,
-            required_system_features: Vec::new(),
-            image_format: None,
-        };
+        let spec = by_id
+            .remove(&row.id)
+            .unwrap_or_else(|| argunix_eval::JobSpec {
+                attr_path: AttrPath::new(row.attr_path.as_str().to_string()),
+                drv_path: row.drv_path.clone(),
+                system: Some(row.system.clone()),
+                error: None,
+                outputs: std::collections::BTreeMap::new(),
+                meta: serde_json::Value::Null,
+                is_cached: false,
+                required_system_features: Vec::new(),
+                image_format: None,
+            });
         out.push((spec, row.id));
     }
     Ok(out)
@@ -1722,6 +1777,20 @@ async fn persist_job(
         },
     )
     .await?;
+    // Persist the whole spec as JSON so crash-resume can rehydrate it
+    // verbatim (image_format, meta, required_system_features) rather than
+    // lossily reconstructing it from columns. Best-effort: a failure here
+    // only degrades resume to the lossy path for this one job. COR-4.
+    match serde_json::to_string(spec) {
+        Ok(json) => {
+            if let Err(e) = <SqlxStore as JobStore>::set_spec_json(store, job_id, &json).await {
+                tracing::warn!(error = %e, attr = %spec.attr_path, "failed to persist job spec_json");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, attr = %spec.attr_path, "failed to serialize job spec for resume")
+        }
+    }
     if let Some(error) = spec.error.as_deref() {
         // Write the eval error to the standard log path so the UI's
         // log viewer surfaces it. Without this, the job appears as
