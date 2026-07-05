@@ -65,6 +65,18 @@ in
       '';
     };
 
+    openBuilderFirewall = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether to open the builder-enrollment port
+        (`settings.builder_enrollment.listen`) in the firewall. Left false
+        by default so that exposing the SSH enrollment endpoint on all
+        interfaces is an explicit operator decision — many deployments
+        reach it only over a VPN/wireguard interface.
+      '';
+    };
+
     systems = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -176,7 +188,8 @@ in
         builderPort =
           if builderListen != null then lib.toInt (lib.last (lib.splitString ":" builderListen)) else null;
       in
-      lib.optional cfg.openFirewall httpPort ++ lib.optional (builderPort != null) builderPort;
+      lib.optional cfg.openFirewall httpPort
+      ++ lib.optional (cfg.openBuilderFirewall && builderPort != null) builderPort;
 
     systemd.services.argunix = {
       description = "argunix CI daemon";
@@ -186,6 +199,13 @@ in
       ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
+
+      # Reload in place (via the `notify-reload` + `ExecReload` machinery
+      # below) when only the config changes, so `nixos-rebuild switch`
+      # does not SIGTERM the daemon mid-build. A package/binary change
+      # still forces a restart via `restartTriggers`. See bugs.md OPS-2.
+      reloadIfChanged = true;
+      restartTriggers = [ cfg.package ];
 
       path = [
         pkgs.git
