@@ -67,13 +67,18 @@ in
 
     openBuilderFirewall = lib.mkOption {
       type = lib.types.bool;
-      default = false;
+      default = true;
       description = ''
         Whether to open the builder-enrollment port
-        (`settings.builder_enrollment.listen`) in the firewall. Left false
-        by default so that exposing the SSH enrollment endpoint on all
-        interfaces is an explicit operator decision — many deployments
-        reach it only over a VPN/wireguard interface.
+        (`settings.builder_enrollment.listen`) in the firewall. Defaults
+        to true because the dynamic builder pool (M13) is built around
+        remote, NAT-tolerant builders that dial *in* to this port over
+        SSH, so it normally has to be reachable. Set it to false if your
+        builders reach the coordinator only over a VPN/wireguard interface
+        and you don't want the enrollment endpoint exposed on all
+        interfaces. Only takes effect when `settings.builder_enrollment`
+        is configured; with an external `configFile` you manage the
+        firewall yourself.
       '';
     };
 
