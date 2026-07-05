@@ -404,10 +404,10 @@ fn clone_url_uses_oauth2_prefix() {
         "https://m".into(),
     );
     let url = p.clone_url(&Slug::new("myorg/marketing/site").unwrap());
-    assert_eq!(
-        url,
-        "https://oauth2:glpat-xxx@gitlab.example.com/myorg/marketing/site.git"
-    );
+    assert_eq!(url, "https://gitlab.example.com/myorg/marketing/site.git");
+    let creds = p.clone_credentials().unwrap();
+    assert_eq!(creds.username, "oauth2");
+    assert_eq!(creds.token, "glpat-xxx");
 }
 
 #[test]

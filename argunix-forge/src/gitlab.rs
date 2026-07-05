@@ -449,13 +449,15 @@ impl Provider for GitlabProvider {
 
     fn clone_url(&self, slug: &Slug) -> String {
         let host = derive_clone_host(&self.api_url);
-        // GitLab supports `oauth2:<token>@` for HTTPS clone with a PAT.
-        format!(
-            "https://oauth2:{}@{}/{}.git",
-            self.token,
-            host,
-            slug.as_str(),
-        )
+        format!("https://{}/{}.git", host, slug.as_str())
+    }
+
+    fn clone_credentials(&self) -> Option<crate::GitCredentials> {
+        // GitLab authenticates a PAT as the `oauth2` username.
+        Some(crate::GitCredentials {
+            username: "oauth2".to_string(),
+            token: self.token.clone(),
+        })
     }
 }
 

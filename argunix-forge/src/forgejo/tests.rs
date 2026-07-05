@@ -219,8 +219,8 @@ fn clone_url_strips_api_v1() {
         "https://m".into(),
     );
     let url = p.clone_url(&Slug::new("alice/myrepo").unwrap());
-    assert_eq!(
-        url,
-        "https://argunix:tok@forge.example.com/alice/myrepo.git"
-    );
+    assert_eq!(url, "https://forge.example.com/alice/myrepo.git");
+    let creds = p.clone_credentials().unwrap();
+    assert_eq!(creds.username, "argunix");
+    assert_eq!(creds.token, "tok");
 }

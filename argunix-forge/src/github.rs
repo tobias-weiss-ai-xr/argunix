@@ -373,12 +373,14 @@ impl Provider for GithubProvider {
         // - api.github.com → github.com
         // - <enterprise>/api/v3 → <enterprise>
         let host = derive_clone_host(&self.api_url);
-        format!(
-            "https://x-access-token:{}@{}/{}.git",
-            self.token,
-            host,
-            slug.as_str(),
-        )
+        format!("https://{}/{}.git", host, slug.as_str())
+    }
+
+    fn clone_credentials(&self) -> Option<crate::GitCredentials> {
+        Some(crate::GitCredentials {
+            username: "x-access-token".to_string(),
+            token: self.token.clone(),
+        })
     }
 }
 

@@ -392,7 +392,14 @@ async fn process(ctx: &WorkerContext, eval_id: EvalId) -> anyhow::Result<()> {
         }
 
         let clone_url = provider.clone_url(&repo.slug);
-        let clone_fut = clone_repo(&clone_url, &eval.sha, &work_dir, ctx.clone_timeout);
+        let clone_creds = provider.clone_credentials();
+        let clone_fut = clone_repo(
+            &clone_url,
+            &eval.sha,
+            &work_dir,
+            ctx.clone_timeout,
+            clone_creds.as_ref(),
+        );
         tokio::select! {
             biased;
             r = clone_fut => r.with_context(|| format!("cloning {} at {}", repo.slug, eval.sha))?,
@@ -3172,11 +3179,19 @@ async fn add_indirect_gcroot(
     Ok(())
 }
 
+/// A git credential helper that answers `get` with the username and
+/// token taken from the environment. The secret is therefore never in
+/// argv (visible in `/proc/<pid>/cmdline`), in the clone URL, or echoed
+/// by git's own stderr — closing the token-disclosure paths of SEC-1.
+const GIT_CRED_HELPER: &str = "!f() { test \"$1\" = get && \
+     printf 'username=%s\\npassword=%s\\n' \"$ARGUNIX_GIT_USER\" \"$ARGUNIX_GIT_TOKEN\"; }; f";
+
 async fn clone_repo(
     url: &str,
     sha: &argunix_domain::Sha,
     dst: &Path,
     timeout: Duration,
+    creds: Option<&argunix_forge::GitCredentials>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = dst.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
@@ -3184,35 +3199,61 @@ async fn clone_repo(
 
     run_git(
         timeout,
+        creds,
         &["clone", "--filter=blob:none", url, &dst.to_string_lossy()],
     )
     .await?;
     run_git_in(
         timeout,
         dst,
+        creds,
         &["fetch", "--depth=1", "origin", sha.as_str()],
     )
     .await?;
-    run_git_in(timeout, dst, &["checkout", sha.as_str()]).await?;
+    run_git_in(timeout, dst, creds, &["checkout", sha.as_str()]).await?;
     Ok(())
 }
 
-async fn run_git(timeout: Duration, args: &[&str]) -> anyhow::Result<()> {
-    run_git_with_optional_cwd(timeout, None, args).await
+async fn run_git(
+    timeout: Duration,
+    creds: Option<&argunix_forge::GitCredentials>,
+    args: &[&str],
+) -> anyhow::Result<()> {
+    run_git_with_optional_cwd(timeout, None, creds, args).await
 }
 
-async fn run_git_in(timeout: Duration, cwd: &Path, args: &[&str]) -> anyhow::Result<()> {
-    run_git_with_optional_cwd(timeout, Some(cwd), args).await
+async fn run_git_in(
+    timeout: Duration,
+    cwd: &Path,
+    creds: Option<&argunix_forge::GitCredentials>,
+    args: &[&str],
+) -> anyhow::Result<()> {
+    run_git_with_optional_cwd(timeout, Some(cwd), creds, args).await
 }
 
 async fn run_git_with_optional_cwd(
     timeout: Duration,
     cwd: Option<&Path>,
+    creds: Option<&argunix_forge::GitCredentials>,
     args: &[&str],
 ) -> anyhow::Result<()> {
     let mut cmd = Command::new("git");
     if let Some(d) = cwd {
         cmd.current_dir(d);
+    }
+    // Inject HTTPS auth via a credential helper that reads the token from
+    // the environment, so the token never touches argv or the URL. The
+    // leading empty `credential.helper=` clears any inherited system/global
+    // helpers. `GIT_TERMINAL_PROMPT=0` makes auth failures fail fast
+    // instead of blocking on a prompt.
+    if let Some(c) = creds {
+        cmd.arg("-c")
+            .arg("credential.helper=")
+            .arg("-c")
+            .arg(format!("credential.helper={GIT_CRED_HELPER}"))
+            .env("ARGUNIX_GIT_USER", &c.username)
+            .env("ARGUNIX_GIT_TOKEN", &c.token)
+            .env("GIT_TERMINAL_PROMPT", "0");
     }
     cmd.args(args)
         .stdin(Stdio::null())

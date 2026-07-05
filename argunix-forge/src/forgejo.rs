@@ -409,12 +409,15 @@ impl Provider for ForgejoProvider {
         // Forgejo: derive the host by stripping the `/api/v1` suffix
         // (the standard path) from `api_url`.
         let host = derive_clone_host(&self.api_url);
-        format!(
-            "https://argunix:{}@{}/{}.git",
-            self.token,
-            host,
-            slug.as_str(),
-        )
+        format!("https://{}/{}.git", host, slug.as_str())
+    }
+
+    fn clone_credentials(&self) -> Option<crate::GitCredentials> {
+        // Forgejo accepts the token as the password with any username.
+        Some(crate::GitCredentials {
+            username: "argunix".to_string(),
+            token: self.token.clone(),
+        })
     }
 }
 

@@ -260,6 +260,9 @@ mod tests {
         fn clone_url(&self, _: &Slug) -> String {
             unreachable!("policy never builds clone URLs");
         }
+        fn clone_credentials(&self) -> Option<argunix_forge::GitCredentials> {
+            unreachable!("policy never builds clone credentials");
+        }
     }
 
     fn provider_returning(perm: Permission) -> Arc<dyn Provider> {

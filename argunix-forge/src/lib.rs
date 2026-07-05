@@ -114,10 +114,25 @@ pub trait Provider: Send + Sync {
         secret: &[u8],
     ) -> Result<HookId, ForgeError>;
 
-    /// Build a clone URL for `slug` that includes whatever auth this
-    /// provider uses. v1 covers HTTPS-with-token; SSH and per-repo
-    /// `clone.method` overrides are not yet supported.
+    /// Build the clone URL for `slug`. This is **token-free** — the URL
+    /// is safe to log, store, and pass on the command line. HTTPS auth is
+    /// supplied separately via [`clone_credentials`](Self::clone_credentials)
+    /// so the secret never lands in argv, git's stderr, logs, or the DB.
     fn clone_url(&self, slug: &Slug) -> String;
+
+    /// The username/token pair for HTTPS clone auth, or `None` for an
+    /// anonymous clone. The token here must never be interpolated into a
+    /// URL or an argv; the caller feeds it to git via a credential helper
+    /// that reads it from the environment.
+    fn clone_credentials(&self) -> Option<GitCredentials>;
+}
+
+/// HTTPS clone credentials, kept out of the clone URL. See
+/// [`Provider::clone_credentials`].
+#[derive(Clone)]
+pub struct GitCredentials {
+    pub username: String,
+    pub token: String,
 }
 
 /// Forge-side webhook id, returned by `ensure_webhook`. Stored in

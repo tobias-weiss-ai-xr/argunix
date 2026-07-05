@@ -351,10 +351,11 @@ fn clone_url_for_saas_github() {
         "https://m".into(),
     );
     let url = p.clone_url(&Slug::new("myorg/myrepo").unwrap());
-    assert_eq!(
-        url,
-        "https://x-access-token:ghp_xxx@github.com/myorg/myrepo.git"
-    );
+    // The URL must be token-free; the token is delivered out-of-band.
+    assert_eq!(url, "https://github.com/myorg/myrepo.git");
+    let creds = p.clone_credentials().unwrap();
+    assert_eq!(creds.username, "x-access-token");
+    assert_eq!(creds.token, "ghp_xxx");
 }
 
 #[test]
@@ -365,10 +366,10 @@ fn clone_url_for_enterprise_github() {
         "https://m".into(),
     );
     let url = p.clone_url(&Slug::new("team/proj").unwrap());
-    assert_eq!(
-        url,
-        "https://x-access-token:tok@gh.example.com/team/proj.git"
-    );
+    assert_eq!(url, "https://gh.example.com/team/proj.git");
+    let creds = p.clone_credentials().unwrap();
+    assert_eq!(creds.username, "x-access-token");
+    assert_eq!(creds.token, "tok");
 }
 
 #[tokio::test]
