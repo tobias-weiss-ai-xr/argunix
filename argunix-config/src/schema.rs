@@ -118,12 +118,14 @@ pub struct Schedule {
     /// [docs/concepts/webhook-coalescing.md].
     #[serde(default = "default_webhook_coalesce_seconds")]
     pub webhook_coalesce_seconds: u32,
-    /// Global cap on derivations being built concurrently across the
-    /// whole daemon. Bounds parallel `nix copy` proxies, log capture
-    /// tasks, and `nix-store --realise` invocations dispatched through
-    /// the builder pool. Per-builder concurrency is additionally
-    /// gated by each builder's advertised `max_jobs`. Clamped to ≥1
-    /// at use.
+    /// Cap on concurrent *coordinator-side* build work: parallel
+    /// `nix copy` transfer proxies (closure push/pull) and dispatch
+    /// bookkeeping. A job holds a permit around its Push/Pull phases
+    /// and releases it while the remote builder works or while it sits
+    /// in a wait loop — so slow remote builds never starve dispatch of
+    /// ready jobs (the total number of concurrent *builds* is bounded
+    /// by each builder's advertised `max_jobs`, not by this). Clamped
+    /// to ≥1 at use.
     #[serde(default = "default_build_concurrency")]
     pub build_concurrency: u32,
     /// Wall-clock seconds before a single `nix-store --realise` is
@@ -142,13 +144,27 @@ pub struct Schedule {
     /// re-enrolled yet — the dispatch loop waits here and retries rather
     /// than failing the job and cascade-skipping its dependents. A
     /// transport-failed builder is excluded by *connection*, so the same
-    /// builder reconnecting is picked up again within the window. Note
-    /// the job holds a global build-concurrency permit while it waits,
-    /// and a *genuinely* no-builder job (misconfigured system) waits the
+    /// builder reconnecting is picked up again within the window. The
+    /// waiting job releases its build-concurrency permit for the
+    /// duration, so the wait costs nothing beyond its own latency; a
+    /// *genuinely* no-builder job (misconfigured system) still waits the
     /// full budget before failing — which is why the default is 0. Read
     /// once at startup.
     #[serde(default = "default_builder_wait_seconds")]
     pub builder_wait_seconds: u32,
+    /// How long after the last *native* builder for a system leaves the
+    /// pool before jobs for that system may spill onto emulated
+    /// (binfmt `extra-platforms`) builders. A native builder that drops
+    /// and re-enrolls — an agent restart, a liveness blip — is back
+    /// within seconds; without a grace, every one of those blips
+    /// commits queued jobs to builders that run the same work orders of
+    /// magnitude slower (an aarch64 VM test under x86 emulation takes
+    /// hours, not minutes). Jobs wait in the normal capacity-wait loop
+    /// during the grace and take the native builder the moment it
+    /// returns. Default 300; 0 restores instant spill. Read once at
+    /// startup.
+    #[serde(default = "default_emulation_spill_grace_seconds")]
+    pub emulation_spill_grace_seconds: u32,
 }
 
 fn default_collapsed_threshold() -> u32 {
@@ -161,6 +177,10 @@ fn default_webhook_coalesce_seconds() -> u32 {
 
 fn default_build_concurrency() -> u32 {
     4
+}
+
+fn default_emulation_spill_grace_seconds() -> u32 {
+    300
 }
 
 fn default_build_timeout_seconds() -> u32 {
@@ -188,6 +208,7 @@ impl Default for Schedule {
             build_concurrency: default_build_concurrency(),
             build_timeout_seconds: default_build_timeout_seconds(),
             builder_wait_seconds: default_builder_wait_seconds(),
+            emulation_spill_grace_seconds: default_emulation_spill_grace_seconds(),
         }
     }
 }

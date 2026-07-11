@@ -226,6 +226,9 @@ async fn handle_test_dispatch_drv(
         nix_store_bin: &ctx.nix_store_bin,
         nix_bin: &ctx.nix_bin,
         live_logs: None,
+        // Single-shot operator verb; runs outside the worker's
+        // build-concurrency budget.
+        transfer_slot: None,
     };
     match crate::worker::dispatch_pool_build(spec, None).await? {
         crate::worker::PoolDispatchResult::Outcome {

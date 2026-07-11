@@ -19,8 +19,8 @@ pub use records::{
 };
 pub use sqlite::SqlxStore;
 pub use traits::{
-    BuilderStore, DockerImageStore, EffectRunStore, EvalStore, ForgeStatusStore, InterruptOutcome,
-    JobStore, MAX_INTERRUPTIONS, RepoStore, SbomStore, StoreError,
+    BuilderStore, DockerImageStore, EffectRunStore, EvalStore, ForgeStatusStore, JobStore,
+    RepoStore, SbomStore, StoreError,
 };
 
 use sqlx::sqlite::{
@@ -61,10 +61,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 /// shared lock and then asks to upgrade, and two of them at once
 /// *deadlock* — SQLite breaks the tie with an immediate `SQLITE_BUSY`
 /// that `busy_timeout` cannot absorb. argunix's read-modify-write
-/// operations (`JobStore::record_interruption`,
-/// `BuilderStore::rename`) are therefore each a single
-/// `UPDATE` statement. Plain writer-vs-writer contention is the only
-/// thing left, and `busy_timeout` covers it.
+/// operations (e.g. `BuilderStore::rename`) are therefore each a
+/// single `UPDATE` statement. Plain writer-vs-writer contention is the
+/// only thing left, and `busy_timeout` covers it.
 fn file_pool_options() -> SqlitePoolOptions {
     SqlitePoolOptions::new()
         .max_connections(8)

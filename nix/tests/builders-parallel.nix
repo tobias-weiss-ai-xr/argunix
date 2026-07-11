@@ -1,18 +1,25 @@
 # NixOS test: a coordinator and TWO dynamic-pool builders, each with
 # `max-jobs = parallelJobs`. Two webhook-driven evaluations land on the
 # coordinator; each produces `parallelJobs` derivations. The daemon
-# spawns each eval's build phase as a detached task that shares the
-# global `build_concurrency` semaphore, so the build phases of the
-# two evals run concurrently. We assert that at some moment both
-# builders carry `parallelJobs` in-flight builds simultaneously —
-# i.e. all 2*parallelJobs derivations build in parallel across the pool.
+# spawns each eval's build phase as a detached task; we assert that at
+# some moment both builders carry `parallelJobs` in-flight builds
+# simultaneously — i.e. all 2*parallelJobs derivations build in
+# parallel across the pool.
 #
 # Concurrency knobs in play:
-#   - per-builder `max-jobs`     (set via nix.settings.max-jobs)
-#   - daemon `build_concurrency` (settings.schedule.build_concurrency,
-#                                  set below to 2 * parallelJobs)
-# Both are tied to `parallelJobs` so the "all builders saturated"
-# assertion is a function of one knob.
+#   - per-builder `max-jobs`     (set via nix.settings.max-jobs) — the
+#                                 cap on concurrent *builds*
+#   - daemon `build_concurrency` (settings.schedule.build_concurrency)
+#                                 — the cap on concurrent coordinator-
+#                                 side *transfer* work only
+# `build_concurrency` is deliberately set far BELOW the total build
+# count: reaching full 2*parallelJobs saturation is then only possible
+# because each job releases its transfer permit during the remote
+# Build drain (TransferSlot in argunix-daemon/src/worker.rs). This
+# pins the permit-scoping semantics — with permits held for whole
+# builds (the pre-2026-07-10 behavior), at most `build_concurrency`
+# builds could ever run at once and the saturation assertion would
+# fail.
 let
   # Test knobs. `parallelJobs` is the per-builder `max-jobs` and the
   # derivations-per-eval count; `sleepSecs` is how long each build
@@ -260,10 +267,12 @@ in
         listen = "127.0.0.1:8080";
         settings = {
           external_url = "http://127.0.0.1:8080";
-          # The whole point of this test: two builders should be able
-          # to run `parallelJobs` derivations each at the same time, so
-          # the daemon's global cap must be at least 2*parallelJobs.
-          schedule.build_concurrency = 2 * parallelJobs;
+          # Deliberately far below the 2*parallelJobs concurrent builds
+          # this test demands: permits only bound coordinator-side
+          # transfer work, so reaching full saturation proves each job
+          # released its permit during the remote Build drain (see the
+          # header comment).
+          schedule.build_concurrency = 2;
           builder_enrollment = {
             listen = "[::]:2222";
             token_path = "${stubs.enrollmentToken}";

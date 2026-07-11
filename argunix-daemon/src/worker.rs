@@ -61,6 +61,55 @@ impl Drop for BuilderSlot {
     }
 }
 
+/// One job's handle on the global build-concurrency budget
+/// (`schedule.build_concurrency`). The permit bounds *coordinator-side*
+/// work — concurrent `nix copy` transfer processes, proxy sockets,
+/// dispatch bookkeeping — so it is held only around those phases and
+/// released while the job sits in a wait loop or drains a remote build:
+/// there the coordinator is idle and holding the permit would let a
+/// handful of slow remote builds starve dispatch for every other job
+/// (incident 2026-07-10: six wedged emulated builds held all six
+/// permits while a native builder sat idle). Total concurrent *builds*
+/// are bounded by each builder's `max_jobs`, not by this permit.
+pub struct TransferSlot {
+    sem: Arc<tokio::sync::Semaphore>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl TransferSlot {
+    fn new(sem: Arc<tokio::sync::Semaphore>, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            sem,
+            permit: Some(permit),
+        }
+    }
+
+    /// Give the permit back while this job cannot use it (wait loops,
+    /// remote build drain). Idempotent.
+    fn release(&mut self) {
+        self.permit = None;
+    }
+
+    /// Ensure the permit is held before coordinator-heavy work, racing
+    /// the wait against `cancel`. Returns `false` if cancelled first.
+    /// No deadlock cycle: a permit-holder never waits on another
+    /// permit, and permit-waiters hold no builder slots.
+    async fn acquire(&mut self, cancel: Option<&argunix_web::CancelToken>) -> bool {
+        if self.permit.is_some() {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            _ = wait_cancelled(cancel) => false,
+            p = self.sem.clone().acquire_owned() => {
+                // The semaphore is never closed while workers run.
+                self.permit = p.ok();
+                self.permit.is_some()
+            }
+        }
+    }
+}
+
 /// RAII guard that owns the live-phase entry for one
 /// `(builder, build_id)` pair. Each `set` overwrites the registry's
 /// phase map; `drop` clears it, so every exit path of
@@ -164,8 +213,11 @@ pub struct WorkerContext {
     /// picks one per derivation via `pick_builder_for_spec`; on a
     /// match, dispatch goes through the side channels (push closure
     /// → `Build` control message → drain lifecycle → pull outputs).
-    /// On no match, the worker falls back to a local `nix-store
-    /// --realise` (which itself may use the host's `nix.buildMachines`).
+    /// The pool is the *only* execution path: on no match the job
+    /// waits (capacity / spill grace / `builder_wait_seconds`) and is
+    /// ultimately marked `Interrupted` — the coordinator never builds
+    /// locally. Enrol a loopback `argunix-builder` on the coordinator
+    /// host if it should also build.
     pub builder_registry: Arc<argunix_builders::BuilderRegistry>,
     /// Per-running-build broadcast taps for the SSE log endpoint.
     /// Pool dispatch opens an entry on `BuildStarted`, pushes each
@@ -775,15 +827,15 @@ async fn run_build_phase(
     }
     drop(persisted); // ownership now lives in `specs_by_id` + `strategy`.
 
-    // Parallelise the build loop. Up to `ctx.build_concurrency`
-    // derivations build in parallel *across the whole daemon* (see
-    // `WorkerContext::global_build_sem`); per-builder capacity is
-    // gated separately by each builder's advertised `max_jobs` (read
-    // inside `pick_builder_for_spec` via `BuilderRegistry::eligible`).
-    // When the pool is saturated, `pick_builder_for_spec` returns None
-    // and `build_one` falls back to a multi-builder `--builders`
-    // snapshot, so over-cap dispatches don't deadlock — they go
-    // through nix's own scheduler instead.
+    // Parallelise the build loop. `ctx.global_build_sem`
+    // (`schedule.build_concurrency`) bounds concurrent *coordinator-
+    // side* transfer work — each job's TransferSlot holds a permit
+    // around its Push/Pull phases and releases it while the remote
+    // builder works or while the job waits. Per-builder build capacity
+    // is gated separately by each builder's advertised `max_jobs`
+    // (read inside `pick_builder_for_spec` via
+    // `BuilderRegistry::eligible`); when the pool is saturated,
+    // `build_one` parks in its capacity-wait loop, permit released.
     let global_sem = ctx.global_build_sem.clone();
     type BuildResult = (
         JobId,
@@ -831,8 +883,12 @@ async fn run_build_phase(
                     job_id = job_id.get(),
                     attr = %spec.attr_path,
                 );
+                // The permit travels into `build_one` as a TransferSlot
+                // so it can be released during wait states and the
+                // remote Build drain, and re-acquired around the
+                // coordinator-heavy Push/Pull phases.
+                let slot = TransferSlot::new(global_sem.clone(), permit);
                 set.spawn(async move {
-                    let _permit = permit; // released on drop
                     // Run `build_one` in a nested task so a panic inside
                     // it surfaces here as a `JoinError` we convert to an
                     // `Err` outcome, rather than propagating out and
@@ -853,6 +909,7 @@ async fn run_build_phase(
                                 collapsed_mode,
                                 is_multiarch_member,
                                 &cancel_c,
+                                slot,
                             )
                             .await
                         }
@@ -977,6 +1034,21 @@ async fn run_build_phase(
                 return Ok(());
             }
             r = set.join_next() => r,
+            // A permit freed while builds are still in flight —
+            // `build_one` releases its TransferSlot for the remote
+            // Build drain and the wait loops. Without this arm the
+            // loop would only wake on `join_next`, which for a slow
+            // remote build can be hours away, and Ready jobs would
+            // starve behind permits nobody is using (incident
+            // 2026-07-10). Guarded so an empty Ready queue doesn't
+            // busy-loop: `pending_count() > 0` means `dispatch()` has
+            // something to hand out; the drop re-runs the spawn pass,
+            // which re-acquires via `try_acquire_owned`.
+            _ = global_sem.acquire(),
+                if !strategy_drained_with_permit && strategy.pending_count() > 0 =>
+            {
+                continue 'outer;
+            }
         };
         let Some(joined) = next else {
             continue;
@@ -1851,7 +1923,6 @@ fn format_eval_error_log(attr_path: &str, error: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn build_one(
     ctx: &WorkerContext,
     repo: &argunix_store::RepoRecord,
@@ -1863,6 +1934,7 @@ async fn build_one(
     collapsed_mode: bool,
     is_multiarch_member: bool,
     cancel: &argunix_web::CancelToken,
+    mut slot: TransferSlot,
 ) -> anyhow::Result<JobStatus> {
     let repo_id = repo.id;
     let eval_id = eval.id;
@@ -2024,6 +2096,26 @@ async fn build_one(
     let mut excluded: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut builder_wait_used = false;
     let (outcome, phase_metrics) = loop {
+        // Hold a transfer slot before picking a builder — the push
+        // phase right after dispatch consumes coordinator resources.
+        // Wait loops below release it; this re-acquires after them.
+        if !slot.acquire(Some(cancel)).await {
+            tracing::info!(
+                job_id = job_id.get(),
+                "cancelled while waiting for a transfer slot",
+            );
+            <SqlxStore as JobStore>::finish(
+                &ctx.store,
+                job_id,
+                JobStatus::Cancelled,
+                Utc::now(),
+                None,
+                None,
+                &JobPhaseMetrics::default(),
+            )
+            .await?;
+            return Ok(JobStatus::Cancelled);
+        }
         match pick_builder_for_spec(&ctx.builder_registry, spec, &excluded) {
             Some(b) => {
                 // Reserve the slot before recording dispatch so a
@@ -2056,6 +2148,7 @@ async fn build_one(
                     &log_path,
                     argunix_build::LogCaptureLimit::default(),
                     cancel,
+                    &mut slot,
                 )
                 .await?
                 {
@@ -2111,6 +2204,10 @@ async fn build_one(
                         spec_system = ?spec.system,
                         "all matching builders at capacity; waiting for a slot",
                     );
+                    // Give the transfer slot back while parked — other
+                    // jobs can push/pull with it. Re-acquired at the
+                    // top of the dispatch loop after the `continue`.
+                    slot.release();
                     loop {
                         tokio::select! {
                             biased;
@@ -2149,6 +2246,12 @@ async fn build_one(
                 // useful for the post-restart reconnect race.
                 if !builder_wait_used && !ctx.builder_wait.is_zero() {
                     builder_wait_used = true;
+                    // As above: no coordinator-side work happens while
+                    // waiting for a builder to enrol, so don't sit on a
+                    // transfer slot (this closes the "retry holds a
+                    // global build permit" gap noted in
+                    // design/builder-liveness-decoupling.md).
+                    slot.release();
                     let deadline = tokio::time::Instant::now() + ctx.builder_wait;
                     tracing::info!(
                         job_id = job_id.get(),
@@ -2583,6 +2686,12 @@ pub struct PoolDispatchSpec<'a> {
     /// Optional broadcast tap for the SSE log endpoint. Worker passes
     /// the global registry; the test dispatch path can pass `None`.
     pub live_logs: Option<Arc<argunix_web::LiveLogRegistry>>,
+    /// The job's handle on `schedule.build_concurrency`. When `Some`,
+    /// the dispatch releases it for the remote Build drain (where the
+    /// coordinator does no work) and re-acquires it before the output
+    /// pull. `None` on the single-shot control paths, which run outside
+    /// the worker's concurrency budget.
+    pub transfer_slot: Option<&'a mut TransferSlot>,
 }
 
 /// Outcome of one pool-dispatch attempt against a single builder.
@@ -2634,6 +2743,7 @@ async fn dispatch_build_via_pool(
     log_path: &Path,
     log_limit: argunix_build::LogCaptureLimit,
     cancel: &argunix_web::CancelToken,
+    transfer_slot: &mut TransferSlot,
 ) -> anyhow::Result<PoolAttempt> {
     let spec = PoolDispatchSpec {
         registry: ctx.builder_registry.clone(),
@@ -2647,6 +2757,7 @@ async fn dispatch_build_via_pool(
         nix_store_bin: &ctx.nix_store_bin,
         nix_bin: &ctx.nix_bin,
         live_logs: Some(ctx.live_logs.clone()),
+        transfer_slot: Some(transfer_slot),
     };
     match dispatch_pool_build(spec, Some(cancel)).await? {
         PoolDispatchResult::Outcome {
@@ -2722,6 +2833,7 @@ pub async fn dispatch_pool_build(
         nix_store_bin,
         nix_bin,
         live_logs,
+        mut transfer_slot,
     } = spec;
     let dispatcher = BuilderDispatcher::new(registry.clone());
     let cap = log_limit.max_raw_bytes;
@@ -2845,6 +2957,13 @@ pub async fn dispatch_pool_build(
         phase_metrics.push_ms = Some(m.elapsed.as_millis() as u64);
     }
     phase_guard.set(BuildPhase::Build);
+    // The push is done; the remote build costs the coordinator nothing.
+    // Give the transfer slot back so other jobs can push/pull while
+    // this builder works — a slow remote build must never pin a slot
+    // (re-acquired before the output pull below).
+    if let Some(s) = transfer_slot.as_deref_mut() {
+        s.release();
+    }
 
     // 3. Send Build over the control channel; subscribe to lifecycle.
     let mut lifecycle = match dispatcher
@@ -2966,21 +3085,58 @@ pub async fn dispatch_pool_build(
                 );
                 timed_out = true;
                 let _ = dispatcher.abort_build(builder_name, build_id).await;
-                // After Abort, give the agent up to `grace` for its
-                // BuildFinished{Killed} (and any final log chunks) to
-                // arrive — *don't* spin re-firing the timer. If the
-                // agent is unresponsive, the second timer fires and we
-                // synthesize a Killed outcome.
-                tokio::time::sleep(grace).await;
-                tracing::warn!(
-                    job_id = build_id,
-                    builder = %builder_name,
-                    "agent did not emit BuildFinished within grace window; synthesising Killed",
-                );
-                log_buf.extend_from_slice(
-                    b"argunix: agent unresponsive after Abort; synthesising Killed outcome.\n",
-                );
-                final_status = BuildOutcomeStatus::Killed;
+                // After Abort, drain the lifecycle for up to `grace`:
+                // the agent normally delivers its genuine
+                // BuildFinished{Killed} (exit code + final log chunks)
+                // well inside the window — take it the moment it
+                // arrives rather than sleeping out the full grace and
+                // discarding it (bugs.md COR-9). Synthesize Killed only
+                // if the agent stays silent. `timed_out` remains set,
+                // so the verdict maps to Failure either way — the drain
+                // only rescues the real exit code and log tail.
+                let grace_deadline = tokio::time::Instant::now() + grace;
+                let finished = loop {
+                    tokio::select! {
+                        ev = lifecycle.recv() => match ev {
+                            Some(BuildLifecycle::LogChunk { bytes }) => {
+                                for ev in nom.feed(&bytes) {
+                                    if let Some(ref tap) = live_log {
+                                        tap.push(ev.clone());
+                                    }
+                                    append_log_event(&mut log_buf, &ev, cap, &mut log_truncated);
+                                }
+                            }
+                            Some(BuildLifecycle::Finished {
+                                status,
+                                exit_code: code,
+                                output_paths: outs,
+                                log_truncated: t,
+                            }) => break Some((status, code, outs, t)),
+                            Some(BuildLifecycle::Started { .. }) => {}
+                            None => break None,
+                        },
+                        _ = tokio::time::sleep_until(grace_deadline) => break None,
+                    }
+                };
+                match finished {
+                    Some((status, code, outs, t)) => {
+                        final_status = status;
+                        exit_code = code;
+                        output_paths = outs;
+                        log_truncated = log_truncated || t;
+                    }
+                    None => {
+                        tracing::warn!(
+                            job_id = build_id,
+                            builder = %builder_name,
+                            "agent did not emit BuildFinished within grace window; synthesising Killed",
+                        );
+                        log_buf.extend_from_slice(
+                            b"argunix: agent unresponsive after Abort; synthesising Killed outcome.\n",
+                        );
+                        final_status = BuildOutcomeStatus::Killed;
+                    }
+                }
                 break;
             }
         }
@@ -3031,6 +3187,26 @@ pub async fn dispatch_pool_build(
     //    the daemon protocol — no chunking, no topo sort, no
     //    explicit memory throttle needed.
     if final_status == BuildOutcomeStatus::Success && !output_paths.is_empty() {
+        // Take a transfer slot back before the pull — the coordinator
+        // is about to run `nix copy --from`, which is exactly the work
+        // `schedule.build_concurrency` budgets.
+        if let Some(s) = transfer_slot.as_deref_mut() {
+            if !s.acquire(cancel).await {
+                tracing::info!(
+                    build_id,
+                    builder = %builder_name,
+                    "cancel while waiting for a transfer slot before the output pull",
+                );
+                log_buf.extend_from_slice(
+                    b"\nargunix: cancelled while waiting to pull the output closure.\n",
+                );
+                if log_truncated {
+                    log_buf.extend_from_slice(b"\n--- log truncated by argunix ---\n");
+                }
+                argunix_build::write_zstd_log(log_path, log_buf).await?;
+                return Ok(PoolDispatchResult::Cancelled);
+            }
+        }
         phase_guard.set(BuildPhase::Pull);
         let pull_started_at = std::time::Instant::now();
         match nix_copy_phase(
@@ -3393,7 +3569,7 @@ mod tests {
                 connected_since: chrono::Utc::now(),
                 connection_id: reg.next_connection_id(),
                 session: None,
-                last_heartbeat: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
                 abort: None,
             },
         );
@@ -3499,8 +3675,8 @@ mod tests {
         assert!(
             pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]), &Default::default())
                 .is_none(),
-            "saturated builder must not be chosen — caller falls back to multi-builder \
-             arg so nix's own scheduler can retry against the full pool",
+            "saturated builder must not be chosen — the caller parks in its \
+             capacity-wait loop until a slot frees",
         );
     }
 
@@ -3527,11 +3703,12 @@ mod tests {
             "an excluded builder must not be chosen for a retry",
         );
         // Excluding every eligible builder yields None — `build_one`
-        // then falls back to a local build.
+        // then waits (builder_wait) or marks the job Interrupted; the
+        // coordinator never builds locally.
         excluded.insert(beta_conn);
         assert!(
             pick_builder_for_spec(&reg, &spec(Some("x86_64-linux"), &[]), &excluded).is_none(),
-            "all eligible builders excluded → caller falls back to local",
+            "all eligible builders excluded → no pick",
         );
     }
 

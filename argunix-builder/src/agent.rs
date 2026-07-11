@@ -109,37 +109,38 @@ impl AgentConfig {
 }
 
 /// How long the agent tolerates *zero* connection progress — no
-/// heartbeat sent, no control frame received, no log chunk written —
-/// before it concludes the control session is wedged and tears it down
-/// to reconnect. The failure this guards against does not surface as an
-/// error: a stalled outbound flush against a back-pressured or silently
-/// half-open coordinator just *blocks forever* (TCP raises nothing for a
-/// slow-but-alive peer, and russh's own keepalive is starved on the same
-/// wedged task). Set equal to the coordinator's
-/// [`argunix_builders::LIVENESS_MAX_SILENCE`]: past that point the
-/// coordinator has already evicted us, so clinging to the dead socket is
-/// pointless — reconnecting re-enrols us and refills the pool.
-const SELF_LIVENESS_TIMEOUT: Duration = argunix_builders::LIVENESS_MAX_SILENCE;
-
-/// Upper bound on a single outbound `channel.data()` write. A write that
-/// neither completes nor errors within this window is wedged on a full
-/// send window the peer will never drain; time out and reconnect rather
-/// than park the session loop indefinitely. This is the load-bearing
-/// fix — the incident where builders silently vanished from the pool was
-/// a write that blocked here forever without ever erroring.
-const WRITE_STALL_TIMEOUT: Duration = argunix_builders::LIVENESS_MAX_SILENCE;
+/// heartbeat sent, no control frame received, no log chunk written, no
+/// side-channel byte moved — before it concludes the session is wedged
+/// and tears it down to reconnect. The failure this guards against does
+/// not surface as an error: a stalled outbound flush against a
+/// back-pressured or silently half-open coordinator just *blocks
+/// forever* (TCP raises nothing for a slow-but-alive peer, and russh's
+/// own keepalive is starved on the same wedged task).
+///
+/// Deliberately far below the coordinator's
+/// [`argunix_builders::LIVENESS_MAX_SILENCE`] (95s): giving up first
+/// means the reconnect lands as a *displacement* — the coordinator swaps
+/// the registry entry in place and the builder never leaves the pool —
+/// instead of racing the coordinator's eviction, which removes the entry
+/// and fails in-flight work over to other (possibly emulated) builders.
+/// The 2026-07-10 incident was exactly that race: both sides sat on the
+/// same 95s and declared each other dead simultaneously.
+const SELF_LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the self-liveness watchdog re-checks the progress clock.
 const PROGRESS_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Monotonic "last progress" clock shared by the session loop and the
-/// self-liveness watchdog. Any byte that moves on the control channel —
-/// a heartbeat we managed to send, a control frame we received, or a
-/// build lifecycle/log chunk we wrote — bumps it. The watchdog
-/// reconnects when nothing has moved for [`SELF_LIVENESS_TIMEOUT`]. On a
-/// healthy link the 5s heartbeat keeps bumping it (heartbeats interleave
-/// even during a large side-channel transfer); only a genuinely wedged
-/// session, where even the heartbeat write blocks, lets it go stale.
+/// Monotonic "last progress" clock shared by the session loop, the
+/// side-channel pumps, and the self-liveness watchdog. Any byte that
+/// moves on the connection — a heartbeat we managed to send, a control
+/// frame we received, a build lifecycle/log chunk we wrote, or a
+/// side-channel byte forwarded to/from the local nix-daemon — bumps it.
+/// The watchdog reconnects when nothing has moved for
+/// [`SELF_LIVENESS_TIMEOUT`]. Counting side-channel bytes matters: a
+/// saturating closure transfer can park the session loop (heartbeats
+/// stall) while the transfer itself is progressing fine — tearing that
+/// session down would kill a healthy build. Only a session where
+/// *nothing* moves anywhere is wedged.
 struct ProgressClock {
     base: tokio::time::Instant,
     last_ms: AtomicU64,
@@ -163,6 +164,63 @@ impl ProgressClock {
     fn idle(&self) -> Duration {
         let now = self.base.elapsed().as_millis() as u64;
         Duration::from_millis(now.saturating_sub(self.last_ms.load(Ordering::Relaxed)))
+    }
+}
+
+/// `AsyncRead` adapter that bumps a [`ProgressClock`] whenever bytes
+/// actually arrive. Wrapped around the side-channel stream so transfer
+/// progress counts as connection liveness.
+struct ProgressRead<R> {
+    inner: R,
+    clock: Arc<ProgressClock>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ProgressRead<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(r, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.clock.bump();
+        }
+        r
+    }
+}
+
+/// `AsyncWrite` twin of [`ProgressRead`].
+struct ProgressWrite<W> {
+    inner: W,
+    clock: Arc<ProgressClock>,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ProgressWrite<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(&r, std::task::Poll::Ready(Ok(n)) if *n > 0) {
+            self.clock.bump();
+        }
+        r
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -194,7 +252,11 @@ pub async fn run<S: Future<Output = ()>>(cfg: AgentConfig, shutdown: S) -> Resul
         //   - Ok(true)  — clean shutdown signalled by the caller
         //   - Ok(false) — disconnected; the caller wants a reconnect
         //   - Err(_)    — fatal error (bad token + bad pubkey)
-        let cycle = serve_one_connection(&cfg, &mut shutdown);
+        // A cycle that reaches Welcome resets `backoff` itself — so the
+        // margin between our SELF_LIVENESS_TIMEOUT and the coordinator's
+        // eviction threshold is never eaten by a stale 30s backoff left
+        // over from churn hours earlier.
+        let cycle = serve_one_connection(&cfg, &mut shutdown, &mut backoff);
         match cycle.await {
             Ok(true) => {
                 tracing::info!("agent shutdown complete");
@@ -236,6 +298,7 @@ pub async fn run<S: Future<Output = ()>>(cfg: AgentConfig, shutdown: S) -> Resul
 async fn serve_one_connection(
     cfg: &AgentConfig,
     shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
+    backoff: &mut Duration,
 ) -> Result<bool, AgentError> {
     // Build the russh PrivateKey from our 32-byte seed (same shape
     // as the server-side host key conversion).
@@ -260,10 +323,17 @@ async fn serve_one_connection(
         maximum_packet_size: argunix_builders::BUILDER_SESSION_MAX_PACKET,
         ..client::Config::default()
     });
+    // Progress clock for the self-liveness watchdog (further down).
+    // Created before the handler so side-channel pumps — which the
+    // handler spawns — can bump it too: transfer bytes count as
+    // connection liveness.
+    let progress = Arc::new(ProgressClock::new());
+
     let handler = AgentClient {
         nix_daemon_socket: Arc::new(cfg.nix_daemon_socket.clone()),
         argunix_host_key_path: cfg.argunix_host_key_path.clone(),
         close_signals: Arc::new(StdMutex::new(HashMap::new())),
+        progress: progress.clone(),
     };
 
     // Dead-peer detection. The agent writes a heartbeat every 5s, so
@@ -348,24 +418,30 @@ async fn serve_one_connection(
     };
     channel.data(&hello.encode_line()[..]).await?;
 
-    // Drain control until welcome arrives. Drop trailing data into
-    // the heartbeat loop's framer.
+    // Drain control until welcome arrives. The coordinator may batch
+    // frames right behind `Welcome` in the same TCP segment (e.g. a
+    // `Build` racing our enrollment); queue those for the session loop
+    // instead of dropping them with the rest of the chunk.
     let welcome_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut welcome_seen = false;
     let mut framer = argunix_builders::LineFramer::new();
-    while tokio::time::Instant::now() < welcome_deadline {
+    let mut pending: std::collections::VecDeque<ControlMessage> = Default::default();
+    while !welcome_seen && tokio::time::Instant::now() < welcome_deadline {
         let remaining = welcome_deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, channel.wait()).await {
             Ok(Some(ChannelMsg::Data { data })) => {
                 for parsed in framer.extend(&data) {
-                    if let Ok(ControlMessage::Welcome { builder_id }) = parsed {
-                        tracing::info!(builder_id = %builder_id, "registered with argunix");
-                        welcome_seen = true;
-                        break;
+                    match parsed {
+                        Ok(ControlMessage::Welcome { builder_id }) if !welcome_seen => {
+                            tracing::info!(builder_id = %builder_id, "registered with argunix");
+                            welcome_seen = true;
+                        }
+                        Ok(other) if welcome_seen => pending.push_back(other),
+                        Ok(other) => {
+                            tracing::warn!(?other, "control frame before welcome; ignoring");
+                        }
+                        Err(e) => tracing::warn!(error = %e, "control line dropped"),
                     }
-                }
-                if welcome_seen {
-                    break;
                 }
             }
             Ok(Some(ChannelMsg::Close)) | Ok(None) | Err(_) => break,
@@ -377,6 +453,10 @@ async fn serve_one_connection(
         // reconnect (the next attempt may fare differently).
         return Ok(false);
     }
+    // Successful enrollment proves the path works; reset the reconnect
+    // backoff (per the `reconnect_initial_backoff` contract) so the
+    // *next* disconnect retries promptly.
+    *backoff = cfg.reconnect_initial_backoff;
 
     // Outbound control queue. Build tasks send `BuildStarted /
     // BuildLogChunk / BuildFinished` here; the session loop drains the
@@ -403,11 +483,10 @@ async fn serve_one_connection(
     let in_flight: Arc<StdMutex<HashMap<i64, oneshot::Sender<()>>>> =
         Arc::new(StdMutex::new(HashMap::new()));
 
-    // Progress clock for the self-liveness watchdog (below). The session
-    // loop runs as the inner future of an outer `select!` against the
-    // watchdog; the watchdog is a sibling future, so it is still polled
-    // even while this loop is parked inside a wedged write.
-    let progress = Arc::new(ProgressClock::new());
+    // The session loop runs as the inner future of an outer `select!`
+    // against the self-liveness watchdog; the watchdog is a sibling
+    // future, so it is still polled even while this loop is parked
+    // inside a wedged write.
 
     // Split the control channel so the heartbeat task and the session
     // loop hold independent write handles. russh's `ChannelWriteHalf` is
@@ -425,7 +504,7 @@ async fn serve_one_connection(
     let hb_write = write_half.clone();
     let hb_progress = progress.clone();
     let hb_task = tokio::spawn(async move {
-        let mut hb_interval = tokio::time::interval(Duration::from_secs(5));
+        let mut hb_interval = tokio::time::interval(argunix_builders::HEARTBEAT_INTERVAL);
         hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Skip the immediate first tick.
         hb_interval.tick().await;
@@ -436,18 +515,15 @@ async fn serve_one_connection(
                 ts: chrono::Utc::now().timestamp(),
                 stats: stats_sampler.sample(),
             };
-            match tokio::time::timeout(WRITE_STALL_TIMEOUT, hb_write.data(&hb.encode_line()[..]))
-                .await
-            {
-                Ok(Ok(())) => hb_progress.bump(),
-                Ok(Err(_)) => {
-                    let _ = hb_fail_tx.send(());
-                    return;
-                }
+            // No per-write stall timeout: a write that blocks forever
+            // simply stops bumping the progress clock, and the
+            // self-liveness watchdog tears the session down at
+            // SELF_LIVENESS_TIMEOUT — unless side-channel transfer
+            // progress shows the connection is actually fine, in which
+            // case killing it would be wrong anyway.
+            match hb_write.data(&hb.encode_line()[..]).await {
+                Ok(()) => hb_progress.bump(),
                 Err(_) => {
-                    tracing::warn!(
-                        "heartbeat write stalled past the liveness timeout; reconnecting",
-                    );
                     let _ = hb_fail_tx.send(());
                     return;
                 }
@@ -457,6 +533,85 @@ async fn serve_one_connection(
 
     let session_loop = async {
         'session: loop {
+            // Handle parsed control frames first — seeded with anything
+            // the coordinator batched behind `Welcome`, then refilled by
+            // the read arm below.
+            while let Some(msg) = pending.pop_front() {
+                match msg {
+                    ControlMessage::Kick { reason } => {
+                        tracing::warn!(reason = %reason, "kicked by argunix; reconnect after backoff");
+                        break 'session Ok(false);
+                    }
+                    ControlMessage::Build {
+                        build_id,
+                        drv_path,
+                        gc_root,
+                        timeout_secs,
+                        max_log_bytes,
+                    } => {
+                        let (abort_tx, abort_rx) = oneshot::channel::<()>();
+                        in_flight
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(build_id, abort_tx);
+                        let nix_store_bin = cfg.nix_store_bin.clone();
+                        let out_tx = out_tx.clone();
+                        let in_flight_for_task = in_flight.clone();
+                        // If the daemon supplied a gcroot path it
+                        // owns the lifetime; otherwise we plant a
+                        // throwaway under our state dir solely to
+                        // silence `nix-store`'s "you did not
+                        // specify '--add-root'…" warning. Either
+                        // way we hand the agent path to handle_build
+                        // and `agent_owns_gcroot` tells it whether
+                        // to clean up after the build.
+                        let (effective_gcroot, agent_owns_gcroot) = match gc_root {
+                            Some(p) => (Some(p), false),
+                            None => (
+                                Some(
+                                    cfg.build_gcroot_dir
+                                        .join(build_id.to_string())
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                ),
+                                true,
+                            ),
+                        };
+                        tokio::spawn(async move {
+                            handle_build(
+                                build_id,
+                                drv_path,
+                                effective_gcroot,
+                                agent_owns_gcroot,
+                                timeout_secs,
+                                max_log_bytes,
+                                &nix_store_bin,
+                                out_tx,
+                                abort_rx,
+                            )
+                            .await;
+                            in_flight_for_task
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&build_id);
+                        });
+                    }
+                    ControlMessage::Abort { build_id } => {
+                        let tx = in_flight
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&build_id);
+                        if let Some(tx) = tx {
+                            let _ = tx.send(());
+                        } else {
+                            tracing::debug!(build_id, "abort for unknown build_id; ignoring");
+                        }
+                    }
+                    other => {
+                        tracing::warn!(?other, "ignoring unexpected server-to-builder message");
+                    }
+                }
+            }
             tokio::select! {
                 _ = &mut *shutdown => {
                     // Best-effort goodbye, bounded by a short timeout. Over
@@ -496,100 +651,25 @@ async fn serve_one_connection(
                 _ = &mut hb_fail_rx => {
                     break 'session Ok(false);
                 }
-                // Outbound from build tasks → SSH channel.
+                // Outbound from build tasks → SSH channel. No stall
+                // timeout here either — the self-liveness watchdog is
+                // the arbiter of "wedged" (see the heartbeat task).
                 Some(bytes) = out_rx.recv() => {
-                    match tokio::time::timeout(
-                        WRITE_STALL_TIMEOUT,
-                        write_half.data(&bytes[..]),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => progress.bump(),
-                        Ok(Err(_)) => break 'session Ok(false),
-                        Err(_) => {
-                            tracing::warn!(
-                                "build log/lifecycle write stalled past the liveness timeout; reconnecting",
-                            );
-                            break 'session Ok(false);
-                        }
+                    match write_half.data(&bytes[..]).await {
+                        Ok(()) => progress.bump(),
+                        Err(_) => break 'session Ok(false),
                     }
                 }
                 ev = read_half.wait() => match ev {
                     Some(ChannelMsg::Data { data }) => {
                         progress.bump();
+                        // Parse only; the pending queue at the top of
+                        // the loop handles the frames on the next
+                        // iteration (one shared code path with the
+                        // batched-behind-Welcome case).
                         for parsed in framer.extend(&data) {
                             match parsed {
-                                Ok(ControlMessage::Kick { reason }) => {
-                                    tracing::warn!(reason = %reason, "kicked by argunix; reconnect after backoff");
-                                    break 'session Ok(false);
-                                }
-                                Ok(ControlMessage::Build {
-                                    build_id,
-                                    drv_path,
-                                    gc_root,
-                                    timeout_secs,
-                                    max_log_bytes,
-                                }) => {
-                                    let (abort_tx, abort_rx) = oneshot::channel::<()>();
-                                    in_flight
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .insert(build_id, abort_tx);
-                                    let nix_store_bin = cfg.nix_store_bin.clone();
-                                    let out_tx = out_tx.clone();
-                                    let in_flight_for_task = in_flight.clone();
-                                    // If the daemon supplied a gcroot path it
-                                    // owns the lifetime; otherwise we plant a
-                                    // throwaway under our state dir solely to
-                                    // silence `nix-store`'s "you did not
-                                    // specify '--add-root'…" warning. Either
-                                    // way we hand the agent path to handle_build
-                                    // and `agent_owns_gcroot` tells it whether
-                                    // to clean up after the build.
-                                    let (effective_gcroot, agent_owns_gcroot) = match gc_root {
-                                        Some(p) => (Some(p), false),
-                                        None => (
-                                            Some(
-                                                cfg.build_gcroot_dir
-                                                    .join(build_id.to_string())
-                                                    .to_string_lossy()
-                                                    .into_owned(),
-                                            ),
-                                            true,
-                                        ),
-                                    };
-                                    tokio::spawn(async move {
-                                        handle_build(
-                                            build_id,
-                                            drv_path,
-                                            effective_gcroot,
-                                            agent_owns_gcroot,
-                                            timeout_secs,
-                                            max_log_bytes,
-                                            &nix_store_bin,
-                                            out_tx,
-                                            abort_rx,
-                                        ).await;
-                                        in_flight_for_task
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .remove(&build_id);
-                                    });
-                                }
-                                Ok(ControlMessage::Abort { build_id }) => {
-                                    let tx = in_flight
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .remove(&build_id);
-                                    if let Some(tx) = tx {
-                                        let _ = tx.send(());
-                                    } else {
-                                        tracing::debug!(build_id, "abort for unknown build_id; ignoring");
-                                    }
-                                }
-                                Ok(other) => {
-                                    tracing::warn!(?other, "ignoring unexpected server-to-builder message");
-                                }
+                                Ok(msg) => pending.push_back(msg),
                                 Err(e) => {
                                     tracing::warn!(error = %e, "control line dropped");
                                 }
@@ -1074,6 +1154,10 @@ struct AgentClient {
     nix_daemon_socket: Arc<PathBuf>,
     argunix_host_key_path: Option<PathBuf>,
     close_signals: Arc<StdMutex<HashMap<russh::ChannelId, oneshot::Sender<()>>>>,
+    /// Shared with the session's self-liveness watchdog; side-channel
+    /// pumps bump it so an in-progress transfer keeps the session alive
+    /// even while control-channel heartbeats are parked behind it.
+    progress: Arc<ProgressClock>,
 }
 
 impl Handler for AgentClient {
@@ -1113,8 +1197,9 @@ impl Handler for AgentClient {
             .unwrap_or_else(|e| e.into_inner())
             .insert(channel.id(), close_tx);
         let nix_daemon_socket = self.nix_daemon_socket.clone();
+        let progress = self.progress.clone();
         tokio::spawn(async move {
-            serve_side_channel(channel, &nix_daemon_socket, close_rx).await;
+            serve_side_channel(channel, &nix_daemon_socket, close_rx, progress).await;
         });
         Ok(())
     }
@@ -1164,12 +1249,24 @@ async fn serve_side_channel(
     channel: russh::Channel<ClientMsg>,
     nix_daemon_socket: &Path,
     close_rx: oneshot::Receiver<()>,
+    progress: Arc<ProgressClock>,
 ) {
     let started_at = std::time::Instant::now();
     let channel_id: u32 = channel.id().into();
     let nix_daemon_socket = nix_daemon_socket.to_path_buf();
     let outcome = with_channel_io(channel, Some(close_rx), |io| async move {
-        let (mut reader, mut writer) = tokio::io::split(io);
+        // Every byte that crosses the side channel bumps the session's
+        // progress clock: an active transfer is proof of connection
+        // liveness even when the control channel is parked behind it.
+        let (reader, writer) = tokio::io::split(io);
+        let mut reader = ProgressRead {
+            inner: reader,
+            clock: progress.clone(),
+        };
+        let mut writer = ProgressWrite {
+            inner: writer,
+            clock: progress,
+        };
         dispatch_inbound(&nix_daemon_socket, &mut reader, &mut writer).await
     })
     .await;
@@ -1786,6 +1883,48 @@ mod watchdog_tests {
         assert!(
             clock.idle() < Duration::from_millis(40),
             "a fresh bump must reset idle, got {:?}",
+            clock.idle(),
+        );
+    }
+
+    #[tokio::test]
+    async fn side_channel_adapters_bump_progress() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let clock = Arc::new(ProgressClock::new());
+        clock.bump();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(clock.idle() >= Duration::from_millis(50));
+
+        // Bytes read through ProgressRead reset the idle clock.
+        let (mut a, b) = tokio::io::duplex(64);
+        let mut reader = ProgressRead {
+            inner: b,
+            clock: clock.clone(),
+        };
+        a.write_all(b"nar bytes").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert!(n > 0);
+        assert!(
+            clock.idle() < Duration::from_millis(40),
+            "a side-channel read must count as progress, idle {:?}",
+            clock.idle(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(clock.idle() >= Duration::from_millis(50));
+
+        // Bytes written through ProgressWrite reset it too.
+        let (c, _d) = tokio::io::duplex(64);
+        let mut writer = ProgressWrite {
+            inner: c,
+            clock: clock.clone(),
+        };
+        writer.write_all(b"reply").await.unwrap();
+        assert!(
+            clock.idle() < Duration::from_millis(40),
+            "a side-channel write must count as progress, idle {:?}",
             clock.idle(),
         );
     }

@@ -349,36 +349,6 @@ pub trait JobStore: Send + Sync {
     /// post-`finish` by the coordinator once the output closure is
     /// local. No-op if the row was already gone.
     async fn record_image_size(&self, id: JobId, size_bytes: u64) -> Result<(), StoreError>;
-
-    /// Transport-failure recovery for the dynamic builder pool. Under
-    /// a single transaction: increment `interrupt_count`; if the new
-    /// count is ≤ `MAX_INTERRUPTIONS`, flip status to `Interrupted`;
-    /// otherwise flip to `Failure`, stamp `finished_at`, and write
-    /// `failure_reason="exceeded interruption retry limit"`. Returns
-    /// the outcome and (when re-queueing) the prior builder so the
-    /// caller can build an anti-affinity exclude-set for the next
-    /// dispatch.
-    async fn record_interruption(
-        &self,
-        id: JobId,
-        now: DateTime<Utc>,
-    ) -> Result<InterruptOutcome, StoreError>;
-}
-
-/// Maximum number of transport interruptions before a job flips from
-/// `Interrupted` to `Failure`. Counter lives on `jobs.interrupt_count`.
-pub const MAX_INTERRUPTIONS: u32 = 3;
-
-/// What `JobStore::record_interruption` decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InterruptOutcome {
-    /// Re-queue with anti-affinity excluding `prior_builder`.
-    ReQueued {
-        new_count: u32,
-        prior_builder: Option<BuilderId>,
-    },
-    /// Cap exceeded; the job is now in `Failure` and should not be re-queued.
-    FailedExceeded { prior_builder: Option<BuilderId> },
 }
 
 #[async_trait]

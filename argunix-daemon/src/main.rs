@@ -287,6 +287,14 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // BuilderServer (when `builder_enrollment` is configured) writes
     // into the same Arc; argunixctl reads it via the control socket.
     let builder_registry = argunix_builders::BuilderRegistry::new();
+    // Emulation spill grace: after the last native builder for a system
+    // departs, jobs for that system wait this long for its return
+    // before emulated (binfmt) builders become candidates. YAML
+    // `schedule.emulation_spill_grace_seconds` (default 300, 0 = spill
+    // immediately). Read once at startup.
+    builder_registry.set_spill_grace(std::time::Duration::from_secs(
+        current.load().config.schedule.emulation_spill_grace_seconds as u64,
+    ));
     let live_logs = argunix_web::LiveLogRegistry::new();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

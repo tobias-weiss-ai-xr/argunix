@@ -48,8 +48,12 @@ pub const BUILDER_SESSION_WINDOW_SIZE: u32 = 32 * 1024 * 1024;
 
 /// Maximum SSH packet size for builder sessions. Raised from russh's
 /// 32 KiB default to cut per-packet overhead on the bulk closure
-/// transfer. Must stay ≤ [`BUILDER_SESSION_WINDOW_SIZE`].
-pub const BUILDER_SESSION_MAX_PACKET: u32 = 256 * 1024;
+/// transfer, but capped at 65535: russh logs an ERROR at every connect
+/// for anything larger (`client/mod.rs` "should not larger than a TCP
+/// packet"), and throughput is governed by the window, not the packet
+/// size — beyond ~64 KiB the per-packet overhead saved is noise. Must
+/// stay ≤ [`BUILDER_SESSION_WINDOW_SIZE`].
+pub const BUILDER_SESSION_MAX_PACKET: u32 = 65535;
 
 /// Inbound pump: russh channel → `pump_writer` (which the user reads
 /// via the other end of the duplex). Runs until the peer signals

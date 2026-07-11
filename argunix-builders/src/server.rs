@@ -451,6 +451,15 @@ impl ConnectionHandler {
         msg: ControlMessage,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
+        // Any inbound control frame proves the agent's session loop is
+        // alive — refresh the liveness clock regardless of message type,
+        // and before any `.await` below can stall the read loop. The
+        // heartbeat is merely the frame that guarantees a minimum
+        // cadence; a builder busy streaming lifecycle events must not be
+        // reaped for skipping beats.
+        if let Some(name) = self.registered_name.lock().unwrap().clone() {
+            self.registry.touch_activity(&name);
+        }
         match msg {
             ControlMessage::Hello {
                 name,
@@ -597,7 +606,7 @@ impl ConnectionHandler {
                         handle: session_handle.clone(),
                         control_channel: channel,
                     }),
-                    last_heartbeat: std::time::Instant::now(),
+                    last_activity: std::time::Instant::now(),
                     abort: self.abort_slot.get().cloned(),
                 };
                 let displaced = self.registry.register(record.name.clone(), connected);
@@ -620,11 +629,10 @@ impl ConnectionHandler {
                     return Ok(());
                 };
                 let now = chrono::Utc::now();
-                // Refresh the in-memory liveness clock the watchdog reads
-                // *first*, before any `.await` — this is the whole point
-                // of the heartbeat, and it must not be gated behind a DB
-                // write that could momentarily stall the read loop.
-                self.registry.touch_heartbeat(&record.name);
+                // Liveness was already refreshed at the top of
+                // handle_control (before any `.await`); the heartbeat
+                // handler only carries the stats payload and the DB
+                // last-seen bookkeeping.
                 if let Some(stats) = stats {
                     self.registry.push_stats(&record.name, now, stats);
                 }

@@ -191,6 +191,7 @@
           builder-enrollment = pkgs.testers.runNixOSTest ./nix/tests/builder-enrollment.nix;
           builder-build-dispatch = pkgs.testers.runNixOSTest ./nix/tests/builder-build-dispatch.nix;
           builder-stream-large = pkgs.testers.runNixOSTest ./nix/tests/builder-stream-large.nix;
+          builder-transfer-stall = pkgs.testers.runNixOSTest ./nix/tests/builder-transfer-stall.nix;
           builder-liveness-watchdog = pkgs.testers.runNixOSTest ./nix/tests/builder-liveness-watchdog.nix;
           builders-parallel = pkgs.testers.runNixOSTest ./nix/tests/builders-parallel.nix;
           cache-push = pkgs.testers.runNixOSTest ./nix/tests/cache-push.nix;

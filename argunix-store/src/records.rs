@@ -105,12 +105,14 @@ pub struct JobRecord {
     /// job has never been dispatched (still queued). The dispatcher reads
     /// this on re-queue to set anti-affinity.
     pub builder_id: Option<BuilderId>,
-    /// How many times this job has been interrupted by transport drop /
-    /// graceful builder shutdown. Capped by `MAX_INTERRUPTIONS`; on
-    /// exceedance the job flips to `Failure` with `failure_reason` set.
+    /// Historical counter from a never-wired retry-cap design (DEAD-1
+    /// in bugss.md). The column stays so no migration is needed;
+    /// nothing increments it — in-eval transport retries and
+    /// boot-recovery requeues are deliberately uncapped (see
+    /// crash-recovery.nix, which pins this staying 0).
     pub interrupt_count: u32,
-    /// Set when a job fails for a non-build-process reason (currently only
-    /// "exceeded interruption retry limit"). NULL for build-level failures.
+    /// Set when a job fails for a non-build-process reason. NULL for
+    /// build-level failures.
     pub failure_reason: Option<String>,
     /// Per-phase accounting for pool-dispatched builds. All `None`
     /// for jobs that were never dispatched or built locally.

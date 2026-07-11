@@ -72,11 +72,12 @@ pub struct ConnectedBuilder {
     /// build channels.
     pub session: Option<RusshSession>,
     /// Monotonic timestamp of the last sign of life from this builder
-    /// (its `hello`, then refreshed on every `heartbeat`). Read by the
-    /// liveness watchdog to detect a builder that went silent —
-    /// independent of russh/TCP keepalive, which can be starved when
-    /// the peer freezes mid-transfer and our outbound flush blocks.
-    pub last_heartbeat: Instant,
+    /// (its `hello`, then refreshed on every inbound control frame —
+    /// heartbeat or otherwise). Read by the liveness watchdog to detect
+    /// a builder that went silent — independent of russh/TCP keepalive,
+    /// which can be starved when the peer freezes mid-transfer and our
+    /// outbound flush blocks.
+    pub last_activity: Instant,
     /// `Some` in production: the abort handle for the tokio task
     /// running this connection's russh session loop. The watchdog and
     /// the takeover path call `.abort()` on it to force the underlying
@@ -158,6 +159,16 @@ pub struct BuilderRegistry {
     /// builder live until the builder reconnects (we wipe on register
     /// so a stale window from a previous incarnation doesn't show up).
     stats: Mutex<HashMap<BuilderName, VecDeque<StatsSample>>>,
+    /// Most recent moment a *native* builder for each system departed
+    /// the registry (refreshed on register and — crucially — at the
+    /// moment such a builder is removed). Drives the emulation spill
+    /// holdoff: see [`Self::native_holdoff_active`].
+    last_native_seen: Mutex<HashMap<String, Instant>>,
+    /// How long after the last native builder for a system departs
+    /// before emulated builders become candidates for it. Zero (the
+    /// `Default`) disables the holdoff — spill immediately. Set once at
+    /// startup from `schedule.emulation_spill_grace_seconds`.
+    spill_grace: Mutex<Duration>,
 }
 
 /// A single event in a build's lifecycle. The daemon's worker
@@ -228,6 +239,7 @@ impl BuilderRegistry {
         name: BuilderName,
         conn: ConnectedBuilder,
     ) -> Option<DisplacedConnection> {
+        self.note_native_seen(&conn.capabilities.native_system);
         let mut map = self.inner.lock().unwrap();
         let prior = map.insert(name.clone(), conn);
         // Drop any stats from a previous incarnation so the UI doesn't
@@ -259,23 +271,49 @@ impl BuilderRegistry {
     }
 
     /// Refresh the in-memory liveness timestamp for `name`. Called from
-    /// the SSH server's heartbeat handler. No-op if the builder isn't
-    /// registered (a heartbeat racing a removal).
-    pub fn touch_heartbeat(&self, name: &BuilderName) {
+    /// the SSH server on every inbound control frame (heartbeat, build
+    /// lifecycle, shutdown notice — any frame proves the peer's session
+    /// loop is alive). No-op if the builder isn't registered (a frame
+    /// racing a removal).
+    pub fn touch_activity(&self, name: &BuilderName) {
         if let Some(c) = self.inner.lock().unwrap().get_mut(name) {
-            c.last_heartbeat = Instant::now();
+            c.last_activity = Instant::now();
         }
     }
 
-    /// Names of registered builders whose last heartbeat is older than
-    /// `max_silence`. The watchdog evicts these — see [`Self::evict_dead`].
-    pub fn stale_builders(&self, max_silence: Duration) -> Vec<BuilderName> {
+    /// Names of registered builders whose last observed activity is
+    /// older than the applicable threshold. The watchdog evicts these —
+    /// see [`Self::evict_dead`].
+    ///
+    /// `transfer_max` (≫ `idle_max`) applies while the builder has any
+    /// in-flight build in a `Push`/`Pull` phase: a coordinator-initiated
+    /// closure transfer can saturate the shared session and park the
+    /// agent's session loop on local nix-daemon back-pressure, silencing
+    /// heartbeats from a perfectly healthy peer. `Build`-phase and idle
+    /// builders keep the strict `idle_max` — no bulk traffic competes
+    /// with their heartbeats, so silence there is meaningful.
+    pub fn stale_builders(&self, idle_max: Duration, transfer_max: Duration) -> Vec<BuilderName> {
         let now = Instant::now();
+        let transferring: std::collections::HashSet<BuilderName> = self
+            .phases
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| matches!(p, BuildPhase::Push | BuildPhase::Pull))
+            .map(|((name, _), _)| name.clone())
+            .collect();
         self.inner
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, c)| now.duration_since(c.last_heartbeat) > max_silence)
+            .filter(|(name, c)| {
+                let max = if transferring.contains(*name) {
+                    transfer_max
+                } else {
+                    idle_max
+                };
+                now.duration_since(c.last_activity) > max
+            })
             .map(|(name, _)| name.clone())
             .collect()
     }
@@ -296,6 +334,10 @@ impl BuilderRegistry {
                 Some(c) => {
                     self.in_flight.lock().unwrap().remove(name);
                     self.stats.lock().unwrap().remove(name);
+                    // Departure anchors the emulation spill grace: jobs
+                    // for this system wait for the builder's return
+                    // before emulated builders become candidates.
+                    self.note_native_seen(&c.capabilities.native_system);
                     c.abort
                 }
                 None => return false,
@@ -358,13 +400,18 @@ impl BuilderRegistry {
             .map(|c| c.connection_id == connection_id)
             .unwrap_or(false);
         if matches {
-            map.remove(name);
+            let removed = map.remove(name);
             self.in_flight.lock().unwrap().remove(name);
             self.stats.lock().unwrap().remove(name);
             // Release inner-mutex before we touch in_flight_builds /
             // phases — the drain helper takes those locks itself, and
             // we don't want to hold three at once.
             drop(map);
+            // Departure anchors the emulation spill grace (as in
+            // `evict_dead`).
+            if let Some(c) = removed {
+                self.note_native_seen(&c.capabilities.native_system);
+            }
             let drained = self.drain_in_flight_for(name);
             if !drained.is_empty() {
                 tracing::warn!(
@@ -432,10 +479,14 @@ impl BuilderRegistry {
     /// `any_matching_builder` stays true (a native builder exists), which
     /// the worker reads as a capacity wait.
     ///
-    /// Only when no native builder for `system` is connected at all do
-    /// emulated builders become candidates. So if the lone native
-    /// builder disconnects mid-wait, the next call admits emulation and
-    /// the job proceeds there.
+    /// Only when no native builder for `system` is connected at all —
+    /// and the spill holdoff (see [`Self::native_holdoff_active`]) has
+    /// expired — do emulated builders become candidates. A momentary
+    /// native disconnect (eviction + quick re-enroll) therefore parks
+    /// jobs in the capacity-wait loop instead of committing them to an
+    /// emulated builder that runs the same work orders of magnitude
+    /// slower (incident 2026-07-10: six aarch64 VM tests spilled onto
+    /// x86 binfmt builders during a 6-second reconnect window).
     fn system_candidates(&self, system: &str, exclude: &HashSet<u64>) -> Vec<BuilderSnapshot> {
         let supporting: Vec<BuilderSnapshot> = self
             .list()
@@ -452,9 +503,65 @@ impl BuilderRegistry {
                 .into_iter()
                 .filter(|b| b.capabilities.native_system == system)
                 .collect()
+        } else if self.native_holdoff_active(system) {
+            // Hold the tier: `eligible` comes back empty (no slot right
+            // now) while `any_matching_builder` stays true via the same
+            // holdoff — the worker reads that combination as a capacity
+            // wait and re-polls until the native builder returns or the
+            // grace expires.
+            Vec::new()
         } else {
             supporting
         }
+    }
+
+    /// True while emulated builders must NOT stand in for `system`:
+    /// either a native builder for it is still registered (it may
+    /// merely be transport-excluded for one dispatch — its reconnect
+    /// gets a fresh connection_id and is picked up again), or one
+    /// departed less than the spill grace ago and is expected back (a
+    /// healthy agent re-enrolls within seconds). Systems that never had
+    /// a native builder are unaffected.
+    fn native_holdoff_active(&self, system: &str) -> bool {
+        let grace = *self.spill_grace.lock().unwrap();
+        if grace.is_zero() {
+            return false;
+        }
+        let native_registered = self
+            .inner
+            .lock()
+            .unwrap()
+            .values()
+            .any(|c| c.state == ConnState::Active && c.capabilities.native_system == system);
+        if native_registered {
+            return true;
+        }
+        self.last_native_seen
+            .lock()
+            .unwrap()
+            .get(system)
+            .is_some_and(|t| t.elapsed() < grace)
+    }
+
+    /// Set the emulation spill grace (see `last_native_seen`). Called
+    /// once at daemon startup from
+    /// `schedule.emulation_spill_grace_seconds`; unit tests use it to
+    /// exercise the holdoff with short windows.
+    pub fn set_spill_grace(&self, grace: Duration) {
+        *self.spill_grace.lock().unwrap() = grace;
+    }
+
+    /// Record that a native builder for `system` is present right now.
+    /// Called on register and on removal (the departure moment anchors
+    /// the grace countdown).
+    fn note_native_seen(&self, system: &str) {
+        if system.is_empty() {
+            return;
+        }
+        self.last_native_seen
+            .lock()
+            .unwrap()
+            .insert(system.to_string(), Instant::now());
     }
 
     /// Builders that match `(system, features)`, are `Active`, aren't at
@@ -492,9 +599,23 @@ impl BuilderRegistry {
         features: &[String],
         exclude: &HashSet<u64>,
     ) -> bool {
-        self.system_candidates(system, exclude)
+        if self
+            .system_candidates(system, exclude)
             .into_iter()
             .any(|b| features.iter().all(|f| b.capabilities.features.contains(f)))
+        {
+            return true;
+        }
+        // A native builder that is registered-but-excluded or departed
+        // within the spill grace counts as "matching, at capacity": the
+        // worker parks the job in its capacity-wait loop for the
+        // builder's return instead of interrupting it or spilling to
+        // emulation. Caveat: the holdoff is keyed on `system` only — we
+        // don't retain a departed builder's feature set, so a job whose
+        // features the native builder never had waits out the grace
+        // before reaching an emulated builder that has them. Bounded by
+        // the grace; acceptable.
+        self.native_holdoff_active(system)
     }
 
     /// Look up the SSH-side details for a registered builder. Used by
@@ -721,34 +842,59 @@ impl BuilderRegistry {
     }
 }
 
-/// Builder heartbeat cadence (the agent sends one every 30s; see
-/// `design/builders.md`). The watchdog threshold is a multiple of this.
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// Builder heartbeat cadence. The agent writes one every 5s from a
+/// dedicated task holding its own channel write half (see
+/// `argunix-builder/src/agent.rs`), so the control connection is never
+/// idle on a healthy link.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How long a registered builder may go without a heartbeat before the
-/// watchdog declares it dead. Three missed beats (~95s), matching the
-/// russh keepalive intent — but enforced by an independent timer that
+/// How long a registered builder may go without any observed activity
+/// (heartbeat or any other control frame) before the watchdog declares
+/// it dead — 19 missed 5s beats. Enforced by an independent timer that
 /// a wedged session loop cannot starve.
+///
+/// Deliberate asymmetry: the agent's own `SELF_LIVENESS_TIMEOUT` (60s)
+/// sits well below this, so a stalled-but-alive agent tears its wedged
+/// session down and re-registers — a *displacement* that never removes
+/// the builder from the registry — before this eviction threshold is
+/// reached. Eviction here therefore means the agent could not act
+/// either: a genuinely dead peer. While a coordinator-initiated closure
+/// transfer is in flight the watchdog applies
+/// [`LIVENESS_MAX_SILENCE_TRANSFER`] instead — see
+/// [`BuilderRegistry::stale_builders`].
 pub const LIVENESS_MAX_SILENCE: Duration = Duration::from_secs(95);
+
+/// Silence tolerated while a closure transfer the coordinator itself
+/// initiated (an in-flight `Push`/`Pull` phase) is open. A saturating
+/// transfer can park the agent's single russh session loop on local
+/// nix-daemon back-pressure — heartbeats stop while the peer is
+/// perfectly alive (incident 2026-07-10). A genuinely dead peer
+/// mid-transfer is torn down much earlier by TCP keepalive
+/// (~60s with unacked data) → session drop → `remove_if_matches`; this
+/// cap only bounds the pathological "TCP alive, application wedged"
+/// case that the agent's own 60s watchdog failed to clear.
+pub const LIVENESS_MAX_SILENCE_TRANSFER: Duration = Duration::from_secs(900);
 
 /// How often the watchdog scans the registry for silent builders.
 pub const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Spawn the liveness watchdog: every [`WATCHDOG_SCAN_INTERVAL`], evict
-/// any builder that hasn't sent a heartbeat within
-/// [`LIVENESS_MAX_SILENCE`]. This is the backstop that catches a
-/// builder whose connection silently froze (a slept laptop, a NAT
-/// mapping that expired mid-transfer) — cases where russh's own
-/// keepalive is starved because the session loop is parked on a
-/// blocked outbound flush. Eviction frees in-flight builds for retry
-/// (see [`BuilderRegistry::evict_dead`]).
+/// any builder that has shown no activity within
+/// [`LIVENESS_MAX_SILENCE`] ([`LIVENESS_MAX_SILENCE_TRANSFER`] while a
+/// coordinator-initiated closure transfer is in flight). This is the
+/// backstop that catches a builder whose connection silently froze (a
+/// slept laptop, a NAT mapping that expired mid-transfer) — cases where
+/// russh's own keepalive is starved because the session loop is parked
+/// on a blocked outbound flush. Eviction frees in-flight builds for
+/// retry (see [`BuilderRegistry::evict_dead`]).
 pub fn spawn_liveness_watchdog(registry: Arc<BuilderRegistry>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(WATCHDOG_SCAN_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            for name in registry.stale_builders(LIVENESS_MAX_SILENCE) {
+            for name in registry.stale_builders(LIVENESS_MAX_SILENCE, LIVENESS_MAX_SILENCE_TRANSFER)
+            {
                 registry.evict_dead(&name);
             }
         }
@@ -780,7 +926,7 @@ mod tests {
             connected_since: Utc::now(),
             connection_id: reg.next_connection_id(),
             session: None,
-            last_heartbeat: Instant::now(),
+            last_activity: Instant::now(),
             abort: None,
         }
     }
@@ -928,17 +1074,64 @@ mod tests {
             conn(&reg, 1, caps(&["x86_64-linux"], &[], 1)),
         );
         let mut old = conn(&reg, 2, caps(&["x86_64-linux"], &[], 1));
-        // Backdate the silent builder's last heartbeat well past the
+        // Backdate the silent builder's last activity well past the
         // threshold.
-        old.last_heartbeat = Instant::now() - Duration::from_secs(600);
+        old.last_activity = Instant::now() - Duration::from_secs(600);
         let _ = reg.register(silent.clone(), old);
 
-        let stale = reg.stale_builders(LIVENESS_MAX_SILENCE);
+        let stale = reg.stale_builders(LIVENESS_MAX_SILENCE, LIVENESS_MAX_SILENCE_TRANSFER);
         assert_eq!(stale, vec![silent.clone()]);
 
-        // A heartbeat refresh clears staleness.
-        reg.touch_heartbeat(&silent);
-        assert!(reg.stale_builders(LIVENESS_MAX_SILENCE).is_empty());
+        // An activity refresh clears staleness.
+        reg.touch_activity(&silent);
+        assert!(
+            reg.stale_builders(LIVENESS_MAX_SILENCE, LIVENESS_MAX_SILENCE_TRANSFER)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_builders_defers_eviction_during_transfer_phases() {
+        let reg = BuilderRegistry::new();
+        let name = BuilderName::new("pushing").unwrap();
+        let mut c = conn(&reg, 1, caps(&["x86_64-linux"], &[], 4));
+        // Silent past the idle threshold but inside the transfer budget.
+        c.last_activity = Instant::now() - Duration::from_secs(300);
+        let _ = reg.register(name.clone(), c);
+        let _rx = reg.register_in_flight_build(name.clone(), 1);
+
+        // In a Push phase the relaxed transfer threshold applies: a
+        // saturating closure push can silence heartbeats from a healthy
+        // peer, so 300s of silence is not yet stale.
+        reg.set_phase(&name, 1, BuildPhase::Push);
+        assert!(
+            reg.stale_builders(LIVENESS_MAX_SILENCE, LIVENESS_MAX_SILENCE_TRANSFER)
+                .is_empty(),
+            "push-phase builder within the transfer budget must not be evicted",
+        );
+
+        // Same silence during the Build phase is stale: no bulk transfer
+        // competes with heartbeats there.
+        reg.set_phase(&name, 1, BuildPhase::Build);
+        assert_eq!(
+            reg.stale_builders(LIVENESS_MAX_SILENCE, LIVENESS_MAX_SILENCE_TRANSFER),
+            vec![name.clone()],
+        );
+
+        // Past the transfer budget even a Pull-phase builder is stale —
+        // the cap bounds the "TCP alive, application wedged" case.
+        reg.set_phase(&name, 1, BuildPhase::Pull);
+        reg.inner
+            .lock()
+            .unwrap()
+            .get_mut(&name)
+            .unwrap()
+            .last_activity =
+            Instant::now() - (LIVENESS_MAX_SILENCE_TRANSFER + Duration::from_secs(5));
+        assert_eq!(
+            reg.stale_builders(LIVENESS_MAX_SILENCE, LIVENESS_MAX_SILENCE_TRANSFER),
+            vec![name],
+        );
     }
 
     #[tokio::test]
@@ -1203,9 +1396,12 @@ mod tests {
 
     #[test]
     fn excluded_native_unblocks_emulated() {
-        // If the only native builder is excluded (e.g. transport failure
+        // With the spill grace DISABLED (the registry default, 0): if
+        // the only native builder is excluded (e.g. transport failure
         // this dispatch), the tier opens up to emulation rather than
-        // wedging the job — `exclude` is applied before the native check.
+        // wedging the job — `exclude` is applied before the native
+        // check. With a grace configured the tier instead holds for the
+        // native builder's reconnect; see the *_under_grace tests.
         let reg = BuilderRegistry::new();
         let native = BuilderName::new("arm").unwrap();
         let emu = BuilderName::new("x86-binfmt").unwrap();
@@ -1221,6 +1417,120 @@ mod tests {
         let lst = reg.eligible("aarch64-linux", &[], &excluded);
         assert_eq!(lst.len(), 1);
         assert_eq!(lst[0].name.as_str(), "x86-binfmt");
+    }
+
+    #[test]
+    fn excluded_native_holds_tier_under_grace() {
+        // A transport-excluded native builder is still *registered* —
+        // its reconnect gets a fresh connection_id and is eligible
+        // again. With a spill grace configured, the tier must hold
+        // (capacity wait) instead of instantly legitimizing emulation.
+        let reg = BuilderRegistry::new();
+        reg.set_spill_grace(Duration::from_secs(300));
+        let native = BuilderName::new("arm").unwrap();
+        let emu = BuilderName::new("x86-binfmt").unwrap();
+        let native_conn = conn(&reg, 1, caps(&["aarch64-linux"], &[], 4));
+        let native_conn_id = native_conn.connection_id;
+        let _ = reg.register(native.clone(), native_conn);
+        let _ = reg.register(
+            emu.clone(),
+            conn(&reg, 2, caps(&["x86_64-linux", "aarch64-linux"], &[], 4)),
+        );
+        let mut excluded = HashSet::new();
+        excluded.insert(native_conn_id);
+        assert!(
+            reg.eligible("aarch64-linux", &[], &excluded).is_empty(),
+            "excluded-but-registered native must hold the tier under grace",
+        );
+        assert!(
+            reg.any_matching_builder("aarch64-linux", &[], &excluded),
+            "holdoff reads as capacity wait, not no-match interrupt",
+        );
+    }
+
+    #[test]
+    fn departed_native_holds_tier_until_grace_expires() {
+        // The lone native builder is evicted. Under grace, jobs wait
+        // for its return; once the grace expires the emulated builder
+        // becomes eligible after all.
+        let reg = BuilderRegistry::new();
+        reg.set_spill_grace(Duration::from_millis(80));
+        let native = BuilderName::new("arm").unwrap();
+        let emu = BuilderName::new("x86-binfmt").unwrap();
+        let _ = reg.register(
+            native.clone(),
+            conn(&reg, 1, caps(&["aarch64-linux"], &[], 4)),
+        );
+        let _ = reg.register(
+            emu.clone(),
+            conn(&reg, 2, caps(&["x86_64-linux", "aarch64-linux"], &[], 4)),
+        );
+        assert!(reg.evict_dead(&native));
+
+        assert!(
+            reg.eligible("aarch64-linux", &[], &HashSet::new())
+                .is_empty(),
+            "freshly departed native must hold the tier",
+        );
+        assert!(
+            reg.any_matching_builder("aarch64-linux", &[], &HashSet::new()),
+            "grace window reads as capacity wait",
+        );
+
+        std::thread::sleep(Duration::from_millis(120));
+        let lst = reg.eligible("aarch64-linux", &[], &HashSet::new());
+        assert_eq!(lst.len(), 1, "grace expired ⇒ emulation admitted");
+        assert_eq!(lst[0].name.as_str(), "x86-binfmt");
+    }
+
+    #[test]
+    fn grace_does_not_gate_never_native_systems() {
+        // A system that never had a native builder spills to emulation
+        // immediately even with a grace configured — there is nothing
+        // to wait for.
+        let reg = BuilderRegistry::new();
+        reg.set_spill_grace(Duration::from_secs(300));
+        let emu = BuilderName::new("x86-binfmt").unwrap();
+        let _ = reg.register(
+            emu.clone(),
+            conn(&reg, 1, caps(&["x86_64-linux", "aarch64-linux"], &[], 4)),
+        );
+        let lst = reg.eligible("aarch64-linux", &[], &HashSet::new());
+        assert_eq!(lst.len(), 1);
+        assert_eq!(lst[0].name.as_str(), "x86-binfmt");
+    }
+
+    #[test]
+    fn returning_native_reclaims_tier_during_grace() {
+        // The incident shape: native evicted, reconnects seconds later.
+        // During the grace nothing spilled; the reconnect must make the
+        // native builder eligible again immediately.
+        let reg = BuilderRegistry::new();
+        reg.set_spill_grace(Duration::from_secs(300));
+        let native = BuilderName::new("arm").unwrap();
+        let emu = BuilderName::new("x86-binfmt").unwrap();
+        let _ = reg.register(
+            native.clone(),
+            conn(&reg, 1, caps(&["aarch64-linux"], &[], 4)),
+        );
+        let _ = reg.register(
+            emu.clone(),
+            conn(&reg, 2, caps(&["x86_64-linux", "aarch64-linux"], &[], 4)),
+        );
+        assert!(reg.evict_dead(&native));
+        assert!(
+            reg.eligible("aarch64-linux", &[], &HashSet::new())
+                .is_empty()
+        );
+
+        // Re-enrolls (fresh connection).
+        let _ = reg.register(
+            native.clone(),
+            conn(&reg, 1, caps(&["aarch64-linux"], &[], 4)),
+        );
+        let lst = reg.eligible("aarch64-linux", &[], &HashSet::new());
+        assert_eq!(lst.len(), 1);
+        assert_eq!(lst[0].name.as_str(), "arm");
     }
 
     #[test]
