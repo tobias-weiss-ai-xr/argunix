@@ -21,7 +21,7 @@ let
   # `docs/`, `nix/`, `flake.nix` or the README never enters this
   # fileset, so it never rebuilds the Rust crates. Untracked files are
   # already excluded upstream: a flake's source is its git tree.
-  members = (builtins.fromTOML (builtins.readFile (workspaceRoot + "/Cargo.toml"))).workspace.members;
+  members = (fromTOML (builtins.readFile (workspaceRoot + "/Cargo.toml"))).workspace.members;
 
   src = lib.fileset.toSource {
     root = workspaceRoot;

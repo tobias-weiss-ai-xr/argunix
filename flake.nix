@@ -5,15 +5,16 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     naersk.url = "github:nix-community/naersk";
-    naersk.inputs.nixpkgs.follows = "nixpkgs";
+    naersk.flake = false;
 
     disko.url = "github:nix-community/disko";
-    disko.inputs.nixpkgs.follows = "nixpkgs";
+    disko.flake = false;
   };
 
   outputs =
     inputs:
     let
+      inherit (inputs.nixpkgs) lib;
       systems = [
         "x86_64-linux"
         "aarch64-linux"
@@ -29,9 +30,7 @@
       overlays =
         let
           argunix = import ./nix/overlay.nix;
-          naersk = final: _prev: {
-            naersk = final.callPackage inputs.naersk { };
-          };
+          naersk = import "${inputs.naersk}/overlay.nix";
         in
         {
           inherit argunix naersk;
@@ -53,7 +52,7 @@
       nixosConfigurations.argunix = inputs.nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
         modules = [
-          inputs.disko.nixosModules.disko
+          "${inputs.disko}/module.nix"
           inputs.self.nixosModules.default
           {
             nixpkgs.overlays = [ inputs.self.overlays.default ];
@@ -69,7 +68,6 @@
           inherit system;
           overlays = [ inputs.self.overlays.default ];
         };
-        inherit (pkgs) lib;
 
         treefmt = pkgs.treefmt.withConfig {
           settings = {
