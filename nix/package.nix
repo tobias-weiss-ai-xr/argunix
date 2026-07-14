@@ -21,7 +21,15 @@ let
   # `docs/`, `nix/`, `flake.nix` or the README never enters this
   # fileset, so it never rebuilds the Rust crates. Untracked files are
   # already excluded upstream: a flake's source is its git tree.
-  members = (fromTOML (builtins.readFile (workspaceRoot + "/Cargo.toml"))).workspace.members;
+  workspaceToml = fromTOML (builtins.readFile (workspaceRoot + "/Cargo.toml"));
+  inherit (workspaceToml.workspace) members;
+
+  # naersk only infers a version from a top-level `[package]` section;
+  # a virtual workspace manifest like ours has none, so it would fall
+  # back to "unknown" (and `builtins.trace` the whole config). Read the
+  # `[workspace.package]` version — the one the member crates inherit
+  # via `version.workspace = true` — and pass it explicitly.
+  inherit (workspaceToml.workspace.package) version;
 
   src = lib.fileset.toSource {
     root = workspaceRoot;
@@ -36,7 +44,7 @@ let
 
   rust = naersk.buildPackage {
     name = "argunix";
-    inherit src;
+    inherit src version;
     # Askama compiles templates into the binary; nothing on disk at
     # runtime depends on the template directory. Static assets are
     # added by the wrapper derivation below.
@@ -50,7 +58,7 @@ let
   # `checks.<system>` without duplicating the fileset filter.
   tests = naersk.buildPackage {
     name = "argunix-cargo-tests";
-    inherit src;
+    inherit src version;
     mode = "test";
     release = false;
     cargoTestOptions = x: x ++ [ "--workspace" ];
