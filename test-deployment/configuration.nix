@@ -167,6 +167,9 @@ in
             "oci-community/images/applicative-systems/images" = {
               push_to_registries = [ "opencode" ];
             };
+            "oci-community/images/applicative-systems/nix" = {
+              push_to_registries = [ "opencode" ];
+            };
           };
         };
       };
