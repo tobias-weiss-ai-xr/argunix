@@ -184,6 +184,10 @@
           webhook-smoke = pkgs.callPackage ./nix/tests/webhook-smoke.nix { };
           serve-pipeline-smoke = pkgs.callPackage ./nix/tests/serve-pipeline-smoke.nix { };
           forge-status-smoke = pkgs.callPackage ./nix/tests/forge-status-smoke.nix { };
+        }
+        // lib.optionalAttrs pkgs.stdenv.isx86_64 {
+          # limiting these tests to run on x86 because we currently have no
+          # non-VM arm runners that would be fast enough to make sense.
           module-smoke = pkgs.testers.runNixOSTest ./nix/tests/module-smoke.nix;
           builder-module-smoke = pkgs.testers.runNixOSTest ./nix/tests/builder-module-smoke.nix;
           builder-enrollment = pkgs.testers.runNixOSTest ./nix/tests/builder-enrollment.nix;
