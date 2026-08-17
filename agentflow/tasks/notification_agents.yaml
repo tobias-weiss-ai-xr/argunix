@@ -1,0 +1,233 @@
+---
+# AgentFlow Task: Notification Agents (GitHubStatus, MatrixNotifier)
+# Priority: MEDIUM
+# Estimated Duration: 3-4 hours total
+# Dependencies: GitSyncAgent (optional for GitHubStatus)
+
+id: task-notification-agents-impl-005
+title: "Implement Notification Agents (GitHubStatusAgent, MatrixNotifierAgent)"
+description: |
+  Create two notification agents:
+  
+  1. GitHubStatusAgent: Post build status to GitHub commit status API
+  2. MatrixNotifierAgent: Send notifications via Matrix protocol
+
+task_type: multi-task
+priority: medium
+expected_duration: 14400  # 4 hours in seconds
+
+# Agent assignment
+target_agent: planner
+
+# Input artifacts
+inputs:
+  - type: file
+    path: agentflow/agentflow-core/src
+    description: Core types and traits
+  - type: file
+    path: agentflow/agentflow-server/src
+    description: HTTP server for potential webhook integration
+
+# Expected outputs
+outputs:
+  - type: file
+    path: agentflow/agentflow-agents/src/github_status/mod.rs
+    description: GitHubStatusAgent implementation
+  - type: file
+    path: agentflow/agentflow-agents/src/matrix_notifier/mod.rs
+    description: MatrixNotifierAgent implementation
+  - type: file
+    path: agentflow/agentflow-agents/src/lib.rs
+    description: Updated lib.rs with notification agents export
+
+# Success criteria
+test_criteria:
+  - rust: "cargo check --package agentflow-agents"
+  - rust: "cargo test --package agentflow-agents -- notification"
+  - file_exists: agentflow/agentflow-agents/src/github_status/mod.rs
+  - file_exists: agentflow/agentflow-agents/src/matrix_notifier/mod.rs
+  - contains: "pub struct GitHubStatusAgent"
+  - contains: "pub struct MatrixNotifierAgent"
+
+# Configuration
+environment:
+  RUST_LOG: debug
+
+# Task-specific metadata
+metadata:
+  category: notifications
+  complexity: medium
+
+  subtasks:
+    - id: github-status-subtask
+      title: "GitHubStatusAgent Implementation"
+      estimated_duration: 7200  # 2 hours
+      description: |
+        Post build status to GitHub commit status API:
+        - Create GitHub status checks
+        - Update status (pending, success, failure)
+        - Post detailed build logs
+        - Link to build artifacts
+        - Handle GitHub API rate limiting
+        - Manage repository permissions
+      
+      config_template: |
+        {
+          "github_token": null, // Set via GITHUB_TOKEN env var
+          "default_context": "argunix-ci",
+          "base_url": "https://api.github.com",
+          "rate_limit": {
+            "requests_per_minute": 60,
+            "retry_on_limit": true,
+            "retry_delay": 10,
+            "max_retries": 3
+          },
+          "link_artifacts": true,
+          "artifact_url_base": "https://ci.opendesk.works/artifacts",
+          "description_templates": {
+            "pending": "Build in progress",
+            "success": "Build succeeded",
+            "failure": "Build failed"
+          },
+          "include_details": true,
+          "max_log_lines": 1000
+        }
+      
+      expected_capabilities:
+        - github-status
+        - commit-status
+        - pull-request-status
+        - rate-limit-management
+        - artifact-linking
+      
+      messages_to_handle:
+        - PostGitHubStatus
+        - GitHubStatusPosted
+        - UpdateGitHubStatus
+        - GitHubStatusFailed
+        - NotifyGitHub
+        - BuildStatusUpdate
+      
+      http_endpoints:
+        - path: /github/status
+          method: POST
+          description: Internal endpoint for status updates
+      
+      env_vars:
+        - GITHUB_TOKEN: "Required: GitHub personal access token"
+        - GITHUB_APP_ID: "Optional: GitHub App ID"
+        - GITHUB_APP_INSTALLATION_ID: "Optional: GitHub App installation ID"
+        - GITHUB_APP_PRIVATE_KEY: "Optional: GitHub App private key"
+
+    - id: matrix-notifier-subtask
+      title: "MatrixNotifierAgent Implementation"
+      estimated_duration: 7200  # 2 hours
+      description: |
+        Send notifications via Matrix protocol:
+        - Connect to Matrix server
+        - Send messages to rooms
+        - Format notification messages (HTML, Markdown)
+        - Handle message history
+        - Send file attachments
+        - Manage Matrix sessions
+      
+      config_template: |
+        {
+          "homeserver": "https://matrix.org",
+          "username": "argunix-bot",
+          "password": null, // Set via MATRIX_PASSWORD env var
+          "access_token": null, // Alternative to password
+          "device_id": null,
+          "rooms": {
+            "alerts": "!alerts:opendesk.works",
+            "builds": "!builds:opendesk.works",
+            "general": "!general:opendesk.works",
+            "debug": "!debug:opendesk.works"
+          },
+          "default_room": "!builds:opendesk.works",
+          "message_formats": {
+            "build_started": "\u26a1 Build started: {repo}@{ref}\nCommit: {commit}\nAuthor: {author}",
+            "build_complete": "\u2705 Build succeeded: {repo}@{ref}\nDuration: {duration}s\nArtifacts: {artifacts}",
+            "build_failed": "\u274c Build failed: {repo}@{ref}\n\nError:\n{error}",
+            "test_started": "\u26a1 Tests started: {repo}",
+            "test_passed": "\u2705 All tests passed: {repo}",
+            "test_failed": "\u274c Tests failed: {repo}\nFailed: {failed_count}, Passed: {passed_count}"
+          },
+          "html_enabled": true,
+          "markdown_enabled": true,
+          "use_formatting": true,
+          "max_message_length": 4096,
+          "send_receipts": false,
+          "retry_on_failure": true,
+          "retry_delay": 5,
+          "max_retries": 3
+        }
+      
+      expected_capabilities:
+        - matrix-notify
+        - room-messaging
+        - file-attachments
+        - message-formatting
+        - html-formatting
+        - markdown-formatting
+      
+      messages_to_handle:
+        - SendMatrixNotification
+        - MatrixNotificationSent
+        - BroadcastMatrixMessage
+        - SendMatrixFile
+        - MatrixFileSent
+        - NotificationRequest
+      
+      env_vars:
+        - MATRIX_PASSWORD: "Matrix login password"
+        - MATRIX_ACCESS_TOKEN: "Matrix access token (alternative to password)"
+        - MATRIX_HOMESERVER: "Override default homeserver"
+
+  # Shared notes
+  notes: |
+    These agents handle notifications to external systems.
+    
+    For GitHubStatusAgent:
+    - Use reqwest for GitHub API calls
+    - Handle GitHub API rate limiting (5000 requests/hour for authenticated users)
+    - Use proper User-Agent header (e.g., "argunix-ci/1.0")
+    - Support both personal access tokens and GitHub Apps
+    - GitHub Apps provide better granular permissions
+    - Status contexts are unique per repository
+    
+    GitHub Status API:
+    - POST /repos/{owner}/{repo}/statuses/{sha}
+    - Required: state (pending, success, failure)
+    - Optional: description, context, target_url
+    - See: https://docs.github.com/en/rest/commits/statuses
+    
+    For MatrixNotifierAgent:
+    - Use matrix-rust-sdk or reqwest for HTTP API
+    - Matrix uses REST API v3
+    - Authentication: password or access token
+    - JOIN rooms if not already joined
+    - Format messages nicely with HTML/Markdown
+    
+    Matrix API:
+    - POST /login - Login with password
+    - POST /_matrix/client/v3/rooms/{roomId}/send/m.room.message - Send message
+    - POST /_matrix/media/v3/upload - Upload file
+    - See: https://matrix.org/docs/spec/client_server/latest
+    
+    Consider:
+    - Connecting to opendesk's own Matrix server (matrix.opendesk.works)
+    - Using existing bot accounts
+    - Implementing message deduplication
+    - Supporting mentions (@user:domain)
+    - Adding timestamp to all messages
+    - Rate limiting Matrix API calls
+    
+    Both agents:
+    - Handle network failures gracefully
+    - Implement retry logic with exponential backoff
+    - Don't fail silently - log errors and continue
+    - Support disabling notifications via config
+    - Consider batching notifications to reduce API calls
+
+---

@@ -1,0 +1,232 @@
+---
+# AgentFlow Task: Mœ Agents Suite (MoeSync, MoeVerify, MoeGC)
+# Priority: MEDIUM
+# Estimated Duration: 6-8 hours total
+# Dependencies: StorageManagerAgent
+
+id: task-moe-agents-impl-003
+title: "Implement Mœ Agents (MoeSyncAgent, MoeVerifyAgent, MoeGCAgent)"
+description: |
+  Create three agents for Mœ self-sovereign storage integration:
+  
+  1. MoeSyncAgent: Synchronize data with Mœ storage, manage identities
+  2. MoeVerifyAgent: Verify Mœ object integrity and authenticity
+  3. MoeGCAgent: Garbage collect old Mœ objects
+
+task_type: multi-task
+priority: medium
+expected_duration: 28800  # 8 hours in seconds
+
+# Agent assignment
+target_agent: planner
+
+# Input artifacts
+inputs:
+  - type: file
+    path: agentflow/agentflow-core/src
+    description: Core types including Mœ message types
+  - type: file
+    path: agentflow/agentflow-agents/src/storage_manager
+    description: StorageManagerAgent
+
+# Expected outputs
+outputs:
+  - type: file
+    path: agentflow/agentflow-agents/src/moe_sync/mod.rs
+    description: MoeSyncAgent implementation
+  - type: file
+    path: agentflow/agentflow-agents/src/moe_verify/mod.rs
+    description: MoeVerifyAgent implementation
+  - type: file
+    path: agentflow/agentflow-agents/src/moe_gc/mod.rs
+    description: MoeGCAgent implementation
+  - type: file
+    path: agentflow/agentflow-agents/src/lib.rs
+    description: Updated lib.rs with moe_* exports
+  - type: documentation
+    path: agentflow/docs/agents/moe-integration.md
+    description: Mœ integration documentation
+
+# Success criteria
+test_criteria:
+  - rust: "cargo check --package agentflow-agents"
+  - rust: "cargo test --package agentflow-agents -- moe"
+  - file_exists: agentflow/agentflow-agents/src/moe_sync/mod.rs
+  - file_exists: agentflow/agentflow-agents/src/moe_verify/mod.rs
+  - file_exists: agentflow/agentflow-agents/src/moe_gc/mod.rs
+  - contains: "pub struct MoeSyncAgent"
+  - contains: "pub struct MoeVerifyAgent"
+  - contains: "pub struct MoeGCAgent"
+
+# Configuration
+environment:
+  RUST_LOG: debug
+
+# Task-specific metadata
+metadata:
+  category: moe-integration
+  complexity: medium
+  dependencies:
+    - StorageManagerAgent
+
+  subtasks:
+    - id: moe-sync-subtask
+      title: "MoeSyncAgent Implementation"
+      estimated_duration: 7200  # 2 hours
+      description: |
+        Synchronize data with Mœ self-sovereign storage:
+        - Sync local objects to Mœ
+        - Pull data from Mœ
+        - Manage identity keys
+        - Handle generation transitions
+        - Synchronize with other Mœ peers
+        - Backup and restore Mœ data
+      
+      config_template: |
+        {
+          "identity": {
+            "name": "argunix-ci",
+            "fingerprint": "sha256-...",
+            "private_key": null
+          },
+          "peers": [
+            { "url": "https://moe.opendesk.works", "trusted": true }
+          ],
+          "namespace": "ci-artifacts",
+          "sync_interval": 300,
+          "auto_verify": true
+        }
+      
+      expected_capabilities:
+        - moe-sync
+        - identity-management
+        - generation-management
+        - peer-synchronization
+        - backup
+        - restore
+      
+      messages_to_handle:
+        - SyncToMoe
+        - SyncFromMoe
+        - VerifyMoeObject
+        - MoeSyncComplete
+        - MoeSyncFailed
+
+    - id: moe-verify-subtask
+      title: "MoeVerifyAgent Implementation"
+      estimated_duration: 7200  # 2 hours
+      description: |
+        Verify Mœ content-addressable storage integrity:
+        - Verify object hashes
+        - Check cryptographic signatures
+        - Validate content against claims
+        - Detect tampering or corruption
+        - Generate verification reports
+        - Audit storage integrity
+      
+      config_template: |
+        {
+          "strict_mode": true,
+          "check_signatures": true,
+          "audit_interval": 86400,
+          "report_path": "/var/log/agentflow/verification-reports"
+        }
+      
+      expected_capabilities:
+        - moe-verification
+        - integrity-checking
+        - signature-validation
+        - audit-reporting
+        - tamper-detection
+      
+      messages_to_handle:
+        - VerifyMoeObject
+        - VerifyMoeGeneration
+        - VerificationResult
+        - AuditMoeStorage
+        - VerificationReport
+
+    - id: moe-gc-subtask
+      title: "MoeGCAgent Implementation"
+      estimated_duration: 3600  # 1 hour
+      description: |
+        Garbage collect old Mœ objects:
+        - Identify old/unused objects
+        - Remove expired generations
+        - Compact storage
+        - Clean up orphaned references
+        - Enforce retention policies
+        - Generate cleanup reports
+      
+      config_template: |
+        {
+          "retention_policies": {
+            "build-artifacts": { "keep_days": 30 },
+            "source-code": { "keep_days": 365 },
+            "releases": { "keep_days": 2555 }
+          },
+          "gc_interval": 259200,
+          "dry_run": false,
+          "max_deleted_per_run": 1000
+        }
+      
+      expected_capabilities:
+        - moe-gc
+        - garbage-collection
+        - storage-compaction
+        - retention-management
+        - cleanup-reporting
+      
+      messages_to_handle:
+        - GarbageCollect
+        - MoeGCCycleComplete
+        - CleanupOldObjects
+        - CompactStorage
+        - GcReport
+
+  # Shared environment variables
+  env_vars:
+    - MOE_API_TOKEN: "Mœ API authentication token"
+    - MOE_IDENTITY_KEY: "Path to Mœ identity private key"
+    - MOE_ENDPOINT: "Default Mœ server endpoint"
+
+  # Notes for developer
+  notes: |
+    Mœ (Moebius) is a self-sovereign storage protocol for content-addressable data.
+    
+    Key concepts:
+    - Identity: Cryptographic identity with fingerprint
+    - Generation: Versioned namespace for data
+    - Object: Content-addressable data with hash
+    - Peer: Other Mœ instances to sync with
+    - Namespace: Logical grouping of objects
+    
+    Implementation notes:
+    - Use reqwest for HTTP API calls to Mœ server
+    - Store Mœ API tokens securely (from environment)
+    - Handle identity key management carefully
+    - Implement proper error handling for network failures
+    - Consider rate limiting for API calls
+    - Cache frequently accessed objects locally
+    
+    Mœ API endpoints (approximate):
+    - GET /api/v1/objects/:hash - Load object
+    - POST /api/v1/objects - Store object
+    - GET /api/v1/objects - List objects in namespace
+    - GET /api/v1/identity - Get identity info
+    - POST /api/v1/sync - Sync with peer
+    
+    For MoeVerifyAgent:
+    - Verify content hash matches expected hash
+    - Verify cryptographic signatures if available
+    - Check object exists in expected generation
+    - Validate object metadata
+    
+    For MoeGCAgent:
+    - Scan all objects in namespace
+    - Identify objects older than retention policy
+    - Remove objects (or mark for removal)
+    - Handle errors gracefully (don't stop on single object failure)
+    - Generate report of removed objects
+
+---

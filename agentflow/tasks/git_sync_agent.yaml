@@ -1,0 +1,141 @@
+---
+# AgentFlow Task: GitSyncAgent Implementation
+# Priority: HIGH
+# Estimated Duration: 3 hours
+# Dependencies: None
+
+id: task-git-sync-agent-impl-002
+title: "Implement GitSyncAgent for repository synchronization"
+description: |
+  Create a GitSyncAgent that handles:
+  - Polling Git repositories for changes
+  - Handling webhooks from GitHub, GitLab, Forgejo
+  - Cloning and updating repositories
+  - Detecting flake.nix changes
+  - Triggering downstream build tasks
+  - Managing repository cache
+
+task_type: custom-command
+priority: high
+expected_duration: 10800  # 3 hours in seconds
+
+# Agent assignment
+target_agent: planner
+
+# Input artifacts
+inputs:
+  - type: file
+    path: agentflow/agentflow-core/src
+    description: Core types and traits
+  - type: file
+    path: agentflow/agentflow-agents/src/planner
+    description: PlannerAgent for task creation
+
+# Expected outputs
+outputs:
+  - type: file
+    path: agentflow/agentflow-agents/src/git_sync/mod.rs
+    description: GitSyncAgent implementation
+  - type: file
+    path: agentflow/agentflow-agents/src/lib.rs
+    description: Updated lib.rs with git_sync export
+  - type: file
+    path: agentflow/agentflow-webhooks/
+    description: Optional webhook server (if implementing HTTP handlers)
+
+# Success criteria
+test_criteria:
+  - rust: "cargo check --package agentflow-agents"
+  - rust: "cargo test --package agentflow-agents -- git_sync"
+  - file_exists: agentflow/agentflow-agents/src/git_sync/mod.rs
+  - contains: "pub struct GitSyncAgent"
+  - contains: "impl Agent for GitSyncAgent"
+  - contains: "webhook"
+
+# Configuration
+environment:
+  RUST_LOG: debug
+
+# Task-specific metadata
+metadata:
+  agent_type: GitSync
+  category: source-control
+  complexity: high
+  
+  # GitSyncAgent configuration template
+  config_template: |
+    {
+      "repositories": {
+        "argunix": {
+          "url": "https://github.com/tobias-weiss-ai-xr/argunix",
+          "branch": "main",
+          "poll_interval": 60,
+          "webhook_secret": null,
+          "flake_path": "."
+        }
+      },
+      "providers": {
+        "github": { "enabled": true },
+        "gitlab": { "enabled": false },
+        "forgejo": { "enabled": true }
+      },
+      "cache_path": "/var/cache/agentflow/repos",
+      "max_cache_size": "10G"
+    }
+
+  # Expected agent capabilities
+  expected_capabilities:
+    - git-sync
+    - webhook-handler
+    - repository-polling
+    - flake-detection
+    - source-code
+    - github
+    - gitlab
+    - forgejo
+
+  # Messages to implement
+  messages_to_handle:
+    - SyncRepository
+    - RepositorySynced
+    - WebhookReceived
+    - PollRepository
+    - RepositoryChanged
+    - FlakeDetected
+
+  # Webhook endpoints (if implementing HTTP)
+  http_endpoints:
+    - path: /webhooks/github
+      method: POST
+      description: GitHub webhook handler
+    - path: /webhooks/gitlab
+      method: POST
+      description: GitLab webhook handler
+    - path: /webhooks/forgejo
+      method: POST
+      description: Forgejo webhook handler
+
+  # External dependencies
+  external_deps:
+    - git: ">=2.30"
+    - openssh: any
+
+  # Environment variables needed
+  env_vars:
+    - GITHUB_WEBHOOK_SECRET: "Optional, for GitHub webhook verification"
+    - GITLAB_WEBHOOK_SECRET: "Optional, for GitLab webhook verification"
+    - FORGEJO_WEBHOOK_SECRET: "Optional, for Forgejo webhook verification"
+
+  # Notes for developer
+  notes: |
+    - Use git2 crate for Git operations (pure Rust)
+    - Alternatively, use std::process::Command for git CLI
+    - For webhook handling, consider integrating with agentflow-server
+    - Implement HMAC signature verification for webhooks
+    - Handle both push and pull_request webhook events
+    - Detect changes to flake.nix, flake.lock, and Nix expressions
+    - Consider git shallow clones for faster operations
+    - Implement repository health checks
+    - Handle authentication (SSH keys, HTTPS tokens)
+
+---

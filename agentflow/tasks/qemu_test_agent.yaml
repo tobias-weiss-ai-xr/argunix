@@ -1,0 +1,199 @@
+---
+# AgentFlow Task: QEMUTestAgent Implementation
+# Priority: MEDIUM
+# Estimated Duration: 4 hours
+# Dependencies: StorageManagerAgent
+
+id: task-qemu-test-agent-impl-004
+title: "Implement QEMUTestAgent for cross-platform testing"
+description: |
+  Create a QEMUTestAgent that runs tests in QEMU virtual machines for:
+  - Cross-platform compatibility testing
+  - Isolated test environments
+  - Multi-architecture testing
+  - Network service testing
+
+task_type: custom-command
+priority: medium
+expected_duration: 14400  # 4 hours in seconds
+
+# Agent assignment
+target_agent: planner
+
+# Input artifacts
+inputs:
+  - type: file
+    path: agentflow/agentflow-core/src
+    description: Core types and traits
+  - type: file
+    path: agentflow/agentflow-agents/src/storage_manager
+    description: StorageManagerAgent for artifact caching
+
+# Expected outputs
+outputs:
+  - type: file
+    path: agentflow/agentflow-agents/src/qemu_test/mod.rs
+    description: QEMUTestAgent implementation
+  - type: file
+    path: agentflow/agentflow-agents/src/lib.rs
+    description: Updated lib.rs with qemu_test export
+  - type: file
+    path: agentflow/agentflow-agents/src/qemu_test/images/
+    description: Optional default VM images
+
+# Success criteria
+test_criteria:
+  - rust: "cargo check --package agentflow-agents"
+  - rust: "cargo test --package agentflow-agents -- qemu"
+  - file_exists: agentflow/agentflow-agents/src/qemu_test/mod.rs
+  - contains: "pub struct QEMUTestAgent"
+  - contains: "impl Agent for QEMUTestAgent"
+
+# Configuration
+environment:
+  RUST_LOG: debug
+
+# Task-specific metadata
+metadata:
+  agent_type: QEMUTest
+  category: testing
+  complexity: high
+  dependencies:
+    - StorageManagerAgent
+
+  # QEMUTestAgent configuration template
+  config_template: |
+    {
+      "qemu_path": "/usr/bin/qemu-system-x86_64",
+      "images": {
+        "nixos": {
+          "url": "https://releases.nixos.org/nixos/latest/nixos-qemu-qcow2",
+          "arch": "x86_64",
+          "username": "nixos",
+          "password": "nixos",
+          "ssh_port": 2222
+        }
+      },
+      "network": {
+        "mode": "user",
+        "forward_ports": [22, 80, 443],
+        "host_forwarding": {
+          "2222": "22",
+          "8080": "80",
+          "8443": "443"
+        }
+      },
+      "memory": {
+        "default": "2G",
+        "max": "4G",
+        "per_vm": "1G"
+      },
+      "cpus": {
+        "default": 2,
+        "max": 4
+      },
+      "timeouts": {
+        "provision": 300,
+        "test": 600,
+        "cleanup": 60,
+        "boot": 120
+      },
+      "cache_images": true,
+      "image_cache_path": "/var/cache/agentflow/qemu-images",
+      "max_concurrent_vms": 4,
+      "enable_snapshot": true,
+      "snapshot_name": "agentflow-base"
+    }
+
+  # Expected agent capabilities
+  expected_capabilities:
+    - qemu-testing
+    - cross-platform
+    - vm-management
+    - test-execution
+    - log-capture
+    - network-testing
+    - multi-arch
+
+  # Messages to implement
+  messages_to_handle:
+    - RunTests
+    - TestComplete
+    - TestFailed
+    - ProvisionVM
+    - DestroyVM
+    - VMProvisioned
+    - VMDestroyed
+    - TestOutput
+    - TestLog
+
+  # Supported architectures
+  supported_architectures:
+    - x86_64
+    - aarch64
+    - riscv64
+    - i386
+
+  # External dependencies
+  external_deps:
+    - qemu: ">=6.0"
+    - qemu-system-x86_64: any
+    - qemu-system-aarch64: any (for ARM testing)
+    - cloud-image-utils: any (optional, for image management)
+
+  # Notes for developer
+  notes: |
+    QEMU provides full-system emulation for testing.
+    
+    Implementation approach:
+    
+    1. VM Management:
+       - Use QEMU with -nographic flag for headless operation
+       - Forward ports to host for SSH/network access
+       - Use -snapshot flag for fast VM startup
+       - Consider using -daemonize for background operation
+    
+    2. Provisioning:
+       - Download or build base VM images
+       - Cache images for reuse
+       - Support custom image URLs
+       - Optionally use NixOS images for consistency
+    
+    3. Test Execution:
+       - Copy test files into VM via SSH or shared filesystem
+       - Execute tests via SSH
+       - Capture stdout, stderr, and exit code
+       - Stream logs in real-time
+       - Support timeout for tests
+    
+    4. Cleanup:
+       - Kill QEMU processes
+       - Remove temporary files
+       - Clean up network ports
+       - Handle cleanup failures gracefully
+    
+    5. Networking:
+       - Use user-mode networking by default
+       - Forward specific ports to guest
+       - Support SSH tunneling for file transfer
+       - Consider bridging for more complex setups
+    
+    6. Image Management:
+       - Download images on demand or pre-cache
+       - Support multiple image formats (qcow2, raw, vmdk)
+       - Compress images for storage
+       - Verify image integrity (checksums)
+    
+    Commands:
+    - Start VM: qemu-system-x86_64 -m 2G -hda image.qcow2 -nographic -net nic -net user,hostfwd=tcp::2222-:22
+    - SSH: ssh -p 2222 nixos@localhost
+    - Copy files: scp -P 2222 file nixos@localhost:/tmp/
+    
+    Consider:
+    - Using tokio::process::Command for async execution
+    - Tracking running VMs with PIDs
+    - Handling VM crashes and timeouts
+    - Implementing health checks for running VMs
+    - Caching VM states for faster startup
+
+---

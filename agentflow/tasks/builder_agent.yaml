@@ -1,0 +1,107 @@
+---
+# AgentFlow Task: BuilderAgent Implementation
+# Priority: HIGH
+# Estimated Duration: 3-4 hours
+# Dependencies: StorageManagerAgent
+
+id: task-builder-agent-impl-001
+title: "Implement BuilderAgent for multi-arch Nix builds"
+description: |
+  Create a BuilderAgent that handles Nix build operations with support for:
+  - Multi-architecture builds (x86_64-linux, aarch64-linux, etc.)
+  - Cross-compilation support
+  - Build artifact caching via StorageManager
+  - Build dependency tracking
+  - Nix expression validation
+
+task_type: custom-command
+priority: high
+expected_duration: 14400  # 4 hours in seconds
+
+# Agent assignment
+target_agent: planner
+
+# Input artifacts (files/urls needed)
+inputs:
+  - type: file
+    path: agentflow/agentflow-core/src
+    description: Core types and traits
+  - type: file
+    path: agentflow/agentflow-agents/src/storage_manager
+    description: StorageManagerAgent (dependency)
+
+# Expected outputs
+outputs:
+  - type: file
+    path: agentflow/agentflow-agents/src/builder/mod.rs
+    description: BuilderAgent implementation
+  - type: file
+    path: agentflow/agentflow-agents/src/lib.rs
+    description: Updated lib.rs with builder export
+  - type: documentation
+    path: agentflow/docs/agents/builder.md
+    description: BuilderAgent documentation
+
+# Success criteria
+test_criteria:
+  - rust: "cargo check --package agentflow-agents"
+  - rust: "cargo test --package agentflow-agents"
+  - file_exists: agentflow/agentflow-agents/src/builder/mod.rs
+  - contains: "pub struct BuilderAgent"
+  - contains: "impl Agent for BuilderAgent"
+
+# Configuration for the task
+environment:
+  RUST_LOG: debug
+  RUST_BACKTRACE: 1
+
+# Task-specific metadata
+metadata:
+  agent_type: Builder
+  category: nix-execution
+  complexity: high
+  dependencies:
+    - StorageManagerAgent
+  
+  # BuilderAgent configuration template
+  config_template: |
+    {
+      "nix_path": ["/nix/store"],
+      "supported_systems": ["x86_64-linux", "aarch64-linux"],
+      "max_concurrent_builds": 4,
+      "cache_builds": true,
+      "use_remote": false
+    }
+
+  # Expected agent capabilities
+  expected_capabilities:
+    - nix-build
+    - cross-compilation
+    - multi-arch
+    - artifact-upload
+    - cache-management
+    - derivation-building
+
+  # Messages to implement
+  messages_to_handle:
+    - ExecuteBuild
+    - BuildComplete
+    - BuildFailed
+    - RequestBuild
+    - BuildStatus
+
+  # External dependencies needed
+  external_deps:
+    - nix: ">=2.10"
+    - cargo: ">=1.70"
+
+  # Notes for developer
+  notes: |
+    - Follow the pattern from NixExecutorAgent
+    - Use StorageManagerAgent for artifact storage
+    - Support both local and remote builds
+    - Implement proper error handling for Nix build failures
+    - Consider using tokio::process::Command for async execution
+    - Handle build timeouts gracefully
+
+---
