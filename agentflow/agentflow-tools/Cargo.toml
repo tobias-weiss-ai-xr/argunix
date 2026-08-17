@@ -1,0 +1,26 @@
+[package]
+name = "agentflow-tools"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Utility tools for AgentFlow development and operations"
+
+[dependencies]
+agentflow-core = { path = "../agentflow-core" }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+glob = "0.3"
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[[bin]]
+name = "agentflow-task-dispatcher"
+path = "src/bin/task_dispatcher.rs"
