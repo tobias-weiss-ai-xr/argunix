@@ -7,3 +7,12 @@ members = [
     "agentflow-storage",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+async-trait = "0.1"
+
+[workspace.features]
+nats = ["agentflow-core/nats"]
