@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "agentflow-core",
+    "agentflow-agents",
+    "agentflow-cli",
+    "agentflow-server",
+    "agentflow-storage",
+]
+resolver = "2"

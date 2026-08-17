@@ -1,0 +1,12 @@
+[package]
+name = "agentflow-server"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+agentflow-core = { path = "../agentflow-core" }
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+axum = "0.7"
+serde_json = "1.0"
