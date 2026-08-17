@@ -118,6 +118,11 @@ impl SchedulerAgent {
                 agent.capabilities.contains("moe-storage") ||
                 agent.agent_type == AgentType::StorageManager
             }
+            TaskType::StoreObject | TaskType::LoadObject | TaskType::CacheCheck | TaskType::CacheUpload | TaskType::CacheCleanup => {
+                agent.capabilities.contains("storage") ||
+                agent.capabilities.contains("cache") ||
+                agent.agent_type == AgentType::StorageManager
+            }
             TaskType::CustomCommand | TaskType::MultiTask => {
                 true // Any agent can handle generic tasks
             }

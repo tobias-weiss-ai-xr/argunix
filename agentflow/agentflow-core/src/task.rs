@@ -35,6 +35,18 @@ pub enum TaskType {
     #[strum(serialize = "moe-gc")]
     MoeGC,
     
+    // Storage/Cache tasks
+    #[strum(serialize = "store-object")]
+    StoreObject,
+    #[strum(serialize = "load-object")]
+    LoadObject,
+    #[strum(serialize = "cache-check")]
+    CacheCheck,
+    #[strum(serialize = "cache-upload")]
+    CacheUpload,
+    #[strum(serialize = "cache-cleanup")]
+    CacheCleanup,
+    
     // Generic
     #[strum(serialize = "custom-command")]
     CustomCommand,

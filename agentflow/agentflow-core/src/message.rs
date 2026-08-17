@@ -161,6 +161,48 @@ pub enum AgentMessage {
         objects_count: u64,
     },
     
+    // --- Cache Messages ---
+    
+    /// Check if object exists in cache
+    CheckCache {
+        hash: String,
+        task_id: String,
+    },
+    
+    /// Cache check result
+    CacheCheckResult {
+        hash: String,
+        exists: bool,
+        location: Option<String>,
+        size: Option<u64>,
+        task_id: String,
+    },
+    
+    /// Upload to cache
+    UploadToCache {
+        hash: String,
+        data: Vec<u8>,
+        content_type: String,
+        metadata: HashMap<String, String>,
+        task_id: String,
+    },
+    
+    /// Cache upload complete
+    CacheUploaded {
+        hash: String,
+        size: u64,
+        storage_backend: String,
+        task_id: String,
+    },
+    
+    /// Cache statistics
+    CacheStats {
+        total_objects: u64,
+        total_size: u64,
+        hit_rate: f32,
+        backends: HashMap<String, CacheBackendStats>,
+    },
+    
     // --- Trust & Identity Messages (Mœ-inspired) ---
     
     /// Verify identity
@@ -258,6 +300,15 @@ pub struct Dependency {
     pub from: String,
     pub to: String,
     pub relationship: String, // dependsOn, extends, etc.
+}
+
+/// Cache backend statistics
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CacheBackendStats {
+    pub object_count: u64,
+    pub total_size: u64,
+    pub hit_count: u64,
+    pub miss_count: u64,
 }
 
 /// AI code review result
