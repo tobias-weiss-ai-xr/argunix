@@ -1,5 +1,6 @@
 //! Core types and traits for AgentFlow
 
+pub mod bus;
 pub mod error;
 pub mod message;
 pub mod state;
