@@ -2,7 +2,7 @@
 
 use agentflow_core::{
     SystemState,
-    agent::{TaskStore, StateStore},
+    agent::{AgentDefinition, TaskStore, StateStore},
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -30,6 +30,9 @@ pub struct AppState {
     
     /// Server start time
     pub started_at: chrono::DateTime<chrono::Utc>,
+    
+    /// Spawned agent definitions
+    pub spawned_agents: Vec<AgentDefinition>,
 }
 
 impl AppState {
@@ -38,6 +41,7 @@ impl AppState {
         sender: mpsc::Sender<AgentMessage>,
         system_state: Arc<SystemState>,
         config: ServerConfig,
+        spawned_agents: Vec<AgentDefinition>,
     ) -> Arc<Self> {
         Arc::new(Self {
             sender,
@@ -46,6 +50,7 @@ impl AppState {
             agent_store: system_state.agent_store.clone(),
             config,
             started_at: chrono::Utc::now(),
+            spawned_agents,
         })
     }
     

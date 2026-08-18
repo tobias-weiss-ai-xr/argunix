@@ -1,8 +1,8 @@
 //! AgentFlow Server - HTTP API Gateway
 
 use agentflow_core::{
-    AgentMessage, AgentType, TaskDefinition, TaskFilter, TaskStatus, TaskType,
-    TaskResult, NixOutput, SystemState,
+    AgentMessage, TaskDefinition, TaskFilter, TaskStatus, TaskType,
+    NixOutput, SystemState,
     agent::TaskUpdate,
 };
 use axum::{
@@ -13,18 +13,20 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod agents;
 mod config;
 mod error;
 mod state;
 
+use agents::spawn_all_agents;
 use config::ServerConfig;
 use error::{ApiError, Result};
 use state::AppState;
+use agentflow_core::bus::InMemoryBus;
 
 /// Main entry point for the AgentFlow server
 #[tokio::main]
@@ -32,14 +34,32 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = ServerConfig::from_env()?;
     
+    println!("Starting AgentFlow Server v0.1.0");
+    println!("Bind address: {}", config.bind_address);
+    println!();
+    
+    // Create message bus for agent communication
+    let bus = Arc::new(InMemoryBus::new(10000));
+    
     // Create system state
     let system_state = Arc::new(SystemState::new());
     
     // Create message channel for internal communication
     let (sender, _receiver) = mpsc::channel(10000);
     
+    // Spawn all agents as background workers
+    println!("🚀 Spawning 14 AgentFlow agents...");
+    let spawned_agents = spawn_all_agents(
+        bus.clone(),
+        Some(system_state.task_store.clone()),
+        Some(system_state.agent_store.clone()),
+    ).await?;
+    let agent_definitions: Vec<_> = spawned_agents.iter().map(|a| a.definition.clone()).collect();
+    println!("✅ All {} agents spawned successfully and listening for messages", agent_definitions.len());
+    println!();
+    
     // Create application state
-    let app_state = AppState::new(sender, system_state, config.clone());
+    let app_state = AppState::new(sender, system_state, config.clone(), agent_definitions);
     
     // Build router
     let app = build_router(app_state);

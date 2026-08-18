@@ -25,7 +25,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::{mpsc, RwLock};
 use serde::{Deserialize, Serialize};
 
-use agentflow_core::{Agent, AgentContext, AgentMessage, AgentStatus, AgentType, Result, TaskDefinition, TaskStatus, TaskType};
+use agentflow_core::{Agent, AgentDefinition, AgentContext, AgentMessage, AgentStatus, AgentType, Result, TaskDefinition, TaskStatus, TaskType};
 use agentflow_core::agent::{StateStore, TaskStore};
 
 /// Garbage collection configuration

@@ -6,6 +6,7 @@ license = "Apache-2.0"
 
 [dependencies]
 agentflow-core = { path = "../agentflow-core" }
+agentflow-agents = { path = "../agentflow-agents" }
 
 # HTTP server
 axum = "0.7"

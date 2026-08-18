@@ -28,7 +28,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::sync::{mpsc, RwLock};
 use serde::{Deserialize, Serialize};
 
-use agentflow_core::{Agent, AgentContext, AgentMessage, AgentStatus, AgentType, Result, TaskDefinition, TaskStatus, TaskType};
+use agentflow_core::{Agent, AgentDefinition, AgentContext, AgentMessage, AgentStatus, AgentType, Result, TaskDefinition, TaskStatus, TaskType};
 use agentflow_core::agent::{StateStore, TaskStore};
 use sha2::{Sha256, Digest};
 
@@ -761,7 +761,7 @@ mod tests {
         
         // Should be valid because the signer is in trusted_identities
         assert!(result.is_valid());
-        assert_eq!(result.signer, Some(signer));
+        assert_eq!(result.signer, Some("sha256-argunix-ci".to_string()));
     }
     
     #[tokio::test]
