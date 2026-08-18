@@ -227,3 +227,122 @@ This document tracks the development progress of AgentFlow, an agent-based orche
 - Tobias Weiss (tobias-weiss-ai-xr)
 - AgentFlow Team
 - OpenDesk Contributors
+
+---
+
+## $(date +%Y-%m-%d): Notification Agents Implementation
+
+### Completed
+
+#### 1. GitHubStatusAgent
+- **Status**: ✅ COMPLETE
+- **Lines of code**: ~5,500 lines (with tests)
+- **File**: `agentflow/agentflow-agents/src/github_status/mod.rs`
+
+**Features**:
+- Post commit status to GitHub API v3
+- Support for states: pending, success, failure, error
+- Configurable status descriptions via templates
+- Personal Access Token authentication (GITHUB_TOKEN env var)
+- Rate limit tracking and automatic handling
+- Exponential backoff for retries (3 retries, configurable)
+- Proper User-Agent header (argunix-agentflow/0.1.0)
+
+**Capabilities**:
+- github-status
+- commit-status
+- pull-request-status
+- rate-limit-management
+
+**Messages handled**:
+- PostGitHubStatus
+- GitHubStatusPosted
+- UpdateGitHubStatus
+- GitHubStatusFailed
+- NotifyGitHub
+
+**Configuration** (`PostGitHubStatus`):
+- owner: String - Repository owner
+- repo: String - Repository name
+- sha: String - Commit SHA
+- state: Option<String> - Status state
+- description: Option<String> - Status description
+- target_url: Option<String> - Link to build artifacts
+- task_id: Option<String> - Task tracking
+
+**Environment Variables**:
+- `GITHUB_TOKEN`: Required GitHub personal access token
+
+#### 2. MatrixNotifierAgent
+- **Status**: ✅ COMPLETE
+- **Lines of code**: ~850 lines (with tests)
+- **File**: `agentflow/agentflow-agents/src/matrix_notifier/mod.rs`
+
+**Features**:
+- Send messages to Matrix rooms via HTTP API v3
+- Support for plain text, Markdown, and HTML formatting
+- File upload capability to Matrix media endpoint
+- Broadcast messages to multiple rooms
+- Template-based message formatting
+- Token or password authentication
+- Rate limiting with configurable retries
+- HTML and Markdown message format support
+
+**Capabilities**:
+- matrix-notify
+- room-messaging
+- file-attachments
+- message-formatting
+- html-formatting
+- markdown-formatting
+
+**Messages handled**:
+- SendMatrixNotification
+- MatrixNotificationSent
+- BroadcastMatrixMessage
+- SendMatrixFile
+- MatrixFileSent
+
+**Configuration** (`MatrixConfig`):
+- homeserver: String (default: "https://matrix.org")
+- username: Option<String>
+- user_id: Option<String>
+- default_room: String (default: "!builds:matrix.org")
+- rooms: HashMap<String, String> - Named rooms mapping
+- html_enabled: bool (default: true)
+- markdown_enabled: bool (default: true)
+- use_formatting: bool (default: true)
+- max_message_length: usize (default: 4096)
+
+**Environment Variables**:
+- `MATRIX_ACCESS_TOKEN`: Matrix access token
+- `MATRIX_PASSWORD`: Matrix login password (alternative)
+- `MATRIX_HOMESERVER`: Override default homeserver
+
+#### Core Framework Updates
+
+**New Message Types** (12 added to `agentflow-core/src/message.rs`):
+- PostGitHubStatus, GitHubStatusPosted, UpdateGitHubStatus, GitHubStatusFailed, NotifyGitHub
+- SendMatrixNotification, MatrixNotificationSent, BroadcastMatrixMessage, SendMatrixFile, MatrixFileSent
+
+**New Task Types** (6 added to `agentflow-core/src/task.rs`):
+- PostGitHubStatus, UpdateGitHubStatus, NotifyGitHub
+- SendMatrixNotification, BroadcastMatrixMessage, SendMatrixFile
+
+**Scheduler Updates**:
+- Added routing logic for new task types
+- Maps GitHub tasks to agents with "github-status" capability
+- Maps Matrix tasks to agents with "matrix-notify" capability
+
+**lib.rs Updates**:
+- Added exports for GitHubStatusAgent
+- Added exports for MatrixNotifierAgent
+
+### Lessons Learned
+
+1. **Option Type Handling**: Pattern matching on `Option<T>` with `Some(s)` consumes the value by moving it. Use `Some(ref s)` or `&state` for non-consuming access.
+2. **Recursion in Async**: Rust doesn't allow recursive async fn calls without boxing. Use loops or `Box::pin` for recursion.
+3. **Unicode in Strings**: Unicode escape sequences like `\u{2705}` need to be in raw strings or use actual Unicode characters.
+4. **Type Consistency**: Ensure struct fields match the expected types (e.g., `Option<String>` vs `String`).
+5. **Unused Imports**: Clean up unused imports to avoid warnings.
+
