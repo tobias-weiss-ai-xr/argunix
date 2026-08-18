@@ -1,0 +1,10 @@
+# Task completed on Di 18. Aug 04:15:28 CEST 2026
+Implementers: pi-agent
+Files created:
+  - agentflow/agentflow-agents/src/github_status/mod.rs (19,680 bytes)
+  - agentflow/agentflow-agents/src/matrix_notifier/mod.rs (28,448 bytes)
+Core changes:
+  - agentflow-core/src/message.rs: Added 12 new message types
+  - agentflow-core/src/task.rs: Added 6 new task types
+  - agentflow-agents/src/scheduler/mod.rs: Added routing for new task types
+  - agentflow-agents/src/lib.rs: Added exports for new agents
