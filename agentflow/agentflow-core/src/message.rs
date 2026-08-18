@@ -221,6 +221,63 @@ pub enum AgentMessage {
         error: Option<String>,
     },
     
+    // --- QEMU/Testing Messages ---
+    
+    // Note: These messages use serde_json::Value for config to avoid circular dependencies
+    // Actual types are defined in agentflow-agents/src/qemu_test/mod.rs
+    
+    /// Provision a VM for testing
+    ProvisionVM {
+        vm_config: serde_json::Value,
+        task_id: Option<String>,
+    },
+    
+    /// Destroy a VM
+    DestroyVM {
+        vm_id: String,
+        task_id: Option<String>,
+    },
+    
+    /// VM provisioned successfully
+    VMProvisioned {
+        vm_id: String,
+        ip_address: String,
+        ssh_port: u16,
+        task_id: Option<String>,
+    },
+    
+    /// VM destroyed
+    VMDestroyed {
+        vm_id: String,
+        task_id: Option<String>,
+    },
+    
+    /// Run tests in a VM
+    RunTests {
+        test_config: serde_json::Value,
+        task_id: Option<String>,
+    },
+    
+    /// Test completed successfully
+    TestComplete {
+        test_id: String,
+        vm_id: Option<String>,
+        exit_code: i32,
+        output: String,
+        duration_seconds: f64,
+        task_id: Option<String>,
+    },
+    
+    /// Test failed
+    TestFailed {
+        test_id: String,
+        vm_id: Option<String>,
+        error: String,
+        exit_code: Option<i32>,
+        output: String,
+        task_id: Option<String>,
+    },
+    
     // --- Agent Stats Messages ---
     
     /// Request agent statistics

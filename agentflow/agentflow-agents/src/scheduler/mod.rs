@@ -128,6 +128,10 @@ impl SchedulerAgent {
                 agent.capabilities.contains("git-sync") ||
                 agent.agent_type == AgentType::Custom // GitSync will have its own type eventually
             }
+            TaskType::ProvisionVM | TaskType::DestroyVM | TaskType::RunTests => {
+                agent.capabilities.contains("qemu-testing") ||
+                agent.agent_type == AgentType::Custom // QEMUTest will have its own type eventually
+            }
             TaskType::CustomCommand | TaskType::MultiTask => {
                 true // Any agent can handle generic tasks
             }

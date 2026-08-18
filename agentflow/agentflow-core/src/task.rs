@@ -61,6 +61,14 @@ pub enum TaskType {
     #[strum(serialize = "get-repository-status")]
     GetRepositoryStatus,
     
+    // QEMU tasks
+    #[strum(serialize = "provision-vm")]
+    ProvisionVM,
+    #[strum(serialize = "destroy-vm")]
+    DestroyVM,
+    #[strum(serialize = "run-tests")]
+    RunTests,
+    
     // Generic
     #[strum(serialize = "custom-command")]
     CustomCommand,

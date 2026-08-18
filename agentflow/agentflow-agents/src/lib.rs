@@ -6,6 +6,7 @@ pub mod flake_analyzer;
 pub mod git_sync;
 pub mod nix_executor;
 pub mod planner;
+pub mod qemu_test;
 pub mod scheduler;
 pub mod storage_manager;
 
