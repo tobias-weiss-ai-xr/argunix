@@ -278,6 +278,147 @@ pub enum AgentMessage {
         task_id: Option<String>,
     },
     
+    // --- Mœ Messages ---
+    
+    // Note: These use serde_json::Value for configs to avoid circular dependencies
+    // Actual types in agentflow-agents/src/moe_sync/mod.rs
+    
+    /// Upload an object to Mœ
+    UploadToMoe {
+        data: Vec<u8>,
+        object_type: String,
+        tags: Vec<String>,
+        task_id: Option<String>,
+    },
+    
+    /// Download an object from Mœ
+    DownloadFromMoe {
+        hash: String,
+        task_id: Option<String>,
+    },
+    
+    /// Object uploaded successfully
+    ObjectUploaded {
+        hash: String,
+        size: u64,
+        task_id: Option<String>,
+    },
+    
+    /// Object downloaded successfully
+    ObjectDownloaded {
+        hash: String,
+        data: Vec<u8>,
+        size: u64,
+        task_id: Option<String>,
+    },
+    
+    /// Sync with a Mœ peer
+    SyncWithMoe {
+        peer_url: String,
+        task_id: Option<String>,
+    },
+    
+    /// Mœ sync completed
+    MoeSyncComplete {
+        peer_url: String,
+        objects_uploaded: u64,
+        objects_downloaded: u64,
+        duration_seconds: f64,
+        success: bool,
+        task_id: Option<String>,
+    },
+    
+    /// Create a Mœ namespace
+    CreateNamespace {
+        name: String,
+        task_id: Option<String>,
+    },
+    
+    /// Switch to a new generation
+    SwitchGeneration {
+        generation: u64,
+        message: Option<String>,
+        task_id: Option<String>,
+    },
+    
+    // --- MoeVerify Messages ---
+    
+    /// Verify a Mœ object
+    VerifyMoeObject {
+        hash: String,
+        data: Vec<u8>,
+        signer: Option<String>,
+        signature: Option<Vec<u8>>,
+        task_id: Option<String>,
+    },
+    
+    /// Object verification result
+    MoeObjectVerified {
+        hash: String,
+        valid: bool,
+        verification_status: String,
+        signer: Option<String>,
+        error: Option<String>,
+        task_id: Option<String>,
+    },
+    
+    /// Batch verify multiple Mœ objects
+    BatchVerifyMoe {
+        objects: Vec<VerifyMoeRequest>,
+        task_id: Option<String>,
+    },
+    
+    /// Batch verification result
+    BatchVerifyMoeComplete {
+        results: Vec<MoeVerificationInfo>,
+        total: u64,
+        valid: u64,
+        failed: u64,
+        duration_seconds: f64,
+        task_id: Option<String>,
+    },
+    
+    /// Verify a Mœ identity
+    VerifyMoeIdentity {
+        fingerprint: String,
+        task_id: Option<String>,
+    },
+    
+    /// Mœ identity verification result
+    MoeIdentityVerified {
+        fingerprint: String,
+        trusted: bool,
+        trust_level: Option<u32>,
+        task_id: Option<String>,
+    },
+    
+    // Note: Trust/Identity messages already exist below (VerifyIdentity, IdentityVerified, etc.)
+    
+    // --- MoeGC Messages ---
+    
+    /// Run garbage collection
+    RunGarbageCollection {
+        dry_run: Option<bool>,
+        task_id: Option<String>,
+    },
+    
+    /// GC progress update
+    GCProgress {
+        message: String,
+        processed: u64,
+        total: u64,
+        task_id: Option<String>,
+    },
+    
+    /// GC completed
+    GCDone {
+        objects_deleted: u64,
+        bytes_reclaimed: u64,
+        duration_seconds: f64,
+        dry_run: bool,
+        task_id: Option<String>,
+    },
+    
     // --- Agent Stats Messages ---
     
     /// Request agent statistics
@@ -543,4 +684,25 @@ pub struct SystemHealth {
     pub tasks_completed: u64,
     pub storage_available: u64,
     pub storage_used: u64,
+}
+
+// ========== Mœ Verify helper types ==========
+
+/// Request to verify a Mœ object
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyMoeRequest {
+    pub hash: String,
+    pub data: Vec<u8>,
+    pub signer: Option<String>,
+    pub signature: Option<Vec<u8>>,
+}
+
+/// Verification information for Mœ batch results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoeVerificationInfo {
+    pub hash: String,
+    pub valid: bool,
+    pub verification_status: String,
+    pub signer: Option<String>,
+    pub error: Option<String>,
 }

@@ -69,6 +69,30 @@ pub enum TaskType {
     #[strum(serialize = "run-tests")]
     RunTests,
     
+    // Mœ Sync tasks
+    #[strum(serialize = "upload-to-moe")]
+    UploadToMoe,
+    #[strum(serialize = "download-from-moe")]
+    DownloadFromMoe,
+    #[strum(serialize = "sync-with-moe")]
+    SyncWithMoe,
+    #[strum(serialize = "create-namespace")]
+    CreateNamespace,
+    #[strum(serialize = "switch-generation")]
+    SwitchGeneration,
+    
+    // Mœ Verify tasks
+    #[strum(serialize = "verify-moe-object")]
+    VerifyMoeObject,
+    #[strum(serialize = "batch-verify-moe")]
+    BatchVerifyMoe,
+    #[strum(serialize = "verify-moe-identity")]
+    VerifyMoeIdentity, // Note: VerifyIdentity already exists below
+    
+    // Mœ GC tasks
+    #[strum(serialize = "run-garbage-collection")]
+    RunGarbageCollection,
+    
     // Generic
     #[strum(serialize = "custom-command")]
     CustomCommand,

@@ -132,6 +132,20 @@ impl SchedulerAgent {
                 agent.capabilities.contains("qemu-testing") ||
                 agent.agent_type == AgentType::Custom // QEMUTest will have its own type eventually
             }
+            TaskType::UploadToMoe | TaskType::DownloadFromMoe | TaskType::SyncWithMoe | 
+                TaskType::CreateNamespace | TaskType::SwitchGeneration => {
+                agent.capabilities.contains("moe-sync") ||
+                agent.agent_type == AgentType::Custom
+            }
+            TaskType::VerifyMoeObject | TaskType::BatchVerifyMoe | TaskType::VerifyMoeIdentity => {
+                agent.capabilities.contains("moe-verify") ||
+                agent.agent_type == AgentType::Custom
+            }
+            TaskType::RunGarbageCollection => {
+                agent.capabilities.contains("moe-gc") ||
+                agent.agent_type == AgentType::Custom
+            }
+            // Note: VerifyIdentity task type handled separately (exists in core)
             TaskType::CustomCommand | TaskType::MultiTask => {
                 true // Any agent can handle generic tasks
             }
