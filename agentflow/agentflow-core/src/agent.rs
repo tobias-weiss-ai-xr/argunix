@@ -53,6 +53,10 @@ pub enum AgentType {
     #[strum(serialize = "discovery")]
     Discovery,
     
+    // Source control agents
+    #[strum(serialize = "source-control")]
+    SourceControl,
+    
     // Generic
     #[strum(serialize = "custom")]
     Custom,

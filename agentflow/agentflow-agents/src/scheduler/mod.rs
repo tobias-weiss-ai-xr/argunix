@@ -123,6 +123,11 @@ impl SchedulerAgent {
                 agent.capabilities.contains("cache") ||
                 agent.agent_type == AgentType::StorageManager
             }
+            TaskType::SyncRepository | TaskType::PollRepository | TaskType::SetupRepository | 
+                TaskType::PollAllRepositories | TaskType::WebhookReceived | TaskType::GetRepositoryStatus => {
+                agent.capabilities.contains("git-sync") ||
+                agent.agent_type == AgentType::Custom // GitSync will have its own type eventually
+            }
             TaskType::CustomCommand | TaskType::MultiTask => {
                 true // Any agent can handle generic tasks
             }

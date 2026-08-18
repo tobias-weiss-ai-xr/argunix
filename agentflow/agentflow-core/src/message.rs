@@ -171,6 +171,56 @@ pub enum AgentMessage {
         details: Option<String>,
     },
     
+    // --- Git Messages ---
+    
+    /// Setup a repository for monitoring
+    SetupRepository {
+        repo_config: serde_json::Value,
+        task_id: Option<String>,
+    },
+    
+    /// Sync a repository
+    SyncRepository {
+        repo_config: serde_json::Value,
+        task_id: Option<String>,
+    },
+    
+    /// Poll a repository for changes
+    PollRepository {
+        repo_id: String,
+        task_id: Option<String>,
+    },
+    
+    /// Poll all repositories
+    PollAllRepositories {
+        task_id: Option<String>,
+    },
+    
+    /// Webhook received
+    WebhookReceived {
+        provider: String,
+        payload: serde_json::Value,
+        signature: Option<String>,
+        task_id: Option<String>,
+    },
+    
+    /// Get repository status
+    GetRepositoryStatus {
+        repo_id: String,
+        task_id: Option<String>,
+    },
+    
+    /// Repository status response
+    RepositoryStatus {
+        repo_id: String,
+        status: String,
+        last_commit: Option<String>,
+        last_sync: Option<String>,
+        has_flake: bool,
+        healthy: bool,
+        error: Option<String>,
+    },
+    
     // --- Agent Stats Messages ---
     
     /// Request agent statistics

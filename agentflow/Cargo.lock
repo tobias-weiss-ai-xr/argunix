@@ -10,6 +10,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "hex",
+ "parking_lot",
  "regex",
  "reqwest",
  "serde",

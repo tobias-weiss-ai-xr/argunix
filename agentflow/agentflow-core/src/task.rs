@@ -47,6 +47,20 @@ pub enum TaskType {
     #[strum(serialize = "cache-cleanup")]
     CacheCleanup,
     
+    // Git tasks
+    #[strum(serialize = "sync-repository")]
+    SyncRepository,
+    #[strum(serialize = "poll-repository")]
+    PollRepository,
+    #[strum(serialize = "setup-repository")]
+    SetupRepository,
+    #[strum(serialize = "poll-all-repositories")]
+    PollAllRepositories,
+    #[strum(serialize = "webhook-received")]
+    WebhookReceived,
+    #[strum(serialize = "get-repository-status")]
+    GetRepositoryStatus,
+    
     // Generic
     #[strum(serialize = "custom-command")]
     CustomCommand,
