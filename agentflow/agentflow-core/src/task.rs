@@ -93,6 +93,22 @@ pub enum TaskType {
     #[strum(serialize = "run-garbage-collection")]
     RunGarbageCollection,
     
+    // GitHub Status tasks
+    #[strum(serialize = "post-github-status")]
+    PostGitHubStatus,
+    #[strum(serialize = "update-github-status")]
+    UpdateGitHubStatus,
+    #[strum(serialize = "notify-github")]
+    NotifyGitHub,
+    
+    // Matrix Notifier tasks
+    #[strum(serialize = "send-matrix-notification")]
+    SendMatrixNotification,
+    #[strum(serialize = "broadcast-matrix-message")]
+    BroadcastMatrixMessage,
+    #[strum(serialize = "send-matrix-file")]
+    SendMatrixFile,
+    
     // Generic
     #[strum(serialize = "custom-command")]
     CustomCommand,

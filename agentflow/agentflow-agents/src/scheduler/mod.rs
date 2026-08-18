@@ -145,6 +145,14 @@ impl SchedulerAgent {
                 agent.capabilities.contains("moe-gc") ||
                 agent.agent_type == AgentType::Custom
             }
+            TaskType::PostGitHubStatus | TaskType::UpdateGitHubStatus | TaskType::NotifyGitHub => {
+                agent.capabilities.contains("github-status") ||
+                agent.agent_type == AgentType::Custom
+            }
+            TaskType::SendMatrixNotification | TaskType::BroadcastMatrixMessage | TaskType::SendMatrixFile => {
+                agent.capabilities.contains("matrix-notify") ||
+                agent.agent_type == AgentType::Custom
+            }
             // Note: VerifyIdentity task type handled separately (exists in core)
             TaskType::CustomCommand | TaskType::MultiTask => {
                 true // Any agent can handle generic tasks

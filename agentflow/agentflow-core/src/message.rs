@@ -419,6 +419,96 @@ pub enum AgentMessage {
         task_id: Option<String>,
     },
     
+    // --- GitHub Status Messages ---
+    
+    /// Post status to GitHub
+    PostGitHubStatus {
+        owner: String,
+        repo: String,
+        sha: String,
+        state: Option<String>,
+        description: Option<String>,
+        target_url: Option<String>,
+        task_id: Option<String>,
+    },
+    
+    /// GitHub status posted
+    GitHubStatusPosted {
+        owner: String,
+        repo: String,
+        sha: String,
+        state: String,
+        status_url: String,
+        task_id: Option<String>,
+    },
+    
+    /// Update GitHub status
+    UpdateGitHubStatus {
+        owner: String,
+        repo: String,
+        sha: String,
+        state: Option<String>,
+        description: Option<String>,
+        task_id: Option<String>,
+    },
+    
+    /// GitHub status update failed
+    GitHubStatusFailed {
+        owner: String,
+        repo: String,
+        sha: String,
+        error: String,
+        task_id: Option<String>,
+    },
+    
+    /// Generic GitHub notification
+    NotifyGitHub {
+        message: String,
+        task_id: Option<String>,
+    },
+    
+    // --- Matrix Notifier Messages ---
+    
+    /// Send notification to Matrix room
+    SendMatrixNotification {
+        room: String,
+        message: String,
+        formatted: Option<String>,
+        task_id: Option<String>,
+    },
+    
+    /// Matrix notification sent
+    MatrixNotificationSent {
+        room: String,
+        message: String,
+        event_id: String,
+        task_id: Option<String>,
+    },
+    
+    /// Broadcast message to multiple Matrix rooms
+    BroadcastMatrixMessage {
+        message: String,
+        rooms: Vec<String>,
+        task_id: Option<String>,
+    },
+    
+    /// Send file to Matrix
+    SendMatrixFile {
+        file_name: String,
+        content_type: Option<String>,
+        data: Vec<u8>,
+        room: Option<String>,
+        task_id: Option<String>,
+    },
+    
+    /// Matrix file sent
+    MatrixFileSent {
+        file_name: String,
+        content_type: String,
+        content_uri: String,
+        task_id: Option<String>,
+    },
+    
     // --- Agent Stats Messages ---
     
     /// Request agent statistics
