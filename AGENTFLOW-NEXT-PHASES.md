@@ -50,9 +50,9 @@ This document outlines the next phases of AgentFlow development, building upon t
 
 ## Current Status
 
-- **Lines of Rust**: ~16,000+ across 30+ source files
+- **Lines of Rust**: ~17,000+ across 30+ source files
 - **Crates**: 5 (core, agents, cli, server, storage)
-- **Agents**: 8 implemented (Planner, Scheduler, NixExecutor, FlakeAnalyzer, AICodeReviewer, StorageManager, Builder, GitSync)
+- **Agents**: 9 implemented (Planner, Scheduler, NixExecutor, FlakeAnalyzer, AICodeReviewer, StorageManager, Builder, GitSync, QEMUTest)
 - **Task Types**: 15 defined
 - **Message Types**: 50+ defined
 - **HTTP Endpoints**: 12 REST + 3 webhook handlers
@@ -223,10 +223,10 @@ pub struct ServerState {
 - [x] StorageManagerAgent (implemented ~800 lines, multi-backend support)
 - [x] BuilderAgent (implemented, multi-arch Nix builds)
 - [x] GitSyncAgent (implemented, webhooks + polling)
+- [x] QEMUTestAgent (implemented, VM-based cross-platform testing)
 - [ ] MoeSyncAgent
 - [ ] MoeVerifyAgent
 - [ ] MoeGCAgent
-- [ ] QEMUTestAgent
 - [ ] GitHubStatusAgent
 - [ ] MatrixNotifierAgent
 
