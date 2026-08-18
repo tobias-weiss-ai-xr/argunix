@@ -33,6 +33,9 @@ pub enum ApiError {
     /// Internal server error
     InternalServerError(String),
     
+    /// Request timeout
+    RequestTimeout(String),
+    
     /// Configuration error
     Configuration(String),
     
@@ -60,6 +63,7 @@ impl fmt::Display for ApiError {
             ApiError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
             ApiError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             ApiError::InternalServerError(msg) => write!(f, "Internal server error: {}", msg),
+            ApiError::RequestTimeout(msg) => write!(f, "Request timeout: {}", msg),
             ApiError::Configuration(msg) => write!(f, "Configuration error: {}", msg),
             ApiError::Database(msg) => write!(f, "Database error: {}", msg),
             ApiError::Storage(msg) => write!(f, "Storage error: {}", msg),
@@ -120,6 +124,11 @@ impl IntoResponse for ApiError {
                 "internal_server_error",
                 msg,
             ),
+            ApiError::RequestTimeout(msg) => (
+                StatusCode::REQUEST_TIMEOUT,
+                "request_timeout",
+                msg,
+            ),
             ApiError::Configuration(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "configuration_error",
@@ -173,6 +182,7 @@ impl From<agentflow_core::AgentFlowError> for ApiError {
             agentflow_core::AgentFlowError::NotFound(resource) => ApiError::NotFound(resource),
             agentflow_core::AgentFlowError::AlreadyExists(resource) => ApiError::Conflict(resource),
             agentflow_core::AgentFlowError::ChannelSend(_) => ApiError::InternalServerError("Message bus error".to_string()),
+            agentflow_core::AgentFlowError::Timeout => ApiError::RequestTimeout("Operation timed out".to_string()),
         }
     }
 }

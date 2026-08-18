@@ -1,5 +1,5 @@
 use crate::{AgentDefinition};
-use crate::task::{TaskDefinition, TaskResult};
+use crate::task::{TaskDefinition, TaskResult, TaskStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -98,6 +98,88 @@ pub enum AgentMessage {
     BuildDrv {
         drv_path: String,
         task_id: String,
+    },
+    
+    /// Execute a build (generic)
+    ExecuteBuild {
+        drv_path: String,
+        system: Option<String>,
+        task_id: String,
+    },
+    
+    /// Build a flake output
+    BuildFlake {
+        flake_url: String,
+        flake_ref: Option<String>,
+        targets: Vec<String>,
+        system: Option<String>,
+        task_id: String,
+    },
+    
+    /// Batch build multiple derivations
+    BatchBuild {
+        drvs: Vec<String>,
+        system: Option<String>,
+        task_id: String,
+    },
+    
+    /// Build started notification
+    BuildStarted {
+        task_id: String,
+        drv_path: String,
+        system: String,
+    },
+    
+    /// Build complete notification
+    BuildComplete {
+        task_id: String,
+        drv_path: String,
+        system: String,
+        status: TaskStatus,
+        duration_seconds: Option<f64>,
+    },
+    
+    /// Batch build complete
+    BatchBuildComplete {
+        task_id: String,
+        total: usize,
+        completed: usize,
+        failed: usize,
+    },
+    
+    /// Cancel a build
+    CancelBuild {
+        task_id: String,
+    },
+    
+    /// Build was cancelled
+    BuildCancelled {
+        task_id: String,
+        reason: String,
+    },
+    
+    /// Request build status
+    BuildStatus {
+        task_id: String,
+    },
+    
+    /// Build status update
+    BuildStatusUpdate {
+        task_id: String,
+        status: TaskStatus,
+        progress: f64,
+        details: Option<String>,
+    },
+    
+    // --- Agent Stats Messages ---
+    
+    /// Request agent statistics
+    GetStats,
+    
+    /// Agent statistics response
+    Stats {
+        agent_id: String,
+        data: serde_json::Value,
     },
     
     // --- AI Messages ---

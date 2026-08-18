@@ -10,6 +10,10 @@ pub enum AgentFlowError {
     #[error("{0}")]
     Generic(String),
     
+    /// Timeout error
+    #[error("Operation timed out")]
+    Timeout,
+    
     /// IO error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
