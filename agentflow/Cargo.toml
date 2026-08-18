@@ -6,6 +6,7 @@ members = [
     "agentflow-server",
     "agentflow-storage",
     "agentflow-tools",
+    "agentflow-examples",
 ]
 resolver = "2"
 
