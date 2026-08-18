@@ -125,7 +125,6 @@ pub async fn spawn_all_agents(
 ) -> Result<Vec<SpawnedAgent>> {
     let mut agents = Vec::new();
     
-    println!("🚀 Spawning 14 AgentFlow agents...");
     
     // Use provided stores or create new ones
     let task_store = task_store.unwrap_or_else(|| Arc::new(MemoryTaskStore::default()));
